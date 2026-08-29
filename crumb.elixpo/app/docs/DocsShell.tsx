@@ -27,9 +27,13 @@ export function DocsShell({ children }: { children: React.ReactNode }) {
   }, [pathname])
 
   async function copyForLlm() {
-    const content = document.getElementById('docs-content')?.innerText.trim()
-    if (!content) return
-    const payload = `# Crumb documentation\nSource: ${window.location.href}\n\n${content}`
+    const visibleContent = document.getElementById('docs-content')?.innerText.trim() || ''
+    let payload = `# Crumb documentation\nSource: ${window.location.href}\n\n${visibleContent}`
+    try {
+      const response = await fetch('/llms-full.txt')
+      if (response.ok) payload = await response.text()
+    } catch { /* The visible page remains a useful offline fallback. */ }
+    if (!payload.trim()) return
     try { await navigator.clipboard.writeText(payload) } catch {
       const area = document.createElement('textarea'); area.value = payload; document.body.appendChild(area); area.select(); document.execCommand('copy'); area.remove()
     }

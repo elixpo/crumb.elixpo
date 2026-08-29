@@ -6,7 +6,7 @@ import { pageMetadata } from '@/lib/seo'
 export const metadata = pageMetadata({ title: 'Sign in', description: 'Sign in to manage your Crumb account and provider connections.', path: '/login', noIndex: true })
 
 export default async function LoginPage() {
-  if (await currentUser()) redirect('/profiles')
+  if (await currentUser()) redirect('/profile/connectors')
   return <><SiteHeader /><main className="auth-page">
     <section className="auth-card">
       <div className="auth-logos"><img src="/favicon.ico" alt="Crumb" /><span>↔</span><div className="elixpo-logo">e</div></div>

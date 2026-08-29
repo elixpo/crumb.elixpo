@@ -4,6 +4,7 @@
 
 Canonical site: https://crumb.elixpo.com
 Source: https://github.com/elixpo/crumb.elixpo
+Complete usage guide: https://crumb.elixpo.com/llms-full.txt
 
 ## Documentation
 
