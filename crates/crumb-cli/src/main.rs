@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crumb_auth::{
-    CredentialSource, CredentialStore, OsCredentialStore, SecretString, credential_status, login,
+    CredentialSource, CredentialStore, OsCredentialStore, credential_status, login,
 };
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
@@ -23,6 +23,8 @@ use reedline::{
     FileBackedHistory, History, HistoryItem, Prompt, PromptEditMode, PromptHistorySearch,
     PromptHistorySearchStatus, Reedline, Signal,
 };
+
+mod browser_auth;
 
 const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
 
@@ -204,9 +206,12 @@ fn handle_auth(action: AuthAction, writer: &mut dyn Write) -> Result<()> {
     match action {
         AuthAction::Login => {
             let store = OsCredentialStore::new()?;
-            let secret = SecretString::new(rpassword::prompt_password("Pollinations API key: ")?);
+            let secret = browser_auth::connect(writer)?;
             login(&store, &secret)?;
-            writeln!(writer, "Pollinations BYOK saved in the OS credential store")?;
+            writeln!(
+                writer,
+                "Pollinations account connected and saved in the OS credential store"
+            )?;
         }
         AuthAction::Status => {
             let environment = std::env::var("POLLINATIONS_API_KEY").ok();

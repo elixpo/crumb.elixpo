@@ -17,21 +17,22 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [ ] [Linux terminal parity](https://github.com/elixpo/crumb.elixpo/issues/16) ([PR #18](https://github.com/elixpo/crumb.elixpo/pull/18))
 - [ ] [WP-008 — provider-neutral LLM interface](https://github.com/elixpo/crumb.elixpo/issues/19) ([PR #20](https://github.com/elixpo/crumb.elixpo/pull/20))
 - [ ] [WP-009 — Pollinations adapter](https://github.com/elixpo/crumb.elixpo/issues/21) ([PR #23](https://github.com/elixpo/crumb.elixpo/pull/23))
+- [ ] [WP-010 — secure Pollinations BYOK](https://github.com/elixpo/crumb.elixpo/issues/24) ([PR #27](https://github.com/elixpo/crumb.elixpo/pull/27))
 
-## Current milestone: [WP-010 — secure Pollinations BYOK](https://github.com/elixpo/crumb.elixpo/issues/24)
+## Current milestone: [WP-011 — browser account connector](https://github.com/elixpo/crumb.elixpo/issues/26)
 
-- [x] Add an isolated `crumb-auth` crate and secure-store abstraction.
-- [x] Store Pollinations BYOK in the OS credential manager.
-- [x] Add redacted, zeroizing secret ownership.
-- [x] Add `crumb auth login|status|logout` commands.
-- [x] Add matching `:auth login|status|logout` built-ins.
-- [x] Support a process-scoped `POLLINATIONS_API_KEY` override.
-- [x] Keep secrets out of command arguments, echo, history, diagnostics, and errors.
-- [x] Fail safely when no secure credential store is available.
-- [x] Document Linux Secret Service behavior and safe headless fallback.
-- [ ] Validate Linux Secret Service behavior.
-- [ ] Pass formatting, clippy, and workspace tests.
-- [ ] Merge WP-010.
+- [x] Add the Next.js Cloudflare Pages surface and Lixrl-inspired UI.
+- [x] Add Elixpo Accounts sign-in with `openid profile email`.
+- [x] Adapt the Pollinations PKCE connector.
+- [x] Restrict terminal redirects to loopback port 3000.
+- [x] Add a two-minute, one-time PKCE-bound terminal exchange.
+- [x] Encrypt provider tokens at rest in D1.
+- [x] Replace pasted-key login with the browser connection flow.
+- [x] Keep the OS keyring as the terminal credential boundary.
+- [ ] Configure local D1, KV, and `.env.local` credentials.
+- [ ] Validate the browser-to-terminal flow.
+- [ ] Pass Rust and web checks.
+- [ ] Merge WP-011.
 
 <details>
 <summary>WP-001 completion details</summary>
