@@ -1,6 +1,7 @@
 # crumb documentation
 
 - [Product master plan](product/master-plan.md) — architecture, milestones, and acceptance criteria.
+- [Input namespaces and connectors](product/input-namespaces-and-connectors.md) — `/` commands, `@` references, and connector rollout.
 - [Development TODO](development/TODO.md) — current work package and upcoming implementation order.
 - [Pollinations reference](reference/pollinations.md) — provider API reference used when Pollinations work begins.
 

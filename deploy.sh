@@ -11,7 +11,7 @@ DRY_RUN=false
 TARGET=""
 PACKAGE_NAME=""
 VSCODE_PACKAGE=false
-PAGES_DIR="${CRUMB_PAGES_DIR:-$ROOT_DIR/apps/web}"
+PAGES_DIR="${CRUMB_PAGES_DIR:-$SITE_DIR}"
 PAGES_PROJECT="${CRUMB_PAGES_PROJECT:-crumb-elixpo}"
 PAGES_OUTPUT_DIR="${CRUMB_PAGES_OUTPUT_DIR:-dist}"
 declare -a ACTIONS=()
@@ -360,13 +360,16 @@ deploy_vscode_package() {
 
 require_pages() {
   [ -f "$PAGES_DIR/package.json" ] || fail "Missing Cloudflare Pages package at $PAGES_DIR/package.json."
+  $DRY_RUN && return
   command -v npm >/dev/null 2>&1 || fail "npm is required."
 }
 
 build_pages() {
   require_pages
   install_node_dependencies "$PAGES_DIR"
-  if node -e 'process.exit(require(process.argv[1]).scripts?.["pages:build"] ? 0 : 1)' \
+  if $DRY_RUN; then
+    run_in "$PAGES_DIR" npm run build
+  elif node -e 'process.exit(require(process.argv[1]).scripts?.["pages:build"] ? 0 : 1)' \
     "$PAGES_DIR/package.json"; then
     run_in "$PAGES_DIR" npm run pages:build
   else
