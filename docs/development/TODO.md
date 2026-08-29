@@ -13,10 +13,10 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Launch interactive Bash inside a PTY on Linux.
 - [x] Forward terminal input and output.
 - [x] Preserve working-directory and environment state between commands.
-- [ ] Forward terminal resize events.
-- [ ] Forward Ctrl+C without terminating crumb.
-- [ ] Add focused unit and Linux integration tests.
-- [ ] Pass formatting, clippy, and workspace tests.
+- [x] Forward terminal resize events.
+- [x] Forward Ctrl+C without terminating crumb.
+- [x] Add focused unit and Linux integration tests.
+- [x] Pass formatting, clippy, and workspace tests.
 - [ ] Merge WP-002.
 
 <details>
