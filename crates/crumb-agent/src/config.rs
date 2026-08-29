@@ -133,6 +133,7 @@ pub struct OptimizerConfig {
 pub struct AgentConfig {
     pub mode: AgentMode,
     pub mistakes: MistakePolicy,
+    pub routing: crate::routing::RoutePolicy,
     pub structured_encoding: StructuredEncoding,
     pub limits: AgentLimits,
     pub harness: Option<HarnessConfig>,
@@ -171,11 +172,9 @@ impl AgentConfig {
         {
             bail!("MCP servers require an identifier and command");
         }
-        if self
-            .optimizers
-            .iter()
-            .any(|optimizer| optimizer.id.trim().is_empty() || optimizer.command.as_os_str().is_empty())
-        {
+        if self.optimizers.iter().any(|optimizer| {
+            optimizer.id.trim().is_empty() || optimizer.command.as_os_str().is_empty()
+        }) {
             bail!("optimizers require an identifier and command");
         }
         Ok(())
@@ -211,6 +210,19 @@ impl LiveConfig {
             .with_context(|| format!("failed to parse agent config at {}", self.path.display()))?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Loads the file when present, otherwise returns safe defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when an existing file is invalid or unreadable.
+    pub fn load_or_default(&self) -> Result<AgentConfig> {
+        if self.path.exists() {
+            self.load()
+        } else {
+            Ok(AgentConfig::default())
+        }
     }
 }
 

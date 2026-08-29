@@ -121,7 +121,9 @@ mod tests {
             risk: RiskClass::ReadOnly,
             transport: ToolTransport::Native,
         };
-        registry.register(tool.clone()).expect("first registration should pass");
+        registry
+            .register(tool.clone())
+            .expect("first registration should pass");
         assert!(registry.register(tool).is_err());
     }
 }

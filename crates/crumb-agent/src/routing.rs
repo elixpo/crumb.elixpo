@@ -5,6 +5,8 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 /// Destination selected for one input line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputRoute {
@@ -27,7 +29,8 @@ pub enum RouteReason {
 }
 
 /// Policy for multi-word input whose first word is not a known command.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UnknownInputPolicy {
     #[default]
     Agent,
@@ -36,7 +39,8 @@ pub enum UnknownInputPolicy {
 }
 
 /// Configurable deterministic router policy.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RoutePolicy {
     pub agent_prefixes: Vec<String>,
     pub unknown_input: UnknownInputPolicy,
@@ -92,8 +96,11 @@ impl CommandCatalog {
     }
 
     pub fn extend(&mut self, commands: impl IntoIterator<Item = String>) {
-        self.commands
-            .extend(commands.into_iter().map(|command| normalize_command(&command)));
+        self.commands.extend(
+            commands
+                .into_iter()
+                .map(|command| normalize_command(&command)),
+        );
     }
 
     fn add_directory(&mut self, directory: &Path) {
@@ -132,7 +139,12 @@ impl CommandCatalog {
             return decision(InputRoute::Native, RouteReason::ShellSyntax, input, None);
         };
         if looks_like_path(command) || self.contains(command) {
-            return decision(InputRoute::Native, RouteReason::ResolvedCommand, input, None);
+            return decision(
+                InputRoute::Native,
+                RouteReason::ResolvedCommand,
+                input,
+                None,
+            );
         }
         if let Some(suggestion) = self.suggest(command, policy.typo_distance) {
             return decision(
@@ -179,7 +191,7 @@ impl CommandCatalog {
                 let distance = edit_distance(&normalized, candidate);
                 (distance <= maximum_distance).then_some((distance, candidate))
             })
-            .min_by(|left, right| left.cmp(right))
+            .min_by(std::cmp::Ord::cmp)
             .map(|(_, candidate)| candidate.clone())
     }
 }
@@ -218,17 +230,19 @@ fn is_environment_assignment(word: &str) -> bool {
         return false;
     };
     !name.is_empty()
-        && name
-            .chars()
-            .enumerate()
-            .all(|(index, character)| character == '_' || character.is_ascii_alphanumeric() && (index > 0 || !character.is_ascii_digit()))
+        && name.chars().enumerate().all(|(index, character)| {
+            character == '_'
+                || character.is_ascii_alphanumeric() && (index > 0 || !character.is_ascii_digit())
+        })
 }
 
 fn has_shell_syntax(input: &str) -> bool {
-    input
-        .chars()
-        .any(|character| matches!(character, '|' | '&' | ';' | '<' | '>' | '$' | '`' | '(' | ')' | '\n'))
-        || input.starts_with(['.', '/', '~'])
+    input.chars().any(|character| {
+        matches!(
+            character,
+            '|' | '&' | ';' | '<' | '>' | '$' | '`' | '(' | ')' | '\n'
+        )
+    }) || input.starts_with(['.', '/', '~'])
 }
 
 fn looks_like_path(command: &str) -> bool {
@@ -263,7 +277,12 @@ fn is_executable(path: &Path) -> bool {
         && path
             .extension()
             .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "exe" | "cmd" | "bat" | "com"))
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "exe" | "cmd" | "bat" | "com"
+                )
+            })
 }
 
 fn edit_distance(left: &str, right: &str) -> usize {
@@ -319,12 +338,20 @@ mod tests {
             unknown_input: UnknownInputPolicy::Negotiate,
             ..RoutePolicy::default()
         };
-        assert_eq!(catalog().route("explain this project", &policy).route, InputRoute::Negotiate);
+        assert_eq!(
+            catalog().route("explain this project", &policy).route,
+            InputRoute::Negotiate
+        );
     }
 
     #[test]
     fn shell_operators_never_route_to_agent() {
-        assert_eq!(catalog().route("unknown | less", &RoutePolicy::default()).route, InputRoute::Native);
+        assert_eq!(
+            catalog()
+                .route("unknown | less", &RoutePolicy::default())
+                .route,
+            InputRoute::Native
+        );
     }
 
     #[test]

@@ -1,6 +1,11 @@
 {
   "mode": "negotiate",
   "mistakes": "prompt",
+  "routing": {
+    "agent_prefixes": ["?", "@"],
+    "unknown_input": "agent",
+    "typo_distance": 2
+  },
   "structured_encoding": "auto",
   "limits": {
     "max_steps": 24,

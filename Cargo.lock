@@ -472,6 +472,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "crumb-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "crumb-auth"
 version = "0.1.0"
 dependencies = [
