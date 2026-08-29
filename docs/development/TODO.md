@@ -12,19 +12,21 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [ ] [WP-003 — macOS Zsh parity](https://github.com/elixpo/crumb.elixpo/issues/6) ([PR #7](https://github.com/elixpo/crumb.elixpo/pull/7))
 - [ ] [WP-004 — Windows PowerShell parity](https://github.com/elixpo/crumb.elixpo/issues/8) ([PR #9](https://github.com/elixpo/crumb.elixpo/pull/9))
 - [ ] [WP-005 — shell lifecycle protocol](https://github.com/elixpo/crumb.elixpo/issues/10) ([PR #12](https://github.com/elixpo/crumb.elixpo/pull/12))
+- [ ] [WP-006 — terminal UI layer](https://github.com/elixpo/crumb.elixpo/issues/13) ([PR #14](https://github.com/elixpo/crumb.elixpo/pull/14))
 
-## Current milestone: [WP-006 — terminal UI layer](https://github.com/elixpo/crumb.elixpo/issues/13)
+## Current milestone: [WP-007 — persistent history](https://github.com/elixpo/crumb.elixpo/issues/15)
 
-- [x] Add an isolated `crumb-ui` crate.
-- [x] Render a two-line prompt with crumb, cwd, platform, and execution status.
-- [x] Add compact, full, and disabled branding modes.
-- [x] Respect `NO_COLOR` and non-terminal/plain output.
-- [x] Add a lightweight Git branch and dirty-state segment.
-- [x] Keep prompt rendering free of network activity.
-- [x] Add deterministic renderer tests.
-- [x] Integrate UI without leaking presentation into `crumb-core`.
-- [x] Pass formatting, clippy, and workspace tests.
-- [ ] Merge WP-006.
+- [ ] Add an isolated `crumb-history` crate.
+- [ ] Persist history in local SQLite.
+- [ ] Store command, cwd, platform/mode, exit status, and timestamp.
+- [ ] Exclude empty and likely sensitive commands.
+- [ ] Provide recent and literal text-search queries.
+- [ ] Integrate recording into managed native execution.
+- [ ] Add `:history` and `:history search` built-ins.
+- [ ] Provide interactive Ctrl+R search.
+- [ ] Add migration and persistence tests.
+- [ ] Pass formatting, clippy, and workspace tests.
+- [ ] Merge WP-007.
 
 <details>
 <summary>WP-001 completion details</summary>
@@ -43,7 +45,6 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Planned work packages
 
-- [ ] WP-007 — persistent history.
 - [ ] WP-008 — provider-neutral LLM interface.
 - [ ] WP-009 — Pollinations adapter.
 - [ ] WP-010 — secure authentication.
