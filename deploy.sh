@@ -147,7 +147,7 @@ provision() {
 upload_secrets() {
   require_tools
   if $DRY_RUN; then
-    for key in NEXT_PUBLIC_ELIXPO_CLIENT_ID ELIXPO_CLIENT_SECRET ELIXPO_ACCOUNTS_DELETION_WEBHOOK POLLINATIONS_APP_KEY CONNECTOR_ENCRYPTION_KEY; do
+    for key in NEXT_PUBLIC_ELIXPO_CLIENT_ID NEXT_PUBLIC_ELIXPO_CLIENT_ID_CLI ELIXPO_CLIENT_SECRET ELIXPO_ACCOUNTS_WEBHOOK_SECRET POLLINATIONS_APP_KEY CONNECTOR_ENCRYPTION_KEY; do
       printf '[dry-run] sops decrypt .env | npx wrangler secret put %q --name %q\n' "$key" "$WORKER_NAME"
     done
     return
@@ -158,7 +158,7 @@ upload_secrets() {
   if [ -f "$SITE_DIR/.env.local" ]; then
     local_values="$(<"$SITE_DIR/.env.local")"
   fi
-  for key in NEXT_PUBLIC_ELIXPO_CLIENT_ID ELIXPO_CLIENT_SECRET ELIXPO_ACCOUNTS_DELETION_WEBHOOK POLLINATIONS_APP_KEY CONNECTOR_ENCRYPTION_KEY; do
+  for key in NEXT_PUBLIC_ELIXPO_CLIENT_ID NEXT_PUBLIC_ELIXPO_CLIENT_ID_CLI ELIXPO_CLIENT_SECRET ELIXPO_ACCOUNTS_WEBHOOK_SECRET POLLINATIONS_APP_KEY CONNECTOR_ENCRYPTION_KEY; do
     value=""
     while IFS= read -r line || [ -n "$line" ]; do
       if [[ "$line" == "$key="* ]]; then value="${line#*=}"; break; fi

@@ -8,23 +8,25 @@ Cloudflare Workers through OpenNext, with D1 and KV bindings.
 Register Crumb as a confidential web client in `accounts.elixpo` with scopes
 `openid profile email` and these callbacks:
 
-- `http://localhost:3001/api/auth/callback` for local development.
-- `https://crumb.elixpo.com/api/auth/callback` for production.
+- `http://localhost:3000/auth/callback` for local development.
+- `https://crumb.elixpo.com/auth/callback` for production.
 
 No custom Accounts scope is required. Register an Accounts lifecycle webhook:
 
-- `POST http://localhost:3001/api/webhooks/elixpo` locally.
-- `POST https://crumb.elixpo.com/api/webhooks/elixpo` in production.
+- `POST https://localhost:3000/api/webhook/account_delete` locally.
+- `POST https://crumb.elixpo.com/api/webhook/account_delete` in production.
 
 Subscribe it to `user.deleted`. Accounts must sign the exact request bytes as
 `HMAC-SHA256(secret, "<unix timestamp>.<body>")` and send
 `X-Elixpo-Timestamp`, `X-Elixpo-Signature: sha256=<hex>`, and a stable
 `X-Elixpo-Event-Id`. The shared secret is
-`ELIXPO_ACCOUNTS_DELETION_WEBHOOK`.
+The destination URL is configured in Accounts as
+`ELIXPO_ACCOUNTS_DELETION_WEBHOOK`. Store the separate `whk_…` secret returned
+by Accounts in Crumb as `ELIXPO_ACCOUNTS_WEBHOOK_SECRET`.
 
 Register the Pollinations application callback as:
 
-- `http://localhost:3001/api/integrations/pollinations/callback` locally.
+- `http://localhost:3000/api/integrations/pollinations/callback` locally.
 - `https://crumb.elixpo.com/api/integrations/pollinations/callback` in production.
 
 Pollinations requests `profile usage` and uses PKCE.
@@ -34,13 +36,13 @@ Pollinations requests `profile usage` and uses PKCE.
 Copy `crumb.elixpo/.env.local.example` to `crumb.elixpo/.env.local` and set:
 
 - `NEXT_PUBLIC_ELIXPO_CLIENT_ID`
+- `NEXT_PUBLIC_ELIXPO_CLIENT_ID_CLI`
 - `ELIXPO_CLIENT_SECRET`
-- `ELIXPO_ACCOUNTS_DELETION_WEBHOOK`
+- `ELIXPO_ACCOUNTS_WEBHOOK_SECRET`
 - `POLLINATIONS_APP_KEY`
 - `CONNECTOR_ENCRYPTION_KEY` to a high-entropy server secret
 
-Never commit `.env.local`. The web app runs on port `3001`; the terminal owns
-`127.0.0.1:3000` while `crumb auth login` is active.
+Never commit `.env.local`. The local web app runs on port `3000`.
 
 `./deploy.sh secrets` uses application values from `crumb.elixpo/.env.local`
 when present and falls back per missing key to the SOPS-encrypted root `.env`.
@@ -78,8 +80,8 @@ equivalent are accepted as terminal callbacks.
 
 ## Backend route contract
 
-- `GET /api/auth/login` and `GET /api/auth/callback` — Accounts handshake.
-- `POST /api/webhooks/elixpo` — signed Accounts deletion hook.
+- `GET /api/auth/login` and `GET /auth/callback` — Accounts handshake.
+- `POST /api/webhook/account_delete` — signed Accounts deletion hook.
 - `GET /api/integrations/pollinations/connect` — start Pollinations PKCE.
 - `GET /api/integrations/pollinations/callback` — mint and encrypt the scoped connector.
 - `POST /api/terminal/exchange` — consume the terminal's one-time PKCE grant.
