@@ -14,15 +14,15 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Current milestone: [WP-005 — shell lifecycle protocol](https://github.com/elixpo/crumb.elixpo/issues/10)
 
-- [ ] Generate per-session, per-command completion markers.
-- [ ] Capture cwd and exit status without displaying markers.
-- [ ] Preserve state in one native shell process.
-- [ ] Route ordinary REPL input to the native shell.
-- [ ] Keep colon-prefixed built-ins under crumb control.
-- [ ] Handle empty commands and shell termination cleanly.
-- [ ] Add parser unit tests and Linux lifecycle integration coverage.
-- [ ] Define Zsh and PowerShell hook boundaries.
-- [ ] Pass formatting, clippy, and workspace tests.
+- [x] Generate per-session, per-command completion markers.
+- [x] Capture cwd and exit status without displaying markers.
+- [x] Preserve state in one native shell process.
+- [x] Route ordinary REPL input to the native shell.
+- [x] Keep colon-prefixed built-ins under crumb control.
+- [x] Handle empty commands and shell termination cleanly.
+- [x] Add parser unit tests and Linux lifecycle integration coverage.
+- [x] Define Zsh and PowerShell hook boundaries.
+- [x] Pass formatting, clippy, and workspace tests.
 - [ ] Merge WP-005.
 
 <details>
