@@ -111,7 +111,7 @@ impl CompletionProtocol {
 
     fn posix_submission(&self, command: &str, sequence: u64) -> String {
         format!(
-            "{command}\n__crumb_status=$?; __crumb_cwd_hex=$(printf %s \"$PWD\" | od -An -tx1 | tr -d ' \\n'); printf '\\036crumb:{}:{sequence}:%s:%s\\037' \"$__crumb_status\" \"$__crumb_cwd_hex\"\n",
+            "stty echo\n{command}\n__crumb_status=$?; stty -echo; __crumb_cwd_hex=$(printf %s \"$PWD\" | od -An -tx1 | tr -d ' \\n'); printf '\\036crumb:{}:{sequence}:%s:%s\\037' \"$__crumb_status\" \"$__crumb_cwd_hex\"\n",
             self.token
         )
     }
@@ -197,7 +197,7 @@ mod tests {
 
         let submission = protocol.submission(crate::ShellKind::Bash, "cd /tmp", 7);
 
-        assert!(submission.starts_with("cd /tmp\n__crumb_status=$?;"));
+        assert!(submission.starts_with("stty echo\ncd /tmp\n__crumb_status=$?; stty -echo;"));
         assert!(submission.contains("crumb:abc123:7:"));
     }
 

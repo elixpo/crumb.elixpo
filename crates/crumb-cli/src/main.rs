@@ -6,14 +6,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crumb_core::{BuiltInCommand, HistoryAction, InputEvent};
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::shell_for;
 use crumb_platform::Platform;
-use crumb_pty::{SystemPty, TerminalSize};
+use crumb_pty::{PtyInput, PtyResizer, SystemPty, TerminalSize};
 use crumb_repl::{ReplOutcome, read_classified_line};
 use crumb_ui::{GitSegment, PromptContext, Renderer, UiSettings};
 use reedline::{
@@ -36,7 +36,6 @@ fn run_managed_repl() -> Result<ReplOutcome> {
     let stdout = io::stdout();
     let interactive = stdin.is_terminal() && stdout.is_terminal();
     let renderer = Renderer::new(UiSettings::from_environment(interactive));
-    let mut reader = stdin.lock();
     let platform = Platform::current();
     let mut session: Option<ShellSession> = None;
     let mut last_exit_code = None;
@@ -81,7 +80,7 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             let mut writer = stdout.lock();
             writer.write_all(prompt.as_bytes())?;
             writer.flush()?;
-            read_classified_line(&mut reader)?
+            read_classified_line(&mut stdin.lock())?
         };
         let Some(event) = event else {
             shutdown_session(session)?;
@@ -142,7 +141,12 @@ fn run_managed_repl() -> Result<ReplOutcome> {
                     )?);
                 }
                 if let Some(shell) = session.as_mut() {
-                    match shell.execute(&command, &mut writer)? {
+                    let outcome = if interactive {
+                        execute_foreground(shell, &command, &mut writer)?
+                    } else {
+                        shell.execute(&command, &mut writer)?
+                    };
+                    match outcome {
                         CommandOutcome::Completed(completion) => {
                             last_exit_code = Some(completion.exit_code);
                             record_history(
@@ -172,6 +176,79 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             }
         }
     }
+}
+
+fn execute_foreground(
+    shell: &mut ShellSession,
+    command: &str,
+    output: &mut dyn Write,
+) -> Result<CommandOutcome> {
+    let input = shell.try_clone_input()?;
+    let resizer = shell.resizer();
+    let running = Arc::new(AtomicBool::new(true));
+    let relay_running = Arc::clone(&running);
+    let _raw_mode = RawModeGuard::enable()?;
+    let submitted = shell.submit(command)?;
+
+    thread::scope(|scope| {
+        let relay = scope.spawn(move || relay_foreground_input(input, resizer, &relay_running));
+        let outcome = submitted.wait(output);
+        running.store(false, Ordering::Relaxed);
+        let relay_result = relay
+            .join()
+            .map_err(|_| anyhow!("foreground input relay panicked"))?;
+        relay_result?;
+        outcome
+    })
+}
+
+fn relay_foreground_input(
+    mut destination: PtyInput,
+    resizer: PtyResizer,
+    running: &AtomicBool,
+) -> io::Result<()> {
+    let mut stdin = io::stdin();
+    let mut previous_size = size()?;
+    let mut buffer = [0_u8; 8192];
+
+    while running.load(Ordering::Relaxed) {
+        if stdin_ready(&stdin)? {
+            let bytes_read = stdin.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            destination.write_all(&buffer[..bytes_read])?;
+            destination.flush()?;
+        }
+
+        if let Ok(current @ (cols, rows)) = size()
+            && current != previous_size
+        {
+            resizer
+                .resize(TerminalSize::new(rows, cols))
+                .map_err(io::Error::other)?;
+            previous_size = current;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn stdin_ready(stdin: &io::Stdin) -> io::Result<bool> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 25_000_000,
+    };
+    let mut descriptors = [PollFd::new(stdin, PollFlags::IN)];
+    poll(&mut descriptors, Some(&timeout)).map_err(io::Error::from)?;
+    Ok(descriptors[0].revents().contains(PollFlags::IN))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stdin_ready(_stdin: &io::Stdin) -> io::Result<bool> {
+    crossterm::event::poll(Duration::from_millis(25))
 }
 
 fn create_line_editor(history: Option<&HistoryStore>) -> Result<Reedline> {

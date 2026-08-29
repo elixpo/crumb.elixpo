@@ -18,10 +18,10 @@ This is the local source of truth for implementation order. GitHub issues provid
 ## Current milestone: [Terminal parity gate](https://github.com/elixpo/crumb.elixpo/issues/16)
 
 - [x] Make the managed PTY input stream safely shareable during execution.
-- [ ] Relay terminal input to foreground commands without `:shell`.
-- [ ] Forward terminal resize events while commands run.
-- [ ] Make Ctrl+C interrupt the foreground command without exiting Crumb.
-- [ ] Run interactive and full-screen TTY programs as ordinary commands.
+- [x] Relay terminal input to foreground commands without `:shell` on Linux.
+- [x] Forward terminal resize events while commands run on Linux.
+- [x] Make Ctrl+C interrupt the foreground command without exiting Crumb on Linux.
+- [x] Run interactive and full-screen TTY programs as ordinary commands on Linux.
 - [ ] Preserve shell state and completion metadata after interactive commands.
 - [ ] Cover Linux Bash, macOS Zsh, and Windows PowerShell behavior.
 - [ ] Remove terminal compatibility as a reason to use `:shell`.
