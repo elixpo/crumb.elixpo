@@ -49,7 +49,10 @@ pub fn run<R: BufRead, W: Write>(
             InputEvent::BuiltIn(BuiltInCommand::Version) => writeln!(writer, "crumb {version}")?,
             InputEvent::NativeInput(command) if command.trim().is_empty() => {}
             InputEvent::NativeInput(command) => {
-                writeln!(writer, "native input (execution arrives in WP-002): {command}")?;
+                writeln!(
+                    writer,
+                    "native input (execution arrives in WP-002): {command}"
+                )?;
             }
         }
     }
@@ -93,7 +96,10 @@ mod tests {
 
     #[test]
     fn prompt_contains_the_working_directory() {
-        assert_eq!(render_prompt(Path::new("/tmp/project")), "crumb:/tmp/project> ");
+        assert_eq!(
+            render_prompt(Path::new("/tmp/project")),
+            "crumb:/tmp/project> "
+        );
     }
 
     #[test]

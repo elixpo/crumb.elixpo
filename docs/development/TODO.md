@@ -1,0 +1,38 @@
+# Development TODO
+
+This is the local source of truth for implementation order. GitHub issues provide discussion and ownership; completed work remains checked here for quick repository context.
+
+## Current milestone: WP-001 — workspace bootstrap
+
+- [x] Create the Cargo workspace.
+- [x] Add `crumb-cli`, `crumb-core`, `crumb-repl`, and `crumb-platform`.
+- [x] Detect Linux, macOS, and Windows with a typed `Platform` enum.
+- [x] Render a minimal prompt containing the working directory.
+- [x] Implement `:exit`, `:version`, and `:platform`.
+- [x] Classify all other input as `NativeInput` without executing it.
+- [x] Add unit tests and cross-platform GitHub Actions.
+- [ ] Pass formatting, clippy, and workspace tests.
+- [ ] Merge WP-001.
+
+## Planned work packages
+
+- [ ] WP-002 — persistent Linux Bash PTY prototype.
+- [ ] WP-003 — macOS Zsh parity.
+- [ ] WP-004 — Windows PowerShell parity.
+- [ ] WP-005 — shell lifecycle and completion protocol.
+- [ ] WP-006 — terminal UI layer.
+- [ ] WP-007 — persistent history.
+- [ ] WP-008 — provider-neutral LLM interface.
+- [ ] WP-009 — Pollinations adapter.
+- [ ] WP-010 — secure authentication.
+- [ ] WP-011 — streamed AI question mode.
+
+Later work packages remain defined in the [master plan](../product/master-plan.md). Only the current and immediately upcoming package should be expanded into implementation-level tasks.
+
+## Validation commands
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+```
