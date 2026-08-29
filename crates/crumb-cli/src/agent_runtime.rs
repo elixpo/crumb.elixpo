@@ -60,6 +60,9 @@ impl AgentRuntime {
             .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
         let root = session_root(&workspace);
         let summary = session_summary(&root, session_id)?;
+        if summary.archived {
+            bail!("archived sessions must be restored before resuming");
+        }
         if summary.workspace != workspace {
             bail!("session belongs to a different workspace");
         }
@@ -77,6 +80,11 @@ impl AgentRuntime {
             journal,
         ));
         Ok(())
+    }
+
+    #[must_use]
+    pub fn active_session_id(&self) -> Option<&str> {
+        self.session.as_ref().map(|session| session.id().as_str())
     }
 
     /// Executes one turn and forwards bounded Harness notifications as they

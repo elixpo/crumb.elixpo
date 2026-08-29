@@ -8,7 +8,7 @@ pub mod supervisor;
 
 pub use process::{HarnessEnvironment, ProcessHarness, PromptReceipt, RunResult, ServerInfo};
 pub use protocol::{
-    IncomingFrame, InitializeParams, JsonRpcError, Notification, Response, SessionPromptParams,
-    encode_initialize, encode_session_prompt, encode_shutdown,
+    HarnessActivity, IncomingFrame, InitializeParams, JsonRpcError, Notification, Response,
+    SessionPromptParams, encode_initialize, encode_session_prompt, encode_shutdown,
 };
 pub use supervisor::{HarnessIdentity, HarnessLaunch, HarnessSupervisor, SupervisorLimits};

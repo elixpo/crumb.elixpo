@@ -11,11 +11,12 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crumb_agent::{
     AgentConfig, AgentMode, CancellationToken, CommandCatalog, ConfiguredApprovals, HarnessConfig,
     InputRoute, LiveConfig, MistakePolicy, Modality, RouteDecision, ToolHost, TurnStatus,
-    UnknownInputPolicy, list_sessions, session_summary,
+    UnknownInputPolicy, export_session, list_sessions, search_sessions, session_summary,
+    set_session_archived, set_session_label, trash_session,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
-use crumb_harness_dsh::Notification;
+use crumb_harness_dsh::{HarnessActivity, Notification};
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_mcp::{McpDispatcher, serve_stdio};
 use crumb_native::session::{CommandOutcome, ShellSession};
@@ -434,36 +435,24 @@ fn handle_agent_boundary(
 }
 
 fn harness_event_label(notification: &Notification) -> Option<String> {
-    if notification.method == "session.status" {
-        return notification
-            .params
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .and_then(safe_event_label)
-            .map(|status| format!("session {status}"));
+    match notification.activity()? {
+        HarnessActivity::RequestAccepted => Some("request accepted".to_owned()),
+        HarnessActivity::Status { state } => Some(format!("session {state}")),
+        HarnessActivity::ToolStarted { name } => Some(format!("tool started · {name}")),
+        HarnessActivity::ApprovalRequired { name } => Some(format!("approval required · {name}")),
+        HarnessActivity::ToolOutput { name, bytes } => Some(bytes.map_or_else(
+            || format!("tool output · {name}"),
+            |bytes| format!("tool output · {name} · {bytes} bytes"),
+        )),
+        HarnessActivity::ToolFinished { name, success } => Some(format!(
+            "tool {} · {name}",
+            if success { "completed" } else { "failed" }
+        )),
+        HarnessActivity::Completed { reason } => Some(format!("completed · {reason}")),
+        HarnessActivity::Failed { reason } => Some(format!("failed · {reason}")),
+        HarnessActivity::Cancelled => Some("cancelled".to_owned()),
+        HarnessActivity::Progress { label } => Some(label),
     }
-    if notification.method != "session.event" {
-        return None;
-    }
-    let event_type = notification.params.get("event")?.get("type")?.as_str()?;
-    match event_type {
-        "agent/inbox/spliced" => Some("request accepted".to_owned()),
-        "assistant/message" | "turn/end" => None,
-        other => safe_event_label(other),
-    }
-}
-
-fn safe_event_label(value: &str) -> Option<String> {
-    let label = value
-        .chars()
-        .filter_map(|character| match character {
-            '/' | '-' | '_' => Some(' '),
-            character if character.is_ascii_alphanumeric() || character == ' ' => Some(character),
-            _ => None,
-        })
-        .take(64)
-        .collect::<String>();
-    (!label.trim().is_empty()).then(|| label.trim().to_owned())
 }
 
 const fn agent_mode_name(mode: AgentMode) -> &'static str {
@@ -740,36 +729,8 @@ fn show_sessions(
     let root = cwd.join(".crumb").join("sessions").join("crumb");
     let arguments = command.split_whitespace().skip(1).collect::<Vec<_>>();
     match arguments.as_slice() {
-        [] | ["list"] => {
-            let sessions = list_sessions(&root)?;
-            writeln!(writer, "◆ Agent sessions")?;
-            if sessions.is_empty() {
-                writeln!(writer, "  No sessions in this workspace")?;
-            }
-            for summary in sessions.into_iter().take(20) {
-                writeln!(
-                    writer,
-                    "  {:<34} {:<10} {} turns",
-                    summary.id.as_str(),
-                    turn_status_name(summary.last_status),
-                    summary.turns
-                )?;
-            }
-        }
-        ["inspect", id] => {
-            let summary = session_summary(&root, id)?;
-            writeln!(writer, "◆ Session {}", summary.id.as_str())?;
-            writeln!(writer, "  workspace  {}", summary.workspace.display())?;
-            writeln!(writer, "  mode       {}", agent_mode_name(summary.mode))?;
-            writeln!(writer, "  turns      {}", summary.turns)?;
-            writeln!(
-                writer,
-                "  status     {}",
-                turn_status_name(summary.last_status)
-            )?;
-            writeln!(writer, "  started    {} ms", summary.started_at_ms)?;
-            writeln!(writer, "  last event {} ms", summary.last_event_at_ms)?;
-        }
+        [] | ["list"] => show_session_list(&root, writer)?,
+        ["inspect", id] => show_session_details(&root, id, writer)?,
         ["resume", id] => {
             if runtime.is_none() {
                 *runtime = Some(AgentRuntime::new()?);
@@ -780,10 +741,106 @@ fn show_sessions(
                 .resume(cwd, id)?;
             writeln!(writer, "◆ Resumed session {id}")?;
         }
+        ["search", query @ ..] if !query.is_empty() => {
+            show_session_search(&root, &query.join(" "), writer)?;
+        }
+        ["rename", id, label @ ..] if !label.is_empty() => {
+            let label = label.join(" ");
+            set_session_label(&root, id, &label)?;
+            writeln!(writer, "◆ Session {id} labeled {label}")?;
+        }
+        ["archive" | "restore", id] => {
+            let archived = arguments[0] == "archive";
+            set_session_archived(&root, id, archived)?;
+            writeln!(
+                writer,
+                "◆ Session {id} {}",
+                if archived { "archived" } else { "restored" }
+            )?;
+        }
+        ["export", id] => {
+            let export = export_session(&root, id)?;
+            serde_json::to_writer_pretty(&mut *writer, &export)?;
+            writeln!(writer)?;
+        }
+        ["delete", id] => {
+            if runtime.as_ref().and_then(AgentRuntime::active_session_id) == Some(*id) {
+                return Err(anyhow!("cannot delete the active session"));
+            }
+            let destination = trash_session(&root, id)?;
+            writeln!(writer, "◆ Session {id} moved to {}", destination.display())?;
+        }
         _ => writeln!(
             writer,
-            "usage: /session [list | inspect <id> | resume <id>]"
+            "usage: /session [list | inspect <id> | resume <id> | search <query> | rename <id> <label> | archive <id> | restore <id> | export <id> | delete <id>]"
         )?,
+    }
+    Ok(())
+}
+
+fn show_session_list(root: &Path, writer: &mut dyn Write) -> Result<()> {
+    let sessions = list_sessions(root)?;
+    writeln!(writer, "◆ Agent sessions")?;
+    if sessions.is_empty() {
+        writeln!(writer, "  No sessions in this workspace")?;
+    }
+    for summary in sessions.into_iter().take(20) {
+        let label = summary
+            .label
+            .as_deref()
+            .map_or(String::new(), |label| format!(" · {label}"));
+        let archived = if summary.archived { " [archived]" } else { "" };
+        writeln!(
+            writer,
+            "  {:<34} {:<10} {} turns{}{}",
+            summary.id.as_str(),
+            turn_status_name(summary.last_status),
+            summary.turns,
+            archived,
+            label
+        )?;
+    }
+    Ok(())
+}
+
+fn show_session_details(root: &Path, id: &str, writer: &mut dyn Write) -> Result<()> {
+    let summary = session_summary(root, id)?;
+    writeln!(writer, "◆ Session {}", summary.id.as_str())?;
+    writeln!(
+        writer,
+        "  label      {}",
+        summary.label.as_deref().unwrap_or("—")
+    )?;
+    writeln!(writer, "  archived   {}", summary.archived)?;
+    writeln!(writer, "  workspace  {}", summary.workspace.display())?;
+    writeln!(writer, "  mode       {}", agent_mode_name(summary.mode))?;
+    writeln!(writer, "  turns      {}", summary.turns)?;
+    writeln!(
+        writer,
+        "  status     {}",
+        turn_status_name(summary.last_status)
+    )?;
+    writeln!(writer, "  started    {} ms", summary.started_at_ms)?;
+    writeln!(writer, "  last event {} ms", summary.last_event_at_ms)?;
+    Ok(())
+}
+
+fn show_session_search(root: &Path, query: &str, writer: &mut dyn Write) -> Result<()> {
+    let sessions = search_sessions(root, query)?;
+    writeln!(writer, "◆ Session search · {query}")?;
+    if sessions.is_empty() {
+        writeln!(writer, "  No matching sessions")?;
+    }
+    for summary in sessions.into_iter().take(20) {
+        writeln!(
+            writer,
+            "  {}{}",
+            summary.id.as_str(),
+            summary
+                .label
+                .as_deref()
+                .map_or(String::new(), |label| format!(" · {label}"))
+        )?;
     }
     Ok(())
 }
@@ -1245,7 +1302,7 @@ mod tests {
 
     use crumb_agent::{AgentConfig, RiskClass};
 
-    use super::{agent_config_location, safe_event_label, workspace_read_host};
+    use super::{agent_config_location, workspace_read_host};
 
     #[test]
     fn stdio_mcp_host_exposes_only_read_tools() {
@@ -1270,14 +1327,6 @@ mod tests {
         ] {
             assert!(!composition.contains(forbidden));
         }
-    }
-
-    #[test]
-    fn harness_event_labels_cannot_inject_terminal_controls() {
-        assert_eq!(
-            safe_event_label("tool/run\u{1b}[31m_secret"),
-            Some("tool run31m secret".to_owned())
-        );
     }
 
     #[test]

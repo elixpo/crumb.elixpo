@@ -9,6 +9,7 @@ pub mod config;
 pub mod harness;
 pub mod routing;
 pub mod session;
+pub mod steering;
 pub mod tools;
 
 pub use approvals::{ApprovalInbox, InteractiveApprovalBroker, PendingApproval, approval_channel};
@@ -21,9 +22,11 @@ pub use routing::{
     CommandCatalog, InputRoute, RouteDecision, RoutePolicy, RouteReason, UnknownInputPolicy,
 };
 pub use session::{
-    AgentSession, CancellationToken, SessionEvent, SessionId, SessionJournal, SessionSummary,
-    TurnStatus, list_sessions, session_summary,
+    AgentSession, CancellationToken, SessionEvent, SessionExport, SessionId, SessionJournal,
+    SessionSummary, TurnStatus, export_session, list_sessions, search_sessions, session_summary,
+    set_session_archived, set_session_label, trash_session,
 };
+pub use steering::{SteeringAction, SteeringQueue};
 pub use tools::{
     ApprovalBroker, ApprovalDecision, ApprovalRequest, ConfiguredApprovals, DenyAllApprovals,
     McpServer, OutputKind, RiskClass, TokenOptimizer, ToolCallError, ToolCallErrorKind,

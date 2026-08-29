@@ -96,6 +96,8 @@ pub struct AgentLimits {
     pub max_harness_shutdown_seconds: u64,
     pub max_shell_command_seconds: u64,
     pub max_file_write_bytes: u64,
+    pub max_steering_messages: u32,
+    pub max_steering_bytes: u64,
 }
 
 impl Default for AgentLimits {
@@ -111,6 +113,8 @@ impl Default for AgentLimits {
             max_harness_shutdown_seconds: 5,
             max_shell_command_seconds: 300,
             max_file_write_bytes: 1_048_576,
+            max_steering_messages: 8,
+            max_steering_bytes: 32_768,
         }
     }
 }
@@ -188,6 +192,8 @@ impl AgentConfig {
             || self.limits.max_wall_time_seconds == 0
             || self.limits.max_harness_initialize_seconds == 0
             || self.limits.max_harness_shutdown_seconds == 0
+            || self.limits.max_steering_messages == 0
+            || self.limits.max_steering_bytes == 0
         {
             bail!("agent runtime limits must be positive");
         }

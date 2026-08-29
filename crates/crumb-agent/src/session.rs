@@ -64,40 +64,40 @@ impl CancellationToken {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
     SessionStarted {
-        at_ms: u128,
+        at_ms: u64,
         session_id: SessionId,
         workspace: PathBuf,
         mode: AgentMode,
     },
     TurnStarted {
-        at_ms: u128,
+        at_ms: u64,
         request_bytes: usize,
         request_digest: String,
     },
     ToolRequested {
-        at_ms: u128,
+        at_ms: u64,
         name: String,
         risk: crate::tools::RiskClass,
         arguments_digest: String,
     },
     ToolFinished {
-        at_ms: u128,
+        at_ms: u64,
         name: String,
         success: bool,
         output_bytes: usize,
     },
     TurnFinished {
-        at_ms: u128,
+        at_ms: u64,
         status: TurnStatus,
         steps: u32,
         tool_calls: u32,
     },
     ModeChanged {
-        at_ms: u128,
+        at_ms: u64,
         mode: AgentMode,
     },
     ModelSelected {
-        at_ms: u128,
+        at_ms: u64,
         provider: String,
         model: String,
         reasoning_effort: Option<String>,
@@ -114,15 +114,31 @@ pub enum TurnStatus {
 }
 
 /// Redacted metadata reconstructed from one append-only session journal.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionSummary {
     pub id: SessionId,
+    pub label: Option<String>,
+    pub archived: bool,
     pub workspace: PathBuf,
     pub mode: AgentMode,
-    pub started_at_ms: u128,
-    pub last_event_at_ms: u128,
+    pub started_at_ms: u64,
+    pub last_event_at_ms: u64,
     pub turns: u32,
     pub last_status: Option<TurnStatus>,
+}
+
+/// Portable session data containing only Crumb's redacted event vocabulary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionExport {
+    pub summary: SessionSummary,
+    pub events: Vec<SessionEvent>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct SessionMetadata {
+    label: Option<String>,
+    archived: bool,
 }
 
 /// Lists valid session journals newest-first without loading prompt content.
@@ -151,12 +167,108 @@ pub fn list_sessions(root: &Path) -> Result<Vec<SessionSummary>> {
 /// Returns an error when the identifier or journal is invalid, missing, or
 /// exceeds the bounded event count.
 pub fn session_summary(root: &Path, id: &str) -> Result<SessionSummary> {
+    let (mut summary, _) = load_session(root, id, false)?;
+    let metadata = read_metadata(root, &summary.id)?;
+    summary.label = metadata.label;
+    summary.archived = metadata.archived;
+    Ok(summary)
+}
+
+/// Searches redacted session identifiers, labels, modes, and statuses.
+///
+/// # Errors
+///
+/// Returns an error when the query is empty or the session root cannot be read.
+pub fn search_sessions(root: &Path, query: &str) -> Result<Vec<SessionSummary>> {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        bail!("session search query cannot be empty");
+    }
+    Ok(list_sessions(root)?
+        .into_iter()
+        .filter(|summary| searchable_summary(summary).contains(&query))
+        .collect())
+}
+
+/// Sets or replaces a human-readable label without changing the stable ID.
+///
+/// # Errors
+///
+/// Returns an error for invalid labels or missing sessions.
+pub fn set_session_label(root: &Path, id: &str, label: &str) -> Result<()> {
+    let id = SessionId::new(id)?;
+    validate_label(label)?;
+    let mut metadata = read_metadata(root, &id)?;
+    metadata.label = Some(label.trim().to_owned());
+    write_metadata(root, &id, &metadata)
+}
+
+/// Changes whether a session is archived.
+///
+/// # Errors
+///
+/// Returns an error when the session is missing or metadata cannot be written.
+pub fn set_session_archived(root: &Path, id: &str, archived: bool) -> Result<()> {
+    let id = SessionId::new(id)?;
+    let mut metadata = read_metadata(root, &id)?;
+    metadata.archived = archived;
+    write_metadata(root, &id, &metadata)
+}
+
+/// Loads a portable export containing only redacted session events.
+///
+/// # Errors
+///
+/// Returns an error when the journal is missing, invalid, or oversized.
+pub fn export_session(root: &Path, id: &str) -> Result<SessionExport> {
+    let (mut summary, events) = load_session(root, id, true)?;
+    let metadata = read_metadata(root, &summary.id)?;
+    summary.label = metadata.label;
+    summary.archived = metadata.archived;
+    Ok(SessionExport { summary, events })
+}
+
+/// Moves a session to the root's recoverable `.trash` directory.
+///
+/// # Errors
+///
+/// Returns an error when the session is missing or cannot be moved safely.
+pub fn trash_session(root: &Path, id: &str) -> Result<PathBuf> {
+    let id = SessionId::new(id)?;
+    let source = existing_session_directory(root, &id)?;
+    let canonical_root = source
+        .parent()
+        .context("session directory has no configured root")?;
+    let trash = root.join(".trash");
+    fs::create_dir_all(&trash)
+        .with_context(|| format!("failed to create session trash {}", trash.display()))?;
+    let trash = fs::canonicalize(&trash)
+        .with_context(|| format!("failed to resolve session trash {}", trash.display()))?;
+    if !trash.starts_with(canonical_root) {
+        bail!("session trash escapes its configured root");
+    }
+    let destination = trash.join(format!("{}-{}", id.as_str(), timestamp_ms()));
+    fs::rename(&source, &destination).with_context(|| {
+        format!(
+            "failed to move session {} to recoverable trash",
+            id.as_str()
+        )
+    })?;
+    Ok(destination)
+}
+
+fn load_session(
+    root: &Path,
+    id: &str,
+    include_events: bool,
+) -> Result<(SessionSummary, Vec<SessionEvent>)> {
     const MAX_EVENTS: usize = 100_000;
     let id = SessionId::new(id)?;
-    let path = root.join(id.as_str()).join("events.jsonl");
+    let path = existing_session_directory(root, &id)?.join("events.jsonl");
     let file = File::open(&path)
         .with_context(|| format!("failed to open session journal {}", path.display()))?;
     let mut summary = None;
+    let mut events = Vec::new();
     for (index, line) in BufReader::new(file).lines().enumerate() {
         if index >= MAX_EVENTS {
             bail!("session journal exceeds the event limit");
@@ -166,8 +278,79 @@ pub fn session_summary(root: &Path, id: &str) -> Result<SessionSummary> {
         )
         .with_context(|| format!("invalid session event in {}", path.display()))?;
         apply_summary_event(&mut summary, &event)?;
+        if include_events {
+            events.push(event);
+        }
     }
-    summary.context("session journal has no start event")
+    Ok((
+        summary.context("session journal has no start event")?,
+        events,
+    ))
+}
+
+fn searchable_summary(summary: &SessionSummary) -> String {
+    format!(
+        "{} {} {:?} {:?}",
+        summary.id.as_str(),
+        summary.label.as_deref().unwrap_or_default(),
+        summary.mode,
+        summary.last_status
+    )
+    .to_ascii_lowercase()
+}
+
+fn validate_label(label: &str) -> Result<()> {
+    let label = label.trim();
+    if label.is_empty() || label.len() > 80 || label.chars().any(char::is_control) {
+        bail!("session label must contain 1-80 printable characters");
+    }
+    Ok(())
+}
+
+fn existing_session_directory(root: &Path, id: &SessionId) -> Result<PathBuf> {
+    let root = fs::canonicalize(root)
+        .with_context(|| format!("failed to resolve session root {}", root.display()))?;
+    let directory = fs::canonicalize(root.join(id.as_str()))
+        .with_context(|| format!("session {} does not exist", id.as_str()))?;
+    if !directory.starts_with(&root) || !directory.is_dir() {
+        bail!("session directory escapes its configured root");
+    }
+    Ok(directory)
+}
+
+fn read_metadata(root: &Path, id: &SessionId) -> Result<SessionMetadata> {
+    const MAX_METADATA_EVENTS: usize = 10_000;
+    let path = existing_session_directory(root, id)?.join("metadata.jsonl");
+    if !path.exists() {
+        return Ok(SessionMetadata::default());
+    }
+    let file = File::open(&path)
+        .with_context(|| format!("failed to read session metadata {}", path.display()))?;
+    let mut latest = SessionMetadata::default();
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        if index >= MAX_METADATA_EVENTS {
+            bail!("session metadata exceeds the event limit");
+        }
+        latest = serde_json::from_str(
+            &line.with_context(|| format!("failed to read session metadata {}", path.display()))?,
+        )
+        .with_context(|| format!("invalid session metadata in {}", path.display()))?;
+    }
+    Ok(latest)
+}
+
+fn write_metadata(root: &Path, id: &SessionId, metadata: &SessionMetadata) -> Result<()> {
+    let directory = existing_session_directory(root, id)?;
+    let path = directory.join("metadata.jsonl");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open session metadata {}", path.display()))?;
+    serde_json::to_writer(&mut file, metadata).context("failed to serialize session metadata")?;
+    file.write_all(b"\n")
+        .context("failed to terminate session metadata event")?;
+    file.flush().context("failed to flush session metadata")
 }
 
 fn apply_summary_event(summary: &mut Option<SessionSummary>, event: &SessionEvent) -> Result<()> {
@@ -184,6 +367,8 @@ fn apply_summary_event(summary: &mut Option<SessionSummary>, event: &SessionEven
         }
         *summary = Some(SessionSummary {
             id: session_id.clone(),
+            label: None,
+            archived: false,
             workspace: workspace.clone(),
             mode: *mode,
             started_at_ms: at_ms,
@@ -208,7 +393,7 @@ fn apply_summary_event(summary: &mut Option<SessionSummary>, event: &SessionEven
     Ok(())
 }
 
-const fn event_timestamp(event: &SessionEvent) -> u128 {
+const fn event_timestamp(event: &SessionEvent) -> u64 {
     match event {
         SessionEvent::SessionStarted { at_ms, .. }
         | SessionEvent::TurnStarted { at_ms, .. }
@@ -419,15 +604,25 @@ pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn timestamp_ms() -> u128 {
+fn timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis())
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CancellationToken, SessionEvent, SessionId};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::{AgentMode, TurnStatus};
+
+    use super::{
+        AgentSession, CancellationToken, SessionEvent, SessionId, SessionJournal, export_session,
+        search_sessions, session_summary, set_session_archived, set_session_label, trash_session,
+    };
 
     #[test]
     fn cancellation_is_shared_without_waiting() {
@@ -453,5 +648,50 @@ mod tests {
         let encoded = serde_json::to_string(&event).expect("event should serialize");
         assert!(!encoded.contains("prompt"));
         assert!(encoded.contains("request_digest"));
+    }
+
+    #[test]
+    fn session_lifecycle_uses_only_redacted_journal_data() {
+        let root = temporary_root();
+        let id = SessionId::new("fixture-session").expect("valid session id");
+        let journal = SessionJournal::open(&root, &id).expect("journal opens");
+        let mut session = AgentSession::start(id.clone(), AgentMode::Auto, root.clone(), journal)
+            .expect("session starts");
+        session
+            .record_turn_start("private raw request")
+            .expect("turn starts");
+        session
+            .record_turn_end(TurnStatus::Complete, 1, 0)
+            .expect("turn ends");
+        drop(session);
+
+        set_session_label(&root, id.as_str(), "release checks").expect("label is stored");
+        set_session_archived(&root, id.as_str(), true).expect("session is archived");
+        let summary = session_summary(&root, id.as_str()).expect("summary loads");
+        assert_eq!(summary.label.as_deref(), Some("release checks"));
+        assert!(summary.archived);
+        assert_eq!(
+            search_sessions(&root, "release")
+                .expect("search succeeds")
+                .len(),
+            1
+        );
+
+        let encoded =
+            serde_json::to_string(&export_session(&root, id.as_str()).expect("session exports"))
+                .expect("export serializes");
+        assert!(!encoded.contains("private raw request"));
+        let trashed = trash_session(&root, id.as_str()).expect("session moves to trash");
+        assert!(trashed.is_dir());
+        assert!(session_summary(&root, id.as_str()).is_err());
+        fs::remove_dir_all(root).expect("fixture is removed");
+    }
+
+    fn temporary_root() -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is valid")
+            .as_nanos();
+        std::env::temp_dir().join(format!("crumb-session-lifecycle-{nonce}"))
     }
 }

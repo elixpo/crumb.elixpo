@@ -76,6 +76,42 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "manage agent sessions",
     },
     SlashCommand {
+        usage: "/session list",
+        description: "list agent sessions",
+    },
+    SlashCommand {
+        usage: "/session search ",
+        description: "search session metadata",
+    },
+    SlashCommand {
+        usage: "/session resume ",
+        description: "resume an agent session",
+    },
+    SlashCommand {
+        usage: "/session inspect ",
+        description: "inspect redacted session metadata",
+    },
+    SlashCommand {
+        usage: "/session rename ",
+        description: "label an agent session",
+    },
+    SlashCommand {
+        usage: "/session archive ",
+        description: "archive an agent session",
+    },
+    SlashCommand {
+        usage: "/session restore ",
+        description: "restore an archived session",
+    },
+    SlashCommand {
+        usage: "/session export ",
+        description: "print a redacted session export",
+    },
+    SlashCommand {
+        usage: "/session delete ",
+        description: "move a session to recoverable trash",
+    },
+    SlashCommand {
         usage: "/attach ",
         description: "attach a typed @ reference",
     },

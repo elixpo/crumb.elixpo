@@ -24,7 +24,7 @@ never interpreted as prompts or passed to the native shell accidentally.
 - `/mode auto|negotiate|plan` — change agent autonomy
 - `/model` — inspect or select a model route
 - `/effort` — inspect or set reasoning effort
-- `/session new|list|resume|close` — manage agent sessions
+- `/session list|inspect|resume|search|rename|archive|restore|export|delete` — manage redacted agent sessions
 - `/context` — show the context budget and attached references
 - `/attach` and `/detach` — manage files, folders, or connector resources
 - `/connectors` — list, connect, inspect, or revoke integrations

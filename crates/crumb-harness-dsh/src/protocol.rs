@@ -65,6 +65,95 @@ pub struct Notification {
     pub params: Value,
 }
 
+/// Redacted state safe to send through the bounded terminal activity channel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HarnessActivity {
+    RequestAccepted,
+    Status { state: String },
+    ToolStarted { name: String },
+    ApprovalRequired { name: String },
+    ToolOutput { name: String, bytes: Option<u64> },
+    ToolFinished { name: String, success: bool },
+    Completed { reason: String },
+    Failed { reason: String },
+    Cancelled,
+    Progress { label: String },
+}
+
+impl Notification {
+    /// Projects provider-shaped data into bounded labels without tool
+    /// arguments, output contents, or credentials.
+    #[must_use]
+    pub fn activity(&self) -> Option<HarnessActivity> {
+        if self.method == "session.status" {
+            let state = self.params.get("status")?.as_str().and_then(safe_label)?;
+            return Some(HarnessActivity::Status { state });
+        }
+        if self.method != "session.event" {
+            return None;
+        }
+        let event = self.params.get("event")?;
+        let event_type = event.get("type")?.as_str()?;
+        let data = event.get("data").unwrap_or(&Value::Null);
+        let name = tool_name(data);
+        match event_type {
+            "agent/inbox/spliced" => Some(HarnessActivity::RequestAccepted),
+            "tool/start" | "tool/call" | "tool/requested" => {
+                Some(HarnessActivity::ToolStarted { name })
+            }
+            "approval/requested" | "tool/approval" => {
+                Some(HarnessActivity::ApprovalRequired { name })
+            }
+            "tool/output" | "tool/result" => Some(HarnessActivity::ToolOutput {
+                name,
+                bytes: data.get("outputBytes").and_then(Value::as_u64),
+            }),
+            "tool/end" | "tool/completed" => Some(HarnessActivity::ToolFinished {
+                name,
+                success: data.get("success").and_then(Value::as_bool).unwrap_or(true),
+            }),
+            "turn/end" => turn_end_activity(data),
+            "assistant/message" => None,
+            other => safe_label(other).map(|label| HarnessActivity::Progress { label }),
+        }
+    }
+}
+
+fn turn_end_activity(data: &Value) -> Option<HarnessActivity> {
+    let reason = data
+        .pointer("/reason/kind")
+        .and_then(Value::as_str)
+        .and_then(safe_label)
+        .unwrap_or_else(|| "completed".to_owned());
+    match reason.as_str() {
+        "cancelled" | "canceled" => Some(HarnessActivity::Cancelled),
+        "failed" | "error" => Some(HarnessActivity::Failed { reason }),
+        _ => Some(HarnessActivity::Completed { reason }),
+    }
+}
+
+fn tool_name(data: &Value) -> String {
+    data.get("toolName")
+        .or_else(|| data.get("name"))
+        .or_else(|| data.pointer("/tool/name"))
+        .and_then(Value::as_str)
+        .and_then(safe_label)
+        .unwrap_or_else(|| "tool".to_owned())
+}
+
+fn safe_label(value: &str) -> Option<String> {
+    let label = value
+        .chars()
+        .filter_map(|character| match character {
+            '/' | '-' | '_' | '.' => Some(' '),
+            character if character.is_ascii_alphanumeric() || character == ' ' => Some(character),
+            _ => None,
+        })
+        .take(64)
+        .collect::<String>();
+    (!label.trim().is_empty()).then(|| label.trim().to_owned())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum IncomingFrame {
     Response(Response),
@@ -173,8 +262,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        IncomingFrame, InitializeParams, SessionPromptParams, encode_initialize,
-        encode_session_prompt, encode_shutdown,
+        HarnessActivity, IncomingFrame, InitializeParams, Notification, SessionPromptParams,
+        encode_initialize, encode_session_prompt, encode_shutdown,
     };
 
     #[test]
@@ -235,5 +324,37 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn activity_projection_removes_arguments_and_terminal_controls() {
+        let notification = Notification {
+            method: "session.event".to_owned(),
+            params: json!({
+                "event": {
+                    "type": "tool/start",
+                    "data": {
+                        "toolName": "shell\u{1b}[31m_run",
+                        "arguments": {"command": "secret command"}
+                    }
+                }
+            }),
+        };
+        assert_eq!(
+            notification.activity(),
+            Some(HarnessActivity::ToolStarted {
+                name: "shell31m run".to_owned()
+            })
+        );
+        assert!(!format!("{:?}", notification.activity()).contains("secret command"));
+    }
+
+    #[test]
+    fn turn_end_states_are_distinct() {
+        let notification = Notification {
+            method: "session.event".to_owned(),
+            params: json!({"event":{"type":"turn/end","data":{"reason":{"kind":"cancelled"}}}}),
+        };
+        assert_eq!(notification.activity(), Some(HarnessActivity::Cancelled));
     }
 }

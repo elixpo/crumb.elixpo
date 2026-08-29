@@ -75,6 +75,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Add read-only `/mode`, `/model`, `/effort`, `/config`, and `/plugins` surfaces.
 - [x] Stream real Harness notifications into the renderer instead of projecting them after completion.
 - [x] Expose bounded Pollinations web search through MCP with an explicit network-tool grant.
+- [x] Add bounded queue/replace steering state and redacted Harness activity projections.
 - [ ] Add queued steering and richer tool-specific event projection to the Harness stream.
 - [ ] Add interactive approval, tool-call, patch, error, and completion components.
 - [ ] Add live model, effort, and mode selection backed by atomic configuration writes.
@@ -86,8 +87,10 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [ ] [Stream Harness activity and support queued steering](https://github.com/elixpo/crumb.elixpo/issues/36)
 - [ ] [Add reviewable diffs, checkpoints, and safe rewind](https://github.com/elixpo/crumb.elixpo/issues/37)
 - [ ] [Ship modern input editing, shell completions, and accessibility modes](https://github.com/elixpo/crumb.elixpo/issues/38)
-- [ ] [Add resumable and searchable agent sessions](https://github.com/elixpo/crumb.elixpo/issues/35)
+- [x] [Add resumable and searchable agent sessions](https://github.com/elixpo/crumb.elixpo/issues/35)
 - [ ] [Add opt-in background jobs and scheduled agent work](https://github.com/elixpo/crumb.elixpo/issues/34)
+- [ ] [Add pluggable Codex and Claude coding-agent backends](https://github.com/elixpo/crumb.elixpo/issues/39)
+- [ ] [Add OpenRouter-compatible BYOK providers and explicit model selection](https://github.com/elixpo/crumb.elixpo/issues/40)
 
 ## Planned work packages
 

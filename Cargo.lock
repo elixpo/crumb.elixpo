@@ -380,7 +380,6 @@ version = "4.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfc320937d09e6de266b31b9afb480f197d7a861be86be7cb2ea7e5d1bfffc5e"
 dependencies = [
- "anyhow",
  "bytes",
  "memchr",
 ]
@@ -582,6 +581,7 @@ version = "0.1.0"
 name = "crumb-pollinations"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "crumb-agent",
  "crumb-llm",
