@@ -7,12 +7,20 @@ use std::path::Path;
 use crumb_core::{BuiltInCommand, InputEvent};
 use crumb_platform::Platform;
 
+/// Reason the REPL returned control to its caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplOutcome {
+    Exit,
+    LaunchNativeShell,
+}
+
 /// Classifies one line without executing native shell input.
 #[must_use]
 pub fn classify_input(input: &str) -> InputEvent {
     match input.trim_end_matches(['\r', '\n']) {
         ":exit" => InputEvent::BuiltIn(BuiltInCommand::Exit),
         ":platform" => InputEvent::BuiltIn(BuiltInCommand::Platform),
+        ":shell" => InputEvent::BuiltIn(BuiltInCommand::Shell),
         ":version" => InputEvent::BuiltIn(BuiltInCommand::Version),
         command => InputEvent::NativeInput(command.to_owned()),
     }
@@ -37,7 +45,7 @@ pub fn run<R: BufRead, W: Write>(
     mut writer: W,
     platform: Platform,
     version: &str,
-) -> io::Result<()> {
+) -> io::Result<ReplOutcome> {
     loop {
         let cwd = env::current_dir()?;
         write!(writer, "{}", render_prompt(&cwd))?;
@@ -45,12 +53,15 @@ pub fn run<R: BufRead, W: Write>(
 
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
-            break;
+            return Ok(ReplOutcome::Exit);
         }
 
         match classify_input(&line) {
-            InputEvent::BuiltIn(BuiltInCommand::Exit) => break,
+            InputEvent::BuiltIn(BuiltInCommand::Exit) => return Ok(ReplOutcome::Exit),
             InputEvent::BuiltIn(BuiltInCommand::Platform) => writeln!(writer, "{platform}")?,
+            InputEvent::BuiltIn(BuiltInCommand::Shell) => {
+                return Ok(ReplOutcome::LaunchNativeShell);
+            }
             InputEvent::BuiltIn(BuiltInCommand::Version) => writeln!(writer, "crumb {version}")?,
             InputEvent::NativeInput(command) if command.trim().is_empty() => {}
             InputEvent::NativeInput(command) => {
@@ -61,8 +72,6 @@ pub fn run<R: BufRead, W: Write>(
             }
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -73,7 +82,7 @@ mod tests {
     use crumb_core::{BuiltInCommand, InputEvent};
     use crumb_platform::Platform;
 
-    use super::{classify_input, render_prompt, run};
+    use super::{ReplOutcome, classify_input, render_prompt, run};
 
     #[test]
     fn classifies_supported_built_ins() {
@@ -88,6 +97,10 @@ mod tests {
         assert_eq!(
             classify_input(":platform"),
             InputEvent::BuiltIn(BuiltInCommand::Platform)
+        );
+        assert_eq!(
+            classify_input(":shell"),
+            InputEvent::BuiltIn(BuiltInCommand::Shell)
         );
     }
 
@@ -112,10 +125,21 @@ mod tests {
         let input = Cursor::new(":platform\n:version\n:exit\n");
         let mut output = Vec::new();
 
-        run(input, &mut output, Platform::Linux, "0.1.0").expect("REPL should run");
+        let outcome = run(input, &mut output, Platform::Linux, "0.1.0").expect("REPL should run");
 
         let output = String::from_utf8(output).expect("output should be UTF-8");
+        assert_eq!(outcome, ReplOutcome::Exit);
         assert!(output.contains("linux"));
         assert!(output.contains("crumb 0.1.0"));
+    }
+
+    #[test]
+    fn shell_command_returns_control_to_the_cli() {
+        let input = Cursor::new(":shell\n");
+        let mut output = Vec::new();
+
+        let outcome = run(input, &mut output, Platform::Linux, "0.1.0").expect("REPL should run");
+
+        assert_eq!(outcome, ReplOutcome::LaunchNativeShell);
     }
 }

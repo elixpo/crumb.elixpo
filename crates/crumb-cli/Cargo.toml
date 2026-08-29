@@ -9,8 +9,12 @@ name = "crumb"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
+crumb-native = { path = "../crumb-native" }
 crumb-platform = { path = "../crumb-platform" }
+crumb-pty = { path = "../crumb-pty" }
 crumb-repl = { path = "../crumb-repl" }
+crossterm.workspace = true
 
 [lints]
 workspace = true

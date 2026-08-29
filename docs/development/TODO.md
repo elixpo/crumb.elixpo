@@ -8,8 +8,8 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Current milestone: [WP-002 — persistent Linux Bash PTY](https://github.com/elixpo/crumb.elixpo/issues/4)
 
-- [ ] Add isolated `crumb-pty` and `crumb-native` crates.
-- [ ] Define PTY and native-shell lifecycle abstractions.
+- [x] Add isolated `crumb-pty` and `crumb-native` crates.
+- [x] Define PTY and native-shell lifecycle abstractions.
 - [ ] Launch interactive Bash inside a PTY on Linux.
 - [ ] Forward terminal input and output.
 - [ ] Preserve working-directory and environment state between commands.

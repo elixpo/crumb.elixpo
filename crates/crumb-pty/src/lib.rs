@@ -3,8 +3,9 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 /// Initial or updated dimensions for a pseudoterminal.
@@ -119,8 +120,8 @@ impl PtyBackend for SystemPty {
         let writer = pair.master.take_writer()?;
 
         Ok(PtyProcess {
-            master: pair.master,
-            writer,
+            master: Arc::new(Mutex::new(pair.master)),
+            writer: Some(writer),
             child,
         })
     }
@@ -128,8 +129,8 @@ impl PtyBackend for SystemPty {
 
 /// A live child process and its controlling pseudoterminal.
 pub struct PtyProcess {
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    writer: Option<Box<dyn Write + Send>>,
     child: Box<dyn Child + Send + Sync>,
 }
 
@@ -140,7 +141,10 @@ impl PtyProcess {
     ///
     /// Returns an error if the operating-system PTY reader cannot be cloned.
     pub fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>> {
-        self.master.try_clone_reader()
+        self.master
+            .lock()
+            .map_err(|_| anyhow!("PTY master lock is poisoned"))?
+            .try_clone_reader()
     }
 
     /// Writes bytes to the PTY input stream and flushes them immediately.
@@ -149,9 +153,24 @@ impl PtyProcess {
     ///
     /// Returns an error if writing or flushing the PTY fails.
     pub fn write_input(&mut self, input: &[u8]) -> Result<()> {
-        self.writer.write_all(input)?;
-        self.writer.flush()?;
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| anyhow!("PTY input writer has already been taken"))?;
+        writer.write_all(input)?;
+        writer.flush()?;
         Ok(())
+    }
+
+    /// Transfers ownership of the PTY input stream to a relay thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer was already taken.
+    pub fn take_writer(&mut self) -> Result<Box<dyn Write + Send>> {
+        self.writer
+            .take()
+            .ok_or_else(|| anyhow!("PTY input writer has already been taken"))
     }
 
     /// Updates the terminal dimensions seen by the child process.
@@ -160,7 +179,14 @@ impl PtyProcess {
     ///
     /// Returns an error if the platform cannot resize the PTY.
     pub fn resize(&self, size: TerminalSize) -> Result<()> {
-        self.master.resize(size.into())
+        self.resizer().resize(size)
+    }
+
+    #[must_use]
+    pub fn resizer(&self) -> PtyResizer {
+        PtyResizer {
+            master: Arc::clone(&self.master),
+        }
     }
 
     /// Requests termination of the child process.
@@ -172,9 +198,39 @@ impl PtyProcess {
         Ok(self.child.kill()?)
     }
 
+    /// Waits for the PTY child to exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the child status cannot be collected.
+    pub fn wait(&mut self) -> Result<()> {
+        self.child.wait()?;
+        Ok(())
+    }
+
     #[must_use]
     pub fn process_id(&self) -> Option<u32> {
         self.child.process_id()
+    }
+}
+
+/// Cloneable handle used to resize a live PTY from a watcher thread.
+#[derive(Clone)]
+pub struct PtyResizer {
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+}
+
+impl PtyResizer {
+    /// Updates the terminal dimensions seen by the child process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the PTY lock is poisoned or resizing fails.
+    pub fn resize(&self, size: TerminalSize) -> Result<()> {
+        self.master
+            .lock()
+            .map_err(|_| anyhow!("PTY master lock is poisoned"))?
+            .resize(size.into())
     }
 }
 
