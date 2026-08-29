@@ -1,5 +1,6 @@
 //! PTY primitives isolated from crumb's shell and UI layers.
 
+use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -85,15 +86,17 @@ impl CommandSpec {
         self.current_dir.as_deref()
     }
 
-    fn to_command_builder(&self) -> CommandBuilder {
+    fn to_command_builder(&self) -> Result<CommandBuilder> {
         let mut command = CommandBuilder::new(&self.program);
         for arg in &self.args {
             command.arg(arg);
         }
-        if let Some(path) = &self.current_dir {
-            command.cwd(path);
-        }
-        command
+        let current_dir = match &self.current_dir {
+            Some(path) => path.clone(),
+            None => env::current_dir()?,
+        };
+        command.cwd(current_dir);
+        Ok(command)
     }
 }
 
@@ -115,7 +118,7 @@ pub struct SystemPty;
 impl PtyBackend for SystemPty {
     fn spawn(&self, command: &CommandSpec, size: TerminalSize) -> Result<PtyProcess> {
         let pair = native_pty_system().openpty(size.into())?;
-        let child = pair.slave.spawn_command(command.to_command_builder())?;
+        let child = pair.slave.spawn_command(command.to_command_builder()?)?;
         drop(pair.slave);
         let writer = pair.master.take_writer()?;
 

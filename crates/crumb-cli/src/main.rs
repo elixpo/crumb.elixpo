@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -52,13 +52,31 @@ fn run_native_shell() -> Result<()> {
     });
 
     let mut stdout = io::stdout().lock();
-    io::copy(&mut reader, &mut stdout)?;
-    stdout.flush()?;
+    let output_result = relay_output(&mut reader, &mut stdout);
 
     running.store(false, Ordering::Relaxed);
     let _ = resize_thread.join();
-    process.wait()?;
+    if output_result.is_err() {
+        let _ = process.kill();
+    }
+    let wait_result = process.wait();
     drop(input_thread);
+
+    output_result?;
+    wait_result?;
+    Ok(())
+}
+
+fn relay_output(reader: &mut dyn Read, writer: &mut dyn Write) -> io::Result<()> {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let bytes_read = reader.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..bytes_read])?;
+        writer.flush()?;
+    }
     Ok(())
 }
 
