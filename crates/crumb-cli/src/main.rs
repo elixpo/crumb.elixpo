@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +12,8 @@ use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::shell_for;
 use crumb_platform::Platform;
 use crumb_pty::{SystemPty, TerminalSize};
-use crumb_repl::{ReplOutcome, read_input};
+use crumb_repl::{ReplOutcome, read_classified_line};
+use crumb_ui::{GitSegment, PromptContext, Renderer, UiSettings};
 
 fn main() -> Result<()> {
     if run_managed_repl()? == ReplOutcome::LaunchNativeShell {
@@ -25,16 +26,33 @@ fn main() -> Result<()> {
 fn run_managed_repl() -> Result<ReplOutcome> {
     let stdin = io::stdin();
     let stdout = io::stdout();
+    let renderer = Renderer::new(UiSettings::from_environment(stdout.is_terminal()));
     let mut reader = stdin.lock();
     let mut writer = stdout.lock();
     let platform = Platform::current();
     let mut session: Option<ShellSession> = None;
+    let mut last_exit_code = None;
+
+    let branding = renderer.branding();
+    if !branding.is_empty() {
+        writeln!(writer, "{branding}")?;
+    }
 
     loop {
         let cwd = session
             .as_ref()
             .map_or_else(current_process_dir, |shell| Ok(shell.cwd().to_path_buf()))?;
-        let Some(event) = read_input(&mut reader, &mut writer, &cwd)? else {
+        let git = GitSegment::discover(&cwd);
+        let prompt = renderer.prompt(&PromptContext {
+            cwd: &cwd,
+            platform,
+            git: git.as_ref(),
+            last_exit_code,
+        });
+        writer.write_all(prompt.as_bytes())?;
+        writer.flush()?;
+
+        let Some(event) = read_classified_line(&mut reader)? else {
             shutdown_session(session)?;
             return Ok(ReplOutcome::Exit);
         };
@@ -69,8 +87,11 @@ fn run_managed_repl() -> Result<ReplOutcome> {
                     )?);
                 }
                 if let Some(shell) = session.as_mut() {
-                    if shell.execute(&command, &mut writer)? == CommandOutcome::ShellExited {
-                        return Ok(ReplOutcome::Exit);
+                    match shell.execute(&command, &mut writer)? {
+                        CommandOutcome::Completed(completion) => {
+                            last_exit_code = Some(completion.exit_code);
+                        }
+                        CommandOutcome::ShellExited => return Ok(ReplOutcome::Exit),
                     }
                 }
             }

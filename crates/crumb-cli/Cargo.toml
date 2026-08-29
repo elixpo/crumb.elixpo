@@ -15,6 +15,7 @@ crumb-core = { path = "../crumb-core" }
 crumb-platform = { path = "../crumb-platform" }
 crumb-pty = { path = "../crumb-pty" }
 crumb-repl = { path = "../crumb-repl" }
+crumb-ui = { path = "../crumb-ui" }
 crossterm.workspace = true
 
 [lints]
