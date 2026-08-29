@@ -17,7 +17,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Current milestone: [Terminal parity gate](https://github.com/elixpo/crumb.elixpo/issues/16)
 
-- [ ] Make the managed PTY input stream safely shareable during execution.
+- [x] Make the managed PTY input stream safely shareable during execution.
 - [ ] Relay terminal input to foreground commands without `:shell`.
 - [ ] Forward terminal resize events while commands run.
 - [ ] Make Ctrl+C interrupt the foreground command without exiting Crumb.
