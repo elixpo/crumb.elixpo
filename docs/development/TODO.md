@@ -2,7 +2,25 @@
 
 This is the local source of truth for implementation order. GitHub issues provide discussion and ownership; completed work remains checked here for quick repository context.
 
-## Current milestone: [WP-001 — workspace bootstrap](https://github.com/elixpo/crumb.elixpo/issues/1)
+## Completed milestones
+
+- [x] [WP-001 — workspace bootstrap](https://github.com/elixpo/crumb.elixpo/issues/1)
+
+## Current milestone: [WP-002 — persistent Linux Bash PTY](https://github.com/elixpo/crumb.elixpo/issues/4)
+
+- [ ] Add isolated `crumb-pty` and `crumb-native` crates.
+- [ ] Define PTY and native-shell lifecycle abstractions.
+- [ ] Launch interactive Bash inside a PTY on Linux.
+- [ ] Forward terminal input and output.
+- [ ] Preserve working-directory and environment state between commands.
+- [ ] Forward terminal resize events.
+- [ ] Forward Ctrl+C without terminating crumb.
+- [ ] Add focused unit and Linux integration tests.
+- [ ] Pass formatting, clippy, and workspace tests.
+- [ ] Merge WP-002.
+
+<details>
+<summary>WP-001 completion details</summary>
 
 - [x] Create the Cargo workspace.
 - [x] Add `crumb-cli`, `crumb-core`, `crumb-repl`, and `crumb-platform`.
@@ -14,9 +32,10 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Pass formatting, clippy, and workspace tests.
 - [x] Publish WP-001 to `main`.
 
+</details>
+
 ## Planned work packages
 
-- [ ] WP-002 — persistent Linux Bash PTY prototype.
 - [ ] WP-003 — macOS Zsh parity.
 - [ ] WP-004 — Windows PowerShell parity.
 - [ ] WP-005 — shell lifecycle and completion protocol.
