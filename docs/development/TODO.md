@@ -23,7 +23,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Provide recent and literal text-search queries.
 - [x] Integrate recording into managed native execution.
 - [x] Add `:history` and `:history search` built-ins.
-- [ ] Provide interactive Ctrl+R search.
+- [x] Provide interactive Ctrl+R search.
 - [x] Add migration and persistence tests.
 - [ ] Pass formatting, clippy, and workspace tests.
 - [ ] Merge WP-007.
@@ -45,6 +45,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Planned work packages
 
+- [ ] [Terminal parity gate — run interactive commands without `:shell`](https://github.com/elixpo/crumb.elixpo/issues/16).
 - [ ] WP-008 — provider-neutral LLM interface.
 - [ ] WP-009 — Pollinations adapter.
 - [ ] WP-010 — secure authentication.

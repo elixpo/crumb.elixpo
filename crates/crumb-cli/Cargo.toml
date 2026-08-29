@@ -18,6 +18,7 @@ crumb-pty = { path = "../crumb-pty" }
 crumb-repl = { path = "../crumb-repl" }
 crumb-ui = { path = "../crumb-ui" }
 crossterm.workspace = true
+reedline.workspace = true
 
 [lints]
 workspace = true

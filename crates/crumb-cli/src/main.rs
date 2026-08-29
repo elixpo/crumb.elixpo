@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,6 +16,12 @@ use crumb_platform::Platform;
 use crumb_pty::{SystemPty, TerminalSize};
 use crumb_repl::{ReplOutcome, read_classified_line};
 use crumb_ui::{GitSegment, PromptContext, Renderer, UiSettings};
+use reedline::{
+    FileBackedHistory, History, HistoryItem, Prompt, PromptEditMode, PromptHistorySearch,
+    PromptHistorySearchStatus, Reedline, Signal,
+};
+
+const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
 
 fn main() -> Result<()> {
     if run_managed_repl()? == ReplOutcome::LaunchNativeShell {
@@ -27,23 +34,29 @@ fn main() -> Result<()> {
 fn run_managed_repl() -> Result<ReplOutcome> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let renderer = Renderer::new(UiSettings::from_environment(stdout.is_terminal()));
+    let interactive = stdin.is_terminal() && stdout.is_terminal();
+    let renderer = Renderer::new(UiSettings::from_environment(interactive));
     let mut reader = stdin.lock();
-    let mut writer = stdout.lock();
     let platform = Platform::current();
     let mut session: Option<ShellSession> = None;
     let mut last_exit_code = None;
     let history = match HistoryStore::open_default() {
         Ok(store) => Some(store),
         Err(error) => {
-            writeln!(writer, "warning: command history is unavailable: {error}")?;
+            writeln!(
+                stdout.lock(),
+                "warning: command history is unavailable: {error}"
+            )?;
             None
         }
     };
+    let mut line_editor = interactive
+        .then(|| create_line_editor(history.as_ref()))
+        .transpose()?;
 
     let branding = renderer.branding();
     if !branding.is_empty() {
-        writeln!(writer, "{branding}")?;
+        writeln!(stdout.lock(), "{branding}")?;
     }
 
     loop {
@@ -57,13 +70,24 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             git: git.as_ref(),
             last_exit_code,
         });
-        writer.write_all(prompt.as_bytes())?;
-        writer.flush()?;
-
-        let Some(event) = read_classified_line(&mut reader)? else {
+        let event = if let Some(editor) = line_editor.as_mut() {
+            match editor.read_line(&CrumbPrompt::new(prompt))? {
+                Signal::Success(command) => Some(crumb_repl::classify_input(&command)),
+                Signal::CtrlC => continue,
+                Signal::CtrlD => None,
+                _ => continue,
+            }
+        } else {
+            let mut writer = stdout.lock();
+            writer.write_all(prompt.as_bytes())?;
+            writer.flush()?;
+            read_classified_line(&mut reader)?
+        };
+        let Some(event) = event else {
             shutdown_session(session)?;
             return Ok(ReplOutcome::Exit);
         };
+        let mut writer = stdout.lock();
 
         match event {
             InputEvent::BuiltIn(BuiltInCommand::Exit) => {
@@ -147,6 +171,57 @@ fn run_managed_repl() -> Result<ReplOutcome> {
                 }
             }
         }
+    }
+}
+
+fn create_line_editor(history: Option<&HistoryStore>) -> Result<Reedline> {
+    let mut interactive_history = FileBackedHistory::new(INTERACTIVE_HISTORY_CAPACITY)?;
+    if let Some(history) = history {
+        let mut entries = history.recent(INTERACTIVE_HISTORY_CAPACITY as u32)?;
+        entries.reverse();
+        for entry in entries {
+            interactive_history.save(HistoryItem::from_command_line(entry.command))?;
+        }
+    }
+    Ok(Reedline::create().with_history(Box::new(interactive_history)))
+}
+
+struct CrumbPrompt {
+    rendered: String,
+}
+
+impl CrumbPrompt {
+    const fn new(rendered: String) -> Self {
+        Self { rendered }
+    }
+}
+
+impl Prompt for CrumbPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.rendered)
+    }
+
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Borrowed("::: ")
+    }
+
+    fn render_prompt_history_search_indicator(
+        &self,
+        history_search: PromptHistorySearch,
+    ) -> Cow<'_, str> {
+        let status = match history_search.status {
+            PromptHistorySearchStatus::Passing => "reverse-search",
+            PromptHistorySearchStatus::Failing => "failing reverse-search",
+        };
+        Cow::Owned(format!("({status}: {}) ", history_search.term))
     }
 }
 
