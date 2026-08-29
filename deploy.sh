@@ -2,12 +2,11 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SITE_DIR="$ROOT_DIR/crumbs.elixpo"
+SITE_DIR="$ROOT_DIR/crumb.elixpo"
 WRANGLER_CONFIG="$SITE_DIR/wrangler.toml"
-PAGES_PROJECT="crumbs-elixpo"
-D1_DATABASE="crumbs-elixpo"
-KV_TITLE="crumbs-elixpo-KV"
-DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
+WORKER_NAME="crumb-elixpo"
+D1_DATABASE="crumb-elixpo"
+KV_TITLE="crumb-elixpo-KV"
 DRY_RUN=false
 
 log() { printf '\033[32m▸\033[0m %s\n' "$1"; }
@@ -18,15 +17,14 @@ usage() {
 Usage: ./deploy.sh COMMAND [--dry-run]
 
 Commands:
-  provision   Create the Pages project, D1 database, and KV namespace if absent
+  provision   Create the D1 database and KV namespace if absent
   secrets     Upload application secrets from the SOPS-encrypted root .env
   migrate     Apply D1 migrations remotely
   build       Install dependencies and build the Cloudflare Pages bundle
-  deploy      Deploy the existing Pages bundle (including its Functions worker)
-  all         Provision, upload secrets, migrate, build, and deploy
+  deploy      Build and deploy the OpenNext Worker
+  all         Provision, migrate, deploy, and upload secrets
 
-The Next-on-Pages build emits the Pages Functions worker. A separate Worker
-service is neither created nor required for this application.
+The first OpenNext deployment creates the Worker service automatically.
 USAGE
 }
 
@@ -101,11 +99,6 @@ kv_id() {
   run_site npx wrangler kv namespace list --config "$WRANGLER_CONFIG" | json_match title "$KV_TITLE" id
 }
 
-pages_exists() {
-  run_site npx wrangler pages project list --json --config "$WRANGLER_CONFIG" |
-    json_match name "$PAGES_PROJECT" name
-}
-
 replace_resource_ids() {
   local database_id="$1" namespace_id="$2"
   DATABASE_ID="$database_id" NAMESPACE_ID="$namespace_id" CONFIG_PATH="$WRANGLER_CONFIG" node -e '
@@ -125,13 +118,12 @@ provision() {
   require_tools
   if $DRY_RUN; then
     run_site npx wrangler d1 create "$D1_DATABASE" --location apac
-    run_site npx wrangler kv namespace create KV --config "$WRANGLER_CONFIG"
-    run_site npx wrangler pages project create "$PAGES_PROJECT" --production-branch main
+    run_site npx wrangler kv namespace create "$KV_TITLE" --config "$WRANGLER_CONFIG"
     return
   fi
   load_cloudflare_auth
 
-  local database_id namespace_id project
+  local database_id namespace_id
   database_id="$(d1_id)"
   if [ -z "$database_id" ]; then
     log "Creating D1 database $D1_DATABASE..."
@@ -143,16 +135,10 @@ provision() {
   namespace_id="$(kv_id)"
   if [ -z "$namespace_id" ]; then
     log "Creating KV namespace $KV_TITLE..."
-    run_site npx wrangler kv namespace create KV --config "$WRANGLER_CONFIG"
+    run_site npx wrangler kv namespace create "$KV_TITLE" --config "$WRANGLER_CONFIG"
     namespace_id="$(kv_id)"
   fi
   [ -n "$namespace_id" ] || fail "Could not resolve the KV namespace ID."
-
-  project="$(pages_exists)"
-  if [ -z "$project" ]; then
-    log "Creating Pages project $PAGES_PROJECT..."
-    run_site npx wrangler pages project create "$PAGES_PROJECT" --production-branch main
-  fi
 
   replace_resource_ids "$database_id" "$namespace_id"
   log "Cloudflare resources are ready and wrangler.toml is bound."
@@ -162,21 +148,25 @@ upload_secrets() {
   require_tools
   if $DRY_RUN; then
     for key in NEXT_PUBLIC_ELIXPO_CLIENT_ID ELIXPO_CLIENT_SECRET POLLINATIONS_APP_KEY CONNECTOR_ENCRYPTION_KEY; do
-      printf '[dry-run] sops decrypt .env | npx wrangler pages secret put %q --project-name %q\n' "$key" "$PAGES_PROJECT"
+      printf '[dry-run] sops decrypt .env | npx wrangler secret put %q --name %q\n' "$key" "$WORKER_NAME"
     done
     return
   fi
   load_cloudflare_auth
   local decrypted key value
-  decrypted="$(sops decrypt "$ROOT_DIR/.env")"
+  if [ -f "$SITE_DIR/.env.local" ]; then
+    decrypted="$(<"$SITE_DIR/.env.local")"
+  else
+    decrypted="$(sops decrypt "$ROOT_DIR/.env")"
+  fi
   for key in NEXT_PUBLIC_ELIXPO_CLIENT_ID ELIXPO_CLIENT_SECRET POLLINATIONS_APP_KEY CONNECTOR_ENCRYPTION_KEY; do
     value=""
     while IFS= read -r line || [ -n "$line" ]; do
       if [[ "$line" == "$key="* ]]; then value="${line#*=}"; break; fi
     done <<< "$decrypted"
     [ -n "$value" ] || fail "$key is missing from the decrypted .env."
-    printf '%s' "$value" | run_site npx wrangler pages secret put "$key" \
-      --project-name "$PAGES_PROJECT" --config "$WRANGLER_CONFIG" >/dev/null
+    printf '%s' "$value" | run_site npx wrangler secret put "$key" \
+      --name "$WORKER_NAME" --config "$WRANGLER_CONFIG" >/dev/null
   done
   log "Application secrets uploaded."
 }
@@ -195,17 +185,13 @@ build() {
   else
     run_site npm install
   fi
-  run_site npm run pages:build
+  run_site npm run cloudflare:build
 }
 
 deploy() {
   require_tools
-  [ -d "$SITE_DIR/.vercel/output/static" ] || $DRY_RUN || \
-    fail "Pages output is missing; run ./deploy.sh build first."
   if ! $DRY_RUN; then load_cloudflare_auth; fi
-  run_site npx wrangler pages deploy .vercel/output/static \
-    --project-name "$PAGES_PROJECT" --branch "$DEPLOY_BRANCH" \
-    --config "$WRANGLER_CONFIG"
+  run_site npm run deploy
 }
 
 [ "${1:-}" ] || { usage; exit 1; }
@@ -220,7 +206,7 @@ case "$command" in
   migrate) migrate ;;
   build) build ;;
   deploy) deploy ;;
-  all) provision; upload_secrets; migrate; build; deploy ;;
+  all) provision; migrate; deploy; upload_secrets ;;
   -h|--help|help) usage ;;
   *) fail "Unknown command: $command" ;;
 esac
