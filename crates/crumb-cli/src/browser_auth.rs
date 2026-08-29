@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 const CALLBACK_ADDRESS: &str = "127.0.0.1:3000";
-const CALLBACK_URL: &str = "http://localhost:3000/auth/callback";
+const CALLBACK_URL: &str = "http://localhost:3000/auth/connector/callback";
 const DEFAULT_ACCOUNT_ORIGIN: &str = "https://crumb.elixpo.com";
 const FLOW_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -135,7 +135,7 @@ fn handle_callback(stream: &mut TcpStream, expected_state: &str) -> Result<Strin
     let values = url
         .query_pairs()
         .collect::<std::collections::HashMap<_, _>>();
-    let result = if url.path() != "/auth/callback"
+    let result = if url.path() != "/auth/connector/callback"
         || values
             .get("state")
             .is_none_or(|state| state != expected_state)
