@@ -30,3 +30,4 @@ directories = "6.0.0"
 portable-pty = "0.9.0"
 reedline = { version = "0.51.0", default-features = false }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustix = { version = "1.1.4", features = ["event"] }

@@ -16,6 +16,28 @@ pub enum CommandOutcome {
     ShellExited,
 }
 
+/// One command submitted to a managed shell and awaiting its lifecycle frame.
+#[must_use = "a submitted shell command must be driven to completion"]
+pub struct SubmittedCommand<'a> {
+    session: &'a mut ShellSession,
+    sequence: u64,
+}
+
+impl SubmittedCommand<'_> {
+    /// Streams command output until its completion frame or shell exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if PTY output fails or the lifecycle frame is invalid.
+    pub fn wait(self, output: &mut dyn Write) -> Result<CommandOutcome> {
+        let Some(completion) = self.session.read_until(self.sequence, output)? else {
+            return Ok(CommandOutcome::ShellExited);
+        };
+        self.session.cwd.clone_from(&completion.cwd);
+        Ok(CommandOutcome::Completed(completion))
+    }
+}
+
 /// A persistent native shell controlled through hidden completion frames.
 pub struct ShellSession {
     kind: ShellKind,
@@ -72,6 +94,16 @@ impl ShellSession {
     /// Returns an error if command input/output fails or its lifecycle frame is
     /// invalid. A normal shell exit is returned as [`CommandOutcome::ShellExited`].
     pub fn execute(&mut self, command: &str, output: &mut dyn Write) -> Result<CommandOutcome> {
+        self.submit(command)?.wait(output)
+    }
+
+    /// Submits one command before its terminal input relay starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sequence counter overflows or command input
+    /// cannot be written to the PTY.
+    pub fn submit(&mut self, command: &str) -> Result<SubmittedCommand<'_>> {
         let sequence = self.next_sequence;
         self.next_sequence = self
             .next_sequence
@@ -79,11 +111,10 @@ impl ShellSession {
             .ok_or_else(|| anyhow!("shell command sequence overflowed"))?;
         let submission = self.protocol.submission(self.kind, command, sequence);
         self.process.write_input(submission.as_bytes())?;
-        let Some(completion) = self.read_until(sequence, output)? else {
-            return Ok(CommandOutcome::ShellExited);
-        };
-        self.cwd.clone_from(&completion.cwd);
-        Ok(CommandOutcome::Completed(completion))
+        Ok(SubmittedCommand {
+            session: self,
+            sequence,
+        })
     }
 
     #[must_use]

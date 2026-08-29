@@ -135,6 +135,7 @@ dependencies = [
  "crumb-repl",
  "crumb-ui",
  "reedline",
+ "rustix",
 ]
 
 [[package]]
