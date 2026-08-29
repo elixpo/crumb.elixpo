@@ -42,6 +42,11 @@ typed patch and pass the same validation and approval path as manual edits.
 Models, skills, MCP processes, harness commands, optimizer commands, limits,
 and modality routes are data. They are not compiled into the router.
 
+Reasoning effort is an adapter-defined string stored with the session and may
+be overridden per exact model route. The harness adapter must validate it
+against that model's advertised effort list before network I/O; unsupported
+values fail visibly rather than being silently remapped.
+
 ## Sessions and cancellation
 
 Crumb owns the session identifier, workspace, mode, limits, cancellation token,

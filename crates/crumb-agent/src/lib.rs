@@ -5,6 +5,7 @@
 //! requests and is not part of native-shell startup.
 
 pub mod config;
+pub mod harness;
 pub mod routing;
 pub mod session;
 pub mod tools;
@@ -13,6 +14,7 @@ pub use config::{
     AgentConfig, AgentLimits, AgentMode, HarnessConfig, LiveConfig, MistakePolicy, Modality,
     ModelRoute, StructuredEncoding,
 };
+pub use harness::{HarnessTurnRequest, ModelCapabilities};
 pub use routing::{
     CommandCatalog, InputRoute, RouteDecision, RoutePolicy, RouteReason, UnknownInputPolicy,
 };
