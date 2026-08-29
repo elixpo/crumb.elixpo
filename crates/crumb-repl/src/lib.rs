@@ -60,6 +60,11 @@ pub fn run<R: BufRead, W: Write>(
             InputEvent::BuiltIn(BuiltInCommand::Exit) => return Ok(ReplOutcome::Exit),
             InputEvent::BuiltIn(BuiltInCommand::Platform) => writeln!(writer, "{platform}")?,
             InputEvent::BuiltIn(BuiltInCommand::Shell) => {
+                writeln!(
+                    writer,
+                    "entering native Bash through crumb (type `exit` to leave crumb)"
+                )?;
+                writer.flush()?;
                 return Ok(ReplOutcome::LaunchNativeShell);
             }
             InputEvent::BuiltIn(BuiltInCommand::Version) => writeln!(writer, "crumb {version}")?,
@@ -141,5 +146,10 @@ mod tests {
         let outcome = run(input, &mut output, Platform::Linux, "0.1.0").expect("REPL should run");
 
         assert_eq!(outcome, ReplOutcome::LaunchNativeShell);
+        assert!(
+            String::from_utf8(output)
+                .expect("output should be UTF-8")
+                .contains("entering native Bash")
+        );
     }
 }

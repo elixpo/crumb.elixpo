@@ -10,9 +10,9 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 - [x] Add isolated `crumb-pty` and `crumb-native` crates.
 - [x] Define PTY and native-shell lifecycle abstractions.
-- [ ] Launch interactive Bash inside a PTY on Linux.
-- [ ] Forward terminal input and output.
-- [ ] Preserve working-directory and environment state between commands.
+- [x] Launch interactive Bash inside a PTY on Linux.
+- [x] Forward terminal input and output.
+- [x] Preserve working-directory and environment state between commands.
 - [ ] Forward terminal resize events.
 - [ ] Forward Ctrl+C without terminating crumb.
 - [ ] Add focused unit and Linux integration tests.
