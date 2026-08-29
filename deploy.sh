@@ -146,21 +146,29 @@ provision() {
 
 upload_secrets() {
   require_tools
+  local -a keys=(
+    NEXT_PUBLIC_ELIXPO_CLIENT_ID
+    NEXT_PUBLIC_ELIXPO_CLIENT_ID_CLI
+    ELIXPO_CLIENT_SECRET
+    ELIXPO_ACCOUNTS_WEBHOOK_SECRET
+    POLLINATIONS_APP_KEY
+    CONNECTOR_ENCRYPTION_KEY
+  )
   if $DRY_RUN; then
-    for key in NEXT_PUBLIC_ELIXPO_CLIENT_ID NEXT_PUBLIC_ELIXPO_CLIENT_ID_CLI ELIXPO_CLIENT_SECRET ELIXPO_ACCOUNTS_WEBHOOK_SECRET POLLINATIONS_APP_KEY CONNECTOR_ENCRYPTION_KEY; do
-      printf '[dry-run] sops decrypt .env | npx wrangler secret put %q --name %q\n' "$key" "$WORKER_NAME"
-    done
+    printf '[dry-run] upload %d secrets with one wrangler secret bulk request to %q\n' \
+      "${#keys[@]}" "$WORKER_NAME"
     return
   fi
   load_cloudflare_auth
   local decrypted local_values="" key value
+  local -A values=()
   decrypted="$(sops decrypt "$ROOT_DIR/.env")"
   if [ -f "$ROOT_DIR/.env.local" ]; then
     local_values="$(<"$ROOT_DIR/.env.local")"
   elif [ -f "$SITE_DIR/.env.local" ]; then
     local_values="$(<"$SITE_DIR/.env.local")"
   fi
-  for key in NEXT_PUBLIC_ELIXPO_CLIENT_ID NEXT_PUBLIC_ELIXPO_CLIENT_ID_CLI ELIXPO_CLIENT_SECRET ELIXPO_ACCOUNTS_WEBHOOK_SECRET POLLINATIONS_APP_KEY CONNECTOR_ENCRYPTION_KEY; do
+  for key in "${keys[@]}"; do
     value=""
     while IFS= read -r line || [ -n "$line" ]; do
       if [[ "$line" == "$key="* ]]; then value="${line#*=}"; break; fi
@@ -168,10 +176,27 @@ upload_secrets() {
     while IFS= read -r line || [ -n "$line" ]; do
       if [ -z "$value" ] && [[ "$line" == "$key="* ]]; then value="${line#*=}"; break; fi
     done <<< "$decrypted"
-    [ -n "$value" ] || fail "$key is missing from the decrypted .env."
-    printf '%s' "$value" | run_site npx wrangler secret put "$key" \
-      --name "$WORKER_NAME" --config "$WRANGLER_CONFIG" >/dev/null
+    [ -n "$value" ] || fail "$key is missing from local or encrypted environment configuration."
+    values["$key"]="$value"
   done
+
+  log "Uploading ${#keys[@]} application secrets in one request..."
+  {
+    for key in "${keys[@]}"; do
+      printf '%s\0%s\0' "$key" "${values[$key]}"
+    done
+  } | node -e '
+    const chunks = [];
+    process.stdin.on("data", chunk => chunks.push(chunk));
+    process.stdin.on("end", () => {
+      const parts = Buffer.concat(chunks).toString("utf8").split("\0");
+      const secrets = {};
+      for (let index = 0; index + 1 < parts.length; index += 2) {
+        secrets[parts[index]] = parts[index + 1];
+      }
+      process.stdout.write(JSON.stringify(secrets));
+    });
+  ' | run_site npx wrangler secret bulk --name "$WORKER_NAME" --config "$WRANGLER_CONFIG"
   log "Application secrets uploaded."
 }
 
