@@ -1,4 +1,4 @@
-import { bindings, originFor } from '@/lib/cloudflare'
+import { config, originFor } from '@/lib/cloudflare'
 import { encode, randomToken, text } from '@/lib/encoding'
 
 const AUTHORIZE = 'https://enter.pollinations.ai/authorize'
@@ -14,7 +14,7 @@ export async function challenge(value: string): Promise<string> {
 }
 
 export function authorizeUrl(state: string, pkce: string, requestUrl: string): string {
-  const key = bindings().POLLINATIONS_APP_KEY
+  const key = config().pollinationsAppKey
   if (!key?.startsWith('pk_')) throw new Error('Pollinations App Key is not configured')
   const url = new URL(AUTHORIZE)
   url.search = new URLSearchParams({
@@ -37,7 +37,7 @@ export async function exchangeCode(code: string, pkceVerifier: string, requestUr
     body: new URLSearchParams({
       grant_type: 'authorization_code',
       code,
-      client_id: bindings().POLLINATIONS_APP_KEY,
+      client_id: config().pollinationsAppKey,
       redirect_uri: `${originFor(requestUrl)}/api/integrations/pollinations/callback`,
       code_verifier: pkceVerifier,
     }),
