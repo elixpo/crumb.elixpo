@@ -7,6 +7,7 @@
     "typo_distance": 2
   },
   "structured_encoding": "auto",
+  "effort": null,
   "limits": {
     "max_steps": 24,
     "max_tool_calls": 48,
@@ -23,18 +24,18 @@
   },
   "models": {
     "text": [
-      { "provider": "pollinations", "model": "nova-fast" },
-      { "provider": "pollinations", "model": "qwen-coder" }
+      { "provider": "pollinations", "model": "nova-fast", "effort": null },
+      { "provider": "pollinations", "model": "qwen-coder", "effort": "high" }
     ],
     "image": [
-      { "provider": "pollinations", "model": "flux" },
-      { "provider": "pollinations", "model": "klein" }
+      { "provider": "pollinations", "model": "flux", "effort": null },
+      { "provider": "pollinations", "model": "klein", "effort": null }
     ],
-    "video": [{ "provider": "pollinations", "model": "wan-fast" }],
-    "audio": [{ "provider": "pollinations", "model": "elevenflash" }],
-    "three_d": [{ "provider": "pollinations", "model": "trellis-2" }],
-    "transcription": [{ "provider": "pollinations", "model": "whisper" }],
-    "embeddings": [{ "provider": "pollinations", "model": "openai-3-small" }]
+    "video": [{ "provider": "pollinations", "model": "wan-fast", "effort": null }],
+    "audio": [{ "provider": "pollinations", "model": "elevenflash", "effort": null }],
+    "three_d": [{ "provider": "pollinations", "model": "trellis-2", "effort": null }],
+    "transcription": [{ "provider": "pollinations", "model": "whisper", "effort": null }],
+    "embeddings": [{ "provider": "pollinations", "model": "openai-3-small", "effort": null }]
   },
   "skills": [],
   "mcp_servers": [],

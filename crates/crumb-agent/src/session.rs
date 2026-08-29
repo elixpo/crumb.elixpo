@@ -96,6 +96,12 @@ pub enum SessionEvent {
         at_ms: u128,
         mode: AgentMode,
     },
+    ModelSelected {
+        at_ms: u128,
+        provider: String,
+        model: String,
+        reasoning_effort: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -227,6 +233,25 @@ impl AgentSession {
         self.journal.append(&SessionEvent::ModeChanged {
             at_ms: timestamp_ms(),
             mode,
+        })
+    }
+
+    /// Records the effective exact-model selection and reasoning effort.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selection cannot be persisted.
+    pub fn record_model_selection(
+        &mut self,
+        provider: String,
+        model: String,
+        reasoning_effort: Option<String>,
+    ) -> Result<()> {
+        self.journal.append(&SessionEvent::ModelSelected {
+            at_ms: timestamp_ms(),
+            provider,
+            model,
+            reasoning_effort,
         })
     }
 

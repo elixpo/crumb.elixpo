@@ -8,6 +8,10 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
+use crumb_agent::{
+    AgentConfig, CommandCatalog, InputRoute, LiveConfig, MistakePolicy, RouteDecision,
+    UnknownInputPolicy,
+};
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
@@ -56,6 +60,16 @@ fn run_managed_repl() -> Result<ReplOutcome> {
     let interactive = stdin.is_terminal() && stdout.is_terminal();
     let renderer = Renderer::new(UiSettings::from_environment(interactive));
     let platform = Platform::current();
+    let mut command_catalog = CommandCatalog::discover();
+    command_catalog.extend(
+        shell_for(platform)
+            .builtin_commands()
+            .iter()
+            .map(|command| (*command).to_owned()),
+    );
+    if matches!(platform, Platform::Windows) {
+        command_catalog.enable_powershell_commands();
+    }
     let mut session: Option<ShellSession> = None;
     let mut last_exit_code = None;
     let history = open_history(&mut stdout.lock())?;
@@ -106,6 +120,21 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             }
             InputEvent::NativeInput(command) if command.trim().is_empty() => {}
             InputEvent::NativeInput(command) => {
+                let agent_config = load_agent_config(&cwd, &mut writer);
+                let decision = command_catalog.route(&command, &agent_config.routing);
+                if !matches!(decision.route, InputRoute::Native) {
+                    handle_agent_boundary(&decision, &agent_config, &mut writer)?;
+                    record_history(
+                        history.as_ref(),
+                        &command,
+                        &cwd,
+                        platform,
+                        HistoryMode::Agent,
+                        None,
+                        &mut writer,
+                    )?;
+                    continue;
+                }
                 if session.is_none() {
                     let (cols, rows) = size()?;
                     let shell = shell_for(platform);
@@ -124,6 +153,14 @@ fn run_managed_repl() -> Result<ReplOutcome> {
                     match outcome {
                         CommandOutcome::Completed(completion) => {
                             last_exit_code = Some(completion.exit_code);
+                            if completion.exit_code != 0 {
+                                render_error_assistance(
+                                    &command,
+                                    &decision,
+                                    agent_config.mistakes,
+                                    &mut writer,
+                                )?;
+                            }
                             record_history(
                                 history.as_ref(),
                                 &command,
@@ -151,6 +188,76 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             }
         }
     }
+}
+
+fn load_agent_config(cwd: &Path, writer: &mut dyn Write) -> AgentConfig {
+    let store = LiveConfig::new(cwd.join(".crumb").join("agent.json"));
+    match store.load_or_default() {
+        Ok(config) => config,
+        Err(error) => {
+            let _ = writeln!(
+                writer,
+                "warning: agent config is invalid; unresolved input will stay native: {error}"
+            );
+            let mut config = AgentConfig::default();
+            config.routing.unknown_input = UnknownInputPolicy::Native;
+            config
+        }
+    }
+}
+
+fn handle_agent_boundary(
+    decision: &RouteDecision,
+    config: &AgentConfig,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    match decision.route {
+        InputRoute::Agent => writeln!(
+            writer,
+            "agent request detected ({:?}, effort: {}); runtime arrives in the next package",
+            config.mode,
+            config
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or("model default")
+        )?,
+        InputRoute::Negotiate => writeln!(
+            writer,
+            "natural-language request detected; negotiate mode will show its plan before tools run"
+        )?,
+        InputRoute::Native => unreachable!("native input is handled by the shell path"),
+    }
+    Ok(())
+}
+
+fn render_error_assistance(
+    command: &str,
+    decision: &RouteDecision,
+    policy: MistakePolicy,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    if matches!(policy, MistakePolicy::Disabled) {
+        return Ok(());
+    }
+    if let Some(suggestion) = &decision.suggestion {
+        writeln!(
+            writer,
+            "help: `{}` may be a typo for `{suggestion}`",
+            command.split_whitespace().next().unwrap_or(command)
+        )?;
+    }
+    match policy {
+        MistakePolicy::Prompt => writeln!(
+            writer,
+            "help: use `? explain the last error` for AI assistance"
+        )?,
+        MistakePolicy::Automatic => writeln!(
+            writer,
+            "help: automatic AI diagnosis will start when the agent runtime is enabled"
+        )?,
+        MistakePolicy::Disabled => {}
+    }
+    Ok(())
 }
 
 fn open_history(writer: &mut dyn Write) -> Result<Option<HistoryStore>> {

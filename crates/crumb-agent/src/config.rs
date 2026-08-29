@@ -74,6 +74,9 @@ pub enum Modality {
 pub struct ModelRoute {
     pub provider: String,
     pub model: String,
+    /// Adapter-defined exact-model effort identifier, such as `high` or `max`.
+    #[serde(default, rename = "effort", alias = "reasoning_effort")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Hard runtime ceilings enforced outside model prompts.
@@ -135,6 +138,9 @@ pub struct AgentConfig {
     pub mistakes: MistakePolicy,
     pub routing: crate::routing::RoutePolicy,
     pub structured_encoding: StructuredEncoding,
+    /// Session preference used only when the selected model advertises it.
+    #[serde(rename = "effort", alias = "reasoning_effort")]
+    pub reasoning_effort: Option<String>,
     pub limits: AgentLimits,
     pub harness: Option<HarnessConfig>,
     pub models: BTreeMap<Modality, Vec<ModelRoute>>,
@@ -155,8 +161,10 @@ impl AgentConfig {
                 if route.provider.trim().is_empty() || route.model.trim().is_empty() {
                     bail!("model routes require non-empty provider and model identifiers");
                 }
+                validate_effort(route.reasoning_effort.as_deref())?;
             }
         }
+        validate_effort(self.reasoning_effort.as_deref())?;
         if self.skills.iter().any(|skill| skill.id.trim().is_empty()) {
             bail!("skill identifiers cannot be empty");
         }
@@ -179,6 +187,28 @@ impl AgentConfig {
         }
         Ok(())
     }
+
+    /// Resolves a per-model override before the session default.
+    #[must_use]
+    pub fn reasoning_effort_for<'a>(&'a self, route: &'a ModelRoute) -> Option<&'a str> {
+        route
+            .reasoning_effort
+            .as_deref()
+            .or(self.reasoning_effort.as_deref())
+    }
+}
+
+fn validate_effort(effort: Option<&str>) -> Result<()> {
+    if let Some(effort) = effort
+        && (effort.is_empty()
+            || effort.len() > 32
+            || !effort.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            }))
+    {
+        bail!("reasoning effort must be a 1-32 character adapter-defined identifier");
+    }
+    Ok(())
 }
 
 /// Reloads the configuration file for every new turn, making edits immediately live.
@@ -240,6 +270,7 @@ mod tests {
             vec![ModelRoute {
                 provider: "fixture".to_owned(),
                 model: "fixture-text".to_owned(),
+                reasoning_effort: Some("high".to_owned()),
             }],
         );
         let config = AgentConfig {
@@ -251,6 +282,10 @@ mod tests {
 
         assert!(config.validate().is_ok());
         assert_eq!(config.models[&Modality::Text][0].model, "fixture-text");
+        assert_eq!(
+            config.reasoning_effort_for(&config.models[&Modality::Text][0]),
+            Some("high")
+        );
     }
 
     #[test]

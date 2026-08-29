@@ -70,6 +70,7 @@ pub struct RouteDecision {
 #[derive(Clone, Debug, Default)]
 pub struct CommandCatalog {
     commands: BTreeSet<String>,
+    powershell_commands: bool,
 }
 
 impl CommandCatalog {
@@ -92,7 +93,13 @@ impl CommandCatalog {
                 .into_iter()
                 .map(|command| normalize_command(&command))
                 .collect(),
+            powershell_commands: false,
         }
+    }
+
+    /// Recognizes PowerShell's `Verb-Noun` command form as native shell input.
+    pub fn enable_powershell_commands(&mut self) {
+        self.powershell_commands = true;
     }
 
     pub fn extend(&mut self, commands: impl IntoIterator<Item = String>) {
@@ -138,7 +145,10 @@ impl CommandCatalog {
         let Some(command) = command_word(trimmed) else {
             return decision(InputRoute::Native, RouteReason::ShellSyntax, input, None);
         };
-        if looks_like_path(command) || self.contains(command) {
+        if looks_like_path(command)
+            || (self.powershell_commands && looks_like_powershell_command(command))
+            || self.contains(command)
+        {
             return decision(
                 InputRoute::Native,
                 RouteReason::ResolvedCommand,
@@ -249,6 +259,20 @@ fn looks_like_path(command: &str) -> bool {
     command.contains('/') || command.contains('\\') || Path::new(command).is_absolute()
 }
 
+fn looks_like_powershell_command(command: &str) -> bool {
+    let Some((verb, noun)) = command.split_once('-') else {
+        return false;
+    };
+    !verb.is_empty()
+        && !noun.is_empty()
+        && verb
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+        && noun
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+}
+
 fn normalize_command(command: &str) -> String {
     let command = command.trim_matches(['\'', '"']);
     #[cfg(windows)]
@@ -349,6 +373,24 @@ mod tests {
         assert_eq!(
             catalog()
                 .route("unknown | less", &RoutePolicy::default())
+                .route,
+            InputRoute::Native
+        );
+    }
+
+    #[test]
+    fn powershell_command_shape_is_platform_opt_in() {
+        let mut catalog = catalog();
+        assert_eq!(
+            catalog
+                .route("Get-ChildItem files", &RoutePolicy::default())
+                .route,
+            InputRoute::Agent
+        );
+        catalog.enable_powershell_commands();
+        assert_eq!(
+            catalog
+                .route("Get-ChildItem files", &RoutePolicy::default())
                 .route,
             InputRoute::Native
         );
