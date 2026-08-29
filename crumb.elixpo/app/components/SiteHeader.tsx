@@ -13,7 +13,7 @@ export async function SiteHeader() {
         <span>crumb</span><span className="brand-badge">NLT</span>
       </Link>
       <nav className="desktop-nav" aria-label="Main navigation">
-        <Link href="/#features">Features</Link><Link href="/docs">Docs</Link><Link href="/about">About</Link>
+        <Link href="/features">Features</Link><Link href="/skills">Skills</Link><Link href="/profile/connectors">Connectors</Link><Link href="/docs">Docs</Link><Link href="/about">About</Link>
       </nav>
       <div className="nav-actions">
         {user ? <AccountMenu name={user.displayName} email={user.email} avatarUrl={`${accountsOrigin}/api/avatar/${encodeURIComponent(user.id)}`} accountsOrigin={accountsOrigin} /> : <Link className="button button-small" href="/login">Sign in</Link>}
