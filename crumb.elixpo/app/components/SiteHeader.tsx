@@ -26,7 +26,7 @@ export async function SiteHeader() {
           </summary>
           <div className="user-popover">
             <p>{user.email}</p>
-            <Link href="/profiles">Profiles and connections</Link>
+            <Link href="/profile/connectors">Check Connectors</Link>
             <a href={`${accountsOrigin}/dashboard/services`}>Elixpo account</a>
             <form action="/api/auth/logout" method="post"><button type="submit">Sign out</button></form>
           </div>

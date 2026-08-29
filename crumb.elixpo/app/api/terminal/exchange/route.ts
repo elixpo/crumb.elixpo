@@ -22,7 +22,7 @@ export async function POST(request: Request) {
     access_token_encrypted: string
     token_expires_at: number
   }>()
-  if (!row) return NextResponse.json({ error: 'pollinations_connector_required', connect_url: '/profiles' }, { status: 409 })
+  if (!row) return NextResponse.json({ error: 'pollinations_connector_required', connect_url: '/profile/connectors' }, { status: 409 })
   const accessToken = await decryptToken(row.access_token_encrypted, user.id)
   return NextResponse.json(
     { access_token: accessToken, expires_at: row.token_expires_at, models: CONNECTOR_MODELS },
