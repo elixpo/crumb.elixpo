@@ -1,6 +1,6 @@
 # Account connector development
 
-The account site lives in `apps/web` and runs as a Next.js Cloudflare Pages
+The account site lives in `crumbs.elixpo` and runs as a Next.js Cloudflare Pages
 application with D1 and KV bindings.
 
 ## OAuth registrations
@@ -23,7 +23,7 @@ Pollinations requests `profile usage` and uses PKCE.
 
 ## Local configuration
 
-Copy `apps/web/.env.local.example` to `apps/web/.env.local` and set:
+Copy `crumbs.elixpo/.env.local.example` to `crumbs.elixpo/.env.local` and set:
 
 - `NEXT_PUBLIC_ELIXPO_CLIENT_ID`
 - `ELIXPO_CLIENT_SECRET`
@@ -33,9 +33,24 @@ Copy `apps/web/.env.local.example` to `apps/web/.env.local` and set:
 Never commit `.env.local`. The web app runs on port `3001`; the terminal owns
 `127.0.0.1:3000` while `crumb auth login` is active.
 
-Apply `apps/web/migrations/0001_initial.sql` to the bound D1 database before
+Apply `crumbs.elixpo/migrations/0001_initial.sql` to the bound D1 database before
 testing. Replace the placeholder D1 and KV identifiers in `wrangler.toml` only
 with the resources intended for this project.
+
+The root deployment script provisions and binds the Cloudflare resources with
+Wrangler:
+
+```bash
+./deploy.sh provision
+./deploy.sh secrets
+./deploy.sh migrate
+./deploy.sh build
+./deploy.sh deploy
+```
+
+`./deploy.sh all` runs the same sequence. The Next-on-Pages build produces the
+Pages Functions worker, so this application does not need a second standalone
+Worker service.
 
 ## Handoff security
 
