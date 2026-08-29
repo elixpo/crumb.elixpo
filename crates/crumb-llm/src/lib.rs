@@ -142,7 +142,7 @@ pub trait ChatStream: Send {
 /// Object-safe interface implemented by model provider adapters.
 pub trait LlmProvider: Send + Sync {
     #[must_use]
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
 
     /// Lists models currently exposed by this provider.
     fn list_models(&self) -> ProviderFuture<'_, Vec<ModelInfo>>;
@@ -190,7 +190,7 @@ impl MockProvider {
 }
 
 impl LlmProvider for MockProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "mock"
     }
 
@@ -226,8 +226,7 @@ impl ChatStream for MockChatStream {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll, Waker};
 
     use super::{
         ChatEvent, ChatMessage, ChatRequest, ChatRole, EmbeddingRequest, EmbeddingResponse,
@@ -235,15 +234,8 @@ mod tests {
         ProviderErrorKind, TokenUsage,
     };
 
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
     fn resolve<T>(future: impl Future<Output = T>) -> T {
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
         let mut future = Box::pin(future);
         match future.as_mut().poll(&mut context) {
             Poll::Ready(value) => value,
