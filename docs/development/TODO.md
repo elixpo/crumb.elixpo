@@ -30,7 +30,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Map HTTP and Pollinations failures into neutral errors.
 - [x] Add safe bounded retries for model discovery and explicit request timeouts.
 - [x] Keep credentials out of logs and errors.
-- [ ] Add deterministic HTTP fixture tests without live API access.
+- [x] Add deterministic HTTP fixture tests without live API access.
 - [ ] Pass formatting, clippy, and workspace tests.
 - [ ] Merge WP-009.
 
