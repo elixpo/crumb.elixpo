@@ -1,0 +1,244 @@
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+
+use crumb_agent::LiveConfig;
+use reedline::{Completer, CompletionResult, Span, Suggestion};
+
+const STATIC_REFERENCES: &[(&str, &str)] = &[
+    ("@file:", "reference a workspace file"),
+    ("@folder:", "reference a workspace folder"),
+    ("@selection", "reference the active selection"),
+    ("@clipboard", "reference confirmed clipboard content"),
+    ("@last-error", "reference the previous native error"),
+    ("@diff", "reference the current repository diff"),
+    ("@session:", "reference a Crumb session"),
+    ("@skill:", "reference a configured skill"),
+    ("@plugin:", "reference a configured plugin or MCP server"),
+    (
+        "@connector:pollinations",
+        "reference the Pollinations connector",
+    ),
+];
+
+#[derive(Clone, Debug)]
+pub struct CompletionWorkspace(Arc<RwLock<PathBuf>>);
+
+impl CompletionWorkspace {
+    pub fn new(workspace: PathBuf) -> Self {
+        Self(Arc::new(RwLock::new(workspace)))
+    }
+
+    pub fn set(&self, workspace: &Path) {
+        if let Ok(mut active) = self.0.write() {
+            workspace.clone_into(&mut active);
+        }
+    }
+
+    fn get(&self) -> PathBuf {
+        self.0
+            .read()
+            .map_or_else(|_| PathBuf::from("."), |active| active.clone())
+    }
+}
+
+pub struct CrumbCompleter {
+    workspace: CompletionWorkspace,
+}
+
+impl CrumbCompleter {
+    pub const fn new(workspace: CompletionWorkspace) -> Self {
+        Self { workspace }
+    }
+}
+
+impl Completer for CrumbCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
+        let Some(prefix) = line.get(..pos) else {
+            return CompletionResult::fresh(Vec::new());
+        };
+        let suggestions = if prefix.starts_with('/') && !prefix.contains('\n') {
+            slash_suggestions(prefix, pos)
+        } else {
+            reference_suggestions(prefix, pos, &self.workspace.get())
+        };
+        CompletionResult::fresh(suggestions)
+    }
+}
+
+fn slash_suggestions(prefix: &str, pos: usize) -> Vec<Suggestion> {
+    crumb_repl::SLASH_COMMANDS
+        .iter()
+        .filter(|command| command.usage.starts_with(prefix))
+        .map(|command| suggestion(command.usage, command.description, Span::new(0, pos)))
+        .collect()
+}
+
+fn reference_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Suggestion> {
+    let start = line
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| character.is_whitespace().then_some(index + 1))
+        .unwrap_or(0);
+    let token = &line[start..];
+    if !token.starts_with('@') {
+        return Vec::new();
+    }
+    let span = Span::new(start, pos);
+    if let Some(path) = token.strip_prefix("@file:") {
+        return path_suggestions(workspace, path, false, span);
+    }
+    if let Some(path) = token.strip_prefix("@folder:") {
+        return path_suggestions(workspace, path, true, span);
+    }
+
+    let mut candidates = STATIC_REFERENCES
+        .iter()
+        .map(|(value, description)| ((*value).to_owned(), (*description).to_owned()))
+        .collect::<Vec<_>>();
+    if token.starts_with("@skill:") {
+        candidates.extend(configured_references(workspace, true));
+    } else if token.starts_with("@plugin:") {
+        candidates.extend(configured_references(workspace, false));
+    }
+    candidates
+        .into_iter()
+        .filter(|(value, _)| value.starts_with(token))
+        .map(|(value, description)| suggestion(&value, &description, span))
+        .collect()
+}
+
+fn configured_references(workspace: &Path, skills: bool) -> Vec<(String, String)> {
+    let Some(path) = config_path(workspace) else {
+        return Vec::new();
+    };
+    let Ok(config) = LiveConfig::new(path).load() else {
+        return Vec::new();
+    };
+    if skills {
+        config
+            .skills
+            .into_iter()
+            .filter(|skill| skill.enabled)
+            .map(|skill| {
+                (
+                    format!("@skill:{}", skill.id),
+                    "configured skill".to_owned(),
+                )
+            })
+            .collect()
+    } else {
+        config
+            .mcp_servers
+            .into_iter()
+            .map(|server| {
+                (
+                    format!("@plugin:{}", server.id),
+                    "configured plugin or MCP server".to_owned(),
+                )
+            })
+            .collect()
+    }
+}
+
+fn config_path(workspace: &Path) -> Option<PathBuf> {
+    workspace.ancestors().find_map(|directory| {
+        let candidate = directory.join(".crumb/agent.json");
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+fn path_suggestions(
+    workspace: &Path,
+    typed: &str,
+    directories_only: bool,
+    span: Span,
+) -> Vec<Suggestion> {
+    let typed_path = Path::new(typed);
+    let parent = typed_path.parent().unwrap_or_else(|| Path::new(""));
+    let fragment = typed_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let directory = workspace.join(parent);
+    let Ok(canonical_workspace) = std::fs::canonicalize(workspace) else {
+        return Vec::new();
+    };
+    let Ok(canonical_directory) = std::fs::canonicalize(&directory) else {
+        return Vec::new();
+    };
+    if !canonical_directory.starts_with(&canonical_workspace) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(canonical_directory) else {
+        return Vec::new();
+    };
+    let marker = if directories_only {
+        "@folder:"
+    } else {
+        "@file:"
+    };
+    let mut suggestions = entries
+        .flatten()
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            if (directories_only && !file_type.is_dir())
+                || (!directories_only && !file_type.is_file())
+            {
+                return None;
+            }
+            let name = entry.file_name().into_string().ok()?;
+            if !name.starts_with(fragment) {
+                return None;
+            }
+            let path = parent.join(name);
+            Some(suggestion(
+                &format!("{marker}{}", path.display()),
+                if directories_only { "folder" } else { "file" },
+                span,
+            ))
+        })
+        .take(100)
+        .collect::<Vec<_>>();
+    suggestions.sort_by(|left, right| left.value.cmp(&right.value));
+    suggestions
+}
+
+fn suggestion(value: &str, description: &str, span: Span) -> Suggestion {
+    Suggestion {
+        value: value.to_owned(),
+        display_override: Some(format!("{value}  {description}")),
+        description: Some(description.to_owned()),
+        span,
+        append_whitespace: !value.ends_with([':', ' ']),
+        ..Suggestion::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use reedline::Completer;
+
+    use super::{CompletionWorkspace, CrumbCompleter};
+
+    #[test]
+    fn slash_completion_includes_help() {
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
+        let result = completer.complete("/he", 3);
+        assert!(
+            result
+                .suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "/help")
+        );
+    }
+
+    #[test]
+    fn references_complete_inside_plain_language() {
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
+        let result = completer.complete("explain @last", 13);
+        assert_eq!(result.suggestions()[0].value, "@last-error");
+        assert_eq!(result.suggestions()[0].span.start, 8);
+    }
+}

@@ -24,14 +24,17 @@ use crumb_repl::{ReplOutcome, read_classified_line};
 use crumb_tools::{WorkspaceToolLimits, register_workspace_read_tools};
 use crumb_ui::{GitSegment, PromptContext, Renderer, UiSettings};
 use reedline::{
-    FileBackedHistory, History, HistoryItem, Prompt, PromptEditMode, PromptHistorySearch,
-    PromptHistorySearchStatus, Reedline, Signal,
+    ColumnarMenu, Emacs, FileBackedHistory, History, HistoryItem, KeyCode, KeyModifiers,
+    MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
+    ReedlineEvent, ReedlineMenu, Signal, default_emacs_keybindings,
 };
 
 mod agent_runtime;
+mod completion;
 mod device_auth;
 
 use agent_runtime::AgentRuntime;
+use completion::{CompletionWorkspace, CrumbCompleter};
 
 const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
 
@@ -123,8 +126,9 @@ fn run_managed_repl() -> Result<ReplOutcome> {
     let mut agent_runtime: Option<AgentRuntime> = None;
     let mut last_exit_code = None;
     let history = open_history(&mut stdout.lock())?;
+    let completion_workspace = CompletionWorkspace::new(current_process_dir()?);
     let mut line_editor = interactive
-        .then(|| create_line_editor(history.as_ref()))
+        .then(|| create_line_editor(history.as_ref(), completion_workspace.clone()))
         .transpose()?;
 
     let branding = renderer.branding();
@@ -138,7 +142,8 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             .map_or_else(current_process_dir, |shell| Ok(shell.cwd().to_path_buf()))?;
         let prompt = render_prompt(renderer, &cwd, platform, last_exit_code);
         let event = if let Some(editor) = line_editor.as_mut() {
-            match editor.read_line(&CrumbPrompt::new(prompt))? {
+            editor.workspace.set(&cwd);
+            match editor.editor.read_line(&CrumbPrompt::new(prompt))? {
                 Signal::Success(command) => Some(crumb_repl::classify_input(&command)),
                 Signal::CtrlD => None,
                 _ => continue,
@@ -412,10 +417,13 @@ fn handle_builtin(
 ) -> Result<Option<ReplOutcome>> {
     match command {
         BuiltInCommand::Auth(action) => handle_auth(action, writer)?,
+        BuiltInCommand::Connectors => handle_auth(AuthAction::Status, writer)?,
+        BuiltInCommand::Context => show_reference_help(writer)?,
         BuiltInCommand::Exit => {
             shutdown_session(session.take())?;
             return Ok(Some(ReplOutcome::Exit));
         }
+        BuiltInCommand::Help => show_slash_help(writer)?,
         BuiltInCommand::History(action) => show_history(history, &action, writer)?,
         BuiltInCommand::Platform => {
             writeln!(writer, "{platform}")?;
@@ -429,6 +437,10 @@ fn handle_builtin(
                 writer,
             )?;
         }
+        BuiltInCommand::Reserved(command) => writeln!(
+            writer,
+            "`{command}` is reserved for Crumb but is not available in this build"
+        )?,
         BuiltInCommand::Version => {
             writeln!(writer, "crumb {}", env!("CARGO_PKG_VERSION"))?;
             record_history(
@@ -448,8 +460,60 @@ fn handle_builtin(
             writer,
             "`/shell` is available before the managed shell starts; restart crumb to enter raw mode"
         )?,
+        BuiltInCommand::Skills => show_skills(cwd, writer)?,
     }
     Ok(None)
+}
+
+fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
+    writeln!(writer, "Crumb commands (type `/` then Tab):")?;
+    for command in crumb_repl::SLASH_COMMANDS {
+        writeln!(writer, "  {:<22} {}", command.usage, command.description)?;
+    }
+    Ok(())
+}
+
+fn show_reference_help(writer: &mut dyn Write) -> Result<()> {
+    writeln!(
+        writer,
+        "Inline references (type `@` then Tab inside a request):"
+    )?;
+    for reference in [
+        "@file:<path>",
+        "@folder:<path>",
+        "@selection",
+        "@clipboard",
+        "@last-error",
+        "@diff",
+        "@session:<id>",
+        "@skill:<id>",
+        "@plugin:<id>",
+        "@connector:pollinations",
+    ] {
+        writeln!(writer, "  {reference}")?;
+    }
+    Ok(())
+}
+
+fn show_skills(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    if config.skills.is_empty() {
+        writeln!(writer, "No skills are configured")?;
+        return Ok(());
+    }
+    for skill in config.skills {
+        writeln!(
+            writer,
+            "{}  {}",
+            if skill.enabled {
+                "enabled "
+            } else {
+                "disabled"
+            },
+            skill.id
+        )?;
+    }
+    Ok(())
 }
 
 fn handle_auth(action: AuthAction, writer: &mut dyn Write) -> Result<()> {
@@ -578,7 +642,15 @@ fn stdin_ready(_stdin: &io::Stdin) -> io::Result<bool> {
     crossterm::event::poll(Duration::from_millis(25))
 }
 
-fn create_line_editor(history: Option<&HistoryStore>) -> Result<Reedline> {
+struct InteractiveLineEditor {
+    editor: Reedline,
+    workspace: CompletionWorkspace,
+}
+
+fn create_line_editor(
+    history: Option<&HistoryStore>,
+    workspace: CompletionWorkspace,
+) -> Result<InteractiveLineEditor> {
     let mut interactive_history = FileBackedHistory::new(INTERACTIVE_HISTORY_CAPACITY)?;
     if let Some(history) = history {
         let capacity = u32::try_from(INTERACTIVE_HISTORY_CAPACITY)
@@ -589,7 +661,24 @@ fn create_line_editor(history: Option<&HistoryStore>) -> Result<Reedline> {
             interactive_history.save(HistoryItem::from_command_line(entry.command))?;
         }
     }
-    Ok(Reedline::create().with_history(Box::new(interactive_history)))
+    let mut keybindings = default_emacs_keybindings();
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu("completion_menu".to_owned()),
+            ReedlineEvent::MenuNext,
+        ]),
+    );
+    let menu = ColumnarMenu::default()
+        .with_name("completion_menu")
+        .with_columns(1);
+    let editor = Reedline::create()
+        .with_history(Box::new(interactive_history))
+        .with_completer(Box::new(CrumbCompleter::new(workspace.clone())))
+        .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
+        .with_edit_mode(Box::new(Emacs::new(keybindings)));
+    Ok(InteractiveLineEditor { editor, workspace })
 }
 
 struct CrumbPrompt {

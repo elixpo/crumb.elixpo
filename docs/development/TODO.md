@@ -51,6 +51,20 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 </details>
 
+## Active CLI package: `/` commands and `@` references
+
+- [x] Keep plain English as the only natural-language prompt form.
+- [x] Reserve known `/` commands without intercepting native absolute paths.
+- [x] Implement `/help`, `/skills`, `/connectors`, and `/context`.
+- [x] Keep authentication, history, platform, version, shell, and exit commands functional.
+- [x] Add Tab suggestions for slash commands and typed inline references.
+- [x] Load enabled skill and configured MCP/plugin identifiers into suggestions.
+- [x] Bound file and folder suggestions to the active workspace.
+- [ ] Resolve selected `@` references into bounded, redacted agent context.
+- [ ] Implement `/attach`, `/detach`, and persistent session context.
+- [ ] Implement live `/mode`, `/model`, `/effort`, and `/config` changes.
+- [ ] Add the installable terminal UI and binary packaging pass.
+
 ## Planned work packages
 
 - [x] [WP-012 — deterministic agent/session foundation](https://github.com/elixpo/crumb.elixpo/issues/33) ([design](agent-foundation.md)).

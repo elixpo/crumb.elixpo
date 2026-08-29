@@ -14,6 +14,125 @@ pub enum ReplOutcome {
     LaunchNativeShell,
 }
 
+/// One command exposed through Crumb's `/` namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SlashCommand {
+    pub usage: &'static str,
+    pub description: &'static str,
+}
+
+/// Commands shown by `/help` and interactive completion.
+pub const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        usage: "/help",
+        description: "show Crumb commands",
+    },
+    SlashCommand {
+        usage: "/auth login",
+        description: "connect Pollinations",
+    },
+    SlashCommand {
+        usage: "/auth status",
+        description: "show connector authentication",
+    },
+    SlashCommand {
+        usage: "/auth logout",
+        description: "remove the stored connector",
+    },
+    SlashCommand {
+        usage: "/connectors",
+        description: "show connected services",
+    },
+    SlashCommand {
+        usage: "/skills",
+        description: "show configured skills",
+    },
+    SlashCommand {
+        usage: "/context",
+        description: "show inline reference syntax",
+    },
+    SlashCommand {
+        usage: "/history",
+        description: "show recent native history",
+    },
+    SlashCommand {
+        usage: "/history search ",
+        description: "search native history",
+    },
+    SlashCommand {
+        usage: "/mode ",
+        description: "select auto, negotiate, or plan mode",
+    },
+    SlashCommand {
+        usage: "/model",
+        description: "inspect or select a model",
+    },
+    SlashCommand {
+        usage: "/effort",
+        description: "inspect or set reasoning effort",
+    },
+    SlashCommand {
+        usage: "/session",
+        description: "manage agent sessions",
+    },
+    SlashCommand {
+        usage: "/attach ",
+        description: "attach a typed @ reference",
+    },
+    SlashCommand {
+        usage: "/detach ",
+        description: "remove attached context",
+    },
+    SlashCommand {
+        usage: "/plugins",
+        description: "inspect installed plugins",
+    },
+    SlashCommand {
+        usage: "/tools",
+        description: "inspect available tools",
+    },
+    SlashCommand {
+        usage: "/permissions",
+        description: "inspect agent permissions",
+    },
+    SlashCommand {
+        usage: "/memory",
+        description: "manage approved memory",
+    },
+    SlashCommand {
+        usage: "/config",
+        description: "inspect live configuration",
+    },
+    SlashCommand {
+        usage: "/cancel",
+        description: "cancel the active agent turn",
+    },
+    SlashCommand {
+        usage: "/doctor",
+        description: "diagnose optional AI services",
+    },
+    SlashCommand {
+        usage: "/cost",
+        description: "show session usage",
+    },
+    SlashCommand {
+        usage: "/platform",
+        description: "show the native platform",
+    },
+    SlashCommand {
+        usage: "/version",
+        description: "show the Crumb version",
+    },
+    SlashCommand {
+        usage: "/shell",
+        description: "enter the raw native shell",
+    },
+    SlashCommand {
+        usage: "/exit",
+        description: "exit Crumb",
+    },
+];
+
 /// Classifies one line without executing native shell input.
 #[must_use]
 pub fn classify_input(input: &str) -> InputEvent {
@@ -22,21 +141,41 @@ pub fn classify_input(input: &str) -> InputEvent {
         "/auth login" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Login)),
         "/auth status" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Status)),
         "/auth logout" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Logout)),
+        "/connectors" => InputEvent::BuiltIn(BuiltInCommand::Connectors),
+        "/context" => InputEvent::BuiltIn(BuiltInCommand::Context),
         "/exit" => InputEvent::BuiltIn(BuiltInCommand::Exit),
+        "/help" => InputEvent::BuiltIn(BuiltInCommand::Help),
         "/history" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Recent)),
         "/history search" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
             String::new(),
         ))),
         "/platform" => InputEvent::BuiltIn(BuiltInCommand::Platform),
         "/shell" => InputEvent::BuiltIn(BuiltInCommand::Shell),
+        "/skills" => InputEvent::BuiltIn(BuiltInCommand::Skills),
         "/version" => InputEvent::BuiltIn(BuiltInCommand::Version),
         _ if command.starts_with("/history search ") => {
             InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
                 command["/history search ".len()..].to_owned(),
             )))
         }
+        _ if reserved_slash_command(command) => {
+            InputEvent::BuiltIn(BuiltInCommand::Reserved(command.to_owned()))
+        }
         _ => InputEvent::NativeInput(command.to_owned()),
     }
+}
+
+fn reserved_slash_command(command: &str) -> bool {
+    let Some(name) = command.split_whitespace().next() else {
+        return false;
+    };
+    SLASH_COMMANDS.iter().any(|candidate| {
+        candidate
+            .usage
+            .split_whitespace()
+            .next()
+            .is_some_and(|root| root == name)
+    })
 }
 
 /// Renders the phase-one prompt for a working directory.
@@ -105,11 +244,26 @@ pub fn run<R: BufRead, W: Write>(
                     "authentication is available in the crumb executable"
                 )?;
             }
+            InputEvent::BuiltIn(BuiltInCommand::Connectors) => {
+                writeln!(writer, "connectors are available in the crumb executable")?;
+            }
+            InputEvent::BuiltIn(BuiltInCommand::Context) => {
+                writeln!(
+                    writer,
+                    "context references are available in the crumb executable"
+                )?;
+            }
             InputEvent::BuiltIn(BuiltInCommand::Exit) => return Ok(ReplOutcome::Exit),
+            InputEvent::BuiltIn(BuiltInCommand::Help) => {
+                writeln!(writer, "help is available in the crumb executable")?;
+            }
             InputEvent::BuiltIn(BuiltInCommand::History(_)) => {
                 writeln!(writer, "history is available in the crumb executable")?;
             }
             InputEvent::BuiltIn(BuiltInCommand::Platform) => writeln!(writer, "{platform}")?,
+            InputEvent::BuiltIn(BuiltInCommand::Reserved(command)) => {
+                writeln!(writer, "reserved Crumb command: {command}")?;
+            }
             InputEvent::BuiltIn(BuiltInCommand::Shell) => {
                 let shell_name = match platform {
                     Platform::Linux => "Bash",
@@ -122,6 +276,9 @@ pub fn run<R: BufRead, W: Write>(
                 )?;
                 writer.flush()?;
                 return Ok(ReplOutcome::LaunchNativeShell);
+            }
+            InputEvent::BuiltIn(BuiltInCommand::Skills) => {
+                writeln!(writer, "skills are available in the crumb executable")?;
             }
             InputEvent::BuiltIn(BuiltInCommand::Version) => writeln!(writer, "crumb {version}")?,
             InputEvent::NativeInput(command) if command.trim().is_empty() => {}
@@ -173,6 +330,14 @@ mod tests {
                 "cargo test".to_owned()
             )))
         );
+        assert_eq!(
+            classify_input("/skills"),
+            InputEvent::BuiltIn(BuiltInCommand::Skills)
+        );
+        assert_eq!(
+            classify_input("/mode auto"),
+            InputEvent::BuiltIn(BuiltInCommand::Reserved("/mode auto".to_owned()))
+        );
     }
 
     #[test]
@@ -180,6 +345,10 @@ mod tests {
         assert_eq!(
             classify_input("  git status  "),
             InputEvent::NativeInput("  git status  ".to_owned())
+        );
+        assert_eq!(
+            classify_input("/usr/bin/env"),
+            InputEvent::NativeInput("/usr/bin/env".to_owned())
         );
     }
 
