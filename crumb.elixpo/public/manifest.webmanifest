@@ -1,6 +1,6 @@
 {
   "name": "Crumb — Natural Language Terminal",
-  "short_name": "Crumb LNT",
+  "short_name": "Crumb NLT",
   "description": "A native-first terminal with intelligence when you ask.",
   "start_url": "/",
   "display": "standalone",

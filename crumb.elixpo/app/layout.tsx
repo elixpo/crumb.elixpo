@@ -12,7 +12,7 @@ export const metadata: Metadata = {
   metadataBase: new URL(siteUrl),
   title: { default: title, template: '%s · Crumb' },
   description,
-  applicationName: 'Crumb LNT',
+  applicationName: 'Crumb NLT',
   keywords: ['natural language terminal', 'AI terminal', 'shell', 'developer tools', 'Crumb'],
   authors: [{ name: 'Elixpo', url: 'https://elixpo.com' }],
   creator: 'Elixpo',
@@ -20,7 +20,7 @@ export const metadata: Metadata = {
   alternates: { canonical: '/' },
   manifest: '/manifest.webmanifest',
   robots: { index: true, follow: true },
-  openGraph: { type: 'website', url: siteUrl, siteName: 'Crumb LNT', title, description },
+  openGraph: { type: 'website', url: siteUrl, siteName: 'Crumb NLT', title, description },
   twitter: { card: 'summary', title, description },
   icons: { icon: '/favicon.ico', shortcut: '/favicon.ico' },
   formatDetection: { telephone: false },
@@ -29,8 +29,10 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   const software = {
     '@context': 'https://schema.org', '@type': 'SoftwareApplication', name: 'Crumb',
-    alternateName: 'Crumb LNT', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows',
+    alternateName: 'Crumb NLT', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows',
     description, url: siteUrl, codeRepository: 'https://github.com/elixpo/crumb.elixpo',
+    downloadUrl: 'https://github.com/elixpo/crumb.elixpo/releases',
+    offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
   }
   return <html lang="en" className={`${sans.variable} ${mono.variable}`}>
     <body>{children}<script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(software) }} /></body>

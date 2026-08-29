@@ -15,6 +15,6 @@ export function SiteFooter() {
       <div><h3>Project</h3><Link href="/about">About</Link><a href={`${REPO}/issues`}>Issues</a><a href="https://status.elixpo.com">Status</a></div>
       <div><h3>Legal</h3><Link href="/privacy">Privacy</Link><Link href="/terms">Terms</Link><a href={`${REPO}/blob/main/LICENSE`}>License</a></div>
     </div>
-    <div className="footer-bottom"><span>© {new Date().getFullYear()} Elixpo · Crumb LNT</span><span>Open source terminal infrastructure.</span></div>
+    <div className="footer-bottom"><span>© {new Date().getFullYear()} Elixpo · Crumb NLT</span><span>Open source terminal infrastructure.</span></div>
   </footer>
 }

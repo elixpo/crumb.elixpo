@@ -15,7 +15,7 @@ export function pageMetadata({ title, description, path, keywords = [], noIndex 
     keywords,
     alternates: { canonical: path },
     robots: noIndex ? { index: false, follow: false } : { index: true, follow: true },
-    openGraph: { title: `${title} · Crumb`, description, url: `${SITE}${path}`, type: 'website', siteName: 'Crumb LNT' },
+    openGraph: { title: `${title} · Crumb`, description, url: `${SITE}${path}`, type: 'website', siteName: 'Crumb NLT' },
     twitter: { card: 'summary', title: `${title} · Crumb`, description },
   }
 }

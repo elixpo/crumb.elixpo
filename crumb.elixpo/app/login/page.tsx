@@ -1,9 +1,9 @@
-import type { Metadata } from 'next'
 import { redirect } from 'next/navigation'
 import { SiteHeader } from '@/app/components/SiteHeader'
 import { currentUser } from '@/lib/auth'
+import { pageMetadata } from '@/lib/seo'
 
-export const metadata: Metadata = { title: 'Sign in' }
+export const metadata = pageMetadata({ title: 'Sign in', description: 'Sign in to manage your Crumb account and provider connections.', path: '/login', noIndex: true })
 
 export default async function LoginPage() {
   if (await currentUser()) redirect('/profiles')

@@ -1,4 +1,7 @@
 import { redirect } from 'next/navigation'
+import { pageMetadata } from '@/lib/seo'
+
+export const metadata = pageMetadata({ title: 'Connections', description: 'Continue to Crumb Profiles and connections.', path: '/connect', noIndex: true })
 
 export default async function LegacyConnectPage({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
   const params = await searchParams
