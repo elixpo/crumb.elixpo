@@ -14,19 +14,20 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [ ] [WP-005 — shell lifecycle protocol](https://github.com/elixpo/crumb.elixpo/issues/10) ([PR #12](https://github.com/elixpo/crumb.elixpo/pull/12))
 - [ ] [WP-006 — terminal UI layer](https://github.com/elixpo/crumb.elixpo/issues/13) ([PR #14](https://github.com/elixpo/crumb.elixpo/pull/14))
 - [ ] [WP-007 — persistent history](https://github.com/elixpo/crumb.elixpo/issues/15) ([PR #17](https://github.com/elixpo/crumb.elixpo/pull/17))
+- [ ] [Linux terminal parity](https://github.com/elixpo/crumb.elixpo/issues/16) ([PR #18](https://github.com/elixpo/crumb.elixpo/pull/18))
 
-## Current milestone: [Terminal parity gate](https://github.com/elixpo/crumb.elixpo/issues/16)
+## Current milestone: [WP-008 — provider-neutral LLM interface](https://github.com/elixpo/crumb.elixpo/issues/19)
 
-- [x] Make the managed PTY input stream safely shareable during execution.
-- [x] Relay terminal input to foreground commands without `:shell` on Linux.
-- [x] Forward terminal resize events while commands run on Linux.
-- [x] Make Ctrl+C interrupt the foreground command without exiting Crumb on Linux.
-- [x] Run interactive and full-screen TTY programs as ordinary commands on Linux.
-- [x] Preserve shell state and completion metadata after interactive commands on Linux.
-- [ ] Cover Linux Bash, macOS Zsh, and Windows PowerShell behavior.
-- [ ] Remove terminal compatibility as a reason to use `:shell`.
+- [x] Add an isolated `crumb-llm` crate.
+- [x] Define typed model metadata and capabilities.
+- [x] Define chat messages, requests, and ordered streaming events.
+- [x] Define embedding requests and responses.
+- [x] Provide object-safe asynchronous provider and stream contracts.
+- [x] Define structured vendor-neutral errors and retryability.
+- [x] Add a deterministic mock provider.
+- [x] Keep Pollinations, HTTP, credentials, and startup initialization out of the crate.
 - [ ] Pass formatting, clippy, and workspace tests.
-- [ ] Merge the terminal parity gate.
+- [ ] Merge WP-008.
 
 <details>
 <summary>WP-001 completion details</summary>
@@ -45,7 +46,6 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Planned work packages
 
-- [ ] WP-008 — provider-neutral LLM interface.
 - [ ] WP-009 — Pollinations adapter.
 - [ ] WP-010 — secure authentication.
 - [ ] WP-011 — streamed AI question mode.
