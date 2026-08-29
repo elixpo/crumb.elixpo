@@ -153,16 +153,18 @@ upload_secrets() {
     return
   fi
   load_cloudflare_auth
-  local decrypted key value
+  local decrypted local_values="" key value
+  decrypted="$(sops decrypt "$ROOT_DIR/.env")"
   if [ -f "$SITE_DIR/.env.local" ]; then
-    decrypted="$(<"$SITE_DIR/.env.local")"
-  else
-    decrypted="$(sops decrypt "$ROOT_DIR/.env")"
+    local_values="$(<"$SITE_DIR/.env.local")"
   fi
   for key in NEXT_PUBLIC_ELIXPO_CLIENT_ID ELIXPO_CLIENT_SECRET ELIXPO_ACCOUNTS_DELETION_WEBHOOK POLLINATIONS_APP_KEY CONNECTOR_ENCRYPTION_KEY; do
     value=""
     while IFS= read -r line || [ -n "$line" ]; do
       if [[ "$line" == "$key="* ]]; then value="${line#*=}"; break; fi
+    done <<< "$local_values"
+    while IFS= read -r line || [ -n "$line" ]; do
+      if [ -z "$value" ] && [[ "$line" == "$key="* ]]; then value="${line#*=}"; break; fi
     done <<< "$decrypted"
     [ -n "$value" ] || fail "$key is missing from the decrypted .env."
     printf '%s' "$value" | run_site npx wrangler secret put "$key" \
