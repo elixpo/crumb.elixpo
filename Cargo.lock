@@ -520,6 +520,7 @@ name = "crumb-harness-dsh"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crumb-agent",
  "serde",
  "serde_json",
 ]
