@@ -1,5 +1,6 @@
 import { config, originFor } from '@/lib/cloudflare'
 import { encode, randomToken, text } from '@/lib/encoding'
+import { CONNECTOR_MODELS } from '@/lib/model-policy'
 
 const AUTHORIZE = 'https://enter.pollinations.ai/authorize'
 const TOKEN = 'https://enter.pollinations.ai/api/oauth/token'
@@ -22,6 +23,7 @@ export function authorizeUrl(state: string, pkce: string, requestUrl: string): s
     client_id: key,
     redirect_uri: `${originFor(requestUrl)}/api/integrations/pollinations/callback`,
     scope: SCOPE,
+    models: CONNECTOR_MODELS.join(','),
     expiry: '30',
     state,
     code_challenge: pkce,
