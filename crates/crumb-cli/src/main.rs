@@ -6,11 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crumb_agent::{
     AgentConfig, AgentMode, CancellationToken, CommandCatalog, DenyAllApprovals, HarnessConfig,
-    InputRoute, LiveConfig, MistakePolicy, Modality, RouteDecision, ToolHost, UnknownInputPolicy,
+    InputRoute, LiveConfig, MistakePolicy, Modality, RouteDecision, ToolHost, TurnStatus,
+    UnknownInputPolicy, list_sessions, session_summary,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
@@ -166,6 +167,7 @@ fn run_managed_repl() -> Result<ReplOutcome> {
                 if let Some(outcome) = handle_builtin(
                     command,
                     &mut session,
+                    &mut agent_runtime,
                     history.as_ref(),
                     &cwd,
                     platform,
@@ -509,6 +511,7 @@ fn render_prompt(
 fn handle_builtin(
     command: BuiltInCommand,
     session: &mut Option<ShellSession>,
+    agent_runtime: &mut Option<AgentRuntime>,
     history: Option<&HistoryStore>,
     cwd: &std::path::Path,
     platform: Platform,
@@ -536,7 +539,9 @@ fn handle_builtin(
                 writer,
             )?;
         }
-        BuiltInCommand::Reserved(command) => show_reserved(&command, cwd, writer)?,
+        BuiltInCommand::Reserved(command) => {
+            show_reserved(&command, cwd, agent_runtime, writer)?;
+        }
         BuiltInCommand::Version => {
             writeln!(writer, "crumb {}", env!("CARGO_PKG_VERSION"))?;
             record_history(
@@ -663,7 +668,12 @@ fn show_skills(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     Ok(())
 }
 
-fn show_reserved(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+fn show_reserved(
+    command: &str,
+    cwd: &Path,
+    runtime: &mut Option<AgentRuntime>,
+    writer: &mut dyn Write,
+) -> Result<()> {
     match command {
         "/mode" => {
             let config = read_agent_config(cwd)?;
@@ -689,12 +699,82 @@ fn show_reserved(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()
         }
         "/config" => show_config_summary(cwd, writer)?,
         "/plugins" => show_plugins(cwd, writer)?,
+        command if command == "/session" || command.starts_with("/session ") => {
+            show_sessions(command, cwd, runtime, writer)?;
+        }
         _ => {
             writeln!(writer, "◇ {command}")?;
             writeln!(writer, "  Reserved by Crumb; not available in this build.")?;
         }
     }
     Ok(())
+}
+
+fn show_sessions(
+    command: &str,
+    cwd: &Path,
+    runtime: &mut Option<AgentRuntime>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let root = cwd.join(".crumb").join("sessions").join("crumb");
+    let arguments = command.split_whitespace().skip(1).collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [] | ["list"] => {
+            let sessions = list_sessions(&root)?;
+            writeln!(writer, "◆ Agent sessions")?;
+            if sessions.is_empty() {
+                writeln!(writer, "  No sessions in this workspace")?;
+            }
+            for summary in sessions.into_iter().take(20) {
+                writeln!(
+                    writer,
+                    "  {:<34} {:<10} {} turns",
+                    summary.id.as_str(),
+                    turn_status_name(summary.last_status),
+                    summary.turns
+                )?;
+            }
+        }
+        ["inspect", id] => {
+            let summary = session_summary(&root, id)?;
+            writeln!(writer, "◆ Session {}", summary.id.as_str())?;
+            writeln!(writer, "  workspace  {}", summary.workspace.display())?;
+            writeln!(writer, "  mode       {}", agent_mode_name(summary.mode))?;
+            writeln!(writer, "  turns      {}", summary.turns)?;
+            writeln!(
+                writer,
+                "  status     {}",
+                turn_status_name(summary.last_status)
+            )?;
+            writeln!(writer, "  started    {} ms", summary.started_at_ms)?;
+            writeln!(writer, "  last event {} ms", summary.last_event_at_ms)?;
+        }
+        ["resume", id] => {
+            if runtime.is_none() {
+                *runtime = Some(AgentRuntime::new()?);
+            }
+            runtime
+                .as_mut()
+                .context("agent runtime is unavailable")?
+                .resume(cwd, id)?;
+            writeln!(writer, "◆ Resumed session {id}")?;
+        }
+        _ => writeln!(
+            writer,
+            "usage: /session [list | inspect <id> | resume <id>]"
+        )?,
+    }
+    Ok(())
+}
+
+const fn turn_status_name(status: Option<TurnStatus>) -> &'static str {
+    match status {
+        Some(TurnStatus::Complete) => "complete",
+        Some(TurnStatus::Cancelled) => "cancelled",
+        Some(TurnStatus::Failed) => "failed",
+        Some(TurnStatus::LimitReached) => "limit",
+        None => "new",
+    }
 }
 
 fn show_models(cwd: &Path, writer: &mut dyn Write) -> Result<()> {

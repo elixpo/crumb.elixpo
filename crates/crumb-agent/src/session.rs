@@ -137,10 +137,10 @@ pub fn list_sessions(root: &Path) -> Result<Vec<SessionSummary>> {
     }
     let mut summaries = fs::read_dir(root)
         .with_context(|| format!("failed to read session root {}", root.display()))?
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .filter_map(|entry| session_summary(root, &entry.file_name().to_string_lossy()).ok())
         .collect::<Vec<_>>();
-    summaries.sort_by(|left, right| right.last_event_at_ms.cmp(&left.last_event_at_ms));
+    summaries.sort_by_key(|summary| std::cmp::Reverse(summary.last_event_at_ms));
     Ok(summaries)
 }
 

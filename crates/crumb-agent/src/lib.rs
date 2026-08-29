@@ -22,7 +22,7 @@ pub use routing::{
 };
 pub use session::{
     AgentSession, CancellationToken, SessionEvent, SessionId, SessionJournal, SessionSummary,
-    list_sessions, session_summary,
+    TurnStatus, list_sessions, session_summary,
 };
 pub use tools::{
     ApprovalBroker, ApprovalDecision, ApprovalRequest, DenyAllApprovals, McpServer, OutputKind,

@@ -521,6 +521,7 @@ dependencies = [
  "reqwest",
  "rustix",
  "serde",
+ "serde_json",
  "url",
 ]
 

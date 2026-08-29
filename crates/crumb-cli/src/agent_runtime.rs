@@ -79,27 +79,14 @@ impl AgentRuntime {
         Ok(())
     }
 
-    /// Executes one natural-language turn through the configured Harness.
-    ///
-    /// # Errors
-    ///
-    /// Returns a redacted error when configuration, credentials, persistence,
-    /// Harness startup, model execution, or cancellation fails.
-    pub fn run(
-        &mut self,
-        request: &str,
-        config: &AgentConfig,
-        workspace: &Path,
-    ) -> Result<RunResult> {
-        self.run_with_events(request, config, workspace, |_| Ok(()))
-    }
-
     /// Executes one turn and forwards bounded Harness notifications as they
     /// arrive.
     ///
     /// # Errors
     ///
-    /// Returns the same failures as [`Self::run`], including observer errors.
+    /// Returns a redacted error when configuration, credentials, persistence,
+    /// Harness startup, model execution, cancellation, or event observation
+    /// fails.
     pub fn run_with_events(
         &mut self,
         request: &str,
