@@ -8,8 +8,8 @@ crumb auth status
 crumb auth logout
 ```
 
-The same actions are available inside Crumb as `:auth login`, `:auth status`,
-and `:auth logout`. First sign in at the Crumb account site and link
+The same actions are available inside Crumb as `/auth login`, `/auth status`,
+and `/auth logout`. First sign in at the Crumb account site and link
 Pollinations. `crumb auth login` then uses the Elixpo Accounts RFC 8628 device
 flow and sends its short-lived Accounts access token to Crumb's connector
 exchange endpoint. The Pollinations credential is returned over HTTPS and

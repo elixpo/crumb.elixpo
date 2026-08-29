@@ -239,25 +239,25 @@ No AI is involved.
 
 ## 5.2 Built-in terminal commands
 
-Recommended prefix:
+Reserved namespace:
 
 ```text
-:
+/
 ```
 
 Examples:
 
 ```text
-:help
-:session list
-:memory show
-:model list
-:auth status
-:tools
-:permissions
-:sandbox new
-:cost
-:doctor
+/help
+/session list
+/memory show
+/model list
+/auth status
+/tools
+/permissions
+/sandbox new
+/cost
+/doctor
 ```
 
 These execute inside the Rust process.
@@ -266,18 +266,14 @@ These execute inside the Rust process.
 
 ## 5.3 AI question mode
 
-Recommended prefix:
-
-```text
-?
-```
+Natural-language questions require no prefix.
 
 Example:
 
 ```text
-? explain the last command error
-? what does this Docker command do
-? summarize this git diff
+explain the last command error
+what does this Docker command do
+summarize this git diff
 ```
 
 This calls the configured AI provider but does not automatically execute agent tools unless explicitly requested.
@@ -286,19 +282,16 @@ This calls the configured AI provider but does not automatically execute agent t
 
 ## 5.4 Agent mode
 
-Recommended prefix:
-
-```text
-@
-```
+Natural-language tasks use the same deterministic routing path without a
+special character.
 
 Examples:
 
 ```text
-@ inspect this repository and fix the failing tests
-@ create an API endpoint and validate it
-@ debug why this Rust binary crashes
-@ optimize this Dockerfile
+inspect this repository and fix the failing tests
+create an API endpoint and validate it
+debug why this Rust binary crashes
+optimize this Dockerfile
 ```
 
 This invokes the multi-step agent runtime.

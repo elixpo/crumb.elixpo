@@ -366,7 +366,7 @@ fn render_error_assistance(
     match policy {
         MistakePolicy::Prompt => writeln!(
             writer,
-            "help: use `? explain the last error` for AI assistance"
+            "help: describe the error in plain English for AI assistance"
         )?,
         MistakePolicy::Automatic => writeln!(
             writer,
