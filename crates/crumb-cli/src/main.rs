@@ -8,9 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
-use crumb_auth::{
-    CredentialSource, CredentialStore, OsCredentialStore, credential_status, login,
-};
+use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_native::session::{CommandOutcome, ShellSession};
