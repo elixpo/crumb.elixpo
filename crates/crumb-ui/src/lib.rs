@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crumb_platform::Platform;
 
@@ -18,7 +18,38 @@ const FULL_LOGO: &str = r"   ██████╗██████╗ ██�
   ╚██████╗██║  ██║╚██████╔╝██║ ╚═╝ ██║██████╔╝
    ╚═════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝╚═════╝";
 
-const TAGLINE: &str = "Native when you command. Agentic when you ask.";
+const PUNCHLINES: &[&str] = &[
+    "Broken biscuit. Working terminal.",
+    "Crumbs included. Cleanup optional.",
+    "Breaking biscuits, not workflows.",
+    "Small crumb. Big terminal energy.",
+    "Bash first. Snack later.",
+    "Shell yeah. Crumb happens.",
+    "Fresh from the command-line bakery.",
+    "One shell. Several questionable snacks.",
+    "Bite-sized commands. Full-stack appetite.",
+    "Crunching tasks, not your patience.",
+    "Natural language in. Terminal magic out.",
+    "The shell is real. The jokes are optional-ish.",
+    "Your command broke. The biscuit came that way.",
+    "Less yak shaving. More biscuit breaking.",
+    "Works offline. The jokes do too.",
+    "AI optional. Personality unavoidable.",
+    "No prompt prefix. No crumbs under the rug.",
+    "Built with Rust. Seasoned with crumbs.",
+    "404: boring terminal not found.",
+    "Your shell called. It wants an agent.",
+    "Command line, now with conversational crunch.",
+    "The panda has entered the shell.",
+    "Oreo approved this terminal. Probably.",
+    "Oreo is debugging. Please hold the bamboo.",
+    "Oreo says this probably needs a test.",
+    "Oreo watches the permissions. Closely.",
+    "Panda-powered. Developer-controlled.",
+    "No cookies were accepted. One was broken.",
+    "A little crumb goes a long way.",
+    "Type boldly. Ctrl+C responsibly.",
+];
 
 /// Startup branding density.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,18 +128,19 @@ impl Renderer {
 
     #[must_use]
     pub fn branding(&self) -> String {
+        let punchline = startup_punchline();
         match self.settings.branding {
             BrandingMode::Full => format!(
                 "{}\n  {}  {}",
                 self.paint(FULL_LOGO, "36"),
-                self.paint(TAGLINE, "1"),
+                self.paint(punchline, "1"),
                 self.paint("Type /help or press Tab after / and @", "2")
             ),
             BrandingMode::Compact => {
                 format!(
                     "{}  {}",
                     self.paint("crumb", "36;1"),
-                    self.paint(TAGLINE, "2")
+                    self.paint(punchline, "2")
                 )
             }
             BrandingMode::Disabled => String::new(),
@@ -141,12 +173,7 @@ impl Renderer {
 
     /// Renders one committed Harness response and its bounded session metadata.
     #[must_use]
-    pub fn agent_response(
-        &self,
-        response: &str,
-        session_id: &str,
-        event_count: usize,
-    ) -> String {
+    pub fn agent_response(&self, response: &str, session_id: &str, event_count: usize) -> String {
         format!(
             "{}\n{} {}",
             response.trim(),
@@ -205,6 +232,16 @@ impl Renderer {
             text.to_owned()
         }
     }
+}
+
+fn startup_punchline() -> &'static str {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    let process = u128::from(std::process::id());
+    let width = u128::try_from(PUNCHLINES.len()).unwrap_or(1);
+    let index = usize::try_from((elapsed.as_nanos() ^ process) % width).unwrap_or(0);
+    PUNCHLINES[index]
 }
 
 /// A best-effort activity line that always clears itself before final output.
@@ -320,7 +357,7 @@ mod tests {
 
     use crumb_platform::Platform;
 
-    use super::{BrandingMode, GitSegment, PromptContext, Renderer, UiSettings};
+    use super::{BrandingMode, GitSegment, PUNCHLINES, PromptContext, Renderer, UiSettings};
 
     #[test]
     fn plain_prompt_is_deterministic() {
@@ -377,7 +414,11 @@ mod tests {
         let branding = renderer.branding();
 
         assert!(branding.contains("██████╗"));
-        assert!(branding.contains(TAGLINE));
+        assert!(
+            PUNCHLINES
+                .iter()
+                .any(|punchline| branding.contains(punchline))
+        );
         assert_eq!(branding.lines().count(), 7);
     }
 

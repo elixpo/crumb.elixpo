@@ -337,7 +337,11 @@ fn handle_agent_boundary(
         match AgentRuntime::new() {
             Ok(created) => *runtime = Some(created),
             Err(error) => {
-                writeln!(writer, "{}", renderer.agent_error(&error.to_string(), false))?;
+                writeln!(
+                    writer,
+                    "{}",
+                    renderer.agent_error(&error.to_string(), false)
+                )?;
                 return Ok(());
             }
         }
@@ -514,22 +518,25 @@ fn handle_builtin(
 
 fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
     writeln!(writer, "Crumb command palette")?;
-    writeln!(writer, "  Type `/` then Tab to search · `@` then Tab for context")?;
+    writeln!(
+        writer,
+        "  Type `/` then Tab to search · `@` then Tab for context"
+    )?;
     for (title, roots) in [
         (
             "SHELL",
-            &["/help", "/history", "/platform", "/version", "/shell", "/exit"][..],
+            &[
+                "/help",
+                "/history",
+                "/platform",
+                "/version",
+                "/shell",
+                "/exit",
+            ][..],
         ),
         (
             "AGENT",
-            &[
-                "/mode",
-                "/model",
-                "/effort",
-                "/session",
-                "/cancel",
-                "/cost",
-            ][..],
+            &["/mode", "/model", "/effort", "/session", "/cancel", "/cost"][..],
         ),
         (
             "CONTEXT & CAPABILITIES",
@@ -590,7 +597,10 @@ fn show_skills(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     let config = read_agent_config(cwd)?;
     if config.skills.is_empty() {
         writeln!(writer, "◇ No skills configured")?;
-        writeln!(writer, "  Add skills to .crumb/agent.json, then type @skill: and press Tab.")?;
+        writeln!(
+            writer,
+            "  Add skills to .crumb/agent.json, then type @skill: and press Tab."
+        )?;
         return Ok(());
     }
     for skill in config.skills {
@@ -614,7 +624,10 @@ fn show_reserved(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()
             let config = read_agent_config(cwd)?;
             writeln!(writer, "◆ Agent mode")?;
             writeln!(writer, "  {}", agent_mode_name(config.mode))?;
-            writeln!(writer, "  auto executes approved steps · negotiate pauses · plan is read-only")?;
+            writeln!(
+                writer,
+                "  auto executes approved steps · negotiate pauses · plan is read-only"
+            )?;
         }
         "/model" => show_models(cwd, writer)?,
         "/effort" => {
@@ -685,7 +698,10 @@ fn show_config_summary(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         "  mode {} · {routes} model routes · {enabled_skills} skills · {enabled_plugins} plugins",
         agent_mode_name(config.mode)
     )?;
-    writeln!(writer, "  Reloaded before every agent turn · secrets excluded")?;
+    writeln!(
+        writer,
+        "  Reloaded before every agent turn · secrets excluded"
+    )?;
     Ok(())
 }
 

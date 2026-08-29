@@ -79,6 +79,14 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [ ] Add terminal-width snapshots, reduced-motion behavior, and accessibility checks.
 - [ ] Package signed standalone binaries for Linux, macOS, and Windows.
 
+### Competitive terminal roadmap
+
+- [ ] [Stream Harness activity and support queued steering](https://github.com/elixpo/crumb.elixpo/issues/36)
+- [ ] [Add reviewable diffs, checkpoints, and safe rewind](https://github.com/elixpo/crumb.elixpo/issues/37)
+- [ ] [Ship modern input editing, shell completions, and accessibility modes](https://github.com/elixpo/crumb.elixpo/issues/38)
+- [ ] [Add resumable and searchable agent sessions](https://github.com/elixpo/crumb.elixpo/issues/35)
+- [ ] [Add opt-in background jobs and scheduled agent work](https://github.com/elixpo/crumb.elixpo/issues/34)
+
 ## Planned work packages
 
 - [x] [WP-012 — deterministic agent/session foundation](https://github.com/elixpo/crumb.elixpo/issues/33) ([design](agent-foundation.md)).
