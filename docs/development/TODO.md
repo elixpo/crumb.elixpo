@@ -13,12 +13,12 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Current milestone: [WP-004 — Windows PowerShell parity](https://github.com/elixpo/crumb.elixpo/issues/8)
 
-- [ ] Add a typed Windows PowerShell implementation.
-- [ ] Prefer `pwsh` and fall back to Windows PowerShell.
-- [ ] Select PowerShell for `Platform::Windows`.
-- [ ] Reuse the portable PTY lifecycle and terminal relay.
-- [ ] Preserve cwd and environment state in one PowerShell process.
-- [ ] Add deterministic Windows integration coverage.
+- [x] Add a typed Windows PowerShell implementation.
+- [x] Prefer `pwsh` and fall back to Windows PowerShell.
+- [x] Select PowerShell for `Platform::Windows`.
+- [x] Reuse the portable PTY lifecycle and terminal relay.
+- [x] Preserve cwd and environment state in one PowerShell process.
+- [x] Add deterministic Windows integration coverage.
 - [ ] Keep Linux and macOS workspace builds green.
 - [ ] Pass formatting, clippy, and workspace tests.
 - [ ] Merge WP-004.
