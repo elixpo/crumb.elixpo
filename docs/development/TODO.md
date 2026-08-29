@@ -2,7 +2,7 @@
 
 This is the local source of truth for implementation order. GitHub issues provide discussion and ownership; completed work remains checked here for quick repository context.
 
-## Current milestone: WP-001 — workspace bootstrap
+## Current milestone: [WP-001 — workspace bootstrap](https://github.com/elixpo/crumb.elixpo/issues/1)
 
 - [x] Create the Cargo workspace.
 - [x] Add `crumb-cli`, `crumb-core`, `crumb-repl`, and `crumb-platform`.
