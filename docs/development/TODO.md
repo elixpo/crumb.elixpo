@@ -53,8 +53,8 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Planned work packages
 
-- [ ] [WP-012 — deterministic agent/session foundation](https://github.com/elixpo/crumb.elixpo/issues/33) ([design](agent-foundation.md)).
-- [ ] [DeepSeek Harness + RTK/token optimizers](https://github.com/elixpo/crumb.elixpo/issues/22): native boundary first, harness adapter second, optimizers third.
+- [x] [WP-012 — deterministic agent/session foundation](https://github.com/elixpo/crumb.elixpo/issues/33) ([design](agent-foundation.md)).
+- [ ] [DeepSeek Harness + RTK/token optimizers](https://github.com/elixpo/crumb.elixpo/issues/22): [Harness adapter](deepseek-harness.md) first, optimizers second.
 - [ ] [Skills and natural-language routing](https://github.com/elixpo/crumb.elixpo/issues/25): valid commands stay native; unresolved phrases follow configured deterministic policy.
 - [ ] Refine the CLI UI after the harness and optimizers.
 - [ ] Resume the `crumb.elixpo` web UI after the CLI UI.

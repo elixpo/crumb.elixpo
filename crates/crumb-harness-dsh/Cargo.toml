@@ -1,0 +1,13 @@
+[package]
+name = "crumb-harness-dsh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

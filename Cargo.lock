@@ -516,6 +516,15 @@ name = "crumb-core"
 version = "0.1.0"
 
 [[package]]
+name = "crumb-harness-dsh"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "crumb-history"
 version = "0.1.0"
 dependencies = [

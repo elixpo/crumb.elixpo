@@ -16,8 +16,7 @@ pub struct ModelCapabilities {
 
 /// One turn passed to either the native or subprocess harness.
 ///
-/// The wire name follows the `DeepSeek` Harness protocol while configuration
-/// remains provider-neutral.
+/// Adapters translate this provider-neutral shape into their supported wire.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HarnessTurnRequest {
@@ -100,9 +99,11 @@ mod tests {
     }
 
     #[test]
-    fn effort_is_forwarded_with_the_harness_wire_name() {
-        let encoded = serde_json::to_value(request(Some("high"))).expect("serializes");
-        assert_eq!(encoded["reasoningEffort"], "high");
+    fn effort_is_preserved_for_the_selected_harness() {
+        assert_eq!(
+            request(Some("high")).reasoning_effort.as_deref(),
+            Some("high")
+        );
     }
 
     #[test]
