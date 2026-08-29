@@ -9,11 +9,11 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Current milestone: [WP-003 — macOS Zsh parity](https://github.com/elixpo/crumb.elixpo/issues/6)
 
-- [ ] Add a typed macOS Zsh implementation.
-- [ ] Select interactive Zsh for `Platform::MacOs`.
-- [ ] Reuse the portable PTY lifecycle and terminal relay.
-- [ ] Preserve cwd and environment state in one Zsh process.
-- [ ] Add deterministic macOS integration coverage.
+- [x] Add a typed macOS Zsh implementation.
+- [x] Select interactive Zsh for `Platform::MacOs`.
+- [x] Reuse the portable PTY lifecycle and terminal relay.
+- [x] Preserve cwd and environment state in one Zsh process.
+- [x] Add deterministic macOS integration coverage.
 - [ ] Keep Linux and Windows workspace builds green.
 - [ ] Pass formatting, clippy, and workspace tests.
 - [ ] Merge WP-003.
