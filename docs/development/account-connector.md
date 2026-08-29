@@ -19,10 +19,17 @@ No custom Accounts scope is required. Register an Accounts lifecycle webhook:
 Subscribe it to `user.deleted`. Accounts must sign the exact request bytes as
 `HMAC-SHA256(secret, "<unix timestamp>.<body>")` and send
 `X-Elixpo-Timestamp`, `X-Elixpo-Signature: sha256=<hex>`, and a stable
-`X-Elixpo-Event-Id`. The shared secret is
-The destination URL is configured in Accounts as
+`X-Elixpo-Event-Id`. The destination URL is configured in Accounts as
 `ELIXPO_ACCOUNTS_DELETION_WEBHOOK`. Store the separate `whk_…` secret returned
 by Accounts in Crumb as `ELIXPO_ACCOUNTS_WEBHOOK_SECRET`.
+
+Register `NEXT_PUBLIC_ELIXPO_CLIENT_ID_CLI` as a public device client with:
+
+- Audience: `crumb.elixpo.com`
+- Scopes: `openid profile email`
+- Grant: `urn:ietf:params:oauth:grant-type:device_code`
+
+The device client has no client secret or redirect URI.
 
 Register the Pollinations application callback as:
 
@@ -65,18 +72,16 @@ Wrangler:
 `./deploy.sh all` runs the complete sequence. OpenNext produces the Worker and
 static-assets bundle; the first deployment creates the Worker service.
 
-## Handoff security
+## Connector security
 
-1. Crumb creates a random state and PKCE verifier, listens only on loopback,
-   and opens `/connect` in the browser.
-2. The site authenticates with Accounts and connects Pollinations.
-3. The site stores the provider token encrypted and sends only a two-minute,
-   single-use code to the loopback callback.
-4. Crumb exchanges the code with its verifier and stores the returned token in
-   the OS keyring.
-
-Only `http://localhost:3000/auth/connector/callback` and its `127.0.0.1`
-equivalent are accepted as terminal callbacks.
+1. The user signs into the Crumb site and links Pollinations with PKCE.
+2. Crumb stores the scoped provider token encrypted in D1.
+3. `crumb auth login` completes Accounts device authorization using the public
+   CLI client. The Accounts access token stays in process memory.
+4. The CLI sends that short-lived token to Crumb. Crumb validates its issuer,
+   audience, client ID, scopes, expiry, and Accounts profile before releasing
+   the already-linked connector over HTTPS.
+5. The CLI stores the connector only in the OS keyring.
 
 ## Backend route contract
 
@@ -84,6 +89,7 @@ equivalent are accepted as terminal callbacks.
 - `POST /api/webhook/account_delete` — signed Accounts deletion hook.
 - `GET /api/integrations/pollinations/connect` — start Pollinations PKCE.
 - `GET /api/integrations/pollinations/callback` — mint and encrypt the scoped connector.
-- `POST /api/terminal/exchange` — consume the terminal's one-time PKCE grant.
+- `GET /api/terminal/config` — publish non-secret Accounts device settings.
+- `POST /api/terminal/exchange` — validate device authorization and return the linked connector.
 
 Frontend work is deferred until the harness, token optimizers, and CLI UI land.

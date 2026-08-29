@@ -12,6 +12,7 @@ export function config() {
     accountsCliClientId: env.NEXT_PUBLIC_ELIXPO_CLIENT_ID_CLI || process.env.NEXT_PUBLIC_ELIXPO_CLIENT_ID_CLI || '',
     accountsClientSecret: env.ELIXPO_CLIENT_SECRET || process.env.ELIXPO_CLIENT_SECRET || '',
     accountsWebhookSecret: env.ELIXPO_ACCOUNTS_WEBHOOK_SECRET || process.env.ELIXPO_ACCOUNTS_WEBHOOK_SECRET || '',
+    accountsCliAudience: env.ACCOUNTS_CLI_AUDIENCE || process.env.ACCOUNTS_CLI_AUDIENCE || 'crumb.elixpo.com',
     pollinationsAppKey: env.POLLINATIONS_APP_KEY || process.env.POLLINATIONS_APP_KEY || '',
     connectorEncryptionKey: env.CONNECTOR_ENCRYPTION_KEY || process.env.CONNECTOR_ENCRYPTION_KEY || '',
   }

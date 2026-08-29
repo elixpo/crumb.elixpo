@@ -8,4 +8,5 @@ interface CloudflareEnv {
   POLLINATIONS_APP_KEY: string
   CONNECTOR_ENCRYPTION_KEY: string
   ACCOUNTS_ORIGIN: string
+  ACCOUNTS_CLI_AUDIENCE: string
 }

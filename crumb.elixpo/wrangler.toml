@@ -22,3 +22,4 @@ id = "8311e9c3a73d446d92e4dc50653e9ac9"
 
 [vars]
 ACCOUNTS_ORIGIN = "https://accounts.elixpo.com"
+ACCOUNTS_CLI_AUDIENCE = "crumb.elixpo.com"
