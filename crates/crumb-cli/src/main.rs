@@ -120,72 +120,99 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             }
             InputEvent::NativeInput(command) if command.trim().is_empty() => {}
             InputEvent::NativeInput(command) => {
-                let agent_config = load_agent_config(&cwd, &mut writer);
-                let decision = command_catalog.route(&command, &agent_config.routing);
-                if !matches!(decision.route, InputRoute::Native) {
-                    handle_agent_boundary(&decision, &agent_config, &mut writer)?;
-                    record_history(
-                        history.as_ref(),
-                        &command,
-                        &cwd,
-                        platform,
-                        HistoryMode::Agent,
-                        None,
-                        &mut writer,
-                    )?;
-                    continue;
-                }
-                if session.is_none() {
-                    let (cols, rows) = size()?;
-                    let shell = shell_for(platform);
-                    session = Some(ShellSession::start(
-                        shell.as_ref(),
-                        &SystemPty,
-                        TerminalSize::new(rows, cols),
-                    )?);
-                }
-                if let Some(shell) = session.as_mut() {
-                    let outcome = if interactive {
-                        execute_foreground(shell, &command, &mut writer)?
-                    } else {
-                        shell.execute(&command, &mut writer)?
-                    };
-                    match outcome {
-                        CommandOutcome::Completed(completion) => {
-                            last_exit_code = Some(completion.exit_code);
-                            if completion.exit_code != 0 {
-                                render_error_assistance(
-                                    &command,
-                                    &decision,
-                                    agent_config.mistakes,
-                                    &mut writer,
-                                )?;
-                            }
-                            record_history(
-                                history.as_ref(),
-                                &command,
-                                &cwd,
-                                platform,
-                                HistoryMode::Native,
-                                Some(completion.exit_code),
-                                &mut writer,
-                            )?;
-                        }
-                        CommandOutcome::ShellExited => {
-                            record_history(
-                                history.as_ref(),
-                                &command,
-                                &cwd,
-                                platform,
-                                HistoryMode::Native,
-                                None,
-                                &mut writer,
-                            )?;
-                            return Ok(ReplOutcome::Exit);
-                        }
-                    }
+                let mut context = InputContext {
+                    command_catalog: &command_catalog,
+                    session: &mut session,
+                    history: history.as_ref(),
+                    cwd: &cwd,
+                    platform,
+                    interactive,
+                    writer: &mut writer,
+                    last_exit_code: &mut last_exit_code,
+                };
+                if let Some(outcome) = handle_input(&command, &mut context)? {
+                    return Ok(outcome);
                 }
             }
+        }
+    }
+}
+
+struct InputContext<'a> {
+    command_catalog: &'a CommandCatalog,
+    session: &'a mut Option<ShellSession>,
+    history: Option<&'a HistoryStore>,
+    cwd: &'a Path,
+    platform: Platform,
+    interactive: bool,
+    writer: &'a mut dyn Write,
+    last_exit_code: &'a mut Option<i32>,
+}
+
+fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<ReplOutcome>> {
+    let agent_config = load_agent_config(context.cwd, context.writer);
+    let decision = context
+        .command_catalog
+        .route(command, &agent_config.routing);
+    if !matches!(decision.route, InputRoute::Native) {
+        handle_agent_boundary(&decision, &agent_config, context.writer)?;
+        record_history(
+            context.history,
+            command,
+            context.cwd,
+            context.platform,
+            HistoryMode::Agent,
+            None,
+            context.writer,
+        )?;
+        return Ok(None);
+    }
+    if context.session.is_none() {
+        let (cols, rows) = size()?;
+        let shell = shell_for(context.platform);
+        *context.session = Some(ShellSession::start(
+            shell.as_ref(),
+            &SystemPty,
+            TerminalSize::new(rows, cols),
+        )?);
+    }
+    let shell = context
+        .session
+        .as_mut()
+        .expect("shell session is initialized above");
+    let outcome = if context.interactive {
+        execute_foreground(shell, command, context.writer)?
+    } else {
+        shell.execute(command, context.writer)?
+    };
+    match outcome {
+        CommandOutcome::Completed(completion) => {
+            *context.last_exit_code = Some(completion.exit_code);
+            if completion.exit_code != 0 {
+                render_error_assistance(command, &decision, agent_config.mistakes, context.writer)?;
+            }
+            record_history(
+                context.history,
+                command,
+                context.cwd,
+                context.platform,
+                HistoryMode::Native,
+                Some(completion.exit_code),
+                context.writer,
+            )?;
+            Ok(None)
+        }
+        CommandOutcome::ShellExited => {
+            record_history(
+                context.history,
+                command,
+                context.cwd,
+                context.platform,
+                HistoryMode::Native,
+                None,
+                context.writer,
+            )?;
+            Ok(Some(ReplOutcome::Exit))
         }
     }
 }

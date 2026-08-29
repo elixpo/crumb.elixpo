@@ -16,7 +16,7 @@ pub struct ModelCapabilities {
 
 /// One turn passed to either the native or subprocess harness.
 ///
-/// The wire name follows the DeepSeek Harness protocol while configuration
+/// The wire name follows the `DeepSeek` Harness protocol while configuration
 /// remains provider-neutral.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

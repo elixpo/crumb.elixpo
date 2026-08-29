@@ -25,7 +25,9 @@ pub trait NativeShell {
 
     /// Built-ins that cannot be discovered by scanning `PATH`.
     #[must_use]
-    fn builtin_commands(&self) -> &'static [&'static str];
+    fn builtin_commands(&self) -> &'static [&'static str] {
+        &[]
+    }
 
     /// Starts the native shell with the selected PTY backend.
     ///
