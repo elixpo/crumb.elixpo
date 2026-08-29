@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
-use crumb_core::{BuiltInCommand, InputEvent};
+use crumb_core::{BuiltInCommand, HistoryAction, InputEvent};
+use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::shell_for;
 use crumb_platform::Platform;
@@ -32,6 +33,13 @@ fn run_managed_repl() -> Result<ReplOutcome> {
     let platform = Platform::current();
     let mut session: Option<ShellSession> = None;
     let mut last_exit_code = None;
+    let history = match HistoryStore::open_default() {
+        Ok(store) => Some(store),
+        Err(error) => {
+            writeln!(writer, "warning: command history is unavailable: {error}")?;
+            None
+        }
+    };
 
     let branding = renderer.branding();
     if !branding.is_empty() {
@@ -62,9 +70,32 @@ fn run_managed_repl() -> Result<ReplOutcome> {
                 shutdown_session(session)?;
                 return Ok(ReplOutcome::Exit);
             }
-            InputEvent::BuiltIn(BuiltInCommand::Platform) => writeln!(writer, "{platform}")?,
+            InputEvent::BuiltIn(BuiltInCommand::History(action)) => {
+                show_history(history.as_ref(), &action, &mut writer)?;
+            }
+            InputEvent::BuiltIn(BuiltInCommand::Platform) => {
+                writeln!(writer, "{platform}")?;
+                record_history(
+                    history.as_ref(),
+                    ":platform",
+                    &cwd,
+                    platform,
+                    HistoryMode::BuiltIn,
+                    Some(0),
+                    &mut writer,
+                )?;
+            }
             InputEvent::BuiltIn(BuiltInCommand::Version) => {
                 writeln!(writer, "crumb {}", env!("CARGO_PKG_VERSION"))?;
+                record_history(
+                    history.as_ref(),
+                    ":version",
+                    &cwd,
+                    platform,
+                    HistoryMode::BuiltIn,
+                    Some(0),
+                    &mut writer,
+                )?;
             }
             InputEvent::BuiltIn(BuiltInCommand::Shell) if session.is_none() => {
                 return Ok(ReplOutcome::LaunchNativeShell);
@@ -90,13 +121,101 @@ fn run_managed_repl() -> Result<ReplOutcome> {
                     match shell.execute(&command, &mut writer)? {
                         CommandOutcome::Completed(completion) => {
                             last_exit_code = Some(completion.exit_code);
+                            record_history(
+                                history.as_ref(),
+                                &command,
+                                &cwd,
+                                platform,
+                                HistoryMode::Native,
+                                Some(completion.exit_code),
+                                &mut writer,
+                            )?;
                         }
-                        CommandOutcome::ShellExited => return Ok(ReplOutcome::Exit),
+                        CommandOutcome::ShellExited => {
+                            record_history(
+                                history.as_ref(),
+                                &command,
+                                &cwd,
+                                platform,
+                                HistoryMode::Native,
+                                None,
+                                &mut writer,
+                            )?;
+                            return Ok(ReplOutcome::Exit);
+                        }
                     }
                 }
             }
         }
     }
+}
+
+fn show_history(
+    history: Option<&HistoryStore>,
+    action: &HistoryAction,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let Some(history) = history else {
+        writeln!(writer, "history is unavailable")?;
+        return Ok(());
+    };
+    let result = match action {
+        HistoryAction::Recent => history.recent(20),
+        HistoryAction::Search(query) if query.trim().is_empty() => {
+            writeln!(writer, "usage: :history search <text>")?;
+            return Ok(());
+        }
+        HistoryAction::Search(query) => history.search(query, 20),
+    };
+    match result {
+        Ok(entries) if entries.is_empty() => writeln!(writer, "no history entries")?,
+        Ok(entries) => {
+            for entry in entries {
+                writeln!(writer, "{}", format_history_entry(&entry))?;
+            }
+        }
+        Err(error) => writeln!(writer, "warning: history query failed: {error}")?,
+    }
+    Ok(())
+}
+
+fn format_history_entry(entry: &HistoryEntry) -> String {
+    let exit = entry
+        .exit_code
+        .map_or_else(|| "-".to_owned(), |code| code.to_string());
+    format!(
+        "{}\t{}\t{}\t{}",
+        entry.id,
+        exit,
+        entry.cwd.display(),
+        entry.command
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_history(
+    history: Option<&HistoryStore>,
+    command: &str,
+    cwd: &std::path::Path,
+    platform: Platform,
+    mode: HistoryMode,
+    exit_code: Option<i32>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    if let Some(history) = history
+        && let Err(error) = history.record(
+            command,
+            RecordContext {
+                cwd,
+                platform,
+                mode,
+                exit_code,
+            },
+        )
+    {
+        writeln!(writer, "warning: failed to record history: {error}")?;
+    }
+    Ok(())
 }
 
 fn current_process_dir() -> Result<PathBuf> {
