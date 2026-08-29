@@ -1,0 +1,25 @@
+{
+  "name": "@crumb/web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "pages:build": "next-on-pages",
+    "db:migrate:local": "wrangler d1 migrations apply crumb-web --local"
+  },
+  "dependencies": {
+    "@cloudflare/next-on-pages": "^1.12.0",
+    "next": "^15.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240620.0",
+    "@types/node": "^20.14.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^4.86.0"
+  }
+}
