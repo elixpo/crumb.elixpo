@@ -15,19 +15,24 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [ ] [WP-006 — terminal UI layer](https://github.com/elixpo/crumb.elixpo/issues/13) ([PR #14](https://github.com/elixpo/crumb.elixpo/pull/14))
 - [ ] [WP-007 — persistent history](https://github.com/elixpo/crumb.elixpo/issues/15) ([PR #17](https://github.com/elixpo/crumb.elixpo/pull/17))
 - [ ] [Linux terminal parity](https://github.com/elixpo/crumb.elixpo/issues/16) ([PR #18](https://github.com/elixpo/crumb.elixpo/pull/18))
+- [ ] [WP-008 — provider-neutral LLM interface](https://github.com/elixpo/crumb.elixpo/issues/19) ([PR #20](https://github.com/elixpo/crumb.elixpo/pull/20))
 
-## Current milestone: [WP-008 — provider-neutral LLM interface](https://github.com/elixpo/crumb.elixpo/issues/19)
+## Current milestone: [WP-009 — Pollinations adapter](https://github.com/elixpo/crumb.elixpo/issues/21)
 
-- [x] Add an isolated `crumb-llm` crate.
-- [x] Define typed model metadata and capabilities.
-- [x] Define chat messages, requests, and ordered streaming events.
-- [x] Define embedding requests and responses.
-- [x] Provide object-safe asynchronous provider and stream contracts.
-- [x] Define structured vendor-neutral errors and retryability.
-- [x] Add a deterministic mock provider.
-- [x] Keep Pollinations, HTTP, credentials, and startup initialization out of the crate.
+- [x] Add an isolated `crumb-pollinations` crate.
+- [x] Add redacted endpoint, timeout, and bounded-retry configuration.
+- [x] Encode provider-neutral chat requests into the OpenAI-compatible wire format.
+- [x] Incrementally decode split UTF-8 SSE events.
+- [x] Map streamed text, usage, and finish reasons into `crumb-llm` events.
+- [x] Implement model discovery and metadata mapping.
+- [x] Implement streaming chat transport.
+- [x] Implement embeddings.
+- [x] Map HTTP and Pollinations failures into neutral errors.
+- [x] Add safe bounded retries for model discovery and explicit request timeouts.
+- [x] Keep credentials out of logs and errors.
+- [ ] Add deterministic HTTP fixture tests without live API access.
 - [ ] Pass formatting, clippy, and workspace tests.
-- [ ] Merge WP-008.
+- [ ] Merge WP-009.
 
 <details>
 <summary>WP-001 completion details</summary>
@@ -46,7 +51,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Planned work packages
 
-- [ ] WP-009 — Pollinations adapter.
+- [ ] [DeepSeek Harness + RTK/token optimizers](https://github.com/elixpo/crumb.elixpo/issues/22).
 - [ ] WP-010 — secure authentication.
 - [ ] WP-011 — streamed AI question mode.
 
