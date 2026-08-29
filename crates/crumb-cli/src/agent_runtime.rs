@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use crumb_agent::session::TurnStatus;
 use crumb_agent::{
     AgentConfig, AgentMode, AgentSession, CancellationToken, HarnessConfig, Modality, SessionId,
-    SessionJournal,
+    SessionJournal, session_summary,
 };
 use crumb_auth::{CredentialStore, OsCredentialStore, SecretString};
 use crumb_harness_dsh::{
@@ -47,6 +47,36 @@ impl AgentRuntime {
             supervisor_limits: None,
             environment_revision: 1,
         })
+    }
+
+    /// Selects a previous redacted session journal for the next agent turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is missing, belongs to another
+    /// workspace, or cannot be reopened safely.
+    pub fn resume(&mut self, workspace: &Path, session_id: &str) -> Result<()> {
+        let workspace = std::fs::canonicalize(workspace)
+            .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
+        let root = session_root(&workspace);
+        let summary = session_summary(&root, session_id)?;
+        if summary.workspace != workspace {
+            bail!("session belongs to a different workspace");
+        }
+        if let Some(supervisor) = self.supervisor.as_mut() {
+            supervisor.shutdown()?;
+        }
+        self.supervisor = None;
+        self.supervisor_limits = None;
+        self.environment_revision = self.environment_revision.saturating_add(1);
+        let journal = SessionJournal::open(&root, &summary.id)?;
+        self.session = Some(AgentSession::resume(
+            summary.id,
+            summary.mode,
+            workspace,
+            journal,
+        ));
+        Ok(())
     }
 
     /// Executes one natural-language turn through the configured Harness.
@@ -113,13 +143,7 @@ impl AgentRuntime {
             .supervisor
             .as_mut()
             .context("Harness supervisor unavailable")?
-            .run_text_with_events(
-                launch,
-                &session_id,
-                request,
-                &cancellation,
-                on_notification,
-            );
+            .run_text_with_events(launch, &session_id, request, &cancellation, on_notification);
         let status = match &result {
             Ok(_) => TurnStatus::Complete,
             Err(_) if cancellation.is_cancelled() => TurnStatus::Cancelled,
@@ -145,10 +169,7 @@ impl AgentRuntime {
         }
         if self.session.is_none() {
             let id = new_session_id()?;
-            let journal = SessionJournal::open(
-                &workspace.join(".crumb").join("sessions").join("crumb"),
-                &id,
-            )?;
+            let journal = SessionJournal::open(&session_root(workspace), &id)?;
             self.session = Some(AgentSession::start(
                 id,
                 mode,
@@ -169,6 +190,10 @@ impl AgentRuntime {
         }
         Ok(())
     }
+}
+
+fn session_root(workspace: &Path) -> PathBuf {
+    workspace.join(".crumb").join("sessions").join("crumb")
 }
 
 impl Drop for AgentRuntime {

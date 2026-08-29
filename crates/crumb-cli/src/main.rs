@@ -14,8 +14,8 @@ use crumb_agent::{
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
-use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_harness_dsh::Notification;
+use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_mcp::{McpDispatcher, serve_stdio};
 use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::shell_for;
@@ -366,21 +366,16 @@ fn handle_agent_boundary(
     let result = runtime
         .as_mut()
         .expect("agent runtime is initialized above")
-        .run_with_events(
-            &decision.payload,
-            config,
-            workspace,
-            |notification| {
-                if let Some(label) = harness_event_label(notification) {
-                    if let Some(indicator) = activity.take() {
-                        indicator.finish();
-                    }
-                    writeln!(writer, "  ↳ {label}")?;
-                    writer.flush()?;
+        .run_with_events(&decision.payload, config, workspace, |notification| {
+            if let Some(label) = harness_event_label(notification) {
+                if let Some(indicator) = activity.take() {
+                    indicator.finish();
                 }
-                Ok(())
-            },
-        );
+                writeln!(writer, "  ↳ {label}")?;
+                writer.flush()?;
+            }
+            Ok(())
+        });
     if let Some(indicator) = activity.take() {
         indicator.finish();
     }
@@ -427,11 +422,7 @@ fn harness_event_label(notification: &Notification) -> Option<String> {
     if notification.method != "session.event" {
         return None;
     }
-    let event_type = notification
-        .params
-        .get("event")?
-        .get("type")?
-        .as_str()?;
+    let event_type = notification.params.get("event")?.get("type")?.as_str()?;
     match event_type {
         "agent/inbox/spliced" => Some("request accepted".to_owned()),
         "assistant/message" | "turn/end" => None,

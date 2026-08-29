@@ -20,7 +20,10 @@ pub use harness::{HarnessTurnRequest, ModelCapabilities};
 pub use routing::{
     CommandCatalog, InputRoute, RouteDecision, RoutePolicy, RouteReason, UnknownInputPolicy,
 };
-pub use session::{AgentSession, CancellationToken, SessionEvent, SessionId, SessionJournal};
+pub use session::{
+    AgentSession, CancellationToken, SessionEvent, SessionId, SessionJournal, SessionSummary,
+    list_sessions, session_summary,
+};
 pub use tools::{
     ApprovalBroker, ApprovalDecision, ApprovalRequest, DenyAllApprovals, McpServer, OutputKind,
     RiskClass, TokenOptimizer, ToolCallError, ToolCallErrorKind, ToolDescriptor, ToolHandler,

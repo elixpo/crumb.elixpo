@@ -1,7 +1,7 @@
 //! Cancellable, append-only agent session primitives.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,6 +113,113 @@ pub enum TurnStatus {
     LimitReached,
 }
 
+/// Redacted metadata reconstructed from one append-only session journal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionSummary {
+    pub id: SessionId,
+    pub workspace: PathBuf,
+    pub mode: AgentMode,
+    pub started_at_ms: u128,
+    pub last_event_at_ms: u128,
+    pub turns: u32,
+    pub last_status: Option<TurnStatus>,
+}
+
+/// Lists valid session journals newest-first without loading prompt content.
+///
+/// # Errors
+///
+/// Returns an error when the session root cannot be read. Invalid individual
+/// entries are skipped so one damaged journal does not hide healthy sessions.
+pub fn list_sessions(root: &Path) -> Result<Vec<SessionSummary>> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut summaries = fs::read_dir(root)
+        .with_context(|| format!("failed to read session root {}", root.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| session_summary(root, &entry.file_name().to_string_lossy()).ok())
+        .collect::<Vec<_>>();
+    summaries.sort_by(|left, right| right.last_event_at_ms.cmp(&left.last_event_at_ms));
+    Ok(summaries)
+}
+
+/// Reads one redacted session summary by validated identifier.
+///
+/// # Errors
+///
+/// Returns an error when the identifier or journal is invalid, missing, or
+/// exceeds the bounded event count.
+pub fn session_summary(root: &Path, id: &str) -> Result<SessionSummary> {
+    const MAX_EVENTS: usize = 100_000;
+    let id = SessionId::new(id)?;
+    let path = root.join(id.as_str()).join("events.jsonl");
+    let file = File::open(&path)
+        .with_context(|| format!("failed to open session journal {}", path.display()))?;
+    let mut summary = None;
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        if index >= MAX_EVENTS {
+            bail!("session journal exceeds the event limit");
+        }
+        let event: SessionEvent = serde_json::from_str(
+            &line.with_context(|| format!("failed to read session journal {}", path.display()))?,
+        )
+        .with_context(|| format!("invalid session event in {}", path.display()))?;
+        apply_summary_event(&mut summary, &event)?;
+    }
+    summary.context("session journal has no start event")
+}
+
+fn apply_summary_event(summary: &mut Option<SessionSummary>, event: &SessionEvent) -> Result<()> {
+    let at_ms = event_timestamp(event);
+    if let SessionEvent::SessionStarted {
+        session_id,
+        workspace,
+        mode,
+        ..
+    } = event
+    {
+        if summary.is_some() {
+            bail!("session journal contains multiple start events");
+        }
+        *summary = Some(SessionSummary {
+            id: session_id.clone(),
+            workspace: workspace.clone(),
+            mode: *mode,
+            started_at_ms: at_ms,
+            last_event_at_ms: at_ms,
+            turns: 0,
+            last_status: None,
+        });
+        return Ok(());
+    }
+    let summary = summary
+        .as_mut()
+        .context("session journal event precedes its start event")?;
+    summary.last_event_at_ms = at_ms;
+    match event {
+        SessionEvent::ModeChanged { mode, .. } => summary.mode = *mode,
+        SessionEvent::TurnFinished { status, .. } => {
+            summary.turns = summary.turns.saturating_add(1);
+            summary.last_status = Some(*status);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+const fn event_timestamp(event: &SessionEvent) -> u128 {
+    match event {
+        SessionEvent::SessionStarted { at_ms, .. }
+        | SessionEvent::TurnStarted { at_ms, .. }
+        | SessionEvent::ToolRequested { at_ms, .. }
+        | SessionEvent::ToolFinished { at_ms, .. }
+        | SessionEvent::TurnFinished { at_ms, .. }
+        | SessionEvent::ModeChanged { at_ms, .. }
+        | SessionEvent::ModelSelected { at_ms, .. } => *at_ms,
+    }
+}
+
 /// Append-only JSONL writer for one session.
 #[derive(Debug)]
 pub struct SessionJournal {
@@ -201,6 +308,24 @@ impl AgentSession {
             cancellation: CancellationToken::default(),
             journal,
         })
+    }
+
+    /// Reopens a previously validated session without writing a second start
+    /// event.
+    #[must_use]
+    pub fn resume(
+        id: SessionId,
+        mode: AgentMode,
+        workspace: PathBuf,
+        journal: SessionJournal,
+    ) -> Self {
+        Self {
+            id,
+            mode,
+            workspace,
+            cancellation: CancellationToken::default(),
+            journal,
+        }
     }
 
     #[must_use]
