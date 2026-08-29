@@ -19,20 +19,20 @@ pub enum ReplOutcome {
 pub fn classify_input(input: &str) -> InputEvent {
     let command = input.trim_end_matches(['\r', '\n']);
     match command {
-        ":auth login" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Login)),
-        ":auth status" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Status)),
-        ":auth logout" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Logout)),
-        ":exit" => InputEvent::BuiltIn(BuiltInCommand::Exit),
-        ":history" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Recent)),
-        ":history search" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
+        "/auth login" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Login)),
+        "/auth status" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Status)),
+        "/auth logout" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Logout)),
+        "/exit" => InputEvent::BuiltIn(BuiltInCommand::Exit),
+        "/history" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Recent)),
+        "/history search" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
             String::new(),
         ))),
-        ":platform" => InputEvent::BuiltIn(BuiltInCommand::Platform),
-        ":shell" => InputEvent::BuiltIn(BuiltInCommand::Shell),
-        ":version" => InputEvent::BuiltIn(BuiltInCommand::Version),
-        _ if command.starts_with(":history search ") => {
+        "/platform" => InputEvent::BuiltIn(BuiltInCommand::Platform),
+        "/shell" => InputEvent::BuiltIn(BuiltInCommand::Shell),
+        "/version" => InputEvent::BuiltIn(BuiltInCommand::Version),
+        _ if command.starts_with("/history search ") => {
             InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
-                command[":history search ".len()..].to_owned(),
+                command["/history search ".len()..].to_owned(),
             )))
         }
         _ => InputEvent::NativeInput(command.to_owned()),
@@ -78,7 +78,7 @@ pub fn read_classified_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Inp
     Ok(Some(classify_input(&line)))
 }
 
-/// Runs the WP-001 REPL until `:exit` or end-of-input.
+/// Runs the WP-001 REPL until `/exit` or end-of-input.
 ///
 /// Native input is classified and reported, but deliberately not executed.
 ///
@@ -148,27 +148,27 @@ mod tests {
     #[test]
     fn classifies_supported_built_ins() {
         assert_eq!(
-            classify_input(":exit\n"),
+            classify_input("/exit\n"),
             InputEvent::BuiltIn(BuiltInCommand::Exit)
         );
         assert_eq!(
-            classify_input(":version"),
+            classify_input("/version"),
             InputEvent::BuiltIn(BuiltInCommand::Version)
         );
         assert_eq!(
-            classify_input(":platform"),
+            classify_input("/platform"),
             InputEvent::BuiltIn(BuiltInCommand::Platform)
         );
         assert_eq!(
-            classify_input(":shell"),
+            classify_input("/shell"),
             InputEvent::BuiltIn(BuiltInCommand::Shell)
         );
         assert_eq!(
-            classify_input(":auth login"),
+            classify_input("/auth login"),
             InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Login))
         );
         assert_eq!(
-            classify_input(":history search cargo test"),
+            classify_input("/history search cargo test"),
             InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
                 "cargo test".to_owned()
             )))
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn repl_handles_built_ins_and_stops() {
-        let input = Cursor::new(":platform\n:version\n:exit\n");
+        let input = Cursor::new("/platform\n/version\n/exit\n");
         let mut output = Vec::new();
 
         let outcome = run(input, &mut output, Platform::Linux, "0.1.0").expect("REPL should run");
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn shell_command_returns_control_to_the_cli() {
-        let input = Cursor::new(":shell\n");
+        let input = Cursor::new("/shell\n");
         let mut output = Vec::new();
 
         let outcome = run(input, &mut output, Platform::Linux, "0.1.0").expect("REPL should run");

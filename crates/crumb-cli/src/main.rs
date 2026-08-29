@@ -421,7 +421,7 @@ fn handle_builtin(
             writeln!(writer, "{platform}")?;
             record_history(
                 history,
-                ":platform",
+                "/platform",
                 cwd,
                 platform,
                 HistoryMode::BuiltIn,
@@ -433,7 +433,7 @@ fn handle_builtin(
             writeln!(writer, "crumb {}", env!("CARGO_PKG_VERSION"))?;
             record_history(
                 history,
-                ":version",
+                "/version",
                 cwd,
                 platform,
                 HistoryMode::BuiltIn,
@@ -446,7 +446,7 @@ fn handle_builtin(
         }
         BuiltInCommand::Shell => writeln!(
             writer,
-            "`:shell` is available before the managed shell starts; restart crumb to enter raw mode"
+            "`/shell` is available before the managed shell starts; restart crumb to enter raw mode"
         )?,
     }
     Ok(None)
@@ -643,7 +643,7 @@ fn show_history(
     let result = match action {
         HistoryAction::Recent => history.recent(20),
         HistoryAction::Search(query) if query.trim().is_empty() => {
-            writeln!(writer, "usage: :history search <text>")?;
+            writeln!(writer, "usage: /history search <text>")?;
             return Ok(());
         }
         HistoryAction::Search(query) => history.search(query, 20),

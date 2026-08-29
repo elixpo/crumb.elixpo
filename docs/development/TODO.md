@@ -43,7 +43,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Add `crumb-cli`, `crumb-core`, `crumb-repl`, and `crumb-platform`.
 - [x] Detect Linux, macOS, and Windows with a typed `Platform` enum.
 - [x] Render a minimal prompt containing the working directory.
-- [x] Implement `:exit`, `:version`, and `:platform`.
+- [x] Implement `/exit`, `/version`, and `/platform`.
 - [x] Classify all other input as `NativeInput` without executing it.
 - [x] Add unit tests and cross-platform GitHub Actions.
 - [x] Pass formatting, clippy, and workspace tests.

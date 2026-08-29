@@ -29,7 +29,7 @@ mod tests {
         let mut output = Vec::new();
 
         let outcome =
-            super::run(Cursor::new(":exit\n"), &mut output).expect("application should exit");
+            super::run(Cursor::new("/exit\n"), &mut output).expect("application should exit");
 
         assert_eq!(outcome, crumb_repl::ReplOutcome::Exit);
         assert!(

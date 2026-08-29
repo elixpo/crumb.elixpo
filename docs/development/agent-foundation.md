@@ -11,17 +11,17 @@ native commands.
 Routing performs no model call and follows this precedence:
 
 1. Crumb built-ins remain typed and local.
-2. `?` and `@` explicitly select the agent path.
-3. Shell syntax, paths, environment assignments, and commands resolved from
+2. Shell syntax, paths, environment assignments, and commands resolved from
    `PATH` remain native.
-4. A likely typo of a discovered executable remains native and carries a
+3. A likely typo of a discovered executable remains native and carries a
    deterministic suggestion for the error UI.
-5. A single unknown token remains native so the shell owns `command not found`.
-6. An unresolved multi-word phrase follows the configured fallback: agent,
+4. A single unknown token remains native so the shell owns `command not found`.
+5. An unresolved multi-word phrase follows the configured fallback: agent,
    negotiate, or native.
 
-This deliberately favors the shell when input is ambiguous. A phrase beginning
-with an executable name can always use `?` or `@` to opt into intelligence.
+No prefix is needed for natural language. Inputs beginning with `/` are
+reserved for Crumb commands, connector/plugin references, and future file or
+folder attachments; they never select the agent path.
 
 ## Operating modes
 

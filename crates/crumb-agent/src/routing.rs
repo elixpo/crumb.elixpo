@@ -19,7 +19,6 @@ pub enum InputRoute {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteReason {
     Empty,
-    ExplicitAgentPrefix,
     ShellSyntax,
     ResolvedCommand,
     PossibleCommandTypo,
@@ -42,7 +41,6 @@ pub enum UnknownInputPolicy {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RoutePolicy {
-    pub agent_prefixes: Vec<String>,
     pub unknown_input: UnknownInputPolicy,
     pub typo_distance: usize,
 }
@@ -50,7 +48,6 @@ pub struct RoutePolicy {
 impl Default for RoutePolicy {
     fn default() -> Self {
         Self {
-            agent_prefixes: vec!["?".to_owned(), "@".to_owned()],
             unknown_input: UnknownInputPolicy::Agent,
             typo_distance: 2,
         }
@@ -131,14 +128,6 @@ impl CommandCatalog {
         if trimmed.is_empty() {
             return decision(InputRoute::Native, RouteReason::Empty, input, None);
         }
-        if let Some(payload) = explicit_agent_payload(trimmed, &policy.agent_prefixes) {
-            return decision(
-                InputRoute::Agent,
-                RouteReason::ExplicitAgentPrefix,
-                payload,
-                None,
-            );
-        }
         if has_shell_syntax(trimmed) {
             return decision(InputRoute::Native, RouteReason::ShellSyntax, input, None);
         }
@@ -218,15 +207,6 @@ fn decision(
         payload: payload.into(),
         suggestion,
     }
-}
-
-fn explicit_agent_payload<'a>(input: &'a str, prefixes: &[String]) -> Option<&'a str> {
-    prefixes.iter().find_map(|prefix| {
-        input
-            .strip_prefix(prefix)
-            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-            .map(str::trim_start)
-    })
 }
 
 fn command_word(input: &str) -> Option<&str> {
@@ -342,10 +322,18 @@ mod tests {
     }
 
     #[test]
-    fn explicit_agent_prefix_is_removed_from_payload() {
-        let decision = catalog().route("? explain this error", &RoutePolicy::default());
+    fn natural_language_routes_without_a_prefix() {
+        let decision = catalog().route("explain this error", &RoutePolicy::default());
         assert_eq!(decision.route, InputRoute::Agent);
         assert_eq!(decision.payload, "explain this error");
+        assert_eq!(decision.reason, RouteReason::NaturalLanguageCandidate);
+    }
+
+    #[test]
+    fn slash_namespace_never_routes_to_agent() {
+        let decision = catalog().route("/connectors pollinations", &RoutePolicy::default());
+        assert_eq!(decision.route, InputRoute::Native);
+        assert_eq!(decision.reason, RouteReason::ShellSyntax);
     }
 
     #[test]
