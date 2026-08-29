@@ -23,7 +23,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Keep prompt rendering free of network activity.
 - [x] Add deterministic renderer tests.
 - [x] Integrate UI without leaking presentation into `crumb-core`.
-- [ ] Pass formatting, clippy, and workspace tests.
+- [x] Pass formatting, clippy, and workspace tests.
 - [ ] Merge WP-006.
 
 <details>
