@@ -5,7 +5,8 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-use crumb_native::session::ShellSession;
+use crumb_native::protocol::CommandCompletion;
+use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::{NativeShell, ShellKind};
 use crumb_pty::{CommandSpec, SystemPty, TerminalSize};
 
@@ -49,7 +50,7 @@ fn exercise_lifecycle() -> Result<String> {
         ShellSession::start(&DeterministicBash, &SystemPty, TerminalSize::new(24, 80))?;
     let mut output = Vec::new();
 
-    let cd = session.execute("cd /", &mut output)?;
+    let cd = completed(session.execute("cd /", &mut output)?);
     assert_eq!(cd.sequence, 1);
     assert_eq!(cd.exit_code, 0);
     assert_eq!(cd.cwd.to_string_lossy(), "/");
@@ -59,9 +60,19 @@ fn exercise_lifecycle() -> Result<String> {
         "printf 'state=%s\\n' \"$CRUMB_LIFECYCLE_STATE\"",
         &mut output,
     )?;
-    let failed = session.execute("false", &mut output)?;
+    let failed = completed(session.execute("false", &mut output)?);
     assert_eq!(failed.exit_code, 1);
-    session.shutdown()?;
+    assert_eq!(
+        session.execute("exit", &mut output)?,
+        CommandOutcome::ShellExited
+    );
 
     Ok(String::from_utf8(output)?)
+}
+
+fn completed(outcome: CommandOutcome) -> CommandCompletion {
+    match outcome {
+        CommandOutcome::Completed(completion) => completion,
+        CommandOutcome::ShellExited => panic!("shell exited before command completion"),
+    }
 }

@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crumb_core::{BuiltInCommand, InputEvent};
-use crumb_native::session::ShellSession;
+use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::shell_for;
 use crumb_platform::Platform;
 use crumb_pty::{SystemPty, TerminalSize};
@@ -69,7 +69,9 @@ fn run_managed_repl() -> Result<ReplOutcome> {
                     )?);
                 }
                 if let Some(shell) = session.as_mut() {
-                    shell.execute(&command, &mut writer)?;
+                    if shell.execute(&command, &mut writer)? == CommandOutcome::ShellExited {
+                        return Ok(ReplOutcome::Exit);
+                    }
                 }
             }
         }

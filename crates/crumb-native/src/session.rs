@@ -9,6 +9,13 @@ use crumb_pty::{PtyBackend, PtyProcess, TerminalSize};
 use crate::protocol::{CommandCompletion, CompletionProtocol};
 use crate::{NativeShell, ShellKind};
 
+/// Result of submitting one native command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandOutcome {
+    Completed(CommandCompletion),
+    ShellExited,
+}
+
 /// A persistent native shell controlled through hidden completion frames.
 pub struct ShellSession {
     kind: ShellKind,
@@ -51,7 +58,9 @@ impl ShellSession {
             cwd: PathBuf::new(),
         };
         let mut startup_sink = std::io::sink();
-        let completion = session.read_until(0, &mut startup_sink)?;
+        let completion = session.read_until(0, &mut startup_sink)?.ok_or_else(|| {
+            anyhow!("native shell exited before lifecycle initialization completed")
+        })?;
         session.cwd.clone_from(&completion.cwd);
         Ok(session)
     }
@@ -60,9 +69,9 @@ impl ShellSession {
     ///
     /// # Errors
     ///
-    /// Returns an error if command input/output fails, the shell exits before
-    /// completion, or its lifecycle frame is invalid.
-    pub fn execute(&mut self, command: &str, output: &mut dyn Write) -> Result<CommandCompletion> {
+    /// Returns an error if command input/output fails or its lifecycle frame is
+    /// invalid. A normal shell exit is returned as [`CommandOutcome::ShellExited`].
+    pub fn execute(&mut self, command: &str, output: &mut dyn Write) -> Result<CommandOutcome> {
         let sequence = self.next_sequence;
         self.next_sequence = self
             .next_sequence
@@ -70,9 +79,11 @@ impl ShellSession {
             .ok_or_else(|| anyhow!("shell command sequence overflowed"))?;
         let submission = self.protocol.submission(self.kind, command, sequence);
         self.process.write_input(submission.as_bytes())?;
-        let completion = self.read_until(sequence, output)?;
+        let Some(completion) = self.read_until(sequence, output)? else {
+            return Ok(CommandOutcome::ShellExited);
+        };
         self.cwd.clone_from(&completion.cwd);
-        Ok(completion)
+        Ok(CommandOutcome::Completed(completion))
     }
 
     #[must_use]
@@ -105,14 +116,13 @@ impl ShellSession {
         &mut self,
         expected_sequence: u64,
         output: &mut dyn Write,
-    ) -> Result<CommandCompletion> {
+    ) -> Result<Option<CommandCompletion>> {
         let mut buffer = [0_u8; 8192];
         loop {
             let bytes_read = self.reader.read(&mut buffer)?;
             if bytes_read == 0 {
-                return Err(anyhow!(
-                    "native shell exited before command {expected_sequence} completed"
-                ));
+                self.process.wait()?;
+                return Ok(None);
             }
 
             let decoded = self.protocol.decode(&buffer[..bytes_read])?;
@@ -125,7 +135,7 @@ impl ShellSession {
                 .into_iter()
                 .find(|completion| completion.sequence == expected_sequence)
             {
-                return Ok(completion);
+                return Ok(Some(completion));
             }
         }
     }
