@@ -6,6 +6,7 @@ members = [
     "crates/crumb-platform",
     "crates/crumb-pty",
     "crates/crumb-repl",
+    "crates/crumb-ui",
 ]
 resolver = "2"
 
