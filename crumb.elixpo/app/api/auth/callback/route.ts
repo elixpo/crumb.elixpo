@@ -2,8 +2,6 @@ import { NextResponse } from 'next/server'
 import { finishAccountsLogin } from '@/lib/auth'
 import { bindings } from '@/lib/cloudflare'
 
-export const runtime = 'edge'
-
 export async function GET(request: Request) {
   const url = new URL(request.url)
   const code = url.searchParams.get('code')

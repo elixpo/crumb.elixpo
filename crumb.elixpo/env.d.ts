@@ -7,10 +7,3 @@ interface CloudflareEnv {
   CONNECTOR_ENCRYPTION_KEY: string
   ACCOUNTS_ORIGIN: string
 }
-
-declare module '@cloudflare/next-on-pages' {
-  export function getRequestContext(): {
-    env: CloudflareEnv
-    ctx: ExecutionContext
-  }
-}

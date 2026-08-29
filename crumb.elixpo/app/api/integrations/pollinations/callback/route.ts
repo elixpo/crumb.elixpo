@@ -6,8 +6,6 @@ import type { HandoffRequest } from '@/lib/handoff'
 import { exchangeCode } from '@/lib/pollinations'
 import { encryptToken } from '@/lib/secrets'
 
-export const runtime = 'edge'
-
 interface Context { userId: string; handoff: HandoffRequest; verifier: string }
 
 function finish(handoff: HandoffRequest, values: Record<string, string>) {

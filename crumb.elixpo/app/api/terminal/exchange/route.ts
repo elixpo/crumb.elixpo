@@ -3,8 +3,6 @@ import { bindings } from '@/lib/cloudflare'
 import { digest } from '@/lib/encoding'
 import { decryptToken } from '@/lib/secrets'
 
-export const runtime = 'edge'
-
 export async function POST(request: Request) {
   const body = await request.json().catch(() => null) as { code?: string; code_verifier?: string } | null
   if (!body?.code || !body.code_verifier) return NextResponse.json({ error: 'invalid_request' }, { status: 400 })
