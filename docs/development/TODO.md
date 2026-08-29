@@ -11,19 +11,20 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 - [ ] [WP-003 — macOS Zsh parity](https://github.com/elixpo/crumb.elixpo/issues/6) ([PR #7](https://github.com/elixpo/crumb.elixpo/pull/7))
 - [ ] [WP-004 — Windows PowerShell parity](https://github.com/elixpo/crumb.elixpo/issues/8) ([PR #9](https://github.com/elixpo/crumb.elixpo/pull/9))
+- [ ] [WP-005 — shell lifecycle protocol](https://github.com/elixpo/crumb.elixpo/issues/10) ([PR #12](https://github.com/elixpo/crumb.elixpo/pull/12))
 
-## Current milestone: [WP-005 — shell lifecycle protocol](https://github.com/elixpo/crumb.elixpo/issues/10)
+## Current milestone: [WP-006 — terminal UI layer](https://github.com/elixpo/crumb.elixpo/issues/13)
 
-- [x] Generate per-session, per-command completion markers.
-- [x] Capture cwd and exit status without displaying markers.
-- [x] Preserve state in one native shell process.
-- [x] Route ordinary REPL input to the native shell.
-- [x] Keep colon-prefixed built-ins under crumb control.
-- [x] Handle empty commands and shell termination cleanly.
-- [x] Add parser unit tests and Linux lifecycle integration coverage.
-- [x] Define Zsh and PowerShell hook boundaries.
-- [x] Pass formatting, clippy, and workspace tests.
-- [ ] Merge WP-005.
+- [ ] Add an isolated `crumb-ui` crate.
+- [ ] Render a two-line prompt with crumb, cwd, platform, and execution status.
+- [ ] Add compact, full, and disabled branding modes.
+- [ ] Respect `NO_COLOR` and non-terminal/plain output.
+- [ ] Add a lightweight Git branch and dirty-state segment.
+- [ ] Keep prompt rendering free of network activity.
+- [ ] Add deterministic renderer tests.
+- [ ] Integrate UI without leaking presentation into `crumb-core`.
+- [ ] Pass formatting, clippy, and workspace tests.
+- [ ] Merge WP-006.
 
 <details>
 <summary>WP-001 completion details</summary>
@@ -42,7 +43,6 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Planned work packages
 
-- [ ] WP-006 — terminal UI layer.
 - [ ] WP-007 — persistent history.
 - [ ] WP-008 — provider-neutral LLM interface.
 - [ ] WP-009 — Pollinations adapter.
