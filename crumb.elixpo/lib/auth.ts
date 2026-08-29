@@ -31,7 +31,7 @@ export function accountsAuthorizeUrl(state: string, requestUrl: string): string 
   url.search = new URLSearchParams({
     response_type: 'code',
     client_id: env.accountsClientId,
-    redirect_uri: `${originFor(requestUrl)}/api/auth/callback`,
+    redirect_uri: `${originFor(requestUrl)}/auth/callback`,
     state,
     scope: 'openid profile email',
   }).toString()
@@ -49,7 +49,7 @@ export async function finishAccountsLogin(code: string, requestUrl: string): Pro
       code,
       client_id: env.accountsClientId,
       client_secret: env.accountsClientSecret,
-      redirect_uri: `${originFor(requestUrl)}/api/auth/callback`,
+      redirect_uri: `${originFor(requestUrl)}/auth/callback`,
     }),
   })
   const tokens = await tokenResponse.json() as { access_token?: string }

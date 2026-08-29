@@ -15,7 +15,7 @@ Accounts and Pollinations authorization, and returns a one-time code to
 
 The callback URL never contains the Pollinations credential. Crumb exchanges
 the short-lived code using PKCE and saves the resulting credential in the OS
-keyring. Set `CRUMB_ACCOUNT_URL=http://localhost:3001` when testing against the
+keyring. Set `CRUMB_ACCOUNT_URL=http://localhost:3000` when testing against the
 local web app.
 
 ## Linux

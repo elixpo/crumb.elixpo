@@ -9,8 +9,9 @@ export function config() {
   return {
     accountsOrigin: env.ACCOUNTS_ORIGIN || process.env.ACCOUNTS_ORIGIN || 'https://accounts.elixpo.com',
     accountsClientId: env.NEXT_PUBLIC_ELIXPO_CLIENT_ID || process.env.NEXT_PUBLIC_ELIXPO_CLIENT_ID || '',
+    accountsCliClientId: env.NEXT_PUBLIC_ELIXPO_CLIENT_ID_CLI || process.env.NEXT_PUBLIC_ELIXPO_CLIENT_ID_CLI || '',
     accountsClientSecret: env.ELIXPO_CLIENT_SECRET || process.env.ELIXPO_CLIENT_SECRET || '',
-    accountsWebhookSecret: env.ELIXPO_ACCOUNTS_DELETION_WEBHOOK || process.env.ELIXPO_ACCOUNTS_DELETION_WEBHOOK || '',
+    accountsWebhookSecret: env.ELIXPO_ACCOUNTS_WEBHOOK_SECRET || process.env.ELIXPO_ACCOUNTS_WEBHOOK_SECRET || '',
     pollinationsAppKey: env.POLLINATIONS_APP_KEY || process.env.POLLINATIONS_APP_KEY || '',
     connectorEncryptionKey: env.CONNECTOR_ENCRYPTION_KEY || process.env.CONNECTOR_ENCRYPTION_KEY || '',
   }
