@@ -169,7 +169,7 @@ impl PtyProcess {
     ///
     /// Returns an error if the platform cannot signal the child.
     pub fn kill(&mut self) -> Result<()> {
-        self.child.kill()
+        Ok(self.child.kill()?)
     }
 
     #[must_use]
@@ -180,6 +180,8 @@ impl PtyProcess {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::{CommandSpec, TerminalSize};
 
     #[test]
