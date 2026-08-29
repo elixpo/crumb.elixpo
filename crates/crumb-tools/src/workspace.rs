@@ -9,6 +9,8 @@ use crumb_agent::{
 };
 use serde_json::{Value, json};
 
+use crate::bounded_text;
+
 const READ_FILE: &str = "read_file";
 const LIST_DIRECTORY: &str = "list_directory";
 
@@ -207,18 +209,6 @@ fn list_directory(
         output,
         boundary.limits.max_output_bytes,
     )))
-}
-
-fn bounded_text(mut text: String, limit: usize) -> String {
-    if text.len() <= limit {
-        return text;
-    }
-    let mut boundary = limit;
-    while !text.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    text.truncate(boundary);
-    text
 }
 
 fn ensure_active(cancellation: &CancellationToken) -> Result<()> {

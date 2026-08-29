@@ -223,9 +223,28 @@ impl ToolHost {
                 "tool implementation unavailable",
             )
         })?;
-        handler
-            .call(arguments, cancellation)
-            .map_err(|_| ToolCallError::new(ToolCallErrorKind::Internal, "tool execution failed"))
+        let output = match handler.call(arguments, cancellation) {
+            Ok(output) => output,
+            Err(_) if cancellation.is_cancelled() => {
+                return Err(ToolCallError::new(
+                    ToolCallErrorKind::Cancelled,
+                    "tool call cancelled",
+                ));
+            }
+            Err(_) => {
+                return Err(ToolCallError::new(
+                    ToolCallErrorKind::Internal,
+                    "tool execution failed",
+                ));
+            }
+        };
+        if cancellation.is_cancelled() {
+            return Err(ToolCallError::new(
+                ToolCallErrorKind::Cancelled,
+                "tool call cancelled",
+            ));
+        }
+        Ok(output)
     }
 }
 

@@ -596,6 +596,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crumb-agent",
+ "rustix",
  "serde_json",
 ]
 

@@ -29,9 +29,20 @@ the output-byte and directory-entry ceilings; tool arguments may only lower
 those limits. Results are sorted where applicable, UTF-8 only, bounded, and
 share the session cancellation token.
 
+## Isolated shell
+
+`run_shell` starts a fresh non-interactive process for each approved call. It
+never reuses the interactive terminal PTY, inherits no environment variables,
+and runs from the canonical workspace. The caller selects the shell program,
+arguments, safe `PATH`, output ceiling, and timeout. Tool input may shorten the
+timeout but cannot raise it. Standard output keeps its head while standard
+error keeps its tail, preserving the most useful diagnostics within the shared
+result budget. Cancellation and timeout terminate and reap the child; Unix
+builds terminate the complete process group.
+
 ## Next slices
 
 1. [x] Workspace-confined read and directory-list tools.
-2. Isolated shell execution with output/time ceilings.
+2. [x] Isolated shell execution with output/time ceilings.
 3. Interactive allow-once approval bridge for negotiate mode.
 4. `crumb mcp serve` entry point and Harness Cordis composition.
