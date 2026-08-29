@@ -24,11 +24,12 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Add the minimal Next.js Cloudflare Worker surface.
 - [x] Add Elixpo Accounts sign-in with `openid profile email`.
 - [x] Adapt the Pollinations PKCE connector.
-- [x] Restrict terminal redirects to loopback port 3000.
-- [x] Add a two-minute, one-time PKCE-bound terminal exchange.
+- [x] Register a separate public Accounts CLI device client.
+- [x] Exchange verified Accounts device authorization for the linked connector.
 - [x] Encrypt provider tokens at rest in D1.
 - [x] Replace pasted-key login with the browser connection flow.
 - [x] Keep the OS keyring as the terminal credential boundary.
+- [x] Pin the initial multimodal Pollinations connector allowlist.
 - [x] Configure local D1, KV, and `.env.local` credentials.
 - [ ] Register and validate the signed Accounts deletion webhook.
 - [ ] Validate the browser-to-terminal flow.

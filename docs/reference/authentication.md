@@ -9,14 +9,14 @@ crumb auth logout
 ```
 
 The same actions are available inside Crumb as `:auth login`, `:auth status`,
-and `:auth logout`. Login opens the Crumb account site, completes Elixpo
-Accounts and Pollinations authorization, and returns a one-time code to
-`http://localhost:3000/auth/connector/callback`.
+and `:auth logout`. First sign in at the Crumb account site and link
+Pollinations. `crumb auth login` then uses the Elixpo Accounts RFC 8628 device
+flow and sends its short-lived Accounts access token to Crumb's connector
+exchange endpoint. The Pollinations credential is returned over HTTPS and
+saved in the OS keyring; it never appears in a callback URL or terminal log.
 
-The callback URL never contains the Pollinations credential. Crumb exchanges
-the short-lived code using PKCE and saves the resulting credential in the OS
-keyring. Set `CRUMB_ACCOUNT_URL=http://localhost:3000` when testing against the
-local web app.
+Set `CRUMB_ACCOUNT_URL=http://localhost:3000` when testing against the local
+web app.
 
 ## Linux
 

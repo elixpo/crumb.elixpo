@@ -22,7 +22,7 @@ use reedline::{
     PromptHistorySearchStatus, Reedline, Signal,
 };
 
-mod browser_auth;
+mod device_auth;
 
 const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
 
@@ -204,7 +204,7 @@ fn handle_auth(action: AuthAction, writer: &mut dyn Write) -> Result<()> {
     match action {
         AuthAction::Login => {
             let store = OsCredentialStore::new()?;
-            let secret = browser_auth::connect(writer)?;
+            let secret = device_auth::connect(writer)?;
             login(&store, &secret)?;
             writeln!(
                 writer,
