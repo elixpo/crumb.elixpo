@@ -3,6 +3,7 @@ interface CloudflareEnv {
   KV: KVNamespace
   NEXT_PUBLIC_ELIXPO_CLIENT_ID: string
   ELIXPO_CLIENT_SECRET: string
+  ELIXPO_ACCOUNTS_DELETION_WEBHOOK: string
   POLLINATIONS_APP_KEY: string
   CONNECTOR_ENCRYPTION_KEY: string
   ACCOUNTS_ORIGIN: string
