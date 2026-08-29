@@ -63,8 +63,28 @@ impl CompletionProtocol {
         }
     }
 
-    /// Builds a Bash submission that preserves shell state and emits hidden
-    /// completion metadata on the following line.
+    /// Builds the shell hook that emits lifecycle metadata after a command
+    /// returns control to the interactive shell.
+    #[must_use]
+    pub fn bootstrap(&self, kind: ShellKind) -> String {
+        match kind {
+            ShellKind::Bash => format!(
+                "stty -echo; PS1=''; __crumb_emit() {{ __crumb_status=$?; if [ -n \"${{__crumb_seq-}}\" ]; then stty -echo; __crumb_cwd_hex=$(printf %s \"$PWD\" | od -An -tx1 | tr -d ' \\n'); printf '\\036crumb:{}:%s:%s:%s\\037' \"$__crumb_seq\" \"$__crumb_status\" \"$__crumb_cwd_hex\"; unset __crumb_seq; fi; }}; PROMPT_COMMAND=__crumb_emit\n",
+                self.token
+            ),
+            ShellKind::Zsh => format!(
+                "stty -echo; PS1=''; RPS1=''; unsetopt zle prompt_cr prompt_sp; __crumb_emit() {{ __crumb_status=$?; if [ -n \"${{__crumb_seq-}}\" ]; then stty -echo; __crumb_cwd_hex=$(printf %s \"$PWD\" | od -An -tx1 | tr -d ' \\n'); printf '\\036crumb:{}:%s:%s:%s\\037' \"$__crumb_seq\" \"$__crumb_status\" \"$__crumb_cwd_hex\"; unset __crumb_seq; fi; }}; precmd_functions=(__crumb_emit)\n",
+                self.token
+            ),
+            ShellKind::PowerShell => format!(
+                "Remove-Module PSReadLine -ErrorAction SilentlyContinue; function global:prompt {{ $__crumb_status = if ($?) {{ 0 }} elseif ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }}; if ($null -ne $global:__crumb_sequence) {{ $__crumb_cwd_hex = [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes((Get-Location).Path)).ToLowerInvariant(); [Console]::Write([char]0x1e + 'crumb:{}:' + $global:__crumb_sequence + ':' + $__crumb_status + ':' + $__crumb_cwd_hex + [char]0x1f); $global:__crumb_sequence = $null }}; '' }}\r\n",
+                self.token
+            ),
+        }
+    }
+
+    /// Builds a shell submission that preserves state and lets the installed
+    /// prompt hook emit completion metadata after the command returns.
     #[must_use]
     pub fn submission(&self, kind: ShellKind, command: &str, sequence: u64) -> String {
         match kind {
@@ -110,17 +130,11 @@ impl CompletionProtocol {
     }
 
     fn posix_submission(&self, command: &str, sequence: u64) -> String {
-        format!(
-            "stty echo\n{command}\n__crumb_status=$?; stty -echo; __crumb_cwd_hex=$(printf %s \"$PWD\" | od -An -tx1 | tr -d ' \\n'); printf '\\036crumb:{}:{sequence}:%s:%s\\037' \"$__crumb_status\" \"$__crumb_cwd_hex\"\n",
-            self.token
-        )
+        format!("__crumb_seq={sequence}; stty echo; {command}\n")
     }
 
     fn powershell_submission(&self, command: &str, sequence: u64) -> String {
-        format!(
-            "$global:LASTEXITCODE=$null; {command}\r\n$__crumb_status = if ($?) {{ 0 }} elseif ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }}; $__crumb_cwd_hex = [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes((Get-Location).Path)).ToLowerInvariant(); [Console]::Write([char]0x1e + 'crumb:{}:{sequence}:' + $__crumb_status + ':' + $__crumb_cwd_hex + [char]0x1f)\r\n",
-            self.token
-        )
+        format!("$global:LASTEXITCODE=$null; $global:__crumb_sequence={sequence}; {command}\r\n")
     }
 
     fn parse_frame(&self, frame: &[u8]) -> Result<CommandCompletion> {
@@ -197,8 +211,7 @@ mod tests {
 
         let submission = protocol.submission(crate::ShellKind::Bash, "cd /tmp", 7);
 
-        assert!(submission.starts_with("stty echo\ncd /tmp\n__crumb_status=$?; stty -echo;"));
-        assert!(submission.contains("crumb:abc123:7:"));
+        assert_eq!(submission, "__crumb_seq=7; stty echo; cd /tmp\n");
     }
 
     #[test]
@@ -208,8 +221,26 @@ mod tests {
         let submission =
             protocol.submission(crate::ShellKind::PowerShell, "Set-Location C:\\\\", 9);
 
-        assert!(submission.starts_with("$global:LASTEXITCODE=$null;"));
-        assert!(submission.contains("crumb:abc123:9:"));
+        assert_eq!(
+            submission,
+            "$global:LASTEXITCODE=$null; $global:__crumb_sequence=9; Set-Location C:\\\\\r\n"
+        );
+    }
+
+    #[test]
+    fn bootstrap_installs_completion_hooks() {
+        let protocol = CompletionProtocol::with_token("abc123".to_owned());
+
+        let bash = protocol.bootstrap(crate::ShellKind::Bash);
+        let zsh = protocol.bootstrap(crate::ShellKind::Zsh);
+        let powershell = protocol.bootstrap(crate::ShellKind::PowerShell);
+
+        assert!(bash.contains("PROMPT_COMMAND=__crumb_emit"));
+        assert!(zsh.contains("precmd_functions=(__crumb_emit)"));
+        assert!(powershell.contains("function global:prompt"));
+        for bootstrap in [bash, zsh, powershell] {
+            assert!(bootstrap.contains("crumb:abc123:"));
+        }
     }
 
     #[test]

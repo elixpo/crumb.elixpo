@@ -67,7 +67,7 @@ impl ShellSession {
         let mut process = shell.spawn(backend, size)?;
         let reader = process.try_clone_reader()?;
         let protocol = CompletionProtocol::new();
-        let bootstrap = bootstrap_command(kind);
+        let bootstrap = protocol.bootstrap(kind);
         let readiness = protocol.submission(kind, no_op_command(kind), 0);
         process.write_input(format!("{bootstrap}{readiness}").as_bytes())?;
 
@@ -182,16 +182,6 @@ impl ShellSession {
             {
                 return Ok(Some(completion));
             }
-        }
-    }
-}
-
-fn bootstrap_command(kind: ShellKind) -> &'static str {
-    match kind {
-        ShellKind::Bash => "stty -echo; PS1=''; PROMPT_COMMAND=''\n",
-        ShellKind::Zsh => "stty -echo; PS1=''; RPS1=''; unsetopt zle prompt_cr prompt_sp\n",
-        ShellKind::PowerShell => {
-            "Remove-Module PSReadLine -ErrorAction SilentlyContinue; function global:prompt { '' }\r\n"
         }
     }
 }
