@@ -9,17 +9,19 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crumb_agent::{
-    AgentConfig, CommandCatalog, InputRoute, LiveConfig, MistakePolicy, RouteDecision,
-    UnknownInputPolicy,
+    AgentConfig, CancellationToken, CommandCatalog, DenyAllApprovals, InputRoute, LiveConfig,
+    MistakePolicy, RouteDecision, ToolHost, UnknownInputPolicy,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
+use crumb_mcp::{McpDispatcher, serve_stdio};
 use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::shell_for;
 use crumb_platform::Platform;
 use crumb_pty::{PtyInput, PtyResizer, SystemPty, TerminalSize};
 use crumb_repl::{ReplOutcome, read_classified_line};
+use crumb_tools::{WorkspaceToolLimits, register_workspace_read_tools};
 use crumb_ui::{GitSegment, PromptContext, Renderer, UiSettings};
 use reedline::{
     FileBackedHistory, History, HistoryItem, Prompt, PromptEditMode, PromptHistorySearch,
@@ -43,15 +45,59 @@ fn main() -> Result<()> {
 
 fn run_command_line_action() -> Result<bool> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if matches!(arguments.as_slice(), [group, action] if group == "mcp" && action == "serve") {
+        serve_mcp()?;
+        return Ok(true);
+    }
     let action = match arguments.as_slice() {
         [] => return Ok(false),
         [group, action] if group == "auth" && action == "login" => AuthAction::Login,
         [group, action] if group == "auth" && action == "status" => AuthAction::Status,
         [group, action] if group == "auth" && action == "logout" => AuthAction::Logout,
-        _ => return Err(anyhow!("usage: crumb auth <login|status|logout>")),
+        _ => {
+            return Err(anyhow!(
+                "usage: crumb [auth <login|status|logout> | mcp serve]"
+            ));
+        }
     };
     handle_auth(action, &mut io::stdout().lock())?;
     Ok(true)
+}
+
+fn serve_mcp() -> Result<()> {
+    let workspace = current_process_dir()?;
+    let config = LiveConfig::new(workspace.join(".crumb").join("agent.json")).load_or_default()?;
+    let host = workspace_read_host(&workspace, &config)?;
+    let dispatcher = McpDispatcher::new(
+        host,
+        Arc::new(DenyAllApprovals),
+        config.mode,
+        env!("CARGO_PKG_VERSION"),
+    );
+    let cancellation = CancellationToken::default();
+    serve_stdio(
+        &dispatcher,
+        &mut io::stdin().lock(),
+        &mut io::stdout().lock(),
+        &cancellation,
+    )
+}
+
+fn workspace_read_host(workspace: &Path, config: &AgentConfig) -> Result<ToolHost> {
+    let max_output_bytes = usize::try_from(config.limits.max_output_bytes)
+        .map_err(|_| anyhow!("max_output_bytes exceeds this platform's address space"))?;
+    let max_directory_entries = usize::try_from(config.limits.max_directory_entries)
+        .map_err(|_| anyhow!("max_directory_entries exceeds this platform's address space"))?;
+    let mut host = ToolHost::default();
+    register_workspace_read_tools(
+        &mut host,
+        workspace,
+        WorkspaceToolLimits {
+            max_output_bytes,
+            max_directory_entries,
+        },
+    )?;
+    Ok(host)
 }
 
 fn run_managed_repl() -> Result<ReplOutcome> {
@@ -690,5 +736,37 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crumb_agent::{AgentConfig, RiskClass};
+
+    use super::workspace_read_host;
+
+    #[test]
+    fn stdio_mcp_host_exposes_only_read_tools() {
+        let workspace = std::env::current_dir().expect("current directory is available");
+        let host = workspace_read_host(&workspace, &AgentConfig::default())
+            .expect("workspace tools are registered");
+        let tools = host.tools().collect::<Vec<_>>();
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().all(|tool| tool.risk == RiskClass::ReadOnly));
+        assert_eq!(tools[0].name, "list_directory");
+        assert_eq!(tools[1].name, "read_file");
+    }
+
+    #[test]
+    fn cordis_composition_has_no_direct_mutating_tools() {
+        let composition = include_str!("../../../config/harness/crumb.cordis.yml");
+        assert!(composition.contains("@deepseek-ai/dsh-mcp-client"));
+        for forbidden in [
+            "@deepseek-ai/dsh-bash-local",
+            "@deepseek-ai/dsh-fs-local",
+            "@deepseek-ai/dsh-tool-fs",
+        ] {
+            assert!(!composition.contains(forbidden));
+        }
     }
 }

@@ -40,9 +40,27 @@ error keeps its tail, preserving the most useful diagnostics within the shared
 result budget. Cancellation and timeout terminate and reap the child; Unix
 builds terminate the complete process group.
 
+## Interactive approvals
+
+The bounded approval channel transfers one pending request from execution to a
+trusted terminal UI. Metadata carries the stable request identifier, tool,
+risk, and argument digest; raw arguments are transient and accessible only from
+the UI-side pending value. A decision is consumed once. Dropping the pending
+value, losing either channel endpoint, or cancelling the session denies the
+request. A full UI queue is polled with cancellation instead of blocking the
+agent indefinitely.
+
 ## Next slices
 
 1. [x] Workspace-confined read and directory-list tools.
 2. [x] Isolated shell execution with output/time ceilings.
-3. Interactive allow-once approval bridge for negotiate mode.
-4. `crumb mcp serve` entry point and Harness Cordis composition.
+3. [x] Interactive allow-once approval bridge for negotiate mode.
+4. [x] `crumb mcp serve` entry point and Harness Cordis composition.
+
+The stdio entry point intentionally registers only `read_file` and
+`list_directory`. Its stdout is MCP-only, it loads limits and mode from the
+workspace's live `.crumb/agent.json`, and it performs no network access. The
+checked-in Cordis composition exposes those tools as `mcp__crumb__...` and
+omits Harness-native shell and filesystem plugins. Approval-gated mutation will
+be added only through a parent-CLI-owned interactive transport; the unattended
+stdio child cannot approve mutations.

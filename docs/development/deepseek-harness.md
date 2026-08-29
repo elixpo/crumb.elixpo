@@ -24,6 +24,14 @@ must not expose a Harness composition containing direct mutating shell or file
 tools. Executable compositions must route tools through Crumb's policy-enforcing
 MCP boundary; plan-only compositions may omit tools entirely.
 
+The executable composition is
+`config/harness/crumb.cordis.yml`. The launcher supplies absolute values for
+`DSH_CORDIS_CONFIG`, `DSH_CWD`, `DSH_SESSION_ROOT`, and `CRUMB_MCP_COMMAND`.
+It supplies `POLLINATIONS_API_KEY` transiently from Crumb's credential boundary;
+the key is never written into Cordis or agent configuration. The composition
+uses the generic `llm-pi-ai` OpenAI-compatible route for `nova-fast` and
+`qwen-coder`, and contains no Harness-native shell or filesystem tool rows.
+
 ## Failure and cancellation
 
 Requests and shutdown are time-bounded. Ctrl+C first sets Crumb's shared

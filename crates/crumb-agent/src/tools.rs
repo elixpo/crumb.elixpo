@@ -105,7 +105,12 @@ pub enum ApprovalDecision {
 
 /// User-owned approval boundary. Model output cannot implement this trait.
 pub trait ApprovalBroker: Send + Sync {
-    fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision;
+    fn decide(
+        &self,
+        request: &ApprovalRequest,
+        arguments: &serde_json::Value,
+        cancellation: &CancellationToken,
+    ) -> ApprovalDecision;
 }
 
 /// Safe default used when no interactive approval channel exists.
@@ -113,7 +118,12 @@ pub trait ApprovalBroker: Send + Sync {
 pub struct DenyAllApprovals;
 
 impl ApprovalBroker for DenyAllApprovals {
-    fn decide(&self, _request: &ApprovalRequest) -> ApprovalDecision {
+    fn decide(
+        &self,
+        _request: &ApprovalRequest,
+        _arguments: &serde_json::Value,
+        _cancellation: &CancellationToken,
+    ) -> ApprovalDecision {
         ApprovalDecision::Deny
     }
 }
@@ -216,7 +226,7 @@ impl ToolHost {
                 "tool call cancelled",
             ));
         }
-        authorize(descriptor, arguments, mode, approvals)?;
+        authorize(descriptor, arguments, mode, approvals, cancellation)?;
         let handler = self.handlers.get(name).ok_or_else(|| {
             ToolCallError::new(
                 ToolCallErrorKind::Internal,
@@ -253,6 +263,7 @@ fn authorize(
     arguments: &serde_json::Value,
     mode: AgentMode,
     approvals: &dyn ApprovalBroker,
+    cancellation: &CancellationToken,
 ) -> std::result::Result<(), ToolCallError> {
     if matches!(mode, AgentMode::Plan) {
         return Err(ToolCallError::new(
@@ -274,7 +285,14 @@ fn authorize(
         risk: descriptor.risk,
         arguments_digest: crate::session::digest(&encoded),
     };
-    match approvals.decide(&request) {
+    let decision = approvals.decide(&request, arguments, cancellation);
+    if cancellation.is_cancelled() {
+        return Err(ToolCallError::new(
+            ToolCallErrorKind::Cancelled,
+            "tool call cancelled",
+        ));
+    }
+    match decision {
         ApprovalDecision::AllowOnce => Ok(()),
         ApprovalDecision::Deny => Err(ToolCallError::new(
             ToolCallErrorKind::Denied,
@@ -453,7 +471,12 @@ mod tests {
     struct AllowOnce;
 
     impl ApprovalBroker for AllowOnce {
-        fn decide(&self, _request: &ApprovalRequest) -> ApprovalDecision {
+        fn decide(
+            &self,
+            _request: &ApprovalRequest,
+            _arguments: &serde_json::Value,
+            _cancellation: &CancellationToken,
+        ) -> ApprovalDecision {
             ApprovalDecision::AllowOnce
         }
     }

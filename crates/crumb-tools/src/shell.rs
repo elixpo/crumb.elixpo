@@ -289,7 +289,7 @@ fn terminate(child: &mut Child) {
 
     let pid = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
     if let Some(pid) = pid {
-        if kill_process_group(pid, Signal::Kill).is_err() {
+        if kill_process_group(pid, Signal::KILL).is_err() {
             let _ = child.kill();
         }
     } else {
@@ -339,7 +339,12 @@ mod tests {
     struct AllowOnce;
 
     impl ApprovalBroker for AllowOnce {
-        fn decide(&self, _request: &ApprovalRequest) -> ApprovalDecision {
+        fn decide(
+            &self,
+            _request: &ApprovalRequest,
+            _arguments: &serde_json::Value,
+            _cancellation: &CancellationToken,
+        ) -> ApprovalDecision {
             ApprovalDecision::AllowOnce
         }
     }

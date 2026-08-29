@@ -4,12 +4,14 @@
 //! tool metadata, and token-optimization contracts. It performs no network
 //! requests and is not part of native-shell startup.
 
+pub mod approvals;
 pub mod config;
 pub mod harness;
 pub mod routing;
 pub mod session;
 pub mod tools;
 
+pub use approvals::{ApprovalInbox, InteractiveApprovalBroker, PendingApproval, approval_channel};
 pub use config::{
     AgentConfig, AgentLimits, AgentMode, HarnessConfig, LiveConfig, MistakePolicy, Modality,
     ModelRoute, StructuredEncoding,
