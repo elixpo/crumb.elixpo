@@ -28,9 +28,9 @@ impl SessionId {
         let value = value.into();
         if value.is_empty()
             || value.len() > 64
-            || !value
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+            || !value.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
         {
             bail!("session id must contain 1-64 ASCII letters, numbers, dashes, or underscores");
         }
@@ -122,8 +122,9 @@ impl SessionJournal {
     /// Returns an error when the session directory or journal cannot be opened.
     pub fn open(root: &Path, session_id: &SessionId) -> Result<Self> {
         let directory = root.join(session_id.as_str());
-        fs::create_dir_all(&directory)
-            .with_context(|| format!("failed to create session directory {}", directory.display()))?;
+        fs::create_dir_all(&directory).with_context(|| {
+            format!("failed to create session directory {}", directory.display())
+        })?;
         let path = directory.join("events.jsonl");
         let file = OpenOptions::new()
             .create(true)
@@ -147,9 +148,14 @@ impl SessionJournal {
     ///
     /// Returns an error when serialization or durable writing fails.
     pub fn append(&mut self, event: &SessionEvent) -> Result<()> {
-        serde_json::to_writer(&mut self.writer, event).context("failed to serialize session event")?;
-        self.writer.write_all(b"\n").context("failed to terminate session event")?;
-        self.writer.flush().context("failed to flush session event")?;
+        serde_json::to_writer(&mut self.writer, event)
+            .context("failed to serialize session event")?;
+        self.writer
+            .write_all(b"\n")
+            .context("failed to terminate session event")?;
+        self.writer
+            .flush()
+            .context("failed to flush session event")?;
         Ok(())
     }
 }
@@ -243,7 +249,12 @@ impl AgentSession {
     /// # Errors
     ///
     /// Returns an error when the event cannot be persisted.
-    pub fn record_turn_end(&mut self, status: TurnStatus, steps: u32, tool_calls: u32) -> Result<()> {
+    pub fn record_turn_end(
+        &mut self,
+        status: TurnStatus,
+        steps: u32,
+        tool_calls: u32,
+    ) -> Result<()> {
         self.journal.append(&SessionEvent::TurnFinished {
             at_ms: timestamp_ms(),
             status,
