@@ -1,0 +1,18 @@
+name = "crumb-web"
+compatibility_date = "2026-08-29"
+compatibility_flags = ["nodejs_compat"]
+pages_build_output_dir = ".vercel/output/static"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "crumb-web"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[vars]
+ACCOUNTS_ORIGIN = "https://accounts.elixpo.com"
+PUBLIC_ORIGIN = "https://crumb.elixpo.com"
