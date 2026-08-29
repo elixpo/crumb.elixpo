@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
-use crumb_pty::{PtyBackend, PtyProcess, TerminalSize};
+use crumb_pty::{PtyBackend, PtyInput, PtyProcess, PtyResizer, TerminalSize};
 
 use crate::protocol::{CommandCompletion, CompletionProtocol};
 use crate::{NativeShell, ShellKind};
@@ -98,6 +98,20 @@ impl ShellSession {
     /// Returns an error if the operating system rejects the resize.
     pub fn resize(&self, size: TerminalSize) -> Result<()> {
         self.process.resize(size)
+    }
+
+    /// Returns a synchronized handle for forwarding foreground terminal input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the PTY input stream is no longer available.
+    pub fn try_clone_input(&self) -> Result<PtyInput> {
+        self.process.try_clone_input()
+    }
+
+    #[must_use]
+    pub fn resizer(&self) -> PtyResizer {
+        self.process.resizer()
     }
 
     /// Requests a normal shell exit and waits for process cleanup.
