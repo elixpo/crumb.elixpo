@@ -16,23 +16,22 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [ ] [WP-007 — persistent history](https://github.com/elixpo/crumb.elixpo/issues/15) ([PR #17](https://github.com/elixpo/crumb.elixpo/pull/17))
 - [ ] [Linux terminal parity](https://github.com/elixpo/crumb.elixpo/issues/16) ([PR #18](https://github.com/elixpo/crumb.elixpo/pull/18))
 - [ ] [WP-008 — provider-neutral LLM interface](https://github.com/elixpo/crumb.elixpo/issues/19) ([PR #20](https://github.com/elixpo/crumb.elixpo/pull/20))
+- [ ] [WP-009 — Pollinations adapter](https://github.com/elixpo/crumb.elixpo/issues/21) ([PR #23](https://github.com/elixpo/crumb.elixpo/pull/23))
 
-## Current milestone: [WP-009 — Pollinations adapter](https://github.com/elixpo/crumb.elixpo/issues/21)
+## Current milestone: [WP-010 — secure Pollinations BYOK](https://github.com/elixpo/crumb.elixpo/issues/24)
 
-- [x] Add an isolated `crumb-pollinations` crate.
-- [x] Add redacted endpoint, timeout, and bounded-retry configuration.
-- [x] Encode provider-neutral chat requests into the OpenAI-compatible wire format.
-- [x] Incrementally decode split UTF-8 SSE events.
-- [x] Map streamed text, usage, and finish reasons into `crumb-llm` events.
-- [x] Implement model discovery and metadata mapping.
-- [x] Implement streaming chat transport.
-- [x] Implement embeddings.
-- [x] Map HTTP and Pollinations failures into neutral errors.
-- [x] Add safe bounded retries for model discovery and explicit request timeouts.
-- [x] Keep credentials out of logs and errors.
-- [x] Add deterministic HTTP fixture tests without live API access.
+- [x] Add an isolated `crumb-auth` crate and secure-store abstraction.
+- [x] Store Pollinations BYOK in the OS credential manager.
+- [x] Add redacted, zeroizing secret ownership.
+- [x] Add `crumb auth login|status|logout` commands.
+- [x] Add matching `:auth login|status|logout` built-ins.
+- [x] Support a process-scoped `POLLINATIONS_API_KEY` override.
+- [x] Keep secrets out of command arguments, echo, history, diagnostics, and errors.
+- [x] Fail safely when no secure credential store is available.
+- [x] Document Linux Secret Service behavior and safe headless fallback.
+- [ ] Validate Linux Secret Service behavior.
 - [ ] Pass formatting, clippy, and workspace tests.
-- [ ] Merge WP-009.
+- [ ] Merge WP-010.
 
 <details>
 <summary>WP-001 completion details</summary>
@@ -52,7 +51,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 ## Planned work packages
 
 - [ ] [DeepSeek Harness + RTK/token optimizers](https://github.com/elixpo/crumb.elixpo/issues/22).
-- [ ] WP-010 — secure authentication.
+- [ ] [Skills and natural-language routing](https://github.com/elixpo/crumb.elixpo/issues/25).
 - [ ] WP-011 — streamed AI question mode.
 
 Later work packages remain defined in the [master plan](../product/master-plan.md). Only the current and immediately upcoming package should be expanded into implementation-level tasks.

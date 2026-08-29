@@ -4,7 +4,7 @@ use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
-use crumb_core::{BuiltInCommand, HistoryAction, InputEvent};
+use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
 use crumb_platform::Platform;
 
 /// Reason the REPL returned control to its caller.
@@ -19,6 +19,9 @@ pub enum ReplOutcome {
 pub fn classify_input(input: &str) -> InputEvent {
     let command = input.trim_end_matches(['\r', '\n']);
     match command {
+        ":auth login" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Login)),
+        ":auth status" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Status)),
+        ":auth logout" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Logout)),
         ":exit" => InputEvent::BuiltIn(BuiltInCommand::Exit),
         ":history" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Recent)),
         ":history search" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
@@ -96,6 +99,12 @@ pub fn run<R: BufRead, W: Write>(
         };
 
         match event {
+            InputEvent::BuiltIn(BuiltInCommand::Auth(_)) => {
+                writeln!(
+                    writer,
+                    "authentication is available in the crumb executable"
+                )?;
+            }
             InputEvent::BuiltIn(BuiltInCommand::Exit) => return Ok(ReplOutcome::Exit),
             InputEvent::BuiltIn(BuiltInCommand::History(_)) => {
                 writeln!(writer, "history is available in the crumb executable")?;
@@ -131,7 +140,7 @@ mod tests {
     use std::io::Cursor;
     use std::path::Path;
 
-    use crumb_core::{BuiltInCommand, HistoryAction, InputEvent};
+    use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
     use crumb_platform::Platform;
 
     use super::{ReplOutcome, classify_input, read_input, render_prompt, run};
@@ -153,6 +162,10 @@ mod tests {
         assert_eq!(
             classify_input(":shell"),
             InputEvent::BuiltIn(BuiltInCommand::Shell)
+        );
+        assert_eq!(
+            classify_input(":auth login"),
+            InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Login))
         );
         assert_eq!(
             classify_input(":history search cargo test"),
