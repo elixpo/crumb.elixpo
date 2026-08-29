@@ -5,6 +5,11 @@ use std::io::{self, BufRead, Write};
 use crumb_platform::Platform;
 
 /// Starts crumb with injectable input and output for testing.
+///
+/// # Errors
+///
+/// Returns an error when the REPL cannot read its environment or perform
+/// terminal input/output.
 pub fn run<R: BufRead, W: Write>(reader: R, writer: W) -> io::Result<()> {
     crumb_repl::run(
         reader,

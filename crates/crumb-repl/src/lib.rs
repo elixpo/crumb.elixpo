@@ -27,6 +27,11 @@ pub fn render_prompt(cwd: &Path) -> String {
 /// Runs the WP-001 REPL until `:exit` or end-of-input.
 ///
 /// Native input is classified and reported, but deliberately not executed.
+///
+/// # Errors
+///
+/// Returns an error when the working directory cannot be read or terminal
+/// input/output fails.
 pub fn run<R: BufRead, W: Write>(
     mut reader: R,
     mut writer: W,
