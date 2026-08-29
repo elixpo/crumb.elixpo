@@ -15,14 +15,14 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Current milestone: [WP-006 — terminal UI layer](https://github.com/elixpo/crumb.elixpo/issues/13)
 
-- [ ] Add an isolated `crumb-ui` crate.
-- [ ] Render a two-line prompt with crumb, cwd, platform, and execution status.
-- [ ] Add compact, full, and disabled branding modes.
-- [ ] Respect `NO_COLOR` and non-terminal/plain output.
-- [ ] Add a lightweight Git branch and dirty-state segment.
-- [ ] Keep prompt rendering free of network activity.
-- [ ] Add deterministic renderer tests.
-- [ ] Integrate UI without leaking presentation into `crumb-core`.
+- [x] Add an isolated `crumb-ui` crate.
+- [x] Render a two-line prompt with crumb, cwd, platform, and execution status.
+- [x] Add compact, full, and disabled branding modes.
+- [x] Respect `NO_COLOR` and non-terminal/plain output.
+- [x] Add a lightweight Git branch and dirty-state segment.
+- [x] Keep prompt rendering free of network activity.
+- [x] Add deterministic renderer tests.
+- [x] Integrate UI without leaking presentation into `crumb-core`.
 - [ ] Pass formatting, clippy, and workspace tests.
 - [ ] Merge WP-006.
 

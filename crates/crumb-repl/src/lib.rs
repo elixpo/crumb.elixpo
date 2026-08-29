@@ -52,6 +52,19 @@ pub fn read_input<R: BufRead, W: Write>(
     Ok(Some(classify_input(&line)))
 }
 
+/// Reads and classifies one line without rendering a prompt.
+///
+/// # Errors
+///
+/// Returns an error when terminal input fails.
+pub fn read_classified_line<R: BufRead>(reader: &mut R) -> io::Result<Option<InputEvent>> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(classify_input(&line)))
+}
+
 /// Runs the WP-001 REPL until `:exit` or end-of-input.
 ///
 /// Native input is classified and reported, but deliberately not executed.
