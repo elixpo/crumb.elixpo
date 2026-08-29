@@ -540,6 +540,15 @@ name = "crumb-llm"
 version = "0.1.0"
 
 [[package]]
+name = "crumb-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crumb-agent",
+ "serde_json",
+]
+
+[[package]]
 name = "crumb-native"
 version = "0.1.0"
 dependencies = [

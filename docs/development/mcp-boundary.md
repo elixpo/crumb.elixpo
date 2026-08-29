@@ -1,0 +1,28 @@
+# Crumb MCP boundary
+
+Crumb exposes tools through a Rust-owned MCP server rather than granting the
+Harness direct shell or filesystem capabilities. The initial server supports
+newline-delimited stdio for MCP `2025-11-25`, used by the current DeepSeek
+Harness client, and the stateless `2026-07-28` discovery shape.
+
+## Policy
+
+- `plan` denies every tool call.
+- `auto` permits only tools registered as read-only without interaction.
+- `negotiate` and all mutating risk classes require a user-owned allow-once
+  decision.
+- No approval channel means deny, never allow.
+- Approval metadata contains a digest of arguments, not raw arguments.
+- Cancellation is shared with the agent session and tool handler.
+- Unknown tools are protocol errors; expected execution failures are MCP tool
+  results with `isError: true` so the model may self-correct.
+
+Tool annotations are derived from trusted Rust metadata. Model-provided or
+third-party annotations never change Crumb's risk class or approval decision.
+
+## Next slices
+
+1. Workspace-confined read and directory-list tools.
+2. Isolated shell execution with output/time ceilings.
+3. Interactive allow-once approval bridge for negotiate mode.
+4. `crumb mcp serve` entry point and Harness Cordis composition.

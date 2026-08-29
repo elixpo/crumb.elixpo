@@ -20,5 +20,7 @@ pub use routing::{
 };
 pub use session::{AgentSession, CancellationToken, SessionEvent, SessionId, SessionJournal};
 pub use tools::{
-    McpServer, OutputKind, RiskClass, TokenOptimizer, ToolDescriptor, ToolRegistry, ToolTransport,
+    ApprovalBroker, ApprovalDecision, ApprovalRequest, DenyAllApprovals, McpServer, OutputKind,
+    RiskClass, TokenOptimizer, ToolCallError, ToolCallErrorKind, ToolDescriptor, ToolHandler,
+    ToolHost, ToolOutput, ToolRegistry, ToolTransport,
 };
