@@ -155,7 +155,9 @@ upload_secrets() {
   load_cloudflare_auth
   local decrypted local_values="" key value
   decrypted="$(sops decrypt "$ROOT_DIR/.env")"
-  if [ -f "$SITE_DIR/.env.local" ]; then
+  if [ -f "$ROOT_DIR/.env.local" ]; then
+    local_values="$(<"$ROOT_DIR/.env.local")"
+  elif [ -f "$SITE_DIR/.env.local" ]; then
     local_values="$(<"$SITE_DIR/.env.local")"
   fi
   for key in NEXT_PUBLIC_ELIXPO_CLIENT_ID NEXT_PUBLIC_ELIXPO_CLIENT_ID_CLI ELIXPO_CLIENT_SECRET ELIXPO_ACCOUNTS_WEBHOOK_SECRET POLLINATIONS_APP_KEY CONNECTOR_ENCRYPTION_KEY; do

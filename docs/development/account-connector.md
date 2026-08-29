@@ -40,7 +40,7 @@ Pollinations requests `profile usage` and uses PKCE.
 
 ## Local configuration
 
-Copy `crumb.elixpo/.env.local.example` to `crumb.elixpo/.env.local` and set:
+Copy `crumb.elixpo/.env.local.example` to the repository-root `.env.local` and set:
 
 - `NEXT_PUBLIC_ELIXPO_CLIENT_ID`
 - `NEXT_PUBLIC_ELIXPO_CLIENT_ID_CLI`
@@ -51,8 +51,8 @@ Copy `crumb.elixpo/.env.local.example` to `crumb.elixpo/.env.local` and set:
 
 Never commit `.env.local`. The local web app runs on port `3000`.
 
-`./deploy.sh secrets` uses application values from `crumb.elixpo/.env.local`
-when present and falls back per missing key to the SOPS-encrypted root `.env`.
+Both local Next.js and `./deploy.sh secrets` use the repository-root
+`.env.local`, then fall back per missing key to the SOPS-encrypted root `.env`.
 
 Apply `crumb.elixpo/migrations/0001_initial.sql` to the bound D1 database before
 testing. Replace the placeholder D1 and KV identifiers in `wrangler.toml` only
