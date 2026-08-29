@@ -10,6 +10,13 @@ Crumb is the Natural Language Terminal (NLT). It preserves a real Bash, Zsh, or 
 
 Never describe Crumb as a shell emulator or as a terminal where every command is sent to AI. Native commands do not require AI, a connected provider, or network access.
 
+## Product routes
+
+- `/features` explains native execution, deterministic routing, Harness isolation, cancellation, sessions, permissions, and graceful failure.
+- `/skills` explains inspectable task skills, typed plugins, scoped connectors, and how to request new ecosystem capabilities.
+- `/profile/connectors` is the signed-in surface for authorizing and revoking external services.
+- `/docs` contains installation, CLI, authentication, connector, and security documentation.
+
 ## Install and run from source
 
 Requirements: Git and the stable Rust toolchain installed through rustup.

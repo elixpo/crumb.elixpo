@@ -8,6 +8,8 @@ Complete usage guide: https://crumb.elixpo.com/llms-full.txt
 
 ## Documentation
 
+- [Features](https://crumb.elixpo.com/features): Native execution, deterministic routing, Harness isolation, cancellation, sessions, and permissions.
+- [Skills and plugins](https://crumb.elixpo.com/skills): The distinction between task instructions, typed capabilities, and scoped connectors.
 - [Overview](https://crumb.elixpo.com/docs): Product boundaries, capabilities, and quick reference.
 - [Getting started](https://crumb.elixpo.com/docs/getting-started): Requirements, source installation, and first native session.
 - [CLI and native shell](https://crumb.elixpo.com/docs/cli): Native command behavior, built-ins, and the natural-language boundary.
