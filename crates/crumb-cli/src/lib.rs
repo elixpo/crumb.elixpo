@@ -3,6 +3,7 @@
 use std::io::{self, BufRead, Write};
 
 use crumb_platform::Platform;
+use crumb_repl::ReplOutcome;
 
 /// Starts crumb with injectable input and output for testing.
 ///
@@ -10,7 +11,7 @@ use crumb_platform::Platform;
 ///
 /// Returns an error when the REPL cannot read its environment or perform
 /// terminal input/output.
-pub fn run<R: BufRead, W: Write>(reader: R, writer: W) -> io::Result<()> {
+pub fn run<R: BufRead, W: Write>(reader: R, writer: W) -> io::Result<ReplOutcome> {
     crumb_repl::run(
         reader,
         writer,
@@ -27,8 +28,10 @@ mod tests {
     fn application_exits_cleanly() {
         let mut output = Vec::new();
 
-        super::run(Cursor::new(":exit\n"), &mut output).expect("application should exit");
+        let outcome =
+            super::run(Cursor::new(":exit\n"), &mut output).expect("application should exit");
 
+        assert_eq!(outcome, crumb_repl::ReplOutcome::Exit);
         assert!(
             String::from_utf8(output)
                 .expect("output should be UTF-8")
