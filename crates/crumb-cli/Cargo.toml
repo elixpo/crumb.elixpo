@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 crumb-auth = { path = "../crumb-auth" }
 crumb-core = { path = "../crumb-core" }
 crumb-history = { path = "../crumb-history" }
@@ -19,8 +20,12 @@ crumb-pty = { path = "../crumb-pty" }
 crumb-repl = { path = "../crumb-repl" }
 crumb-ui = { path = "../crumb-ui" }
 crossterm.workspace = true
+getrandom.workspace = true
 reedline.workspace = true
-rpassword.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+sha2.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true
