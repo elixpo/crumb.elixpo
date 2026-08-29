@@ -10,18 +10,20 @@ This is the local source of truth for implementation order. GitHub issues provid
 ## Active stack
 
 - [ ] [WP-003 — macOS Zsh parity](https://github.com/elixpo/crumb.elixpo/issues/6) ([PR #7](https://github.com/elixpo/crumb.elixpo/pull/7))
+- [ ] [WP-004 — Windows PowerShell parity](https://github.com/elixpo/crumb.elixpo/issues/8) ([PR #9](https://github.com/elixpo/crumb.elixpo/pull/9))
 
-## Current milestone: [WP-004 — Windows PowerShell parity](https://github.com/elixpo/crumb.elixpo/issues/8)
+## Current milestone: [WP-005 — shell lifecycle protocol](https://github.com/elixpo/crumb.elixpo/issues/10)
 
-- [x] Add a typed Windows PowerShell implementation.
-- [x] Prefer `pwsh` and fall back to Windows PowerShell.
-- [x] Select PowerShell for `Platform::Windows`.
-- [x] Reuse the portable PTY lifecycle and terminal relay.
-- [x] Preserve cwd and environment state in one PowerShell process.
-- [x] Add deterministic Windows integration coverage.
-- [ ] Keep Linux and macOS workspace builds green.
+- [ ] Generate per-session, per-command completion markers.
+- [ ] Capture cwd and exit status without displaying markers.
+- [ ] Preserve state in one native shell process.
+- [ ] Route ordinary REPL input to the native shell.
+- [ ] Keep colon-prefixed built-ins under crumb control.
+- [ ] Handle empty commands and shell termination cleanly.
+- [ ] Add parser unit tests and Linux lifecycle integration coverage.
+- [ ] Define Zsh and PowerShell hook boundaries.
 - [ ] Pass formatting, clippy, and workspace tests.
-- [ ] Merge WP-004.
+- [ ] Merge WP-005.
 
 <details>
 <summary>WP-001 completion details</summary>
@@ -40,7 +42,6 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Planned work packages
 
-- [ ] WP-005 — shell lifecycle and completion protocol.
 - [ ] WP-006 — terminal UI layer.
 - [ ] WP-007 — persistent history.
 - [ ] WP-008 — provider-neutral LLM interface.
