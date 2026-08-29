@@ -9,8 +9,8 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crumb_agent::{
-    AgentConfig, CancellationToken, CommandCatalog, DenyAllApprovals, HarnessConfig, InputRoute,
-    LiveConfig, MistakePolicy, RouteDecision, ToolHost, UnknownInputPolicy,
+    AgentConfig, AgentMode, CancellationToken, CommandCatalog, DenyAllApprovals, HarnessConfig,
+    InputRoute, LiveConfig, MistakePolicy, Modality, RouteDecision, ToolHost, UnknownInputPolicy,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
@@ -183,6 +183,7 @@ fn run_managed_repl() -> Result<ReplOutcome> {
                     cwd: &cwd,
                     platform,
                     interactive,
+                    renderer,
                     writer: &mut writer,
                     last_exit_code: &mut last_exit_code,
                 };
@@ -202,6 +203,7 @@ struct InputContext<'a> {
     cwd: &'a Path,
     platform: Platform,
     interactive: bool,
+    renderer: Renderer,
     writer: &'a mut dyn Write,
     last_exit_code: &'a mut Option<i32>,
 }
@@ -217,6 +219,7 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
             &agent_config,
             context.cwd,
             context.agent_runtime,
+            context.renderer,
             context.writer,
         )?;
         record_history(
@@ -324,6 +327,7 @@ fn handle_agent_boundary(
     config: &AgentConfig,
     workspace: &Path,
     runtime: &mut Option<AgentRuntime>,
+    renderer: Renderer,
     writer: &mut dyn Write,
 ) -> Result<()> {
     if matches!(decision.route, InputRoute::Native) {
@@ -333,23 +337,69 @@ fn handle_agent_boundary(
         match AgentRuntime::new() {
             Ok(created) => *runtime = Some(created),
             Err(error) => {
-                writeln!(writer, "agent unavailable: {error}")?;
+                writeln!(writer, "{}", renderer.agent_error(&error.to_string(), false))?;
                 return Ok(());
             }
         }
     }
-    match runtime
+
+    let route = config
+        .models
+        .get(&Modality::Text)
+        .and_then(|routes| routes.first());
+    let model = route.map_or("not configured".to_owned(), |route| {
+        format!("{}/{}", route.provider, route.model)
+    });
+    let effort = route.and_then(|route| config.reasoning_effort_for(route));
+    writeln!(
+        writer,
+        "{}",
+        renderer.agent_header(&model, effort, agent_mode_name(config.mode), None)
+    )?;
+    writer.flush()?;
+    let activity = renderer.activity("Working through Harness");
+    let result = runtime
         .as_mut()
         .expect("agent runtime is initialized above")
-        .run(&decision.payload, config, workspace)
-    {
+        .run(&decision.payload, config, workspace);
+    activity.finish();
+
+    match result {
         Ok(result) if result.final_response.trim().is_empty() => {
-            writeln!(writer, "agent completed without a text response")?;
+            writeln!(
+                writer,
+                "{}",
+                renderer.agent_response(
+                    "Turn completed without a text response.",
+                    &result.session_id,
+                    result.events.len(),
+                )
+            )?;
         }
-        Ok(result) => writeln!(writer, "{}", result.final_response)?,
-        Err(error) => writeln!(writer, "agent unavailable: {error}")?,
+        Ok(result) => writeln!(
+            writer,
+            "{}",
+            renderer.agent_response(
+                &result.final_response,
+                &result.session_id,
+                result.events.len(),
+            )
+        )?,
+        Err(error) => {
+            let message = error.to_string();
+            let cancelled = message.to_ascii_lowercase().contains("cancel");
+            writeln!(writer, "{}", renderer.agent_error(&message, cancelled))?;
+        }
     }
     Ok(())
+}
+
+const fn agent_mode_name(mode: AgentMode) -> &'static str {
+    match mode {
+        AgentMode::Auto => "auto",
+        AgentMode::Negotiate => "negotiate",
+        AgentMode::Plan => "plan",
+    }
 }
 
 fn render_error_assistance(
@@ -437,10 +487,7 @@ fn handle_builtin(
                 writer,
             )?;
         }
-        BuiltInCommand::Reserved(command) => writeln!(
-            writer,
-            "`{command}` is reserved for Crumb but is not available in this build"
-        )?,
+        BuiltInCommand::Reserved(command) => show_reserved(&command, cwd, writer)?,
         BuiltInCommand::Version => {
             writeln!(writer, "crumb {}", env!("CARGO_PKG_VERSION"))?;
             record_history(
@@ -466,9 +513,53 @@ fn handle_builtin(
 }
 
 fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
-    writeln!(writer, "Crumb commands (type `/` then Tab):")?;
-    for command in crumb_repl::SLASH_COMMANDS {
-        writeln!(writer, "  {:<22} {}", command.usage, command.description)?;
+    writeln!(writer, "Crumb command palette")?;
+    writeln!(writer, "  Type `/` then Tab to search · `@` then Tab for context")?;
+    for (title, roots) in [
+        (
+            "SHELL",
+            &["/help", "/history", "/platform", "/version", "/shell", "/exit"][..],
+        ),
+        (
+            "AGENT",
+            &[
+                "/mode",
+                "/model",
+                "/effort",
+                "/session",
+                "/cancel",
+                "/cost",
+            ][..],
+        ),
+        (
+            "CONTEXT & CAPABILITIES",
+            &[
+                "/context",
+                "/attach",
+                "/detach",
+                "/skills",
+                "/plugins",
+                "/tools",
+                "/permissions",
+                "/memory",
+            ][..],
+        ),
+        (
+            "ACCOUNT & SYSTEM",
+            &["/auth", "/connectors", "/config", "/doctor"][..],
+        ),
+    ] {
+        writeln!(writer, "\n  {title}")?;
+        for command in crumb_repl::SLASH_COMMANDS.iter().filter(|command| {
+            roots.iter().any(|root| {
+                command
+                    .usage
+                    .strip_prefix(root)
+                    .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(' '))
+            })
+        }) {
+            writeln!(writer, "    {:<22} {}", command.usage, command.description)?;
+        }
     }
     Ok(())
 }
@@ -498,7 +589,8 @@ fn show_reference_help(writer: &mut dyn Write) -> Result<()> {
 fn show_skills(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     let config = read_agent_config(cwd)?;
     if config.skills.is_empty() {
-        writeln!(writer, "No skills are configured")?;
+        writeln!(writer, "◇ No skills configured")?;
+        writeln!(writer, "  Add skills to .crumb/agent.json, then type @skill: and press Tab.")?;
         return Ok(());
     }
     for skill in config.skills {
@@ -514,6 +606,118 @@ fn show_skills(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn show_reserved(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    match command {
+        "/mode" => {
+            let config = read_agent_config(cwd)?;
+            writeln!(writer, "◆ Agent mode")?;
+            writeln!(writer, "  {}", agent_mode_name(config.mode))?;
+            writeln!(writer, "  auto executes approved steps · negotiate pauses · plan is read-only")?;
+        }
+        "/model" => show_models(cwd, writer)?,
+        "/effort" => {
+            let config = read_agent_config(cwd)?;
+            let text_route = config
+                .models
+                .get(&Modality::Text)
+                .and_then(|routes| routes.first());
+            let effort = text_route
+                .and_then(|route| config.reasoning_effort_for(route))
+                .unwrap_or("provider default");
+            writeln!(writer, "◆ Reasoning effort")?;
+            writeln!(writer, "  {effort}")?;
+        }
+        "/config" => show_config_summary(cwd, writer)?,
+        "/plugins" => show_plugins(cwd, writer)?,
+        _ => {
+            writeln!(writer, "◇ {command}")?;
+            writeln!(writer, "  Reserved by Crumb; not available in this build.")?;
+        }
+    }
+    Ok(())
+}
+
+fn show_models(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    writeln!(writer, "◆ Model routes")?;
+    if config.models.values().all(Vec::is_empty) {
+        writeln!(writer, "  No model routes configured in .crumb/agent.json")?;
+        return Ok(());
+    }
+    for (modality, routes) in &config.models {
+        for (index, route) in routes.iter().enumerate() {
+            let marker = if index == 0 { "●" } else { "○" };
+            let effort = route
+                .reasoning_effort
+                .as_deref()
+                .or(config.reasoning_effort.as_deref())
+                .map_or(String::new(), |effort| format!(" · effort {effort}"));
+            writeln!(
+                writer,
+                "  {marker} {:<13} {}/{}{}",
+                modality_name(*modality),
+                route.provider,
+                route.model,
+                effort
+            )?;
+        }
+    }
+    writeln!(writer, "  ● active route · ○ fallback")?;
+    Ok(())
+}
+
+fn show_config_summary(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let (path, _) = agent_config_location(cwd);
+    let config = read_agent_config(cwd)?;
+    let routes = config.models.values().map(Vec::len).sum::<usize>();
+    let enabled_skills = config.skills.iter().filter(|skill| skill.enabled).count();
+    let enabled_plugins = config
+        .mcp_servers
+        .iter()
+        .filter(|server| server.enabled)
+        .count();
+    writeln!(writer, "◆ Live configuration")?;
+    writeln!(writer, "  {}", path.display())?;
+    writeln!(
+        writer,
+        "  mode {} · {routes} model routes · {enabled_skills} skills · {enabled_plugins} plugins",
+        agent_mode_name(config.mode)
+    )?;
+    writeln!(writer, "  Reloaded before every agent turn · secrets excluded")?;
+    Ok(())
+}
+
+fn show_plugins(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    writeln!(writer, "◆ Plugins and MCP servers")?;
+    if config.mcp_servers.is_empty() {
+        writeln!(writer, "  No plugins configured in .crumb/agent.json")?;
+        return Ok(());
+    }
+    for server in config.mcp_servers {
+        writeln!(
+            writer,
+            "  {} {}",
+            if server.enabled { "●" } else { "○" },
+            server.id
+        )?;
+    }
+    writeln!(writer, "  ● enabled · ○ disabled")?;
+    Ok(())
+}
+
+const fn modality_name(modality: Modality) -> &'static str {
+    match modality {
+        Modality::Text => "text",
+        Modality::Image => "image",
+        Modality::Video => "video",
+        Modality::Audio => "audio",
+        Modality::ThreeD => "3d",
+        Modality::Transcription => "transcription",
+        Modality::Embeddings => "embeddings",
+    }
 }
 
 fn handle_auth(action: AuthAction, writer: &mut dyn Write) -> Result<()> {

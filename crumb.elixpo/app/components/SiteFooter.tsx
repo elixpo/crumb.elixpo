@@ -11,7 +11,7 @@ export function SiteFooter() {
         <h2>Native when you type.<br />Intelligent when you ask.</h2>
         <FooterActions />
       </div>
-      <div><h3>Product</h3><Link href="/features">Features</Link><Link href="/skills">Skills & plugins</Link><Link href="/profile/connectors">Connectors</Link><Link href="/docs">Documentation</Link><a href={`${REPO}/releases`}>Releases</a></div>
+      <div><h3>Product</h3><Link href="/features">Features</Link><Link href="/skills">Skills</Link><Link href="/plugins">Plugins</Link><Link href="/profile/connectors">Connectors</Link><Link href="/docs">Documentation</Link><a href={`${REPO}/releases`}>Releases</a></div>
       <div><h3>Project</h3><Link href="/about">About</Link><a href={`${REPO}/issues`}>Issues</a><a href="https://status.elixpo.com">Status</a></div>
       <div><h3>Legal</h3><Link href="/privacy">Privacy</Link><Link href="/terms">Terms</Link><a href={`${REPO}/blob/main/LICENSE`}>License</a></div>
     </div>

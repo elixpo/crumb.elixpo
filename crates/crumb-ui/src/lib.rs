@@ -1,8 +1,13 @@
 //! Lightweight terminal presentation for crumb.
 
 use std::env;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crumb_platform::Platform;
 
@@ -12,6 +17,8 @@ const FULL_LOGO: &str = r"   ██████╗██████╗ ██�
   ██║     ██╔══██╗██║   ██║██║╚██╔╝██║██╔══██╗
   ╚██████╗██║  ██║╚██████╔╝██║ ╚═╝ ██║██████╔╝
    ╚═════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝╚═════╝";
+
+const TAGLINE: &str = "Native when you command. Agentic when you ask.";
 
 /// Startup branding density.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,10 +42,10 @@ impl UiSettings {
     pub fn from_environment(is_terminal: bool) -> Self {
         let plain = !is_terminal || env_flag("CRUMB_PLAIN");
         let color = is_terminal && !plain && env::var_os("NO_COLOR").is_none();
-        let branding = match env::var("CRUMB_BRANDING").as_deref() {
-            Ok("full") => BrandingMode::Full,
-            Ok("off" | "none" | "disabled") => BrandingMode::Disabled,
-            _ => BrandingMode::Compact,
+        let branding = match (is_terminal, env::var("CRUMB_BRANDING").as_deref()) {
+            (false, _) | (_, Ok("off" | "none" | "disabled")) => BrandingMode::Disabled,
+            (_, Ok("compact")) => BrandingMode::Compact,
+            _ => BrandingMode::Full,
         };
         Self {
             color,
@@ -91,12 +98,86 @@ impl Renderer {
     #[must_use]
     pub fn branding(&self) -> String {
         match self.settings.branding {
-            BrandingMode::Full => self.paint(FULL_LOGO, "36"),
+            BrandingMode::Full => format!(
+                "{}\n  {}  {}",
+                self.paint(FULL_LOGO, "36"),
+                self.paint(TAGLINE, "1"),
+                self.paint("Type /help or press Tab after / and @", "2")
+            ),
             BrandingMode::Compact => {
-                self.paint("crumb • native shell, intelligently layered", "36")
+                format!(
+                    "{}  {}",
+                    self.paint("crumb", "36;1"),
+                    self.paint(TAGLINE, "2")
+                )
             }
             BrandingMode::Disabled => String::new(),
         }
+    }
+
+    /// Renders the stable context shown before a Harness turn begins.
+    #[must_use]
+    pub fn agent_header(
+        &self,
+        model: &str,
+        effort: Option<&str>,
+        mode: &str,
+        skill: Option<&str>,
+    ) -> String {
+        let mut details = vec![format!("model {model}"), format!("mode {mode}")];
+        if let Some(effort) = effort {
+            details.push(format!("effort {effort}"));
+        }
+        if let Some(skill) = skill {
+            details.push(format!("skill {skill}"));
+        }
+        format!(
+            "{} {}\n  {}",
+            self.paint("◆", "35;1"),
+            self.paint("Crumb agent", "1"),
+            self.paint(&details.join(" · "), "2")
+        )
+    }
+
+    /// Renders one committed Harness response and its bounded session metadata.
+    #[must_use]
+    pub fn agent_response(
+        &self,
+        response: &str,
+        session_id: &str,
+        event_count: usize,
+    ) -> String {
+        format!(
+            "{}\n{} {}",
+            response.trim(),
+            self.paint("─", "2"),
+            self.paint(
+                &format!("session {session_id} · {event_count} committed events"),
+                "2"
+            )
+        )
+    }
+
+    /// Renders a Harness failure without conflating it with native shell output.
+    #[must_use]
+    pub fn agent_error(&self, message: &str, cancelled: bool) -> String {
+        let (marker, title) = if cancelled {
+            ("■", "Agent cancelled")
+        } else {
+            ("!", "Agent unavailable")
+        };
+        format!(
+            "{} {}\n  {}",
+            self.paint(marker, if cancelled { "33;1" } else { "31;1" }),
+            self.paint(title, "1"),
+            self.paint(message, "2")
+        )
+    }
+
+    /// Starts a single-line terminal activity animation.
+    #[must_use]
+    pub fn activity(&self, label: &str) -> ActivityIndicator {
+        ActivityIndicator::start(label, !self.settings.plain, self.settings.color)
     }
 
     #[must_use]
@@ -124,6 +205,64 @@ impl Renderer {
             text.to_owned()
         }
     }
+}
+
+/// A best-effort activity line that always clears itself before final output.
+pub struct ActivityIndicator {
+    running: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ActivityIndicator {
+    fn start(label: &str, animated: bool, color: bool) -> Self {
+        let running = Arc::new(AtomicBool::new(animated));
+        let thread = animated.then(|| {
+            let running = Arc::clone(&running);
+            let label = label.to_owned();
+            thread::spawn(move || animate_activity(&label, color, &running))
+        });
+        Self { running, thread }
+    }
+
+    /// Stops and clears the activity line before another message is rendered.
+    pub fn finish(mut self) {
+        self.stop();
+    }
+
+    fn stop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+            clear_activity_line();
+        }
+    }
+}
+
+impl Drop for ActivityIndicator {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn animate_activity(label: &str, color: bool, running: &AtomicBool) {
+    let frames = ["[.  ]", "[.. ]", "[...]"];
+    let mut frame = 0_usize;
+    while running.load(Ordering::Acquire) {
+        let prefix = if color {
+            format!("\x1b[35m{}\x1b[0m", frames[frame])
+        } else {
+            frames[frame].to_owned()
+        };
+        let _ = write!(io::stderr(), "\r\x1b[2K{prefix} {label}  Ctrl+C to cancel");
+        let _ = io::stderr().flush();
+        frame = (frame + 1) % frames.len();
+        thread::sleep(Duration::from_millis(120));
+    }
+}
+
+fn clear_activity_line() {
+    let _ = write!(io::stderr(), "\r\x1b[2K");
+    let _ = io::stderr().flush();
 }
 
 fn append_optional_segments(segments: &mut Vec<String>, context: &PromptContext<'_>) {
@@ -238,6 +377,25 @@ mod tests {
         let branding = renderer.branding();
 
         assert!(branding.contains("██████╗"));
-        assert_eq!(branding.lines().count(), 6);
+        assert!(branding.contains(TAGLINE));
+        assert_eq!(branding.lines().count(), 7);
+    }
+
+    #[test]
+    fn agent_output_keeps_response_and_metadata_distinct() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            plain: true,
+            branding: BrandingMode::Disabled,
+        });
+
+        assert_eq!(
+            renderer.agent_header("qwen-coder", Some("high"), "auto", None),
+            "◆ Crumb agent\n  model qwen-coder · mode auto · effort high"
+        );
+        assert_eq!(
+            renderer.agent_response("done\n", "session-1", 4),
+            "done\n─ session session-1 · 4 committed events"
+        );
     }
 }

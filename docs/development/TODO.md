@@ -65,6 +65,20 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [ ] Implement live `/mode`, `/model`, `/effort`, and `/config` changes.
 - [ ] Add the installable terminal UI and binary packaging pass.
 
+## Active terminal UX pass
+
+- [x] Make the interactive startup identity use the Crumb ASCII mark and product punchline.
+- [x] Keep non-interactive output free of startup branding and animations.
+- [x] Render Harness turns with model, mode, effort, cancellation guidance, and session metadata.
+- [x] Add a self-clearing inline activity indicator for synchronous Harness turns.
+- [x] Replace flat help output with a grouped `/` command palette.
+- [x] Add read-only `/mode`, `/model`, `/effort`, `/config`, and `/plugins` surfaces.
+- [ ] Stream real Harness tool events into the renderer instead of projecting them after completion.
+- [ ] Add interactive approval, tool-call, patch, error, and completion components.
+- [ ] Add live model, effort, and mode selection backed by atomic configuration writes.
+- [ ] Add terminal-width snapshots, reduced-motion behavior, and accessibility checks.
+- [ ] Package signed standalone binaries for Linux, macOS, and Windows.
+
 ## Planned work packages
 
 - [x] [WP-012 — deterministic agent/session foundation](https://github.com/elixpo/crumb.elixpo/issues/33) ([design](agent-foundation.md)).

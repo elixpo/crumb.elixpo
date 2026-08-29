@@ -13,7 +13,8 @@ Never describe Crumb as a shell emulator or as a terminal where every command is
 ## Product routes
 
 - `/features` explains native execution, deterministic routing, Harness isolation, cancellation, sessions, permissions, and graceful failure.
-- `/skills` explains inspectable task skills, typed plugins, scoped connectors, and how to request new ecosystem capabilities.
+- `/skills` explains inspectable instructions for repeatable work and how to request a new skill.
+- `/plugins` explains typed capabilities, permission boundaries, connectors, and how to request a new plugin.
 - `/profile/connectors` is the signed-in surface for authorizing and revoking external services.
 - `/docs` contains installation, CLI, authentication, connector, and security documentation.
 
