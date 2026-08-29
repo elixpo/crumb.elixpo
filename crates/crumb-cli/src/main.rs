@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
-use crumb_core::{BuiltInCommand, HistoryAction, InputEvent};
+use crumb_auth::{
+    CredentialSource, CredentialStore, OsCredentialStore, SecretString, credential_status, login,
+};
+use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::shell_for;
@@ -24,11 +27,27 @@ use reedline::{
 const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
 
 fn main() -> Result<()> {
+    if run_command_line_action()? {
+        return Ok(());
+    }
     if run_managed_repl()? == ReplOutcome::LaunchNativeShell {
         run_native_shell()?;
     }
 
     Ok(())
+}
+
+fn run_command_line_action() -> Result<bool> {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let action = match arguments.as_slice() {
+        [] => return Ok(false),
+        [group, action] if group == "auth" && action == "login" => AuthAction::Login,
+        [group, action] if group == "auth" && action == "status" => AuthAction::Status,
+        [group, action] if group == "auth" && action == "logout" => AuthAction::Logout,
+        _ => return Err(anyhow!("usage: crumb auth <login|status|logout>")),
+    };
+    handle_auth(action, &mut io::stdout().lock())?;
+    Ok(true)
 }
 
 fn run_managed_repl() -> Result<ReplOutcome> {
@@ -89,6 +108,9 @@ fn run_managed_repl() -> Result<ReplOutcome> {
         let mut writer = stdout.lock();
 
         match event {
+            InputEvent::BuiltIn(BuiltInCommand::Auth(action)) => {
+                handle_auth(action, &mut writer)?;
+            }
             InputEvent::BuiltIn(BuiltInCommand::Exit) => {
                 shutdown_session(session)?;
                 return Ok(ReplOutcome::Exit);
@@ -176,6 +198,56 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             }
         }
     }
+}
+
+fn handle_auth(action: AuthAction, writer: &mut dyn Write) -> Result<()> {
+    match action {
+        AuthAction::Login => {
+            let store = OsCredentialStore::new()?;
+            let secret = SecretString::new(rpassword::prompt_password("Pollinations API key: ")?);
+            login(&store, &secret)?;
+            writeln!(writer, "Pollinations BYOK saved in the OS credential store")?;
+        }
+        AuthAction::Status => {
+            let environment = std::env::var("POLLINATIONS_API_KEY").ok();
+            if environment
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                writeln!(writer, "Pollinations BYOK configured (environment)")?;
+                return Ok(());
+            }
+            let store = OsCredentialStore::new()?;
+            let status = credential_status(&store, None)?;
+            match status.source {
+                Some(CredentialSource::Keyring) => {
+                    writeln!(writer, "Pollinations BYOK configured (OS credential store)")?;
+                }
+                Some(CredentialSource::Environment) => {
+                    unreachable!("handled before keyring access")
+                }
+                None => writeln!(writer, "Pollinations BYOK is not configured")?,
+            }
+        }
+        AuthAction::Logout => {
+            let store = OsCredentialStore::new()?;
+            if store.delete()? {
+                writeln!(
+                    writer,
+                    "Pollinations BYOK removed from the OS credential store"
+                )?;
+            } else {
+                writeln!(writer, "Pollinations BYOK was not stored")?;
+            }
+            if std::env::var_os("POLLINATIONS_API_KEY").is_some() {
+                writeln!(
+                    writer,
+                    "POLLINATIONS_API_KEY remains active for this process"
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn execute_foreground(
