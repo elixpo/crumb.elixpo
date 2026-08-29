@@ -11,8 +11,16 @@ Register Crumb as a confidential web client in `accounts.elixpo` with scopes
 - `http://localhost:3001/api/auth/callback` for local development.
 - `https://crumb.elixpo.com/api/auth/callback` for production.
 
-No Accounts webhook or custom scope is required for the initial connector.
-An account-deletion webhook can be added later for proactive cleanup.
+No custom Accounts scope is required. Register an Accounts lifecycle webhook:
+
+- `POST http://localhost:3001/api/webhooks/elixpo` locally.
+- `POST https://crumb.elixpo.com/api/webhooks/elixpo` in production.
+
+Subscribe it to `user.deleted`. Accounts must sign the exact request bytes as
+`HMAC-SHA256(secret, "<unix timestamp>.<body>")` and send
+`X-Elixpo-Timestamp`, `X-Elixpo-Signature: sha256=<hex>`, and a stable
+`X-Elixpo-Event-Id`. The shared secret is
+`ELIXPO_ACCOUNTS_DELETION_WEBHOOK`.
 
 Register the Pollinations application callback as:
 
@@ -27,6 +35,7 @@ Copy `crumb.elixpo/.env.local.example` to `crumb.elixpo/.env.local` and set:
 
 - `NEXT_PUBLIC_ELIXPO_CLIENT_ID`
 - `ELIXPO_CLIENT_SECRET`
+- `ELIXPO_ACCOUNTS_DELETION_WEBHOOK`
 - `POLLINATIONS_APP_KEY`
 - `CONNECTOR_ENCRYPTION_KEY` to a high-entropy server secret
 
@@ -66,3 +75,13 @@ static-assets bundle; the first deployment creates the Worker service.
 
 Only `http://localhost:3000/auth/connector/callback` and its `127.0.0.1`
 equivalent are accepted as terminal callbacks.
+
+## Backend route contract
+
+- `GET /api/auth/login` and `GET /api/auth/callback` — Accounts handshake.
+- `POST /api/webhooks/elixpo` — signed Accounts deletion hook.
+- `GET /api/integrations/pollinations/connect` — start Pollinations PKCE.
+- `GET /api/integrations/pollinations/callback` — mint and encrypt the scoped connector.
+- `POST /api/terminal/exchange` — consume the terminal's one-time PKCE grant.
+
+Frontend work is deferred until the harness, token optimizers, and CLI UI land.

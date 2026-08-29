@@ -21,7 +21,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Current milestone: [WP-011 — browser account connector](https://github.com/elixpo/crumb.elixpo/issues/26)
 
-- [x] Add the Next.js Cloudflare Pages surface and Lixrl-inspired UI.
+- [x] Add the minimal Next.js Cloudflare Worker surface.
 - [x] Add Elixpo Accounts sign-in with `openid profile email`.
 - [x] Adapt the Pollinations PKCE connector.
 - [x] Restrict terminal redirects to loopback port 3000.
@@ -29,7 +29,8 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Encrypt provider tokens at rest in D1.
 - [x] Replace pasted-key login with the browser connection flow.
 - [x] Keep the OS keyring as the terminal credential boundary.
-- [ ] Configure local D1, KV, and `.env.local` credentials.
+- [x] Configure local D1, KV, and `.env.local` credentials.
+- [ ] Register and validate the signed Accounts deletion webhook.
 - [ ] Validate the browser-to-terminal flow.
 - [ ] Pass Rust and web checks.
 - [ ] Merge WP-011.
@@ -51,8 +52,10 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Planned work packages
 
-- [ ] [DeepSeek Harness + RTK/token optimizers](https://github.com/elixpo/crumb.elixpo/issues/22).
+- [ ] [DeepSeek Harness + RTK/token optimizers](https://github.com/elixpo/crumb.elixpo/issues/22): harness first, optimizers second.
 - [ ] [Skills and natural-language routing](https://github.com/elixpo/crumb.elixpo/issues/25).
+- [ ] Refine the CLI UI after the harness and optimizers.
+- [ ] Resume the `crumb.elixpo` web UI after the CLI UI.
 - [ ] WP-011 — streamed AI question mode.
 
 Later work packages remain defined in the [master plan](../product/master-plan.md). Only the current and immediately upcoming package should be expanded into implementation-level tasks.
