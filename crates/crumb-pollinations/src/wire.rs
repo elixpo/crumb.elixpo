@@ -275,7 +275,7 @@ fn find_event_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
     let crlf = bytes.windows(4).position(|window| window == b"\r\n\r\n");
     match (lf, crlf) {
         (Some(left), Some(right)) if left <= right => Some((left, 2)),
-        (Some(_), Some(right)) | (None, Some(right)) => Some((right, 4)),
+        (Some(_) | None, Some(right)) => Some((right, 4)),
         (Some(left), None) => Some((left, 2)),
         (None, None) => None,
     }

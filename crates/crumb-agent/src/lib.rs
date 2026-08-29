@@ -14,7 +14,7 @@ pub mod tools;
 pub use approvals::{ApprovalInbox, InteractiveApprovalBroker, PendingApproval, approval_channel};
 pub use config::{
     AgentConfig, AgentLimits, AgentMode, HarnessConfig, LiveConfig, MistakePolicy, Modality,
-    ModelRoute, StructuredEncoding,
+    ModelRoute, StructuredEncoding, ToolPermissions,
 };
 pub use harness::{HarnessTurnRequest, ModelCapabilities};
 pub use routing::{
@@ -25,7 +25,7 @@ pub use session::{
     TurnStatus, list_sessions, session_summary,
 };
 pub use tools::{
-    ApprovalBroker, ApprovalDecision, ApprovalRequest, DenyAllApprovals, McpServer, OutputKind,
-    RiskClass, TokenOptimizer, ToolCallError, ToolCallErrorKind, ToolDescriptor, ToolHandler,
-    ToolHost, ToolOutput, ToolRegistry, ToolTransport,
+    ApprovalBroker, ApprovalDecision, ApprovalRequest, ConfiguredApprovals, DenyAllApprovals,
+    McpServer, OutputKind, RiskClass, TokenOptimizer, ToolCallError, ToolCallErrorKind,
+    ToolDescriptor, ToolHandler, ToolHost, ToolOutput, ToolRegistry, ToolTransport,
 };

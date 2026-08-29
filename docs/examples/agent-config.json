@@ -46,6 +46,9 @@
   },
   "skills": [],
   "mcp_servers": [],
+  "permissions": {
+    "allow_network_tools": ["web_search"]
+  },
   "optimizers": [
     { "id": "rtk", "command": "rtk", "arguments": [], "enabled": true }
   ]

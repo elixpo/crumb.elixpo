@@ -1,6 +1,7 @@
 //! Provider-neutral tools, MCP transports, and output optimization contracts.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
@@ -125,6 +126,34 @@ impl ApprovalBroker for DenyAllApprovals {
         _cancellation: &CancellationToken,
     ) -> ApprovalDecision {
         ApprovalDecision::Deny
+    }
+}
+
+/// Approval policy derived only from explicit user configuration.
+#[derive(Clone, Debug, Default)]
+pub struct ConfiguredApprovals {
+    network_tools: BTreeSet<String>,
+}
+
+impl ConfiguredApprovals {
+    #[must_use]
+    pub fn new(network_tools: BTreeSet<String>) -> Self {
+        Self { network_tools }
+    }
+}
+
+impl ApprovalBroker for ConfiguredApprovals {
+    fn decide(
+        &self,
+        request: &ApprovalRequest,
+        _arguments: &serde_json::Value,
+        _cancellation: &CancellationToken,
+    ) -> ApprovalDecision {
+        if request.risk == RiskClass::NetworkAccess && self.network_tools.contains(&request.tool) {
+            ApprovalDecision::AllowOnce
+        } else {
+            ApprovalDecision::Deny
+        }
     }
 }
 
@@ -355,6 +384,7 @@ pub trait TokenOptimizer: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use anyhow::Result;
@@ -362,9 +392,9 @@ mod tests {
     use crate::{AgentMode, CancellationToken};
 
     use super::{
-        ApprovalBroker, ApprovalDecision, ApprovalRequest, DenyAllApprovals, RiskClass,
-        ToolCallErrorKind, ToolDescriptor, ToolHandler, ToolHost, ToolOutput, ToolRegistry,
-        ToolTransport,
+        ApprovalBroker, ApprovalDecision, ApprovalRequest, ConfiguredApprovals, DenyAllApprovals,
+        RiskClass, ToolCallErrorKind, ToolDescriptor, ToolHandler, ToolHost, ToolOutput,
+        ToolRegistry, ToolTransport,
     };
 
     #[test]
@@ -444,6 +474,36 @@ mod tests {
             )
             .expect_err("plan mode denies tools");
         assert_eq!(error.kind, ToolCallErrorKind::Denied);
+    }
+
+    #[test]
+    fn configured_network_grant_is_exact_and_risk_scoped() {
+        let approvals = ConfiguredApprovals::new(BTreeSet::from(["web_search".to_owned()]));
+        let request = ApprovalRequest {
+            tool: "web_search".to_owned(),
+            risk: RiskClass::NetworkAccess,
+            arguments_digest: "digest".to_owned(),
+        };
+        assert_eq!(
+            approvals.decide(
+                &request,
+                &serde_json::json!({}),
+                &CancellationToken::default()
+            ),
+            ApprovalDecision::AllowOnce
+        );
+        let write_request = ApprovalRequest {
+            risk: RiskClass::WriteWorkspace,
+            ..request
+        };
+        assert_eq!(
+            approvals.decide(
+                &write_request,
+                &serde_json::json!({}),
+                &CancellationToken::default()
+            ),
+            ApprovalDecision::Deny
+        );
     }
 
     fn descriptor(risk: RiskClass) -> ToolDescriptor {

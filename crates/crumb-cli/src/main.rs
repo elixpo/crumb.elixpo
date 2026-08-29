@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crumb_agent::{
-    AgentConfig, AgentMode, CancellationToken, CommandCatalog, DenyAllApprovals, HarnessConfig,
+    AgentConfig, AgentMode, CancellationToken, CommandCatalog, ConfiguredApprovals, HarnessConfig,
     InputRoute, LiveConfig, MistakePolicy, Modality, RouteDecision, ToolHost, TurnStatus,
     UnknownInputPolicy, list_sessions, session_summary,
 };
@@ -21,6 +21,7 @@ use crumb_mcp::{McpDispatcher, serve_stdio};
 use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::shell_for;
 use crumb_platform::Platform;
+use crumb_pollinations::{PollinationsSearchConfig, register_web_search_tool};
 use crumb_pty::{PtyInput, PtyResizer, SystemPty, TerminalSize};
 use crumb_repl::{ReplOutcome, read_classified_line};
 use crumb_tools::{WorkspaceToolLimits, register_workspace_read_tools};
@@ -75,10 +76,13 @@ fn run_command_line_action() -> Result<bool> {
 fn serve_mcp() -> Result<()> {
     let workspace = current_process_dir()?;
     let config = read_agent_config(&workspace)?;
-    let host = workspace_read_host(&workspace, &config)?;
+    let search_api_key = std::env::var("POLLINATIONS_API_KEY").ok();
+    let host = workspace_read_host(&workspace, &config, search_api_key)?;
     let dispatcher = McpDispatcher::new(
         host,
-        Arc::new(DenyAllApprovals),
+        Arc::new(ConfiguredApprovals::new(
+            config.permissions.allow_network_tools,
+        )),
         config.mode,
         env!("CARGO_PKG_VERSION"),
     );
@@ -91,7 +95,11 @@ fn serve_mcp() -> Result<()> {
     )
 }
 
-fn workspace_read_host(workspace: &Path, config: &AgentConfig) -> Result<ToolHost> {
+fn workspace_read_host(
+    workspace: &Path,
+    config: &AgentConfig,
+    search_api_key: Option<String>,
+) -> Result<ToolHost> {
     let max_output_bytes = usize::try_from(config.limits.max_output_bytes)
         .map_err(|_| anyhow!("max_output_bytes exceeds this platform's address space"))?;
     let max_directory_entries = usize::try_from(config.limits.max_directory_entries)
@@ -105,6 +113,19 @@ fn workspace_read_host(workspace: &Path, config: &AgentConfig) -> Result<ToolHos
             max_directory_entries,
         },
     )?;
+    if let Some(route) = config
+        .models
+        .get(&Modality::WebSearch)
+        .and_then(|routes| routes.first())
+        && route.provider == "pollinations"
+        && let Some(api_key) = search_api_key
+        && !api_key.trim().is_empty()
+    {
+        register_web_search_tool(
+            &mut host,
+            PollinationsSearchConfig::new(api_key, max_output_bytes)?.with_model(&route.model),
+        )?;
+    }
     Ok(host)
 }
 
@@ -1229,7 +1250,7 @@ mod tests {
     #[test]
     fn stdio_mcp_host_exposes_only_read_tools() {
         let workspace = std::env::current_dir().expect("current directory is available");
-        let host = workspace_read_host(&workspace, &AgentConfig::default())
+        let host = workspace_read_host(&workspace, &AgentConfig::default(), None)
             .expect("workspace tools are registered");
         let tools = host.tools().collect::<Vec<_>>();
         assert_eq!(tools.len(), 2);

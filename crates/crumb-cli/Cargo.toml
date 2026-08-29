@@ -18,6 +18,7 @@ crumb-harness-dsh = { path = "../crumb-harness-dsh" }
 crumb-mcp = { path = "../crumb-mcp" }
 crumb-native = { path = "../crumb-native" }
 crumb-platform = { path = "../crumb-platform" }
+crumb-pollinations = { path = "../crumb-pollinations" }
 crumb-pty = { path = "../crumb-pty" }
 crumb-repl = { path = "../crumb-repl" }
 crumb-tools = { path = "../crumb-tools" }

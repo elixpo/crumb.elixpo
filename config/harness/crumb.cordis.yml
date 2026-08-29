@@ -63,7 +63,8 @@
     command: !!js process.env.CRUMB_MCP_COMMAND
     args: ['mcp', 'serve']
     cwd: !!js process.env.DSH_CWD
-    env: {}
+    env:
+      POLLINATIONS_API_KEY: !!js process.env.POLLINATIONS_API_KEY
     failOnStartupError: true
     reconnect:
       enabled: false

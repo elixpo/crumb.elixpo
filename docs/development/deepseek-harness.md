@@ -30,7 +30,18 @@ The executable composition is
 It supplies `POLLINATIONS_API_KEY` transiently from Crumb's credential boundary;
 the key is never written into Cordis or agent configuration. The composition
 uses the generic `llm-pi-ai` OpenAI-compatible route for `nova-fast` and
-`qwen-coder`, and contains no Harness-native shell or filesystem tool rows.
+`qwen-coder`, with optional `Circuit-Overtime/OreoLook` reasoning and
+`perplexity` search routes. It contains no Harness-native shell or filesystem
+tool rows.
+
+## Web search permission
+
+The MCP server exposes `web_search` only when a Pollinations web-search model
+and a process-scoped credential are available. The tool is always classified as
+`network_access`. It runs only when the user-owned agent configuration includes
+`"permissions": {"allow_network_tools": ["web_search"]}`; model output cannot
+add or widen that grant. Requests, response bytes, and execution time are
+bounded, and Ctrl+C cancels the in-flight HTTP future.
 
 ## Failure and cancellation
 

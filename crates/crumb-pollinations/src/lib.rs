@@ -1,6 +1,9 @@
 //! Pollinations-specific configuration and wire protocol adapter.
 
+mod search;
 mod wire;
+
+pub use search::{PollinationsSearchConfig, register_web_search_tool};
 
 use std::collections::VecDeque;
 use std::fmt;

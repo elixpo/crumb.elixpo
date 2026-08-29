@@ -74,6 +74,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Replace flat help output with a grouped `/` command palette.
 - [x] Add read-only `/mode`, `/model`, `/effort`, `/config`, and `/plugins` surfaces.
 - [x] Stream real Harness notifications into the renderer instead of projecting them after completion.
+- [x] Expose bounded Pollinations web search through MCP with an explicit network-tool grant.
 - [ ] Add queued steering and richer tool-specific event projection to the Harness stream.
 - [ ] Add interactive approval, tool-call, patch, error, and completion components.
 - [ ] Add live model, effort, and mode selection backed by atomic configuration writes.

@@ -1,6 +1,6 @@
 //! Live, user-editable agent configuration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -139,6 +139,14 @@ pub struct OptimizerConfig {
     pub enabled: bool,
 }
 
+/// User-owned grants for tools that cross a trust boundary.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolPermissions {
+    /// Network tools allowed without an interactive approval bridge.
+    pub allow_network_tools: BTreeSet<String>,
+}
+
 /// Complete live configuration. Secrets are deliberately not representable.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -156,6 +164,7 @@ pub struct AgentConfig {
     pub skills: Vec<SkillConfig>,
     pub mcp_servers: Vec<crate::tools::McpServer>,
     pub optimizers: Vec<OptimizerConfig>,
+    pub permissions: ToolPermissions,
 }
 
 impl AgentConfig {
@@ -202,6 +211,14 @@ impl AgentConfig {
         }) {
             bail!("optimizers require an identifier and command");
         }
+        if self
+            .permissions
+            .allow_network_tools
+            .iter()
+            .any(|tool| !valid_identifier(tool))
+        {
+            bail!("network permission entries must be valid tool identifiers");
+        }
         Ok(())
     }
 
@@ -213,6 +230,14 @@ impl AgentConfig {
             .as_deref()
             .or(self.reasoning_effort.as_deref())
     }
+}
+
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
 fn validate_effort(effort: Option<&str>) -> Result<()> {
