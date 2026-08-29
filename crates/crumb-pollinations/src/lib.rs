@@ -384,3 +384,6 @@ mod tests {
         assert!(server.retryable);
     }
 }
+
+#[cfg(test)]
+mod http_tests;
