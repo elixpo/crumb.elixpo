@@ -1,0 +1,27 @@
+# Crumb — Natural Language Terminal
+
+> Crumb is a native-first terminal that runs Bash, Zsh, and PowerShell commands normally and invokes models, skills, and tools only for explicit natural-language work.
+
+Canonical site: https://crumb.elixpo.com
+Source: https://github.com/elixpo/crumb.elixpo
+
+## Documentation
+
+- [Overview](https://crumb.elixpo.com/docs): Product boundaries, capabilities, and quick reference.
+- [Getting started](https://crumb.elixpo.com/docs/getting-started): Requirements, source installation, and first native session.
+- [CLI and native shell](https://crumb.elixpo.com/docs/cli): Native command behavior, built-ins, and the natural-language boundary.
+- [Authentication](https://crumb.elixpo.com/docs/authentication): Elixpo Accounts sign-in and CLI device authorization.
+- [Connect Pollinations](https://crumb.elixpo.com/docs/pollinations): Browser provider connection through Profiles.
+- [Security model](https://crumb.elixpo.com/docs/security): Shell ownership, agent isolation, permissions, secrets, and failure behavior.
+
+## Important constraints
+
+- Normal commands never require AI.
+- Shell and agent execution environments are separate.
+- Models cannot grant themselves permissions.
+- Secrets are not placed in logs or terminal history.
+- Provider failures cannot make the native terminal unusable.
+
+## Current status
+
+Crumb is pre-release software. The native shell and secure account/connector foundations are implemented; the complete natural-language agent harness is still under development.
