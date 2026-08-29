@@ -11,8 +11,8 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Implement `:exit`, `:version`, and `:platform`.
 - [x] Classify all other input as `NativeInput` without executing it.
 - [x] Add unit tests and cross-platform GitHub Actions.
-- [ ] Pass formatting, clippy, and workspace tests.
-- [ ] Merge WP-001.
+- [x] Pass formatting, clippy, and workspace tests.
+- [x] Publish WP-001 to `main`.
 
 ## Planned work packages
 
