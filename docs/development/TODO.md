@@ -13,20 +13,20 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [ ] [WP-004 — Windows PowerShell parity](https://github.com/elixpo/crumb.elixpo/issues/8) ([PR #9](https://github.com/elixpo/crumb.elixpo/pull/9))
 - [ ] [WP-005 — shell lifecycle protocol](https://github.com/elixpo/crumb.elixpo/issues/10) ([PR #12](https://github.com/elixpo/crumb.elixpo/pull/12))
 - [ ] [WP-006 — terminal UI layer](https://github.com/elixpo/crumb.elixpo/issues/13) ([PR #14](https://github.com/elixpo/crumb.elixpo/pull/14))
+- [ ] [WP-007 — persistent history](https://github.com/elixpo/crumb.elixpo/issues/15) ([PR #17](https://github.com/elixpo/crumb.elixpo/pull/17))
 
-## Current milestone: [WP-007 — persistent history](https://github.com/elixpo/crumb.elixpo/issues/15)
+## Current milestone: [Terminal parity gate](https://github.com/elixpo/crumb.elixpo/issues/16)
 
-- [x] Add an isolated `crumb-history` crate.
-- [x] Persist history in local SQLite.
-- [x] Store command, cwd, platform/mode, exit status, and timestamp.
-- [x] Exclude empty and likely sensitive commands.
-- [x] Provide recent and literal text-search queries.
-- [x] Integrate recording into managed native execution.
-- [x] Add `:history` and `:history search` built-ins.
-- [x] Provide interactive Ctrl+R search.
-- [x] Add migration and persistence tests.
+- [ ] Make the managed PTY input stream safely shareable during execution.
+- [ ] Relay terminal input to foreground commands without `:shell`.
+- [ ] Forward terminal resize events while commands run.
+- [ ] Make Ctrl+C interrupt the foreground command without exiting Crumb.
+- [ ] Run interactive and full-screen TTY programs as ordinary commands.
+- [ ] Preserve shell state and completion metadata after interactive commands.
+- [ ] Cover Linux Bash, macOS Zsh, and Windows PowerShell behavior.
+- [ ] Remove terminal compatibility as a reason to use `:shell`.
 - [ ] Pass formatting, clippy, and workspace tests.
-- [ ] Merge WP-007.
+- [ ] Merge the terminal parity gate.
 
 <details>
 <summary>WP-001 completion details</summary>
@@ -45,7 +45,6 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Planned work packages
 
-- [ ] [Terminal parity gate — run interactive commands without `:shell`](https://github.com/elixpo/crumb.elixpo/issues/16).
 - [ ] WP-008 — provider-neutral LLM interface.
 - [ ] WP-009 — Pollinations adapter.
 - [ ] WP-010 — secure authentication.
