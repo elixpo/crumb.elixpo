@@ -60,9 +60,14 @@ pub fn run<R: BufRead, W: Write>(
             InputEvent::BuiltIn(BuiltInCommand::Exit) => return Ok(ReplOutcome::Exit),
             InputEvent::BuiltIn(BuiltInCommand::Platform) => writeln!(writer, "{platform}")?,
             InputEvent::BuiltIn(BuiltInCommand::Shell) => {
+                let shell_name = match platform {
+                    Platform::Linux => "Bash",
+                    Platform::MacOs => "Zsh",
+                    Platform::Windows => "PowerShell",
+                };
                 writeln!(
                     writer,
-                    "entering native Bash through crumb (type `exit` to leave crumb)"
+                    "entering native {shell_name} through crumb (type `exit` to leave crumb)"
                 )?;
                 writer.flush()?;
                 return Ok(ReplOutcome::LaunchNativeShell);
