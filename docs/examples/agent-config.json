@@ -1,0 +1,39 @@
+{
+  "mode": "negotiate",
+  "mistakes": "prompt",
+  "structured_encoding": "auto",
+  "limits": {
+    "max_steps": 24,
+    "max_tool_calls": 48,
+    "max_wall_time_seconds": 900,
+    "max_context_tokens": 64000,
+    "max_output_bytes": 1048576,
+    "max_shell_command_seconds": 300,
+    "max_file_write_bytes": 1048576
+  },
+  "harness": {
+    "kind": "process",
+    "command": "dsh-jsonrpc-agent",
+    "arguments": []
+  },
+  "models": {
+    "text": [
+      { "provider": "pollinations", "model": "nova-fast" },
+      { "provider": "pollinations", "model": "qwen-coder" }
+    ],
+    "image": [
+      { "provider": "pollinations", "model": "flux" },
+      { "provider": "pollinations", "model": "klein" }
+    ],
+    "video": [{ "provider": "pollinations", "model": "wan-fast" }],
+    "audio": [{ "provider": "pollinations", "model": "elevenflash" }],
+    "three_d": [{ "provider": "pollinations", "model": "trellis-2" }],
+    "transcription": [{ "provider": "pollinations", "model": "whisper" }],
+    "embeddings": [{ "provider": "pollinations", "model": "openai-3-small" }]
+  },
+  "skills": [],
+  "mcp_servers": [],
+  "optimizers": [
+    { "id": "rtk", "command": "rtk", "arguments": [], "enabled": true }
+  ]
+}

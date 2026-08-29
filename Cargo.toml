@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/crumb-agent",
     "crates/crumb-auth",
     "crates/crumb-cli",
     "crates/crumb-core",
