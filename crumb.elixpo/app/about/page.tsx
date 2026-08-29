@@ -1,0 +1,5 @@
+import type { Metadata } from 'next'
+import { InfoPage } from '@/app/components/InfoPage'
+
+export const metadata: Metadata = { title: 'About', description: 'Why Crumb is building a native-first Natural Language Terminal.' }
+export default function AboutPage() { return <InfoPage eyebrow="About Crumb" title="A terminal that earns your trust." intro="Crumb adds natural language to the command line without taking the command line away from you."><h2>Native first</h2><p>Normal commands do not need AI. Your chosen shell retains ownership of its semantics, environment, processes, and state.</p><h2>Intelligence with boundaries</h2><p>AI work happens through replaceable skills and an isolated execution environment. Models cannot expand their own permissions, and a failed provider never makes the terminal unusable.</p><h2>Built in the open</h2><p>Crumb is developed as open-source terminal infrastructure by Elixpo. Design discussions, issues, and source code are public on GitHub.</p></InfoPage> }

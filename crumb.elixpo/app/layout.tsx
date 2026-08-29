@@ -1,15 +1,38 @@
 import type { Metadata } from 'next'
+import { Geist, Geist_Mono } from 'next/font/google'
 import './globals.css'
 
+const sans = Geist({ subsets: ['latin'], variable: '--font-sans' })
+const mono = Geist_Mono({ subsets: ['latin'], variable: '--font-mono' })
+const siteUrl = 'https://crumb.elixpo.com'
+const title = 'Crumb — The Natural Language Terminal'
+const description = 'A native-first terminal that runs shell commands normally and brings in models, skills, and tools only when you ask.'
+
 export const metadata: Metadata = {
-  title: 'Crumb — your terminal, intelligently layered',
-  description: 'A native shell with an optional intelligence layer.',
-  icons: {
-    icon: '/favicon.ico',
-    shortcut: '/favicon.ico',
-  },
+  metadataBase: new URL(siteUrl),
+  title: { default: title, template: '%s · Crumb' },
+  description,
+  applicationName: 'Crumb LNT',
+  keywords: ['natural language terminal', 'AI terminal', 'shell', 'developer tools', 'Crumb'],
+  authors: [{ name: 'Elixpo', url: 'https://elixpo.com' }],
+  creator: 'Elixpo',
+  publisher: 'Elixpo',
+  alternates: { canonical: '/' },
+  manifest: '/manifest.webmanifest',
+  robots: { index: true, follow: true },
+  openGraph: { type: 'website', url: siteUrl, siteName: 'Crumb LNT', title, description },
+  twitter: { card: 'summary', title, description },
+  icons: { icon: '/favicon.ico', shortcut: '/favicon.ico' },
+  formatDetection: { telephone: false },
 }
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  return <html lang="en"><body>{children}</body></html>
+  const software = {
+    '@context': 'https://schema.org', '@type': 'SoftwareApplication', name: 'Crumb',
+    alternateName: 'Crumb LNT', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows',
+    description, url: siteUrl, codeRepository: 'https://github.com/elixpo/crumb.elixpo',
+  }
+  return <html lang="en" className={`${sans.variable} ${mono.variable}`}>
+    <body>{children}<script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(software) }} /></body>
+  </html>
 }
