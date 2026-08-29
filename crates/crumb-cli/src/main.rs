@@ -24,7 +24,7 @@ fn main() -> Result<()> {
 
 fn run_native_shell() -> Result<()> {
     let (cols, rows) = size()?;
-    let shell = shell_for(Platform::current())?;
+    let shell = shell_for(Platform::current());
     let mut process = shell.spawn(&SystemPty, TerminalSize::new(rows, cols))?;
     let mut reader = process.try_clone_reader()?;
     let mut writer = process.take_writer()?;
