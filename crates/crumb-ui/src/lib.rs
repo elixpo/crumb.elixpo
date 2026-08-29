@@ -117,7 +117,7 @@ impl Renderer {
         format!("╭─[ {} ]\n╰─❯ ", segments.join(" ]─[ "))
     }
 
-    fn paint(&self, text: &str, color: &str) -> String {
+    fn paint(self, text: &str, color: &str) -> String {
         if self.settings.color {
             format!("\x1b[{color}m{text}\x1b[0m")
         } else {
