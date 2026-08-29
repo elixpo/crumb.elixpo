@@ -36,7 +36,7 @@ futures-util = "0.3.34"
 getrandom = "0.4.3"
 keyring = "4.1.6"
 portable-pty = "0.9.0"
-reqwest = { version = "0.13.4", features = ["blocking", "json", "stream"] }
+reqwest = { version = "0.13.4", features = ["blocking", "form", "json", "stream"] }
 reedline = { version = "0.51.0", default-features = false }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustix = { version = "1.1.4", features = ["event"] }
