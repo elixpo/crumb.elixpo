@@ -1,5 +1,5 @@
 import Link from 'next/link'
-import { GitHubIcon } from './GitHubIcon'
+import { FooterActions } from './FooterActions'
 
 const REPO = 'https://github.com/elixpo/crumb.elixpo'
 
@@ -9,7 +9,7 @@ export function SiteFooter() {
       <div className="footer-brand">
         <p className="kicker">Natural Language Terminal</p>
         <h2>Native when you type.<br />Intelligent when you ask.</h2>
-        <a className="github-pill dark" href={REPO} target="_blank" rel="noreferrer"><GitHubIcon /> View source</a>
+        <FooterActions />
       </div>
       <div><h3>Product</h3><Link href="/profile/connectors">Connectors</Link><Link href="/docs">Documentation</Link><a href={`${REPO}/releases`}>Releases</a></div>
       <div><h3>Project</h3><Link href="/about">About</Link><a href={`${REPO}/issues`}>Issues</a><a href="https://status.elixpo.com">Status</a></div>
