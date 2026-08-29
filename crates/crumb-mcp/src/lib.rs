@@ -49,19 +49,18 @@ impl McpDispatcher {
     /// parse and protocol errors.
     #[must_use]
     pub fn handle_line(&self, line: &str, cancellation: &CancellationToken) -> Option<Vec<u8>> {
-        let value = match serde_json::from_str::<Value>(line) {
-            Ok(value) => value,
-            Err(_) => return Some(response_error(Value::Null, -32700, "parse error")),
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return Some(response_error(&Value::Null, -32700, "parse error"));
         };
         let Some(object) = value.as_object() else {
-            return Some(response_error(Value::Null, -32600, "invalid request"));
+            return Some(response_error(&Value::Null, -32600, "invalid request"));
         };
         let id = object.get("id").cloned();
         if object.get("jsonrpc").and_then(Value::as_str) != Some(JSON_RPC_VERSION) {
-            return id.map(|id| response_error(id, -32600, "invalid request"));
+            return id.map(|id| response_error(&id, -32600, "invalid request"));
         }
         let Some(method) = object.get("method").and_then(Value::as_str) else {
-            return id.map(|id| response_error(id, -32600, "invalid request"));
+            return id.map(|id| response_error(&id, -32600, "invalid request"));
         };
         let params = object.get("params").unwrap_or(&Value::Null);
         let Some(id) = id else {
@@ -71,12 +70,12 @@ impl McpDispatcher {
             return None;
         };
         Some(match method {
-            "server/discover" => response_result(id, self.discovery()),
-            "initialize" => self.initialize(id, params),
-            "ping" => response_result(id, json!({})),
-            "tools/list" => response_result(id, self.list_tools()),
-            "tools/call" => self.call_tool(id, params, cancellation),
-            _ => response_error(id, -32601, "method not found"),
+            "server/discover" => response_result(&id, &self.discovery()),
+            "initialize" => self.initialize(&id, params),
+            "ping" => response_result(&id, &json!({})),
+            "tools/list" => response_result(&id, &self.list_tools()),
+            "tools/call" => self.call_tool(&id, params, cancellation),
+            _ => response_error(&id, -32601, "method not found"),
         })
     }
 
@@ -88,14 +87,14 @@ impl McpDispatcher {
         })
     }
 
-    fn initialize(&self, id: Value, params: &Value) -> Vec<u8> {
+    fn initialize(&self, id: &Value, params: &Value) -> Vec<u8> {
         let requested = params.get("protocolVersion").and_then(Value::as_str);
         if requested != Some(LEGACY_PROTOCOL) {
             return response_error(id, -32602, "unsupported protocol version");
         }
         response_result(
             id,
-            json!({
+            &json!({
                 "protocolVersion": LEGACY_PROTOCOL,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "crumb", "version": self.server_version}
@@ -120,7 +119,7 @@ impl McpDispatcher {
         json!({"tools": tools})
     }
 
-    fn call_tool(&self, id: Value, params: &Value, cancellation: &CancellationToken) -> Vec<u8> {
+    fn call_tool(&self, id: &Value, params: &Value, cancellation: &CancellationToken) -> Vec<u8> {
         let Some(name) = params.get("name").and_then(Value::as_str) else {
             return response_error(id, -32602, "tool name is required");
         };
@@ -138,13 +137,13 @@ impl McpDispatcher {
             self.approvals.as_ref(),
             cancellation,
         ) {
-            Ok(output) => response_result(id, tool_result(output)),
+            Ok(output) => response_result(id, &tool_result(output)),
             Err(error) if error.kind == ToolCallErrorKind::UnknownTool => {
                 response_error(id, -32602, "unknown tool")
             }
             Err(error) => response_result(
                 id,
-                json!({
+                &json!({
                     "content": [{"type":"text", "text":error.to_string()}],
                     "isError": true
                 }),
@@ -203,20 +202,20 @@ fn tool_result(output: crumb_agent::ToolOutput) -> Value {
     Value::Object(result)
 }
 
-fn response_result(id: Value, result: Value) -> Vec<u8> {
-    encode(json!({"jsonrpc":JSON_RPC_VERSION,"id":id,"result":result}))
+fn response_result(id: &Value, result: &Value) -> Vec<u8> {
+    encode(&json!({"jsonrpc":JSON_RPC_VERSION,"id":id,"result":result}))
 }
 
-fn response_error(id: Value, code: i64, message: &str) -> Vec<u8> {
-    encode(json!({
+fn response_error(id: &Value, code: i64, message: &str) -> Vec<u8> {
+    encode(&json!({
         "jsonrpc":JSON_RPC_VERSION,
         "id":id,
         "error":{"code":code,"message":message}
     }))
 }
 
-fn encode(value: Value) -> Vec<u8> {
-    let mut encoded = serde_json::to_vec(&value).unwrap_or_else(|_| {
+fn encode(value: &Value) -> Vec<u8> {
+    let mut encoded = serde_json::to_vec(value).unwrap_or_else(|_| {
         b"{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"internal error\"}}".to_vec()
     });
     encoded.push(b'\n');
@@ -263,7 +262,7 @@ mod tests {
         let dispatcher = dispatcher(AgentMode::Auto, RiskClass::ReadOnly);
         let cancellation = CancellationToken::default();
         let initialize = response(
-            dispatcher
+            &dispatcher
                 .handle_line(
                     r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}"#,
                     &cancellation,
@@ -273,7 +272,7 @@ mod tests {
         assert_eq!(initialize["result"]["protocolVersion"], "2025-11-25");
 
         let discovery = response(
-            dispatcher
+            &dispatcher
                 .handle_line(
                     r#"{"jsonrpc":"2.0","id":2,"method":"server/discover","params":{}}"#,
                     &cancellation,
@@ -287,7 +286,7 @@ mod tests {
     fn read_only_tool_runs_in_auto_mode() {
         let dispatcher = dispatcher(AgentMode::Auto, RiskClass::ReadOnly);
         let result = response(
-            dispatcher
+            &dispatcher
                 .handle_line(
                     r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fixture","arguments":{}}}"#,
                     &CancellationToken::default(),
@@ -302,7 +301,7 @@ mod tests {
     fn plan_mode_returns_a_tool_error_without_execution() {
         let dispatcher = dispatcher(AgentMode::Plan, RiskClass::ReadOnly);
         let result = response(
-            dispatcher
+            &dispatcher
                 .handle_line(
                     r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fixture","arguments":{}}}"#,
                     &CancellationToken::default(),
@@ -347,8 +346,8 @@ mod tests {
         McpDispatcher::new(host, Arc::new(DenyAllApprovals), mode, "test")
     }
 
-    fn response(encoded: Vec<u8>) -> serde_json::Value {
-        serde_json::from_slice(&encoded).expect("response is valid JSON")
+    fn response(encoded: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(encoded).expect("response is valid JSON")
     }
 
     struct FixtureHandler;

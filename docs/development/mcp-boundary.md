@@ -20,9 +20,18 @@ Harness client, and the stateless `2026-07-28` discovery shape.
 Tool annotations are derived from trusted Rust metadata. Model-provided or
 third-party annotations never change Crumb's risk class or approval decision.
 
+## Workspace reads
+
+`crumb-tools` supplies `read_file` and `list_directory` as native, read-only
+tools. The host canonicalizes the workspace and every requested target before
+access, so parent traversal and symlink escapes are rejected. Callers provide
+the output-byte and directory-entry ceilings; tool arguments may only lower
+those limits. Results are sorted where applicable, UTF-8 only, bounded, and
+share the session cancellation token.
+
 ## Next slices
 
-1. Workspace-confined read and directory-list tools.
+1. [x] Workspace-confined read and directory-list tools.
 2. Isolated shell execution with output/time ceilings.
 3. Interactive allow-once approval bridge for negotiate mode.
 4. `crumb mcp serve` entry point and Harness Cordis composition.

@@ -591,6 +591,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crumb-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crumb-agent",
+ "serde_json",
+]
+
+[[package]]
 name = "crumb-ui"
 version = "0.1.0"
 dependencies = [

@@ -13,6 +13,7 @@ members = [
     "crates/crumb-pollinations",
     "crates/crumb-pty",
     "crates/crumb-repl",
+    "crates/crumb-tools",
     "crates/crumb-ui",
 ]
 resolver = "2"
