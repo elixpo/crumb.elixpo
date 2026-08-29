@@ -64,5 +64,5 @@ static-assets bundle; the first deployment creates the Worker service.
 4. Crumb exchanges the code with its verifier and stores the returned token in
    the OS keyring.
 
-Only `http://localhost:3000/auth/callback` and its `127.0.0.1` equivalent are
-accepted as terminal callbacks.
+Only `http://localhost:3000/auth/connector/callback` and its `127.0.0.1`
+equivalent are accepted as terminal callbacks.

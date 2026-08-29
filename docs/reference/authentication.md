@@ -11,7 +11,7 @@ crumb auth logout
 The same actions are available inside Crumb as `:auth login`, `:auth status`,
 and `:auth logout`. Login opens the Crumb account site, completes Elixpo
 Accounts and Pollinations authorization, and returns a one-time code to
-`http://localhost:3000/auth/callback`.
+`http://localhost:3000/auth/connector/callback`.
 
 The callback URL never contains the Pollinations credential. Crumb exchanges
 the short-lived code using PKCE and saves the resulting credential in the OS

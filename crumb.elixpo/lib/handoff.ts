@@ -5,8 +5,8 @@ export interface HandoffRequest {
 }
 
 const CALLBACKS = new Set([
-  'http://localhost:3000/auth/callback',
-  'http://127.0.0.1:3000/auth/callback',
+  'http://localhost:3000/auth/connector/callback',
+  'http://127.0.0.1:3000/auth/connector/callback',
 ])
 
 export function readHandoff(url: URL): HandoffRequest | null {
