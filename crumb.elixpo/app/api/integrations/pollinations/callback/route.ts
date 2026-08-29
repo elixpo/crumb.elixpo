@@ -1,18 +1,13 @@
 import { NextResponse } from 'next/server'
 import { currentUser } from '@/lib/auth'
 import { bindings } from '@/lib/cloudflare'
-import { digest, randomToken } from '@/lib/encoding'
-import type { HandoffRequest } from '@/lib/handoff'
 import { exchangeCode } from '@/lib/pollinations'
 import { encryptToken } from '@/lib/secrets'
 
-interface Context { userId: string; handoff: HandoffRequest; verifier: string }
+interface Context { userId: string; verifier: string }
 
-function finish(handoff: HandoffRequest, values: Record<string, string>) {
-  const destination = new URL(handoff.redirectUri)
-  destination.searchParams.set('state', handoff.state)
-  for (const [key, value] of Object.entries(values)) destination.searchParams.set(key, value)
-  return NextResponse.redirect(destination)
+function finish(requestUrl: string, result: string) {
+  return NextResponse.redirect(new URL(`/connect?pollinations=${result}`, requestUrl))
 }
 
 export async function GET(request: Request) {
@@ -24,9 +19,9 @@ export async function GET(request: Request) {
   await bindings().KV.delete(key)
   const context = JSON.parse(stored) as Context
   const code = url.searchParams.get('code')
-  if (!code || url.searchParams.has('error')) return finish(context.handoff, { error: 'access_denied' })
+  if (!code || url.searchParams.has('error')) return finish(request.url, 'denied')
   const user = await currentUser()
-  if (!user || user.id !== context.userId) return finish(context.handoff, { error: 'invalid_session' })
+  if (!user || user.id !== context.userId) return finish(request.url, 'invalid_session')
   try {
     const tokens = await exchangeCode(code, context.verifier, request.url)
     const now = Math.floor(Date.now() / 1000)
@@ -46,15 +41,10 @@ export async function GET(request: Request) {
       tokens.scope || '',
       now,
     ).run()
-    const grant = randomToken()
-    await bindings().DB.prepare(`
-      INSERT INTO terminal_grants (code_hash, user_id, code_challenge, expires_at)
-      VALUES (?, ?, ?, ?)
-    `).bind(await digest(grant), user.id, context.handoff.challenge, now + 120).run()
-    return finish(context.handoff, { code: grant })
+    return finish(request.url, 'connected')
   } catch (error) {
     const reference = crypto.randomUUID().slice(0, 8)
     console.error(`[crumb/pollinations] callback failed ref=${reference}`, error instanceof Error ? error.message : 'unknown error')
-    return finish(context.handoff, { error: 'connection_failed', error_ref: reference })
+    return NextResponse.redirect(new URL(`/connect?pollinations=failed&error_ref=${reference}`, request.url))
   }
 }
