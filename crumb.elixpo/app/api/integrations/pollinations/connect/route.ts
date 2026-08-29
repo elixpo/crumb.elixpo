@@ -5,8 +5,6 @@ import { randomToken } from '@/lib/encoding'
 import { readHandoff } from '@/lib/handoff'
 import { authorizeUrl, challenge, verifier } from '@/lib/pollinations'
 
-export const runtime = 'edge'
-
 export async function GET(request: Request) {
   const url = new URL(request.url)
   const handoff = readHandoff(url)

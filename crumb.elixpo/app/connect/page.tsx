@@ -2,8 +2,6 @@ import { redirect } from 'next/navigation'
 import { currentUser } from '@/lib/auth'
 import { handoffQuery, readHandoff } from '@/lib/handoff'
 
-export const runtime = 'edge'
-
 export default async function ConnectPage({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
   const params = await searchParams
   const url = new URL('https://crumb.invalid/connect')

@@ -1,25 +1,33 @@
 {
-  "name": "@crumb/crumbs.elixpo",
+  "name": "@crumb/crumb.elixpo",
   "version": "0.1.0",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3001",
     "build": "next build",
-    "pages:build": "next-on-pages",
-    "db:migrate:local": "wrangler d1 migrations apply crumbs-elixpo --local"
+    "cloudflare:build": "opennextjs-cloudflare build",
+    "preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
+    "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
+    "cf-typegen": "wrangler types --env-interface CloudflareEnv cloudflare-env.d.ts",
+    "db:migrate:local": "wrangler d1 migrations apply crumb-elixpo --local"
   },
   "dependencies": {
-    "@cloudflare/next-on-pages": "^1.12.0",
-    "next": "^15.0.0",
+    "@opennextjs/cloudflare": "1.20.4",
+    "next": "15.5.24",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240620.0",
+    "@cloudflare/workers-types": "5.20260828.1",
     "@types/node": "^20.14.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "esbuild": "0.27.3",
     "typescript": "^5.5.0",
-    "wrangler": "^4.86.0"
+    "wrangler": "4.127.1"
+  },
+  "overrides": {
+    "postcss": "8.5.26",
+    "sharp": "0.35.4"
   }
 }

@@ -1,7 +1,7 @@
-import { getRequestContext } from '@cloudflare/next-on-pages'
+import { getCloudflareContext } from '@opennextjs/cloudflare'
 
 export function bindings(): CloudflareEnv {
-  return getRequestContext().env
+  return getCloudflareContext().env
 }
 
 export function config() {

@@ -3,8 +3,6 @@ import { accountsAuthorizeUrl, currentUser } from '@/lib/auth'
 import { bindings } from '@/lib/cloudflare'
 import { randomToken } from '@/lib/encoding'
 
-export const runtime = 'edge'
-
 function safeReturnTo(value: string | null): string {
   return value?.startsWith('/') && !value.startsWith('//') ? value : '/'
 }
