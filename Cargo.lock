@@ -153,6 +153,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "crumb-llm"
+version = "0.1.0"
+
+[[package]]
 name = "crumb-native"
 version = "0.1.0"
 dependencies = [
