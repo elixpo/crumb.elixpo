@@ -1,0 +1,110 @@
+//! Minimal interactive loop and input classification for crumb.
+
+use std::env;
+use std::io::{self, BufRead, Write};
+use std::path::Path;
+
+use crumb_core::{BuiltInCommand, InputEvent};
+use crumb_platform::Platform;
+
+/// Classifies one line without executing native shell input.
+#[must_use]
+pub fn classify_input(input: &str) -> InputEvent {
+    match input.trim_end_matches(['\r', '\n']) {
+        ":exit" => InputEvent::BuiltIn(BuiltInCommand::Exit),
+        ":platform" => InputEvent::BuiltIn(BuiltInCommand::Platform),
+        ":version" => InputEvent::BuiltIn(BuiltInCommand::Version),
+        command => InputEvent::NativeInput(command.to_owned()),
+    }
+}
+
+/// Renders the phase-one prompt for a working directory.
+#[must_use]
+pub fn render_prompt(cwd: &Path) -> String {
+    format!("crumb:{}> ", cwd.display())
+}
+
+/// Runs the WP-001 REPL until `:exit` or end-of-input.
+///
+/// Native input is classified and reported, but deliberately not executed.
+pub fn run<R: BufRead, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    platform: Platform,
+    version: &str,
+) -> io::Result<()> {
+    loop {
+        let cwd = env::current_dir()?;
+        write!(writer, "{}", render_prompt(&cwd))?;
+        writer.flush()?;
+
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+
+        match classify_input(&line) {
+            InputEvent::BuiltIn(BuiltInCommand::Exit) => break,
+            InputEvent::BuiltIn(BuiltInCommand::Platform) => writeln!(writer, "{platform}")?,
+            InputEvent::BuiltIn(BuiltInCommand::Version) => writeln!(writer, "crumb {version}")?,
+            InputEvent::NativeInput(command) if command.trim().is_empty() => {}
+            InputEvent::NativeInput(command) => {
+                writeln!(writer, "native input (execution arrives in WP-002): {command}")?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::path::Path;
+
+    use crumb_core::{BuiltInCommand, InputEvent};
+    use crumb_platform::Platform;
+
+    use super::{classify_input, render_prompt, run};
+
+    #[test]
+    fn classifies_supported_built_ins() {
+        assert_eq!(
+            classify_input(":exit\n"),
+            InputEvent::BuiltIn(BuiltInCommand::Exit)
+        );
+        assert_eq!(
+            classify_input(":version"),
+            InputEvent::BuiltIn(BuiltInCommand::Version)
+        );
+        assert_eq!(
+            classify_input(":platform"),
+            InputEvent::BuiltIn(BuiltInCommand::Platform)
+        );
+    }
+
+    #[test]
+    fn classifies_other_input_as_native() {
+        assert_eq!(
+            classify_input("  git status  "),
+            InputEvent::NativeInput("  git status  ".to_owned())
+        );
+    }
+
+    #[test]
+    fn prompt_contains_the_working_directory() {
+        assert_eq!(render_prompt(Path::new("/tmp/project")), "crumb:/tmp/project> ");
+    }
+
+    #[test]
+    fn repl_handles_built_ins_and_stops() {
+        let input = Cursor::new(":platform\n:version\n:exit\n");
+        let mut output = Vec::new();
+
+        run(input, &mut output, Platform::Linux, "0.1.0").expect("REPL should run");
+
+        let output = String::from_utf8(output).expect("output should be UTF-8");
+        assert!(output.contains("linux"));
+        assert!(output.contains("crumb 0.1.0"));
+    }
+}

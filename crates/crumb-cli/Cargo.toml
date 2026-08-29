@@ -1,0 +1,16 @@
+[package]
+name = "crumb-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "crumb"
+path = "src/main.rs"
+
+[dependencies]
+crumb-platform = { path = "../crumb-platform" }
+crumb-repl = { path = "../crumb-repl" }
+
+[lints]
+workspace = true
