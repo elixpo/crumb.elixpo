@@ -4,7 +4,7 @@ use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
-use crumb_core::{BuiltInCommand, InputEvent};
+use crumb_core::{BuiltInCommand, HistoryAction, InputEvent};
 use crumb_platform::Platform;
 
 /// Reason the REPL returned control to its caller.
@@ -17,12 +17,22 @@ pub enum ReplOutcome {
 /// Classifies one line without executing native shell input.
 #[must_use]
 pub fn classify_input(input: &str) -> InputEvent {
-    match input.trim_end_matches(['\r', '\n']) {
+    let command = input.trim_end_matches(['\r', '\n']);
+    match command {
         ":exit" => InputEvent::BuiltIn(BuiltInCommand::Exit),
+        ":history" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Recent)),
+        ":history search" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
+            String::new(),
+        ))),
         ":platform" => InputEvent::BuiltIn(BuiltInCommand::Platform),
         ":shell" => InputEvent::BuiltIn(BuiltInCommand::Shell),
         ":version" => InputEvent::BuiltIn(BuiltInCommand::Version),
-        command => InputEvent::NativeInput(command.to_owned()),
+        _ if command.starts_with(":history search ") => {
+            InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
+                command[":history search ".len()..].to_owned(),
+            )))
+        }
+        _ => InputEvent::NativeInput(command.to_owned()),
     }
 }
 
@@ -87,6 +97,9 @@ pub fn run<R: BufRead, W: Write>(
 
         match event {
             InputEvent::BuiltIn(BuiltInCommand::Exit) => return Ok(ReplOutcome::Exit),
+            InputEvent::BuiltIn(BuiltInCommand::History(_)) => {
+                writeln!(writer, "history is available in the crumb executable")?;
+            }
             InputEvent::BuiltIn(BuiltInCommand::Platform) => writeln!(writer, "{platform}")?,
             InputEvent::BuiltIn(BuiltInCommand::Shell) => {
                 let shell_name = match platform {
@@ -118,7 +131,7 @@ mod tests {
     use std::io::Cursor;
     use std::path::Path;
 
-    use crumb_core::{BuiltInCommand, InputEvent};
+    use crumb_core::{BuiltInCommand, HistoryAction, InputEvent};
     use crumb_platform::Platform;
 
     use super::{ReplOutcome, classify_input, read_input, render_prompt, run};
@@ -140,6 +153,12 @@ mod tests {
         assert_eq!(
             classify_input(":shell"),
             InputEvent::BuiltIn(BuiltInCommand::Shell)
+        );
+        assert_eq!(
+            classify_input(":history search cargo test"),
+            InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
+                "cargo test".to_owned()
+            )))
         );
     }
 

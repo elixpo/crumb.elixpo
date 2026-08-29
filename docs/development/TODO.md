@@ -16,15 +16,15 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Current milestone: [WP-007 — persistent history](https://github.com/elixpo/crumb.elixpo/issues/15)
 
-- [ ] Add an isolated `crumb-history` crate.
-- [ ] Persist history in local SQLite.
-- [ ] Store command, cwd, platform/mode, exit status, and timestamp.
-- [ ] Exclude empty and likely sensitive commands.
-- [ ] Provide recent and literal text-search queries.
-- [ ] Integrate recording into managed native execution.
-- [ ] Add `:history` and `:history search` built-ins.
+- [x] Add an isolated `crumb-history` crate.
+- [x] Persist history in local SQLite.
+- [x] Store command, cwd, platform/mode, exit status, and timestamp.
+- [x] Exclude empty and likely sensitive commands.
+- [x] Provide recent and literal text-search queries.
+- [x] Integrate recording into managed native execution.
+- [x] Add `:history` and `:history search` built-ins.
 - [ ] Provide interactive Ctrl+R search.
-- [ ] Add migration and persistence tests.
+- [x] Add migration and persistence tests.
 - [ ] Pass formatting, clippy, and workspace tests.
 - [ ] Merge WP-007.
 

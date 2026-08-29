@@ -246,7 +246,10 @@ fn is_sensitive(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
+    use std::process;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crumb_platform::Platform;
 
@@ -307,5 +310,31 @@ mod tests {
             None
         );
         assert!(store.recent(10).expect("history should load").is_empty());
+    }
+
+    #[test]
+    fn file_store_migrates_and_persists_across_reopen() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "crumb-history-test-{}-{nonce}.sqlite",
+            process::id()
+        ));
+
+        {
+            let store = HistoryStore::open(&path).expect("file history should initialize");
+            store
+                .record("echo persisted", context(0))
+                .expect("command should record");
+        }
+        let reopened = HistoryStore::open(&path).expect("history should reopen");
+        let entries = reopened.recent(10).expect("persisted history should load");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command, "echo persisted");
+        drop(reopened);
+        fs::remove_file(path).expect("temporary history should be removable");
     }
 }

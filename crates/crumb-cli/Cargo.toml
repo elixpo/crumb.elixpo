@@ -10,8 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-crumb-native = { path = "../crumb-native" }
 crumb-core = { path = "../crumb-core" }
+crumb-history = { path = "../crumb-history" }
+crumb-native = { path = "../crumb-native" }
 crumb-platform = { path = "../crumb-platform" }
 crumb-pty = { path = "../crumb-pty" }
 crumb-repl = { path = "../crumb-repl" }
