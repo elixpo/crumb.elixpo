@@ -11,7 +11,7 @@ export function SiteFooter() {
         <h2>Native when you type.<br />Intelligent when you ask.</h2>
         <a className="github-pill dark" href={REPO} target="_blank" rel="noreferrer"><GitHubIcon /> View source</a>
       </div>
-      <div><h3>Product</h3><Link href="/connect">Connect</Link><Link href="/docs">Documentation</Link><a href={`${REPO}/releases`}>Releases</a></div>
+      <div><h3>Product</h3><Link href="/profiles">Profiles</Link><Link href="/docs">Documentation</Link><a href={`${REPO}/releases`}>Releases</a></div>
       <div><h3>Project</h3><Link href="/about">About</Link><a href={`${REPO}/issues`}>Issues</a><a href="https://status.elixpo.com">Status</a></div>
       <div><h3>Legal</h3><Link href="/privacy">Privacy</Link><Link href="/terms">Terms</Link><a href={`${REPO}/blob/main/LICENSE`}>License</a></div>
     </div>

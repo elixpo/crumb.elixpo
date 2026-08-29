@@ -9,5 +9,5 @@ export async function GET(request: Request) {
   ;(await cookies()).set('crumb_session', 'crumb-local-session', {
     httpOnly: true, sameSite: 'lax', path: '/', maxAge: 15 * 86400,
   })
-  return NextResponse.redirect(new URL('/connect', url), 303)
+  return NextResponse.redirect(new URL('/profiles', url), 303)
 }
