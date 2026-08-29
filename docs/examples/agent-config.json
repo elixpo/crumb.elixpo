@@ -19,7 +19,8 @@
     "max_shell_command_seconds": 300,
     "max_file_write_bytes": 1048576,
     "max_steering_messages": 8,
-    "max_steering_bytes": 32768
+    "max_steering_bytes": 32768,
+    "max_activity_events": 128
   },
   "harness": {
     "kind": "process",

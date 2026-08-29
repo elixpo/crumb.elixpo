@@ -112,23 +112,23 @@ impl Notification {
                 name,
                 success: data.get("success").and_then(Value::as_bool).unwrap_or(true),
             }),
-            "turn/end" => turn_end_activity(data),
+            "turn/end" => Some(turn_end_activity(data)),
             "assistant/message" => None,
             other => safe_label(other).map(|label| HarnessActivity::Progress { label }),
         }
     }
 }
 
-fn turn_end_activity(data: &Value) -> Option<HarnessActivity> {
+fn turn_end_activity(data: &Value) -> HarnessActivity {
     let reason = data
         .pointer("/reason/kind")
         .and_then(Value::as_str)
         .and_then(safe_label)
         .unwrap_or_else(|| "completed".to_owned());
     match reason.as_str() {
-        "cancelled" | "canceled" => Some(HarnessActivity::Cancelled),
-        "failed" | "error" => Some(HarnessActivity::Failed { reason }),
-        _ => Some(HarnessActivity::Completed { reason }),
+        "cancelled" | "canceled" => HarnessActivity::Cancelled,
+        "failed" | "error" => HarnessActivity::Failed { reason },
+        _ => HarnessActivity::Completed { reason },
     }
 }
 

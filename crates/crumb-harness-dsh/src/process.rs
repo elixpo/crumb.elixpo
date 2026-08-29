@@ -276,16 +276,18 @@ impl ProcessHarness {
         let mut projection =
             RunProjection::new(session_id, &receipt.message_id, event_budget_bytes);
         for notification in initial {
+            let completed = self.project_notification(&mut projection, &notification)?;
             on_notification(&notification)?;
-            if self.project_notification(&mut projection, notification)? {
+            if completed {
                 return projection.finish();
             }
         }
         loop {
             match self.receive_frame(cancellation, deadline, "session activity")? {
                 IncomingFrame::Notification(notification) => {
+                    let completed = self.project_notification(&mut projection, &notification)?;
                     on_notification(&notification)?;
-                    if self.project_notification(&mut projection, notification)? {
+                    if completed {
                         return projection.finish();
                     }
                 }
@@ -300,7 +302,7 @@ impl ProcessHarness {
     fn project_notification(
         &mut self,
         projection: &mut RunProjection<'_>,
-        notification: Notification,
+        notification: &Notification,
     ) -> Result<bool> {
         match projection.observe(notification) {
             Ok(completed) => Ok(completed),
@@ -532,9 +534,9 @@ impl<'a> RunProjection<'a> {
         }
     }
 
-    fn observe(&mut self, notification: Notification) -> Result<bool> {
+    fn observe(&mut self, notification: &Notification) -> Result<bool> {
         if !self.receipt_seen {
-            if !is_inbox_receipt(&notification, self.session_id, self.message_id) {
+            if !is_inbox_receipt(notification, self.session_id, self.message_id) {
                 return Ok(false);
             }
             self.receipt_seen = true;
@@ -573,7 +575,7 @@ impl<'a> RunProjection<'a> {
                 .get("status")
                 .and_then(serde_json::Value::as_str)
                 == Some("idle");
-        self.notifications.push(notification);
+        self.notifications.push(notification.clone());
         Ok(completed)
     }
 
@@ -813,14 +815,14 @@ mod tests {
         let mut projection = RunProjection::new("root", "message-1", 4096);
         assert!(
             !projection
-                .observe(notification(
+                .observe(&notification(
                     "session.status",
                     json!({"sessionId":"root","status":"idle"}),
                 ))
                 .expect("pre-receipt idle is ignored")
         );
         projection
-            .observe(notification(
+            .observe(&notification(
                 "session.event",
                 json!({
                     "sessionId":"root",
@@ -829,7 +831,7 @@ mod tests {
             ))
             .expect("receipt is accepted");
         projection
-            .observe(notification(
+            .observe(&notification(
                 "session.event",
                 json!({
                     "sessionId":"root",
@@ -838,7 +840,7 @@ mod tests {
             ))
             .expect("assistant message is accepted");
         projection
-            .observe(notification(
+            .observe(&notification(
                 "session.event",
                 json!({
                     "sessionId":"root",
@@ -848,7 +850,7 @@ mod tests {
             .expect("turn end is accepted");
         assert!(
             projection
-                .observe(notification(
+                .observe(&notification(
                     "session.status",
                     json!({"sessionId":"root","status":"idle"}),
                 ))
@@ -865,7 +867,7 @@ mod tests {
         let mut projection = RunProjection::new("root", "message-1", 1);
         assert!(
             projection
-                .observe(notification(
+                .observe(&notification(
                     "session.event",
                     json!({
                         "sessionId":"root",

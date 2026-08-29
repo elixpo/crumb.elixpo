@@ -16,7 +16,7 @@ use crumb_agent::{
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
-use crumb_harness_dsh::{HarnessActivity, Notification};
+use crumb_harness_dsh::HarnessActivity;
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_mcp::{McpDispatcher, serve_stdio};
 use crumb_native::session::{CommandOutcome, ShellSession};
@@ -386,20 +386,28 @@ fn handle_agent_boundary(
         renderer.agent_header(&model, effort, agent_mode_name(config.mode), None)
     )?;
     writer.flush()?;
+    let activity_capacity = usize::try_from(config.limits.max_activity_events)
+        .context("max_activity_events exceeds this platform's address space")?;
+    let active_runtime = runtime.take().expect("agent runtime is initialized above");
+    let task = active_runtime.spawn_turn(
+        decision.payload.clone(),
+        config.clone(),
+        workspace.to_path_buf(),
+        activity_capacity,
+    )?;
     let mut activity = Some(renderer.activity("Working through Harness"));
-    let result = runtime
-        .as_mut()
-        .expect("agent runtime is initialized above")
-        .run_with_events(&decision.payload, config, workspace, |notification| {
-            if let Some(label) = harness_event_label(notification) {
-                if let Some(indicator) = activity.take() {
-                    indicator.finish();
-                }
-                writeln!(writer, "  ↳ {label}")?;
-                writer.flush()?;
-            }
-            Ok(())
-        });
+    while !task.is_finished() {
+        match task.recv_timeout(Duration::from_millis(25)) {
+            Ok(event) => render_harness_activity(&event, &mut activity, writer)?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    while let Ok(event) = task.recv_timeout(Duration::ZERO) {
+        render_harness_activity(&event, &mut activity, writer)?;
+    }
+    let (returned_runtime, result) = task.finish()?;
+    *runtime = Some(returned_runtime);
     if let Some(indicator) = activity.take() {
         indicator.finish();
     }
@@ -434,25 +442,38 @@ fn handle_agent_boundary(
     Ok(())
 }
 
-fn harness_event_label(notification: &Notification) -> Option<String> {
-    match notification.activity()? {
-        HarnessActivity::RequestAccepted => Some("request accepted".to_owned()),
-        HarnessActivity::Status { state } => Some(format!("session {state}")),
-        HarnessActivity::ToolStarted { name } => Some(format!("tool started · {name}")),
-        HarnessActivity::ApprovalRequired { name } => Some(format!("approval required · {name}")),
-        HarnessActivity::ToolOutput { name, bytes } => Some(bytes.map_or_else(
+fn harness_activity_label(activity: &HarnessActivity) -> String {
+    match activity {
+        HarnessActivity::RequestAccepted => "request accepted".to_owned(),
+        HarnessActivity::Status { state } => format!("session {state}"),
+        HarnessActivity::ToolStarted { name } => format!("tool started · {name}"),
+        HarnessActivity::ApprovalRequired { name } => format!("approval required · {name}"),
+        HarnessActivity::ToolOutput { name, bytes } => bytes.map_or_else(
             || format!("tool output · {name}"),
             |bytes| format!("tool output · {name} · {bytes} bytes"),
-        )),
-        HarnessActivity::ToolFinished { name, success } => Some(format!(
+        ),
+        HarnessActivity::ToolFinished { name, success } => format!(
             "tool {} · {name}",
-            if success { "completed" } else { "failed" }
-        )),
-        HarnessActivity::Completed { reason } => Some(format!("completed · {reason}")),
-        HarnessActivity::Failed { reason } => Some(format!("failed · {reason}")),
-        HarnessActivity::Cancelled => Some("cancelled".to_owned()),
-        HarnessActivity::Progress { label } => Some(label),
+            if *success { "completed" } else { "failed" }
+        ),
+        HarnessActivity::Completed { reason } => format!("completed · {reason}"),
+        HarnessActivity::Failed { reason } => format!("failed · {reason}"),
+        HarnessActivity::Cancelled => "cancelled".to_owned(),
+        HarnessActivity::Progress { label } => label.clone(),
     }
+}
+
+fn render_harness_activity(
+    activity: &HarnessActivity,
+    indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    if let Some(indicator) = indicator.take() {
+        indicator.finish();
+    }
+    writeln!(writer, "  ↳ {}", harness_activity_label(activity))?;
+    writer.flush()?;
+    Ok(())
 }
 
 const fn agent_mode_name(mode: AgentMode) -> &'static str {

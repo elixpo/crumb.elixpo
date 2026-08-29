@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -10,9 +12,47 @@ use crumb_agent::{
 };
 use crumb_auth::{CredentialStore, OsCredentialStore, SecretString};
 use crumb_harness_dsh::{
-    HarnessEnvironment, HarnessIdentity, HarnessLaunch, HarnessSupervisor, Notification, RunResult,
-    SupervisorLimits,
+    HarnessActivity, HarnessEnvironment, HarnessIdentity, HarnessLaunch, HarnessSupervisor,
+    Notification, RunResult, SupervisorLimits,
 };
+
+type TurnThreadResult = (AgentRuntime, Result<RunResult>);
+
+/// Background Harness turn whose public event stream is already redacted.
+pub struct AgentTurnTask {
+    activities: Receiver<HarnessActivity>,
+    worker: JoinHandle<TurnThreadResult>,
+}
+
+impl AgentTurnTask {
+    /// Waits for one redacted activity state without blocking indefinitely.
+    ///
+    /// # Errors
+    ///
+    /// Returns the standard timeout or disconnection state.
+    pub fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<HarnessActivity, RecvTimeoutError> {
+        self.activities.recv_timeout(timeout)
+    }
+
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.worker.is_finished()
+    }
+
+    /// Rejoins the runtime after its turn completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the isolated worker panicked.
+    pub fn finish(self) -> Result<TurnThreadResult> {
+        self.worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("agent turn worker panicked"))
+    }
+}
 
 pub struct AgentRuntime {
     active_cancellation: Arc<Mutex<Option<CancellationToken>>>,
@@ -85,6 +125,42 @@ impl AgentRuntime {
     #[must_use]
     pub fn active_session_id(&self) -> Option<&str> {
         self.session.as_ref().map(|session| session.id().as_str())
+    }
+
+    /// Runs a turn off the terminal input thread and emits only bounded,
+    /// redacted activity states.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero channel capacity or worker spawn failure.
+    pub fn spawn_turn(
+        self,
+        request: String,
+        config: AgentConfig,
+        workspace: PathBuf,
+        activity_capacity: usize,
+    ) -> Result<AgentTurnTask> {
+        if activity_capacity == 0 {
+            bail!("agent activity channel capacity must be positive");
+        }
+        let (activity_sender, activities) = sync_channel(activity_capacity);
+        let worker = thread::Builder::new()
+            .name("crumb-agent-turn".to_owned())
+            .spawn(move || {
+                let mut runtime = self;
+                let result =
+                    runtime.run_with_events(&request, &config, &workspace, |notification| {
+                        if let Some(activity) = notification.activity() {
+                            activity_sender
+                                .send(activity)
+                                .map_err(|_| anyhow::anyhow!("agent activity receiver closed"))?;
+                        }
+                        Ok(())
+                    });
+                (runtime, result)
+            })
+            .context("failed to start agent turn worker")?;
+        Ok(AgentTurnTask { activities, worker })
     }
 
     /// Executes one turn and forwards bounded Harness notifications as they
