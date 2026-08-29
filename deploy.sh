@@ -8,23 +8,52 @@ WORKER_NAME="crumb-elixpo"
 D1_DATABASE="crumb-elixpo"
 KV_TITLE="crumb-elixpo-KV"
 DRY_RUN=false
+TARGET=""
+PACKAGE_NAME=""
+VSCODE_PACKAGE=false
+PAGES_DIR="${CRUMB_PAGES_DIR:-$ROOT_DIR/apps/web}"
+PAGES_PROJECT="${CRUMB_PAGES_PROJECT:-crumb-elixpo}"
+PAGES_OUTPUT_DIR="${CRUMB_PAGES_OUTPUT_DIR:-dist}"
+declare -a ACTIONS=()
+declare -a PACKAGE_DIRS=()
 
 log() { printf '\033[32m▸\033[0m %s\n' "$1"; }
 fail() { printf '\033[31m✗\033[0m %s\n' "$1" >&2; exit 1; }
 
 usage() {
   cat <<'USAGE'
-Usage: ./deploy.sh COMMAND [--dry-run]
+Usage: ./deploy.sh TARGET [OPTIONS] ACTION...
 
-Commands:
-  provision   Create the D1 database and KV namespace if absent
-  secrets     Upload application secrets from the SOPS-encrypted root .env
-  migrate     Apply D1 migrations remotely
-  build       Install dependencies and build the Cloudflare Pages bundle
-  deploy      Build and deploy the OpenNext Worker
-  all         Provision, migrate, deploy, and upload secrets
+Targets:
+  --package              Publish all public npm packages
+  --package --name NAME  Publish one npm package by name or directory
+  --package --vs         Build or publish the VS Code extension
+  --worker               Build or deploy the OpenNext Cloudflare Worker
+  --pages                Build or deploy a Cloudflare Pages application
+  --github               Mirror public npm packages to GitHub Packages
 
-The first OpenNext deployment creates the Worker service automatically.
+Actions:
+  build                  Install dependencies and build the selected target
+  deploy                 Publish or deploy the selected target
+
+Worker-only actions:
+  provision              Create D1 and KV resources when absent
+  migrate                Apply remote D1 migrations
+  secrets                Upload secrets from the encrypted root .env
+
+Options:
+  --name NAME            Select one npm package
+  --vs                   Select the VS Code package
+  --dry-run              Print commands without executing them
+  -h, --help             Show this help
+
+Examples:
+  ./deploy.sh --package build deploy
+  ./deploy.sh --package --name @crumb/sdk build deploy
+  ./deploy.sh --package --vs build deploy
+  ./deploy.sh --worker build deploy
+  ./deploy.sh --pages build deploy
+  ./deploy.sh --github build deploy
 USAGE
 }
 
@@ -207,35 +236,216 @@ migrate() {
     --remote --config "$WRANGLER_CONFIG"
 }
 
-build() {
-  require_tools
-  if [ -f "$SITE_DIR/package-lock.json" ]; then
-    run_site npm ci
+install_node_dependencies() {
+  local directory="$1"
+  if [ -f "$directory/package-lock.json" ]; then
+    run_in "$directory" npm ci
   else
-    run_site npm install
+    run_in "$directory" npm install
   fi
+}
+
+run_in() {
+  local directory="$1"
+  shift
+  if $DRY_RUN; then
+    printf '[dry-run] cd %q &&' "$directory"
+    printf ' %q' "$@"
+    printf '\n'
+  else
+    (cd "$directory" && "$@")
+  fi
+}
+
+build_worker() {
+  require_tools
+  install_node_dependencies "$SITE_DIR"
   run_site npm run cloudflare:build
 }
 
-deploy() {
+deploy_worker() {
   require_tools
   if ! $DRY_RUN; then load_cloudflare_auth; fi
-  run_site npm run deploy
+  run_site npm run cloudflare:deploy
 }
 
-[ "${1:-}" ] || { usage; exit 1; }
-command="$1"
-shift
-if [ "${1:-}" = "--dry-run" ]; then DRY_RUN=true; shift; fi
-[ $# -eq 0 ] || fail "Unexpected argument: $1"
+package_field() {
+  local manifest="$1" field="$2"
+  node -e '
+    const manifest = require(process.argv[1]);
+    const value = manifest[process.argv[2]];
+    if (value !== undefined) process.stdout.write(String(value));
+  ' "$manifest" "$field"
+}
 
-case "$command" in
-  provision) provision ;;
-  secrets) upload_secrets ;;
-  migrate) migrate ;;
-  build) build ;;
-  deploy) deploy ;;
-  all) provision; migrate; deploy; upload_secrets ;;
-  -h|--help|help) usage ;;
-  *) fail "Unknown command: $command" ;;
-esac
+discover_packages() {
+  local manifest directory name private has_vscode
+  while IFS= read -r manifest; do
+    directory="$(dirname "$manifest")"
+    [ "$directory" != "$SITE_DIR" ] || continue
+    name="$(package_field "$manifest" name)"
+    private="$(package_field "$manifest" private)"
+    has_vscode="$(node -e '
+      const manifest = require(process.argv[1]);
+      process.stdout.write(String(Boolean(manifest.engines?.vscode)));
+    ' "$manifest")"
+
+    if $VSCODE_PACKAGE; then
+      [ "$has_vscode" = true ] || continue
+    else
+      [ "$private" != true ] || continue
+    fi
+    if [ -n "$PACKAGE_NAME" ] \
+      && [ "$PACKAGE_NAME" != "$name" ] \
+      && [ "$PACKAGE_NAME" != "$(basename "$directory")" ]; then
+      continue
+    fi
+    PACKAGE_DIRS+=("$directory")
+  done < <(
+    git -C "$ROOT_DIR" ls-files --cached --others --exclude-standard \
+      -- 'package.json' '*/package.json' | sed "s#^#$ROOT_DIR/#" | sort
+  )
+
+  [ "${#PACKAGE_DIRS[@]}" -gt 0 ] || {
+    if $VSCODE_PACKAGE; then
+      fail "No VS Code extension package was found (a manifest with engines.vscode is required)."
+    fi
+    if [ -n "$PACKAGE_NAME" ]; then
+      fail "No public npm package matches '$PACKAGE_NAME'."
+    fi
+    fail "No public npm packages were found."
+  }
+  if $VSCODE_PACKAGE && [ "${#PACKAGE_DIRS[@]}" -ne 1 ]; then
+    fail "Multiple VS Code packages were found; keep one extension package per repository."
+  fi
+}
+
+build_npm_packages() {
+  local directory
+  for directory in "${PACKAGE_DIRS[@]}"; do
+    log "Building $(package_field "$directory/package.json" name)..."
+    install_node_dependencies "$directory"
+    run_in "$directory" npm run build --if-present
+  done
+}
+
+deploy_npm_packages() {
+  local registry="$1" directory
+  for directory in "${PACKAGE_DIRS[@]}"; do
+    local name
+    name="$(package_field "$directory/package.json" name)"
+    if [ "$registry" = "https://npm.pkg.github.com" ] && [[ "$name" != @*/* ]]; then
+      fail "GitHub Packages requires a scoped npm name; '$name' is not scoped."
+    fi
+    log "Publishing $name to $registry..."
+    run_in "$directory" npm publish --access public --registry "$registry"
+  done
+}
+
+build_vscode_package() {
+  local directory="${PACKAGE_DIRS[0]}"
+  install_node_dependencies "$directory"
+  if node -e 'process.exit(require(process.argv[1]).scripts?.package ? 0 : 1)' \
+    "$directory/package.json"; then
+    run_in "$directory" npm run package
+  else
+    run_in "$directory" npx vsce package
+  fi
+}
+
+deploy_vscode_package() {
+  [ -n "${VSCE_PAT:-}" ] || $DRY_RUN || fail "VSCE_PAT is required to publish a VS Code extension."
+  run_in "${PACKAGE_DIRS[0]}" npx vsce publish
+}
+
+require_pages() {
+  [ -f "$PAGES_DIR/package.json" ] || fail "Missing Cloudflare Pages package at $PAGES_DIR/package.json."
+  command -v npm >/dev/null 2>&1 || fail "npm is required."
+}
+
+build_pages() {
+  require_pages
+  install_node_dependencies "$PAGES_DIR"
+  if node -e 'process.exit(require(process.argv[1]).scripts?.["pages:build"] ? 0 : 1)' \
+    "$PAGES_DIR/package.json"; then
+    run_in "$PAGES_DIR" npm run pages:build
+  else
+    run_in "$PAGES_DIR" npm run build
+  fi
+}
+
+deploy_pages() {
+  require_pages
+  if ! $DRY_RUN; then load_cloudflare_auth; fi
+  [ -d "$PAGES_DIR/$PAGES_OUTPUT_DIR" ] || $DRY_RUN \
+    || fail "Missing Pages output directory: $PAGES_DIR/$PAGES_OUTPUT_DIR"
+  run_in "$PAGES_DIR" npx wrangler pages deploy "$PAGES_OUTPUT_DIR" \
+    --project-name "$PAGES_PROJECT"
+}
+
+set_target() {
+  local selected="$1"
+  [ -z "$TARGET" ] || [ "$TARGET" = "$selected" ] \
+    || fail "Choose exactly one deployment target."
+  TARGET="$selected"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --package) set_target package ;;
+    --worker) set_target worker ;;
+    --pages) set_target pages ;;
+    --github) set_target github ;;
+    --name)
+      shift
+      [ -n "${1:-}" ] || fail "--name requires a package name."
+      PACKAGE_NAME="$1"
+      ;;
+    --vs) VSCODE_PACKAGE=true ;;
+    --dry-run) DRY_RUN=true ;;
+    build|deploy|provision|migrate|secrets) ACTIONS+=("$1") ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) fail "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+[ -n "$TARGET" ] || { usage; fail "A deployment target is required."; }
+[ "${#ACTIONS[@]}" -gt 0 ] || fail "At least one action is required."
+[ -z "$PACKAGE_NAME" ] || [ "$TARGET" = package ] || [ "$TARGET" = github ] \
+  || fail "--name is only valid with --package or --github."
+if $VSCODE_PACKAGE; then
+  [ "$TARGET" = package ] || fail "--vs is only valid with --package."
+  [ -z "$PACKAGE_NAME" ] || fail "--vs and --name cannot be combined."
+fi
+
+for action in "${ACTIONS[@]}"; do
+  case "$TARGET:$action" in
+    worker:build|worker:deploy|worker:provision|worker:migrate|worker:secrets) ;;
+    package:build|package:deploy|github:build|github:deploy|pages:build|pages:deploy) ;;
+    *) fail "Action '$action' is not valid for --$TARGET." ;;
+  esac
+done
+
+if [ "$TARGET" = package ] || [ "$TARGET" = github ]; then
+  command -v node >/dev/null 2>&1 || fail "Node.js is required."
+  command -v npm >/dev/null 2>&1 || fail "npm is required."
+  discover_packages
+fi
+
+for action in "${ACTIONS[@]}"; do
+  case "$TARGET:$action" in
+    worker:build) build_worker ;;
+    worker:deploy) deploy_worker ;;
+    worker:provision) provision ;;
+    worker:migrate) migrate ;;
+    worker:secrets) upload_secrets ;;
+    package:build) if $VSCODE_PACKAGE; then build_vscode_package; else build_npm_packages; fi ;;
+    package:deploy) if $VSCODE_PACKAGE; then deploy_vscode_package; else deploy_npm_packages "https://registry.npmjs.org"; fi ;;
+    github:build) build_npm_packages ;;
+    github:deploy) deploy_npm_packages "https://npm.pkg.github.com" ;;
+    pages:build) build_pages ;;
+    pages:deploy) deploy_pages ;;
+    *) fail "Action '$action' is not valid for --$TARGET." ;;
+  esac
+done
