@@ -1,9 +1,7 @@
 import Link from 'next/link'
 import { currentUser } from '@/lib/auth'
 import { config } from '@/lib/cloudflare'
-import { GitHubIcon } from './GitHubIcon'
-
-const REPO = 'https://github.com/elixpo/crumb.elixpo'
+import { AccountMenu } from './AccountMenu'
 
 export async function SiteHeader() {
   const user = await currentUser().catch(() => null)
@@ -18,19 +16,7 @@ export async function SiteHeader() {
         <Link href="/#features">Features</Link><Link href="/docs">Docs</Link><Link href="/about">About</Link>
       </nav>
       <div className="nav-actions">
-        <a className="github-pill" href={REPO} target="_blank" rel="noreferrer"><GitHubIcon /> GitHub</a>
-        {user ? <details className="user-menu">
-          <summary>
-            <img src={`${accountsOrigin}/api/avatar/${encodeURIComponent(user.id)}`} alt="" width="28" height="28" />
-            <span>{user.displayName}</span><span className="chevron">⌄</span>
-          </summary>
-          <div className="user-popover">
-            <p>{user.email}</p>
-            <Link href="/profile/connectors">Check Connectors</Link>
-            <a href={`${accountsOrigin}/dashboard/services`}>Elixpo account</a>
-            <form action="/api/auth/logout" method="post"><button type="submit">Sign out</button></form>
-          </div>
-        </details> : <Link className="button button-small" href="/login">Sign in</Link>}
+        {user ? <AccountMenu name={user.displayName} email={user.email} avatarUrl={`${accountsOrigin}/api/avatar/${encodeURIComponent(user.id)}`} accountsOrigin={accountsOrigin} /> : <Link className="button button-small" href="/login">Sign in</Link>}
       </div>
     </div>
   </header>
