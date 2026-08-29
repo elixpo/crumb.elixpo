@@ -1,9 +1,6 @@
 //! Native-shell selection and lifecycle boundaries.
 
-use std::error::Error;
-use std::fmt;
-
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crumb_platform::Platform;
 use crumb_pty::{CommandSpec, PtyBackend, PtyProcess, TerminalSize};
 
@@ -62,32 +59,46 @@ impl NativeShell for MacOsZsh {
     }
 }
 
-/// Error returned when the active platform's shell backend is not built yet.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct UnsupportedPlatform(pub Platform);
+/// Windows PowerShell implementation for WP-004.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowsPowerShell;
 
-impl fmt::Display for UnsupportedPlatform {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "native shell support is not implemented for {}",
-            self.0
-        )
+impl WindowsPowerShell {
+    fn legacy_command_spec() -> CommandSpec {
+        CommandSpec::new("powershell.exe")
+            .arg("-NoLogo")
+            .arg("-NoExit")
     }
 }
 
-impl Error for UnsupportedPlatform {}
+impl NativeShell for WindowsPowerShell {
+    fn kind(&self) -> ShellKind {
+        ShellKind::PowerShell
+    }
+
+    fn command_spec(&self) -> CommandSpec {
+        CommandSpec::new("pwsh").arg("-NoLogo").arg("-NoExit")
+    }
+
+    fn spawn(&self, backend: &dyn PtyBackend, size: TerminalSize) -> Result<PtyProcess> {
+        match backend.spawn(&self.command_spec(), size) {
+            Ok(process) => Ok(process),
+            Err(primary_error) => backend
+                .spawn(&Self::legacy_command_spec(), size)
+                .with_context(|| {
+                    format!("pwsh failed before Windows PowerShell fallback: {primary_error:#}")
+                }),
+        }
+    }
+}
 
 /// Selects the native shell implemented for a platform.
-///
-/// # Errors
-///
-/// Returns [`UnsupportedPlatform`] until Windows parity is implemented.
-pub fn shell_for(platform: Platform) -> Result<Box<dyn NativeShell>, UnsupportedPlatform> {
+#[must_use]
+pub fn shell_for(platform: Platform) -> Box<dyn NativeShell> {
     match platform {
-        Platform::Linux => Ok(Box::new(LinuxBash)),
-        Platform::MacOs => Ok(Box::new(MacOsZsh)),
-        Platform::Windows => Err(UnsupportedPlatform(platform)),
+        Platform::Linux => Box::new(LinuxBash),
+        Platform::MacOs => Box::new(MacOsZsh),
+        Platform::Windows => Box::new(WindowsPowerShell),
     }
 }
 
@@ -99,7 +110,7 @@ mod tests {
 
     #[test]
     fn linux_selects_interactive_bash() {
-        let shell = shell_for(Platform::Linux).expect("Linux should be supported");
+        let shell = shell_for(Platform::Linux);
         let command = shell.command_spec();
 
         assert_eq!(shell.kind(), ShellKind::Bash);
@@ -109,7 +120,7 @@ mod tests {
 
     #[test]
     fn macos_selects_interactive_zsh() {
-        let shell = shell_for(Platform::MacOs).expect("macOS should be supported");
+        let shell = shell_for(Platform::MacOs);
         let command = shell.command_spec();
 
         assert_eq!(shell.kind(), ShellKind::Zsh);
@@ -118,7 +129,12 @@ mod tests {
     }
 
     #[test]
-    fn windows_parity_is_explicitly_deferred() {
-        assert!(shell_for(Platform::Windows).is_err());
+    fn windows_selects_modern_powershell() {
+        let shell = shell_for(Platform::Windows);
+        let command = shell.command_spec();
+
+        assert_eq!(shell.kind(), ShellKind::PowerShell);
+        assert_eq!(command.program(), "pwsh");
+        assert_eq!(command.args(), ["-NoLogo", "-NoExit"]);
     }
 }
