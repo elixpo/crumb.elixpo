@@ -1,0 +1,10 @@
+{
+  "name": "Crumb — Natural Language Terminal",
+  "short_name": "Crumb LNT",
+  "description": "A native-first terminal with intelligence when you ask.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f7f7f5",
+  "theme_color": "#151515",
+  "icons": [{ "src": "/favicon.ico", "sizes": "16x16 32x32 48x48 64x64", "type": "image/x-icon" }]
+}

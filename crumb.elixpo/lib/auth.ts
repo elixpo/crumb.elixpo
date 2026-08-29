@@ -25,6 +25,15 @@ export async function currentUser(): Promise<User | null> {
   return row ? { id: row.id, email: row.email, displayName: row.display_name } : null
 }
 
+export async function destroySession(): Promise<void> {
+  const cookieStore = await cookies()
+  const session = cookieStore.get('crumb_session')?.value
+  if (session) {
+    await bindings().DB.prepare('DELETE FROM sessions WHERE id = ?').bind(session).run()
+  }
+  cookieStore.delete('crumb_session')
+}
+
 export function accountsAuthorizeUrl(state: string, requestUrl: string): string {
   const env = config()
   const url = new URL('/oauth/authorize', env.accountsOrigin)
