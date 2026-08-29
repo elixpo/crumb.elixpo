@@ -42,8 +42,8 @@ Copy `crumb.elixpo/.env.local.example` to `crumb.elixpo/.env.local` and set:
 Never commit `.env.local`. The web app runs on port `3001`; the terminal owns
 `127.0.0.1:3000` while `crumb auth login` is active.
 
-`./deploy.sh secrets` reads application values from `crumb.elixpo/.env.local`
-when present, otherwise it falls back to the SOPS-encrypted root `.env`.
+`./deploy.sh secrets` uses application values from `crumb.elixpo/.env.local`
+when present and falls back per missing key to the SOPS-encrypted root `.env`.
 
 Apply `crumb.elixpo/migrations/0001_initial.sql` to the bound D1 database before
 testing. Replace the placeholder D1 and KV identifiers in `wrangler.toml` only
