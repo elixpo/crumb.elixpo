@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -58,16 +58,7 @@ fn run_managed_repl() -> Result<ReplOutcome> {
     let platform = Platform::current();
     let mut session: Option<ShellSession> = None;
     let mut last_exit_code = None;
-    let history = match HistoryStore::open_default() {
-        Ok(store) => Some(store),
-        Err(error) => {
-            writeln!(
-                stdout.lock(),
-                "warning: command history is unavailable: {error}"
-            )?;
-            None
-        }
-    };
+    let history = open_history(&mut stdout.lock())?;
     let mut line_editor = interactive
         .then(|| create_line_editor(history.as_ref()))
         .transpose()?;
@@ -81,17 +72,10 @@ fn run_managed_repl() -> Result<ReplOutcome> {
         let cwd = session
             .as_ref()
             .map_or_else(current_process_dir, |shell| Ok(shell.cwd().to_path_buf()))?;
-        let git = GitSegment::discover(&cwd);
-        let prompt = renderer.prompt(&PromptContext {
-            cwd: &cwd,
-            platform,
-            git: git.as_ref(),
-            last_exit_code,
-        });
+        let prompt = render_prompt(renderer, &cwd, platform, last_exit_code);
         let event = if let Some(editor) = line_editor.as_mut() {
             match editor.read_line(&CrumbPrompt::new(prompt))? {
                 Signal::Success(command) => Some(crumb_repl::classify_input(&command)),
-                Signal::CtrlC => continue,
                 Signal::CtrlD => None,
                 _ => continue,
             }
@@ -108,48 +92,17 @@ fn run_managed_repl() -> Result<ReplOutcome> {
         let mut writer = stdout.lock();
 
         match event {
-            InputEvent::BuiltIn(BuiltInCommand::Auth(action)) => {
-                handle_auth(action, &mut writer)?;
-            }
-            InputEvent::BuiltIn(BuiltInCommand::Exit) => {
-                shutdown_session(session)?;
-                return Ok(ReplOutcome::Exit);
-            }
-            InputEvent::BuiltIn(BuiltInCommand::History(action)) => {
-                show_history(history.as_ref(), &action, &mut writer)?;
-            }
-            InputEvent::BuiltIn(BuiltInCommand::Platform) => {
-                writeln!(writer, "{platform}")?;
-                record_history(
+            InputEvent::BuiltIn(command) => {
+                if let Some(outcome) = handle_builtin(
+                    command,
+                    &mut session,
                     history.as_ref(),
-                    ":platform",
                     &cwd,
                     platform,
-                    HistoryMode::BuiltIn,
-                    Some(0),
                     &mut writer,
-                )?;
-            }
-            InputEvent::BuiltIn(BuiltInCommand::Version) => {
-                writeln!(writer, "crumb {}", env!("CARGO_PKG_VERSION"))?;
-                record_history(
-                    history.as_ref(),
-                    ":version",
-                    &cwd,
-                    platform,
-                    HistoryMode::BuiltIn,
-                    Some(0),
-                    &mut writer,
-                )?;
-            }
-            InputEvent::BuiltIn(BuiltInCommand::Shell) if session.is_none() => {
-                return Ok(ReplOutcome::LaunchNativeShell);
-            }
-            InputEvent::BuiltIn(BuiltInCommand::Shell) => {
-                writeln!(
-                    writer,
-                    "`:shell` is available before the managed shell starts; restart crumb to enter raw mode"
-                )?;
+                )? {
+                    return Ok(outcome);
+                }
             }
             InputEvent::NativeInput(command) if command.trim().is_empty() => {}
             InputEvent::NativeInput(command) => {
@@ -198,6 +151,81 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             }
         }
     }
+}
+
+fn open_history(writer: &mut dyn Write) -> Result<Option<HistoryStore>> {
+    match HistoryStore::open_default() {
+        Ok(store) => Ok(Some(store)),
+        Err(error) => {
+            writeln!(writer, "warning: command history is unavailable: {error}")?;
+            Ok(None)
+        }
+    }
+}
+
+fn render_prompt(
+    renderer: Renderer,
+    cwd: &Path,
+    platform: Platform,
+    last_exit_code: Option<i32>,
+) -> String {
+    let git = GitSegment::discover(cwd);
+    renderer.prompt(&PromptContext {
+        cwd,
+        platform,
+        git: git.as_ref(),
+        last_exit_code,
+    })
+}
+
+fn handle_builtin(
+    command: BuiltInCommand,
+    session: &mut Option<ShellSession>,
+    history: Option<&HistoryStore>,
+    cwd: &std::path::Path,
+    platform: Platform,
+    writer: &mut dyn Write,
+) -> Result<Option<ReplOutcome>> {
+    match command {
+        BuiltInCommand::Auth(action) => handle_auth(action, writer)?,
+        BuiltInCommand::Exit => {
+            shutdown_session(session.take())?;
+            return Ok(Some(ReplOutcome::Exit));
+        }
+        BuiltInCommand::History(action) => show_history(history, &action, writer)?,
+        BuiltInCommand::Platform => {
+            writeln!(writer, "{platform}")?;
+            record_history(
+                history,
+                ":platform",
+                cwd,
+                platform,
+                HistoryMode::BuiltIn,
+                Some(0),
+                writer,
+            )?;
+        }
+        BuiltInCommand::Version => {
+            writeln!(writer, "crumb {}", env!("CARGO_PKG_VERSION"))?;
+            record_history(
+                history,
+                ":version",
+                cwd,
+                platform,
+                HistoryMode::BuiltIn,
+                Some(0),
+                writer,
+            )?;
+        }
+        BuiltInCommand::Shell if session.is_none() => {
+            return Ok(Some(ReplOutcome::LaunchNativeShell));
+        }
+        BuiltInCommand::Shell => writeln!(
+            writer,
+            "`:shell` is available before the managed shell starts; restart crumb to enter raw mode"
+        )?,
+    }
+    Ok(None)
 }
 
 fn handle_auth(action: AuthAction, writer: &mut dyn Write) -> Result<()> {
@@ -266,7 +294,7 @@ fn execute_foreground(
     let submitted = shell.submit(command)?;
 
     thread::scope(|scope| {
-        let relay = scope.spawn(move || relay_foreground_input(input, resizer, &relay_running));
+        let relay = scope.spawn(move || relay_foreground_input(input, &resizer, &relay_running));
         let outcome = submitted.wait(output);
         running.store(false, Ordering::Relaxed);
         let relay_result = relay
@@ -279,7 +307,7 @@ fn execute_foreground(
 
 fn relay_foreground_input(
     mut destination: PtyInput,
-    resizer: PtyResizer,
+    resizer: &PtyResizer,
     running: &AtomicBool,
 ) -> io::Result<()> {
     let mut stdin = io::stdin();
@@ -329,7 +357,9 @@ fn stdin_ready(_stdin: &io::Stdin) -> io::Result<bool> {
 fn create_line_editor(history: Option<&HistoryStore>) -> Result<Reedline> {
     let mut interactive_history = FileBackedHistory::new(INTERACTIVE_HISTORY_CAPACITY)?;
     if let Some(history) = history {
-        let mut entries = history.recent(INTERACTIVE_HISTORY_CAPACITY as u32)?;
+        let capacity = u32::try_from(INTERACTIVE_HISTORY_CAPACITY)
+            .map_err(|_| anyhow!("interactive history capacity exceeds u32"))?;
+        let mut entries = history.recent(capacity)?;
         entries.reverse();
         for entry in entries {
             interactive_history.save(HistoryItem::from_command_line(entry.command))?;
