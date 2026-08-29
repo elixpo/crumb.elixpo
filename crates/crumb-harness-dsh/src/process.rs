@@ -115,12 +115,13 @@ impl ProcessHarness {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        configure_process_group(&mut command);
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to launch Harness process `{}`", program.display()))?;
         let result = Self::attach(&mut child);
         if result.is_err() {
-            let _ = child.kill();
+            terminate(&mut child);
             let _ = child.wait();
         }
         result.map(|parts| Self {
@@ -421,7 +422,7 @@ impl ProcessHarness {
     fn hard_stop(&mut self) {
         self.stdin.take();
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
+            terminate(&mut self.child);
         }
         let _ = self.child.wait();
     }
@@ -434,6 +435,35 @@ impl ProcessHarness {
             let _ = thread.join();
         }
     }
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate(child: &mut Child) {
+    use rustix::process::{Pid, Signal, kill_process_group};
+
+    let pid = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
+    if let Some(pid) = pid {
+        if kill_process_group(pid, Signal::KILL).is_err() {
+            let _ = child.kill();
+        }
+    } else {
+        let _ = child.kill();
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate(child: &mut Child) {
+    let _ = child.kill();
 }
 
 impl Drop for ProcessHarness {

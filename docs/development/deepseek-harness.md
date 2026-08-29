@@ -40,6 +40,11 @@ SDK protocol has no prompt-cancel method. Startup, protocol, timeout, and crash
 errors return control to Crumb's native agent runtime; they never terminate the
 interactive shell.
 
+The CLI installs its interrupt bridge only when the first agent turn starts.
+On Unix the Harness owns a separate process group, so hard cancellation also
+terminates its MCP descendants. Native shell input remains on the existing PTY
+path and does not depend on the agent runtime.
+
 ## Delivery slices
 
 1. Typed protocol framing and compatibility fixtures.
