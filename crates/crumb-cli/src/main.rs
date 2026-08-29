@@ -9,8 +9,8 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crumb_agent::{
-    AgentConfig, CancellationToken, CommandCatalog, DenyAllApprovals, InputRoute, LiveConfig,
-    MistakePolicy, RouteDecision, ToolHost, UnknownInputPolicy,
+    AgentConfig, CancellationToken, CommandCatalog, DenyAllApprovals, HarnessConfig, InputRoute,
+    LiveConfig, MistakePolicy, RouteDecision, ToolHost, UnknownInputPolicy,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
@@ -69,7 +69,7 @@ fn run_command_line_action() -> Result<bool> {
 
 fn serve_mcp() -> Result<()> {
     let workspace = current_process_dir()?;
-    let config = LiveConfig::new(workspace.join(".crumb").join("agent.json")).load_or_default()?;
+    let config = read_agent_config(&workspace)?;
     let host = workspace_read_host(&workspace, &config)?;
     let dispatcher = McpDispatcher::new(
         host,
@@ -276,8 +276,7 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
 }
 
 fn load_agent_config(cwd: &Path, writer: &mut dyn Write) -> AgentConfig {
-    let store = LiveConfig::new(cwd.join(".crumb").join("agent.json"));
-    match store.load_or_default() {
+    match read_agent_config(cwd) {
         Ok(config) => config,
         Err(error) => {
             let _ = writeln!(
@@ -289,6 +288,30 @@ fn load_agent_config(cwd: &Path, writer: &mut dyn Write) -> AgentConfig {
             config
         }
     }
+}
+
+fn read_agent_config(cwd: &Path) -> Result<AgentConfig> {
+    let (path, config_root) = agent_config_location(cwd);
+    let mut config = LiveConfig::new(path).load_or_default()?;
+    if let Some(HarnessConfig::Process {
+        cordis: Some(cordis),
+        ..
+    }) = &mut config.harness
+        && cordis.is_relative()
+    {
+        *cordis = config_root.join(cordis.as_path());
+    }
+    Ok(config)
+}
+
+fn agent_config_location(cwd: &Path) -> (PathBuf, PathBuf) {
+    for directory in cwd.ancestors() {
+        let candidate = directory.join(".crumb").join("agent.json");
+        if candidate.is_file() {
+            return (candidate, directory.to_path_buf());
+        }
+    }
+    (cwd.join(".crumb").join("agent.json"), cwd.to_path_buf())
 }
 
 fn handle_agent_boundary(
@@ -762,9 +785,11 @@ impl Drop for RawModeGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use crumb_agent::{AgentConfig, RiskClass};
 
-    use super::workspace_read_host;
+    use super::{agent_config_location, workspace_read_host};
 
     #[test]
     fn stdio_mcp_host_exposes_only_read_tools() {
@@ -789,5 +814,24 @@ mod tests {
         ] {
             assert!(!composition.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn nested_workspaces_find_the_nearest_agent_config() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-config-{suffix}"));
+        let nested = workspace.join("site");
+        std::fs::create_dir_all(workspace.join(".crumb")).expect("config directory can be created");
+        std::fs::create_dir_all(&nested).expect("nested workspace can be created");
+        std::fs::write(workspace.join(".crumb/agent.json"), b"{}").expect("config can be created");
+
+        let (path, root) = agent_config_location(&nested);
+
+        assert_eq!(root, workspace);
+        assert_eq!(path, root.join(".crumb/agent.json"));
+        std::fs::remove_dir_all(root).expect("temporary workspace can be removed");
     }
 }
