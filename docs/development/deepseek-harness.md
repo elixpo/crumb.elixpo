@@ -19,6 +19,11 @@ model, or effort requires a clean process restart so one Harness process cannot
 silently retain another route's defaults. Unsupported effort values fail before
 model traffic.
 
+The SDK wire currently has no approval request/response channel. Crumb therefore
+must not expose a Harness composition containing direct mutating shell or file
+tools. Executable compositions must route tools through Crumb's policy-enforcing
+MCP boundary; plan-only compositions may omit tools entirely.
+
 ## Failure and cancellation
 
 Requests and shutdown are time-bounded. Ctrl+C first sets Crumb's shared
@@ -30,7 +35,7 @@ interactive shell.
 ## Delivery slices
 
 1. Typed protocol framing and compatibility fixtures.
-2. Lazy subprocess lifecycle with bounded stderr and shutdown escalation.
-3. Session notification projection and committed terminal output.
+2. Lazy subprocess lifecycle with bounded stderr and shutdown escalation. (implemented)
+3. Session notification projection and committed terminal output. (projection implemented)
 4. CLI fallback integration and cancellation.
 5. Pollinations-compatible Harness composition and effort capabilities.

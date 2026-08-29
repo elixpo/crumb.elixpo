@@ -66,6 +66,16 @@ pub struct PromptReceipt {
     pub message_id: String,
 }
 
+/// Committed result of one root-session activity interval.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunResult {
+    pub session_id: String,
+    pub final_response: String,
+    pub finish_reason: Option<String>,
+    pub events: Vec<serde_json::Value>,
+    pub notifications: Vec<Notification>,
+}
+
 enum ReaderEvent {
     Frame(IncomingFrame),
     Failed(String),
@@ -212,6 +222,66 @@ impl ProcessHarness {
         Ok((receipt, notifications))
     }
 
+    /// Queues a text request and waits from its durable inbox receipt through
+    /// the root agent's next idle transition.
+    ///
+    /// Only committed `assistant/message` content becomes the final response;
+    /// transient chunks remain notifications for a future streaming renderer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for cancellation, timeout, malformed lifecycle events,
+    /// transport failure, or exhaustion of the supplied event-byte budget.
+    pub fn run_text(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        cancellation: &CancellationToken,
+        timeout: Duration,
+        event_budget_bytes: usize,
+    ) -> Result<RunResult> {
+        let deadline = Instant::now() + timeout;
+        let (receipt, initial) = self.prompt(
+            SessionPromptParams::text(session_id, text),
+            cancellation,
+            remaining(deadline)?,
+        )?;
+        let mut projection =
+            RunProjection::new(session_id, &receipt.message_id, event_budget_bytes);
+        for notification in initial {
+            if self.project_notification(&mut projection, notification)? {
+                return projection.finish();
+            }
+        }
+        loop {
+            match self.receive_frame(cancellation, deadline, "session activity")? {
+                IncomingFrame::Notification(notification) => {
+                    if self.project_notification(&mut projection, notification)? {
+                        return projection.finish();
+                    }
+                }
+                IncomingFrame::Response(_) => {
+                    self.hard_stop();
+                    bail!("Harness returned an unexpected response during session activity");
+                }
+            }
+        }
+    }
+
+    fn project_notification(
+        &mut self,
+        projection: &mut RunProjection<'_>,
+        notification: Notification,
+    ) -> Result<bool> {
+        match projection.observe(notification) {
+            Ok(completed) => Ok(completed),
+            Err(error) => {
+                self.hard_stop();
+                Err(error)
+            }
+        }
+    }
+
     /// Requests graceful shutdown, then forcefully reaps a process that does
     /// not exit within the supplied bound.
     ///
@@ -281,6 +351,28 @@ impl ProcessHarness {
         let deadline = Instant::now() + timeout;
         let mut notifications = Vec::new();
         loop {
+            match self.receive_frame(cancellation, deadline, operation)? {
+                IncomingFrame::Notification(notification) => {
+                    notifications.push(notification);
+                }
+                IncomingFrame::Response(response) => {
+                    if response.id.as_u64() != Some(id) {
+                        self.hard_stop();
+                        bail!("Harness returned an unexpected response id");
+                    }
+                    return Ok((response, notifications));
+                }
+            }
+        }
+    }
+
+    fn receive_frame(
+        &mut self,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+        operation: &str,
+    ) -> Result<IncomingFrame> {
+        loop {
             if cancellation.is_cancelled() {
                 self.hard_stop();
                 bail!("Harness {operation} cancelled");
@@ -292,16 +384,7 @@ impl ProcessHarness {
             }
             let wait = POLL_INTERVAL.min(deadline.saturating_duration_since(now));
             match self.incoming.recv_timeout(wait) {
-                Ok(ReaderEvent::Frame(IncomingFrame::Notification(notification))) => {
-                    notifications.push(notification);
-                }
-                Ok(ReaderEvent::Frame(IncomingFrame::Response(response))) => {
-                    if response.id.as_u64() != Some(id) {
-                        self.hard_stop();
-                        bail!("Harness returned an unexpected response id");
-                    }
-                    return Ok((response, notifications));
-                }
+                Ok(ReaderEvent::Frame(frame)) => return Ok(frame),
                 Ok(ReaderEvent::Failed(error)) => {
                     self.hard_stop();
                     return Err(anyhow!(error).context("invalid Harness protocol output"));
@@ -366,6 +449,164 @@ struct ProcessParts {
     stderr_tail: Arc<Mutex<BoundedTail>>,
     stdout_thread: JoinHandle<()>,
     stderr_thread: JoinHandle<()>,
+}
+
+struct RunProjection<'a> {
+    session_id: &'a str,
+    message_id: &'a str,
+    receipt_seen: bool,
+    byte_budget: usize,
+    bytes_seen: usize,
+    events: Vec<serde_json::Value>,
+    notifications: Vec<Notification>,
+}
+
+impl<'a> RunProjection<'a> {
+    fn new(session_id: &'a str, message_id: &'a str, byte_budget: usize) -> Self {
+        Self {
+            session_id,
+            message_id,
+            receipt_seen: false,
+            byte_budget,
+            bytes_seen: 0,
+            events: Vec::new(),
+            notifications: Vec::new(),
+        }
+    }
+
+    fn observe(&mut self, notification: Notification) -> Result<bool> {
+        if !self.receipt_seen {
+            if !is_inbox_receipt(&notification, self.session_id, self.message_id) {
+                return Ok(false);
+            }
+            self.receipt_seen = true;
+        }
+        let encoded_bytes = serde_json::to_vec(&notification.params)
+            .context("failed to measure Harness notification")?
+            .len();
+        self.bytes_seen = self
+            .bytes_seen
+            .checked_add(encoded_bytes)
+            .context("Harness event byte count overflowed")?;
+        if self.bytes_seen > self.byte_budget {
+            bail!("Harness session activity exceeded its event-byte budget");
+        }
+        if notification.method == "session.event"
+            && notification
+                .params
+                .get("sessionId")
+                .and_then(serde_json::Value::as_str)
+                == Some(self.session_id)
+            && let Some(event) = notification
+                .params
+                .get("event")
+                .and_then(serde_json::Value::as_object)
+        {
+            self.events.push(serde_json::Value::Object(event.clone()));
+        }
+        let completed = notification.method == "session.status"
+            && notification
+                .params
+                .get("sessionId")
+                .and_then(serde_json::Value::as_str)
+                == Some(self.session_id)
+            && notification
+                .params
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                == Some("idle");
+        self.notifications.push(notification);
+        Ok(completed)
+    }
+
+    fn finish(self) -> Result<RunResult> {
+        Ok(RunResult {
+            session_id: self.session_id.to_owned(),
+            final_response: final_response(&self.events),
+            finish_reason: finish_reason(&self.events)?,
+            events: self.events,
+            notifications: self.notifications,
+        })
+    }
+}
+
+fn is_inbox_receipt(notification: &Notification, session_id: &str, message_id: &str) -> bool {
+    if notification.method != "session.event"
+        || notification
+            .params
+            .get("sessionId")
+            .and_then(serde_json::Value::as_str)
+            != Some(session_id)
+    {
+        return false;
+    }
+    let Some(inserted) = notification
+        .params
+        .get("event")
+        .filter(|event| {
+            event.get("type").and_then(serde_json::Value::as_str) == Some("agent/inbox/spliced")
+        })
+        .and_then(|event| event.get("data"))
+        .and_then(|data| data.get("inserted"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    inserted
+        .iter()
+        .any(|message| message.get("id").and_then(serde_json::Value::as_str) == Some(message_id))
+}
+
+fn final_response(events: &[serde_json::Value]) -> String {
+    events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.get("type").and_then(serde_json::Value::as_str) == Some("assistant/message")
+        })
+        .and_then(|event| event.get("data"))
+        .map(|data| {
+            data.get("message")
+                .filter(|message| message.is_object())
+                .unwrap_or(data)
+        })
+        .and_then(|owner| owner.get("content"))
+        .and_then(serde_json::Value::as_array)
+        .map(|content| {
+            content
+                .iter()
+                .filter(|block| {
+                    block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                })
+                .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+                .collect::<String>()
+        })
+        .unwrap_or_default()
+}
+
+fn finish_reason(events: &[serde_json::Value]) -> Result<Option<String>> {
+    let Some(event) = events
+        .iter()
+        .rev()
+        .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("turn/end"))
+    else {
+        return Ok(None);
+    };
+    let kind = event
+        .get("data")
+        .and_then(|data| data.get("reason"))
+        .and_then(|reason| reason.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .context("Harness turn/end event requires data.reason.kind")?;
+    Ok(Some(kind.to_owned()))
+}
+
+fn remaining(deadline: Instant) -> Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("Harness session activity timed out");
+    }
+    Ok(remaining)
 }
 
 fn successful_result(response: Response) -> Result<serde_json::Value> {
@@ -489,7 +730,11 @@ impl BoundedTail {
 mod tests {
     use std::io::Cursor;
 
-    use super::{BoundedTail, MAX_PROTOCOL_LINE_BYTES, read_protocol_line};
+    use serde_json::json;
+
+    use crate::protocol::Notification;
+
+    use super::{BoundedTail, MAX_PROTOCOL_LINE_BYTES, RunProjection, read_protocol_line};
 
     #[test]
     fn stderr_tail_keeps_only_the_latest_bytes() {
@@ -503,5 +748,80 @@ mod tests {
     fn protocol_lines_are_bounded() {
         let input = vec![b'x'; MAX_PROTOCOL_LINE_BYTES + 1];
         assert!(read_protocol_line(&mut Cursor::new(input)).is_err());
+    }
+
+    #[test]
+    fn projection_waits_for_receipt_and_returns_committed_text() {
+        let mut projection = RunProjection::new("root", "message-1", 4096);
+        assert!(
+            !projection
+                .observe(notification(
+                    "session.status",
+                    json!({"sessionId":"root","status":"idle"}),
+                ))
+                .expect("pre-receipt idle is ignored")
+        );
+        projection
+            .observe(notification(
+                "session.event",
+                json!({
+                    "sessionId":"root",
+                    "event":{"type":"agent/inbox/spliced","data":{"inserted":[{"id":"message-1"}]}}
+                }),
+            ))
+            .expect("receipt is accepted");
+        projection
+            .observe(notification(
+                "session.event",
+                json!({
+                    "sessionId":"root",
+                    "event":{"type":"assistant/message","data":{"message":{"content":[{"type":"text","text":"done"}]}}}
+                }),
+            ))
+            .expect("assistant message is accepted");
+        projection
+            .observe(notification(
+                "session.event",
+                json!({
+                    "sessionId":"root",
+                    "event":{"type":"turn/end","data":{"reason":{"kind":"completed"}}}
+                }),
+            ))
+            .expect("turn end is accepted");
+        assert!(
+            projection
+                .observe(notification(
+                    "session.status",
+                    json!({"sessionId":"root","status":"idle"}),
+                ))
+                .expect("idle completes the interval")
+        );
+        let result = projection.finish().expect("projection is valid");
+        assert_eq!(result.final_response, "done");
+        assert_eq!(result.finish_reason.as_deref(), Some("completed"));
+        assert_eq!(result.notifications.len(), 4);
+    }
+
+    #[test]
+    fn projection_enforces_the_event_byte_budget() {
+        let mut projection = RunProjection::new("root", "message-1", 1);
+        assert!(
+            projection
+                .observe(notification(
+                    "session.event",
+                    json!({
+                        "sessionId":"root",
+                        "event":{"type":"agent/inbox/spliced","data":{"inserted":[{"id":"message-1"}]}}
+                    }),
+                ))
+                .is_err()
+        );
+    }
+
+    fn notification(method: &str, params: serde_json::Value) -> Notification {
+        Notification {
+            method: method.to_owned(),
+            params,
+        }
     }
 }
