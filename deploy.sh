@@ -360,6 +360,8 @@ deploy_vscode_package() {
 
 require_pages() {
   [ -f "$PAGES_DIR/package.json" ] || fail "Missing Cloudflare Pages package at $PAGES_DIR/package.json."
+  grep -q '"pages:build"' "$PAGES_DIR/package.json" || fail \
+    "$(basename "$PAGES_DIR") is not a static Pages app; use './deploy.sh --worker build deploy'."
   $DRY_RUN && return
   command -v npm >/dev/null 2>&1 || fail "npm is required."
 }
@@ -367,14 +369,7 @@ require_pages() {
 build_pages() {
   require_pages
   install_node_dependencies "$PAGES_DIR"
-  if $DRY_RUN; then
-    run_in "$PAGES_DIR" npm run build
-  elif node -e 'process.exit(require(process.argv[1]).scripts?.["pages:build"] ? 0 : 1)' \
-    "$PAGES_DIR/package.json"; then
-    run_in "$PAGES_DIR" npm run pages:build
-  else
-    run_in "$PAGES_DIR" npm run build
-  fi
+  run_in "$PAGES_DIR" npm run pages:build
 }
 
 deploy_pages() {

@@ -11,6 +11,6 @@ export async function GET(request: Request) {
   const returnTo = safeReturnTo(new URL(request.url).searchParams.get('return_to'))
   if (await currentUser()) return NextResponse.redirect(new URL(returnTo, request.url))
   const state = randomToken()
-  await bindings().KV.put(`accounts:${state}`, returnTo, { expirationTtl: 600 })
+  await (await bindings()).KV.put(`accounts:${state}`, returnTo, { expirationTtl: 600 })
   return NextResponse.redirect(accountsAuthorizeUrl(state, request.url))
 }

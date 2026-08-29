@@ -1,11 +1,11 @@
 import { getCloudflareContext } from '@opennextjs/cloudflare'
 
-export function bindings(): CloudflareEnv {
-  return getCloudflareContext().env
+export async function bindings(): Promise<CloudflareEnv> {
+  return (await getCloudflareContext({ async: true })).env
 }
 
 export function config() {
-  const env = bindings()
+  const env = process.env
   return {
     accountsOrigin: env.ACCOUNTS_ORIGIN || process.env.ACCOUNTS_ORIGIN || 'https://accounts.elixpo.com',
     accountsClientId: env.NEXT_PUBLIC_ELIXPO_CLIENT_ID || process.env.NEXT_PUBLIC_ELIXPO_CLIENT_ID || '',

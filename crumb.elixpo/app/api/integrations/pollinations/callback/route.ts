@@ -14,9 +14,10 @@ export async function GET(request: Request) {
   const url = new URL(request.url)
   const state = url.searchParams.get('state') || ''
   const key = `pollinations:${state}`
-  const stored = await bindings().KV.get(key)
+  const env = await bindings()
+  const stored = await env.KV.get(key)
   if (!stored) return NextResponse.redirect(new URL('/?connect=invalid_state', request.url))
-  await bindings().KV.delete(key)
+  await env.KV.delete(key)
   const context = JSON.parse(stored) as Context
   const code = url.searchParams.get('code')
   if (!code || url.searchParams.has('error')) return finish(request.url, 'denied')
@@ -25,7 +26,7 @@ export async function GET(request: Request) {
   try {
     const tokens = await exchangeCode(code, context.verifier, request.url)
     const now = Math.floor(Date.now() / 1000)
-    await bindings().DB.prepare(`
+    await env.DB.prepare(`
       INSERT INTO pollinations_connections
         (user_id, access_token_encrypted, token_expires_at, oauth_scope, updated_at)
       VALUES (?, ?, ?, ?, ?)

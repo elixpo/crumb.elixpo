@@ -11,7 +11,7 @@ export async function GET(request: Request) {
   }
   const oauthState = randomToken()
   const pkceVerifier = verifier()
-  await bindings().KV.put(`pollinations:${oauthState}`, JSON.stringify({
+  await (await bindings()).KV.put(`pollinations:${oauthState}`, JSON.stringify({
     userId: user.id,
     verifier: pkceVerifier,
   }), { expirationTtl: 600 })

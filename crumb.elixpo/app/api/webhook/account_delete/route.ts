@@ -59,13 +59,14 @@ export async function POST(request: Request) {
 
   const eventId = request.headers.get('x-elixpo-event-id')
   const dedupeKey = eventId ? `accounts-webhook:${eventId}` : null
-  if (dedupeKey && await bindings().KV.get(dedupeKey)) {
+  const env = await bindings()
+  if (dedupeKey && await env.KV.get(dedupeKey)) {
     return NextResponse.json({ ok: true, deduped: true })
   }
 
   if (body.event === 'user.deleted') {
-    await bindings().DB.prepare('DELETE FROM users WHERE id = ?').bind(body.elixpo_id).run()
+    await env.DB.prepare('DELETE FROM users WHERE id = ?').bind(body.elixpo_id).run()
   }
-  if (dedupeKey) await bindings().KV.put(dedupeKey, '1', { expirationTtl: 1800 })
+  if (dedupeKey) await env.KV.put(dedupeKey, '1', { expirationTtl: 1800 })
   return NextResponse.json({ ok: true, event: body.event })
 }
