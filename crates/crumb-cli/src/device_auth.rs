@@ -29,7 +29,7 @@ struct DeviceRequest<'a> {
 }
 
 #[derive(Deserialize)]
-struct DeviceCode {
+struct AuthorizationChallenge {
     device_code: String,
     user_code: String,
     verification_uri: String,
@@ -84,7 +84,7 @@ pub(crate) fn connect(writer: &mut dyn Write) -> Result<SecretString> {
         .context("could not start Accounts device authorization")?
         .error_for_status()
         .context("Accounts rejected the Crumb CLI registration")?
-        .json::<DeviceCode>()
+        .json::<AuthorizationChallenge>()
         .context("Accounts returned an invalid device challenge")?;
 
     let verification_url = device
@@ -127,7 +127,7 @@ fn poll_accounts(
     client: &Client,
     accounts: &Url,
     client_id: &str,
-    device: &DeviceCode,
+    device: &AuthorizationChallenge,
 ) -> Result<String> {
     let deadline = Instant::now() + Duration::from_secs(device.expires_in);
     let mut interval = Duration::from_secs(device.interval.max(1));

@@ -88,8 +88,8 @@ impl CompletionProtocol {
     #[must_use]
     pub fn submission(&self, kind: ShellKind, command: &str, sequence: u64) -> String {
         match kind {
-            ShellKind::Bash | ShellKind::Zsh => self.posix_submission(command, sequence),
-            ShellKind::PowerShell => self.powershell_submission(command, sequence),
+            ShellKind::Bash | ShellKind::Zsh => Self::posix_submission(command, sequence),
+            ShellKind::PowerShell => Self::powershell_submission(command, sequence),
         }
     }
 
@@ -129,11 +129,11 @@ impl CompletionProtocol {
         format!("{}crumb:{}:", char::from(FRAME_START), self.token).into_bytes()
     }
 
-    fn posix_submission(&self, command: &str, sequence: u64) -> String {
+    fn posix_submission(command: &str, sequence: u64) -> String {
         format!("__crumb_seq={sequence}; stty echo; {command}\n")
     }
 
-    fn powershell_submission(&self, command: &str, sequence: u64) -> String {
+    fn powershell_submission(command: &str, sequence: u64) -> String {
         format!("$global:LASTEXITCODE=$null; $global:__crumb_sequence={sequence}; {command}\r\n")
     }
 
@@ -171,13 +171,15 @@ impl Default for CompletionProtocol {
 }
 
 fn decode_hex(input: &str) -> Result<Vec<u8>> {
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return Err(anyhow!("cwd hex payload has an odd length"));
     }
 
     input
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let pair = std::str::from_utf8(pair)?;
             Ok(u8::from_str_radix(pair, 16)?)
