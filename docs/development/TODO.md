@@ -22,7 +22,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Forward terminal resize events while commands run on Linux.
 - [x] Make Ctrl+C interrupt the foreground command without exiting Crumb on Linux.
 - [x] Run interactive and full-screen TTY programs as ordinary commands on Linux.
-- [ ] Preserve shell state and completion metadata after interactive commands.
+- [x] Preserve shell state and completion metadata after interactive commands on Linux.
 - [ ] Cover Linux Bash, macOS Zsh, and Windows PowerShell behavior.
 - [ ] Remove terminal compatibility as a reason to use `:shell`.
 - [ ] Pass formatting, clippy, and workspace tests.
