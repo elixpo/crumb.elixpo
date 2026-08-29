@@ -7,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 
+use crate::ShellKind;
+
 const FRAME_START: u8 = 0x1e;
 const FRAME_END: u8 = 0x1f;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -64,11 +66,11 @@ impl CompletionProtocol {
     /// Builds a Bash submission that preserves shell state and emits hidden
     /// completion metadata on the following line.
     #[must_use]
-    pub fn bash_submission(&self, command: &str, sequence: u64) -> String {
-        format!(
-            "{command}\n__crumb_status=$?; __crumb_cwd_hex=$(printf %s \"$PWD\" | od -An -tx1 | tr -d ' \\n'); printf '\\036crumb:{}:{sequence}:%s:%s\\037' \"$__crumb_status\" \"$__crumb_cwd_hex\"\n",
-            self.token
-        )
+    pub fn submission(&self, kind: ShellKind, command: &str, sequence: u64) -> String {
+        match kind {
+            ShellKind::Bash | ShellKind::Zsh => self.posix_submission(command, sequence),
+            ShellKind::PowerShell => self.powershell_submission(command, sequence),
+        }
     }
 
     /// Decodes arbitrary PTY chunks while retaining incomplete frame bytes.
@@ -105,6 +107,20 @@ impl CompletionProtocol {
 
     fn frame_prefix(&self) -> Vec<u8> {
         format!("{}crumb:{}:", char::from(FRAME_START), self.token).into_bytes()
+    }
+
+    fn posix_submission(&self, command: &str, sequence: u64) -> String {
+        format!(
+            "{command}\n__crumb_status=$?; __crumb_cwd_hex=$(printf %s \"$PWD\" | od -An -tx1 | tr -d ' \\n'); printf '\\036crumb:{}:{sequence}:%s:%s\\037' \"$__crumb_status\" \"$__crumb_cwd_hex\"\n",
+            self.token
+        )
+    }
+
+    fn powershell_submission(&self, command: &str, sequence: u64) -> String {
+        format!(
+            "$global:LASTEXITCODE=$null; {command}\r\n$__crumb_status = if ($?) {{ 0 }} elseif ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }}; $__crumb_cwd_hex = [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes((Get-Location).Path)).ToLowerInvariant(); [Console]::Write([char]0x1e + 'crumb:{}:{sequence}:' + $__crumb_status + ':' + $__crumb_cwd_hex + [char]0x1f)\r\n",
+            self.token
+        )
     }
 
     fn parse_frame(&self, frame: &[u8]) -> Result<CommandCompletion> {
@@ -179,10 +195,21 @@ mod tests {
     fn submission_runs_command_before_the_completion_hook() {
         let protocol = CompletionProtocol::with_token("abc123".to_owned());
 
-        let submission = protocol.bash_submission("cd /tmp", 7);
+        let submission = protocol.submission(crate::ShellKind::Bash, "cd /tmp", 7);
 
         assert!(submission.starts_with("cd /tmp\n__crumb_status=$?;"));
         assert!(submission.contains("crumb:abc123:7:"));
+    }
+
+    #[test]
+    fn powershell_submission_resets_stale_native_exit_state() {
+        let protocol = CompletionProtocol::with_token("abc123".to_owned());
+
+        let submission =
+            protocol.submission(crate::ShellKind::PowerShell, "Set-Location C:\\\\", 9);
+
+        assert!(submission.starts_with("$global:LASTEXITCODE=$null;"));
+        assert!(submission.contains("crumb:abc123:9:"));
     }
 
     #[test]
