@@ -73,7 +73,8 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Add a self-clearing inline activity indicator for synchronous Harness turns.
 - [x] Replace flat help output with a grouped `/` command palette.
 - [x] Add read-only `/mode`, `/model`, `/effort`, `/config`, and `/plugins` surfaces.
-- [ ] Stream real Harness tool events into the renderer instead of projecting them after completion.
+- [x] Stream real Harness notifications into the renderer instead of projecting them after completion.
+- [ ] Add queued steering and richer tool-specific event projection to the Harness stream.
 - [ ] Add interactive approval, tool-call, patch, error, and completion components.
 - [ ] Add live model, effort, and mode selection backed by atomic configuration writes.
 - [ ] Add terminal-width snapshots, reduced-motion behavior, and accessibility checks.

@@ -79,18 +79,37 @@ impl HarnessSupervisor {
         text: &str,
         cancellation: &CancellationToken,
     ) -> Result<RunResult> {
+        self.run_text_with_events(launch, session_id, text, cancellation, |_| Ok(()))
+    }
+
+    /// Runs one activity and forwards bounded protocol notifications to a
+    /// caller-owned renderer or observer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`Self::run_text`], or
+    /// when the observer rejects a notification.
+    pub fn run_text_with_events(
+        &mut self,
+        launch: HarnessLaunch,
+        session_id: &str,
+        text: &str,
+        cancellation: &CancellationToken,
+        on_notification: impl FnMut(&crate::Notification) -> Result<()>,
+    ) -> Result<RunResult> {
         self.ensure_active(launch, cancellation)?;
         let result = self
             .active
             .as_mut()
             .context("Harness supervisor lost its active process")?
             .process
-            .run_text(
+            .run_text_with_events(
                 session_id,
                 text,
                 cancellation,
                 self.limits.run_timeout,
                 self.limits.event_budget_bytes,
+                on_notification,
             );
         if result.is_err() {
             self.active.take();

@@ -10,7 +10,7 @@ use crumb_agent::{
 };
 use crumb_auth::{CredentialStore, OsCredentialStore, SecretString};
 use crumb_harness_dsh::{
-    HarnessEnvironment, HarnessIdentity, HarnessLaunch, HarnessSupervisor, RunResult,
+    HarnessEnvironment, HarnessIdentity, HarnessLaunch, HarnessSupervisor, Notification, RunResult,
     SupervisorLimits,
 };
 
@@ -61,6 +61,22 @@ impl AgentRuntime {
         config: &AgentConfig,
         workspace: &Path,
     ) -> Result<RunResult> {
+        self.run_with_events(request, config, workspace, |_| Ok(()))
+    }
+
+    /// Executes one turn and forwards bounded Harness notifications as they
+    /// arrive.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::run`], including observer errors.
+    pub fn run_with_events(
+        &mut self,
+        request: &str,
+        config: &AgentConfig,
+        workspace: &Path,
+        on_notification: impl FnMut(&Notification) -> Result<()>,
+    ) -> Result<RunResult> {
         let workspace = std::fs::canonicalize(workspace)
             .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
         self.ensure_session(&workspace, config.mode)?;
@@ -97,7 +113,13 @@ impl AgentRuntime {
             .supervisor
             .as_mut()
             .context("Harness supervisor unavailable")?
-            .run_text(launch, &session_id, request, &cancellation);
+            .run_text_with_events(
+                launch,
+                &session_id,
+                request,
+                &cancellation,
+                on_notification,
+            );
         let status = match &result {
             Ok(_) => TurnStatus::Complete,
             Err(_) if cancellation.is_cancelled() => TurnStatus::Cancelled,

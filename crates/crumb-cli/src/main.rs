@@ -15,6 +15,7 @@ use crumb_agent::{
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
+use crumb_harness_dsh::Notification;
 use crumb_mcp::{McpDispatcher, serve_stdio};
 use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::shell_for;
@@ -361,12 +362,28 @@ fn handle_agent_boundary(
         renderer.agent_header(&model, effort, agent_mode_name(config.mode), None)
     )?;
     writer.flush()?;
-    let activity = renderer.activity("Working through Harness");
+    let mut activity = Some(renderer.activity("Working through Harness"));
     let result = runtime
         .as_mut()
         .expect("agent runtime is initialized above")
-        .run(&decision.payload, config, workspace);
-    activity.finish();
+        .run_with_events(
+            &decision.payload,
+            config,
+            workspace,
+            |notification| {
+                if let Some(label) = harness_event_label(notification) {
+                    if let Some(indicator) = activity.take() {
+                        indicator.finish();
+                    }
+                    writeln!(writer, "  ↳ {label}")?;
+                    writer.flush()?;
+                }
+                Ok(())
+            },
+        );
+    if let Some(indicator) = activity.take() {
+        indicator.finish();
+    }
 
     match result {
         Ok(result) if result.final_response.trim().is_empty() => {
@@ -396,6 +413,43 @@ fn handle_agent_boundary(
         }
     }
     Ok(())
+}
+
+fn harness_event_label(notification: &Notification) -> Option<String> {
+    if notification.method == "session.status" {
+        return notification
+            .params
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .and_then(safe_event_label)
+            .map(|status| format!("session {status}"));
+    }
+    if notification.method != "session.event" {
+        return None;
+    }
+    let event_type = notification
+        .params
+        .get("event")?
+        .get("type")?
+        .as_str()?;
+    match event_type {
+        "agent/inbox/spliced" => Some("request accepted".to_owned()),
+        "assistant/message" | "turn/end" => None,
+        other => safe_event_label(other),
+    }
+}
+
+fn safe_event_label(value: &str) -> Option<String> {
+    let label = value
+        .chars()
+        .filter_map(|character| match character {
+            '/' | '-' | '_' => Some(' '),
+            character if character.is_ascii_alphanumeric() || character == ' ' => Some(character),
+            _ => None,
+        })
+        .take(64)
+        .collect::<String>();
+    (!label.trim().is_empty()).then(|| label.trim().to_owned())
 }
 
 const fn agent_mode_name(mode: AgentMode) -> &'static str {
@@ -1099,7 +1153,7 @@ mod tests {
 
     use crumb_agent::{AgentConfig, RiskClass};
 
-    use super::{agent_config_location, workspace_read_host};
+    use super::{agent_config_location, safe_event_label, workspace_read_host};
 
     #[test]
     fn stdio_mcp_host_exposes_only_read_tools() {
@@ -1124,6 +1178,14 @@ mod tests {
         ] {
             assert!(!composition.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn harness_event_labels_cannot_inject_terminal_controls() {
+        assert_eq!(
+            safe_event_label("tool/run\u{1b}[31m_secret"),
+            Some("tool run31m secret".to_owned())
+        );
     }
 
     #[test]

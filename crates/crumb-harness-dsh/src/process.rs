@@ -241,6 +241,32 @@ impl ProcessHarness {
         timeout: Duration,
         event_budget_bytes: usize,
     ) -> Result<RunResult> {
+        self.run_text_with_events(
+            session_id,
+            text,
+            cancellation,
+            timeout,
+            event_budget_bytes,
+            |_| Ok(()),
+        )
+    }
+
+    /// Runs one text request while forwarding each bounded Harness
+    /// notification before it is committed to the final projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for the same conditions as [`Self::run_text`], or when
+    /// the event consumer rejects a notification.
+    pub fn run_text_with_events(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        cancellation: &CancellationToken,
+        timeout: Duration,
+        event_budget_bytes: usize,
+        mut on_notification: impl FnMut(&Notification) -> Result<()>,
+    ) -> Result<RunResult> {
         let deadline = Instant::now() + timeout;
         let (receipt, initial) = self.prompt(
             SessionPromptParams::text(session_id, text),
@@ -250,6 +276,7 @@ impl ProcessHarness {
         let mut projection =
             RunProjection::new(session_id, &receipt.message_id, event_budget_bytes);
         for notification in initial {
+            on_notification(&notification)?;
             if self.project_notification(&mut projection, notification)? {
                 return projection.finish();
             }
@@ -257,6 +284,7 @@ impl ProcessHarness {
         loop {
             match self.receive_frame(cancellation, deadline, "session activity")? {
                 IncomingFrame::Notification(notification) => {
+                    on_notification(&notification)?;
                     if self.project_notification(&mut projection, notification)? {
                         return projection.finish();
                     }
