@@ -53,6 +53,8 @@ pub enum HarnessConfig {
         command: PathBuf,
         #[serde(default)]
         arguments: Vec<String>,
+        #[serde(default)]
+        cordis: Option<PathBuf>,
     },
 }
 
@@ -89,6 +91,8 @@ pub struct AgentLimits {
     pub max_context_tokens: u64,
     pub max_output_bytes: u64,
     pub max_directory_entries: u64,
+    pub max_harness_initialize_seconds: u64,
+    pub max_harness_shutdown_seconds: u64,
     pub max_shell_command_seconds: u64,
     pub max_file_write_bytes: u64,
 }
@@ -102,6 +106,8 @@ impl Default for AgentLimits {
             max_context_tokens: 64_000,
             max_output_bytes: 1_048_576,
             max_directory_entries: 4_096,
+            max_harness_initialize_seconds: 30,
+            max_harness_shutdown_seconds: 5,
             max_shell_command_seconds: 300,
             max_file_write_bytes: 1_048_576,
         }
@@ -167,8 +173,13 @@ impl AgentConfig {
             }
         }
         validate_effort(self.reasoning_effort.as_deref())?;
-        if self.limits.max_output_bytes == 0 || self.limits.max_directory_entries == 0 {
-            bail!("workspace read limits must be positive");
+        if self.limits.max_output_bytes == 0
+            || self.limits.max_directory_entries == 0
+            || self.limits.max_wall_time_seconds == 0
+            || self.limits.max_harness_initialize_seconds == 0
+            || self.limits.max_harness_shutdown_seconds == 0
+        {
+            bail!("agent runtime limits must be positive");
         }
         if self.skills.iter().any(|skill| skill.id.trim().is_empty()) {
             bail!("skill identifiers cannot be empty");

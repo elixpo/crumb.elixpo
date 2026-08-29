@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crumb_agent::CancellationToken;
+use crumb_agent::{AgentMode, CancellationToken};
 
 use crate::{HarnessEnvironment, InitializeParams, ProcessHarness, RunResult, ServerInfo};
 
@@ -14,6 +14,8 @@ pub struct HarnessIdentity {
     pub program: PathBuf,
     pub arguments: Vec<String>,
     pub cwd: PathBuf,
+    pub composition: PathBuf,
+    pub mode: AgentMode,
     pub provider: String,
     pub model: String,
     pub reasoning_effort: Option<String>,

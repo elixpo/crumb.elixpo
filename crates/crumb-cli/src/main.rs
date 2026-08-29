@@ -28,7 +28,10 @@ use reedline::{
     PromptHistorySearchStatus, Reedline, Signal,
 };
 
+mod agent_runtime;
 mod device_auth;
+
+use agent_runtime::AgentRuntime;
 
 const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
 
@@ -117,6 +120,7 @@ fn run_managed_repl() -> Result<ReplOutcome> {
         command_catalog.enable_powershell_commands();
     }
     let mut session: Option<ShellSession> = None;
+    let mut agent_runtime: Option<AgentRuntime> = None;
     let mut last_exit_code = None;
     let history = open_history(&mut stdout.lock())?;
     let mut line_editor = interactive
@@ -168,6 +172,7 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             InputEvent::NativeInput(command) => {
                 let mut context = InputContext {
                     command_catalog: &command_catalog,
+                    agent_runtime: &mut agent_runtime,
                     session: &mut session,
                     history: history.as_ref(),
                     cwd: &cwd,
@@ -186,6 +191,7 @@ fn run_managed_repl() -> Result<ReplOutcome> {
 
 struct InputContext<'a> {
     command_catalog: &'a CommandCatalog,
+    agent_runtime: &'a mut Option<AgentRuntime>,
     session: &'a mut Option<ShellSession>,
     history: Option<&'a HistoryStore>,
     cwd: &'a Path,
@@ -201,7 +207,13 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
         .command_catalog
         .route(command, &agent_config.routing);
     if !matches!(decision.route, InputRoute::Native) {
-        handle_agent_boundary(&decision, &agent_config, context.writer)?;
+        handle_agent_boundary(
+            &decision,
+            &agent_config,
+            context.cwd,
+            context.agent_runtime,
+            context.writer,
+        )?;
         record_history(
             context.history,
             command,
@@ -282,23 +294,32 @@ fn load_agent_config(cwd: &Path, writer: &mut dyn Write) -> AgentConfig {
 fn handle_agent_boundary(
     decision: &RouteDecision,
     config: &AgentConfig,
+    workspace: &Path,
+    runtime: &mut Option<AgentRuntime>,
     writer: &mut dyn Write,
 ) -> Result<()> {
-    match decision.route {
-        InputRoute::Agent => writeln!(
-            writer,
-            "agent request detected ({:?}, effort: {}); runtime arrives in the next package",
-            config.mode,
-            config
-                .reasoning_effort
-                .as_deref()
-                .unwrap_or("model default")
-        )?,
-        InputRoute::Negotiate => writeln!(
-            writer,
-            "natural-language request detected; negotiate mode will show its plan before tools run"
-        )?,
-        InputRoute::Native => unreachable!("native input is handled by the shell path"),
+    if matches!(decision.route, InputRoute::Native) {
+        unreachable!("native input is handled by the shell path");
+    }
+    if runtime.is_none() {
+        match AgentRuntime::new() {
+            Ok(created) => *runtime = Some(created),
+            Err(error) => {
+                writeln!(writer, "agent unavailable: {error}")?;
+                return Ok(());
+            }
+        }
+    }
+    match runtime
+        .as_mut()
+        .expect("agent runtime is initialized above")
+        .run(&decision.payload, config, workspace)
+    {
+        Ok(result) if result.final_response.trim().is_empty() => {
+            writeln!(writer, "agent completed without a text response")?;
+        }
+        Ok(result) => writeln!(writer, "{}", result.final_response)?,
+        Err(error) => writeln!(writer, "agent unavailable: {error}")?,
     }
     Ok(())
 }

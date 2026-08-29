@@ -45,5 +45,5 @@ interactive shell.
 1. Typed protocol framing and compatibility fixtures.
 2. Lazy subprocess lifecycle with bounded stderr and shutdown escalation. (implemented)
 3. Session notification projection and committed terminal output. (projection implemented)
-4. CLI fallback integration and cancellation.
+4. CLI fallback integration and cancellation. (implemented)
 5. Pollinations-compatible Harness composition and effort capabilities.
