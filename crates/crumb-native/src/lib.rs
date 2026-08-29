@@ -1,6 +1,7 @@
 //! Native-shell selection and lifecycle boundaries.
 
 pub mod protocol;
+pub mod session;
 
 use anyhow::{Context, Result};
 use crumb_platform::Platform;

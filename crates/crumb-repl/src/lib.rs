@@ -32,6 +32,26 @@ pub fn render_prompt(cwd: &Path) -> String {
     format!("crumb:{}> ", cwd.display())
 }
 
+/// Reads and classifies one prompt line.
+///
+/// # Errors
+///
+/// Returns an error when terminal input/output fails.
+pub fn read_input<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    cwd: &Path,
+) -> io::Result<Option<InputEvent>> {
+    write!(writer, "{}", render_prompt(cwd))?;
+    writer.flush()?;
+
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(classify_input(&line)))
+}
+
 /// Runs the WP-001 REPL until `:exit` or end-of-input.
 ///
 /// Native input is classified and reported, but deliberately not executed.
@@ -48,15 +68,11 @@ pub fn run<R: BufRead, W: Write>(
 ) -> io::Result<ReplOutcome> {
     loop {
         let cwd = env::current_dir()?;
-        write!(writer, "{}", render_prompt(&cwd))?;
-        writer.flush()?;
-
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
+        let Some(event) = read_input(&mut reader, &mut writer, &cwd)? else {
             return Ok(ReplOutcome::Exit);
-        }
+        };
 
-        match classify_input(&line) {
+        match event {
             InputEvent::BuiltIn(BuiltInCommand::Exit) => return Ok(ReplOutcome::Exit),
             InputEvent::BuiltIn(BuiltInCommand::Platform) => writeln!(writer, "{platform}")?,
             InputEvent::BuiltIn(BuiltInCommand::Shell) => {
@@ -92,7 +108,7 @@ mod tests {
     use crumb_core::{BuiltInCommand, InputEvent};
     use crumb_platform::Platform;
 
-    use super::{ReplOutcome, classify_input, render_prompt, run};
+    use super::{ReplOutcome, classify_input, read_input, render_prompt, run};
 
     #[test]
     fn classifies_supported_built_ins() {
@@ -127,6 +143,24 @@ mod tests {
         assert_eq!(
             render_prompt(Path::new("/tmp/project")),
             "crumb:/tmp/project> "
+        );
+    }
+
+    #[test]
+    fn reads_one_classified_input_event() {
+        let mut input = Cursor::new("git status\n");
+        let mut output = Vec::new();
+
+        let event = read_input(&mut input, &mut output, Path::new("/workspace"))
+            .expect("input should be read");
+
+        assert_eq!(
+            event,
+            Some(InputEvent::NativeInput("git status".to_owned()))
+        );
+        assert_eq!(
+            String::from_utf8(output).expect("output should be UTF-8"),
+            "crumb:/workspace> "
         );
     }
 

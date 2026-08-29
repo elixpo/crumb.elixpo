@@ -1,4 +1,5 @@
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -6,19 +7,83 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
+use crumb_core::{BuiltInCommand, InputEvent};
+use crumb_native::session::ShellSession;
 use crumb_native::shell_for;
 use crumb_platform::Platform;
 use crumb_pty::{SystemPty, TerminalSize};
-use crumb_repl::ReplOutcome;
+use crumb_repl::{ReplOutcome, read_input};
 
 fn main() -> Result<()> {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-
-    if crumb_cli::run(stdin.lock(), stdout.lock())? == ReplOutcome::LaunchNativeShell {
+    if run_managed_repl()? == ReplOutcome::LaunchNativeShell {
         run_native_shell()?;
     }
 
+    Ok(())
+}
+
+fn run_managed_repl() -> Result<ReplOutcome> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut reader = stdin.lock();
+    let mut writer = stdout.lock();
+    let platform = Platform::current();
+    let mut session: Option<ShellSession> = None;
+
+    loop {
+        let cwd = session
+            .as_ref()
+            .map_or_else(current_process_dir, |shell| Ok(shell.cwd().to_path_buf()))?;
+        let Some(event) = read_input(&mut reader, &mut writer, &cwd)? else {
+            shutdown_session(session)?;
+            return Ok(ReplOutcome::Exit);
+        };
+
+        match event {
+            InputEvent::BuiltIn(BuiltInCommand::Exit) => {
+                shutdown_session(session)?;
+                return Ok(ReplOutcome::Exit);
+            }
+            InputEvent::BuiltIn(BuiltInCommand::Platform) => writeln!(writer, "{platform}")?,
+            InputEvent::BuiltIn(BuiltInCommand::Version) => {
+                writeln!(writer, "crumb {}", env!("CARGO_PKG_VERSION"))?;
+            }
+            InputEvent::BuiltIn(BuiltInCommand::Shell) if session.is_none() => {
+                return Ok(ReplOutcome::LaunchNativeShell);
+            }
+            InputEvent::BuiltIn(BuiltInCommand::Shell) => {
+                writeln!(
+                    writer,
+                    "`:shell` is available before the managed shell starts; restart crumb to enter raw mode"
+                )?;
+            }
+            InputEvent::NativeInput(command) if command.trim().is_empty() => {}
+            InputEvent::NativeInput(command) => {
+                if session.is_none() {
+                    let (cols, rows) = size()?;
+                    let shell = shell_for(platform);
+                    session = Some(ShellSession::start(
+                        shell.as_ref(),
+                        &SystemPty,
+                        TerminalSize::new(rows, cols),
+                    )?);
+                }
+                if let Some(shell) = session.as_mut() {
+                    shell.execute(&command, &mut writer)?;
+                }
+            }
+        }
+    }
+}
+
+fn current_process_dir() -> Result<PathBuf> {
+    Ok(std::env::current_dir()?)
+}
+
+fn shutdown_session(session: Option<ShellSession>) -> Result<()> {
+    if let Some(session) = session {
+        session.shutdown()?;
+    }
     Ok(())
 }
 
