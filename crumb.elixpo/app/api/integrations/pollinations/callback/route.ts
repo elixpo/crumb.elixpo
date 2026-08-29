@@ -7,7 +7,7 @@ import { encryptToken } from '@/lib/secrets'
 interface Context { userId: string; verifier: string }
 
 function finish(requestUrl: string, result: string) {
-  return NextResponse.redirect(new URL(`/connect?pollinations=${result}`, requestUrl))
+  return NextResponse.redirect(new URL(`/profiles?pollinations=${result}`, requestUrl))
 }
 
 export async function GET(request: Request) {
@@ -45,6 +45,6 @@ export async function GET(request: Request) {
   } catch (error) {
     const reference = crypto.randomUUID().slice(0, 8)
     console.error(`[crumb/pollinations] callback failed ref=${reference}`, error instanceof Error ? error.message : 'unknown error')
-    return NextResponse.redirect(new URL(`/connect?pollinations=failed&error_ref=${reference}`, request.url))
+    return NextResponse.redirect(new URL(`/profiles?pollinations=failed&error_ref=${reference}`, request.url))
   }
 }

@@ -6,7 +6,7 @@ import { currentUser } from '@/lib/auth'
 export const metadata: Metadata = { title: 'Sign in' }
 
 export default async function LoginPage() {
-  if (await currentUser()) redirect('/connect')
+  if (await currentUser()) redirect('/profiles')
   return <><SiteHeader /><main className="auth-page">
     <section className="auth-card">
       <div className="auth-logos"><img src="/favicon.ico" alt="Crumb" /><span>↔</span><div className="elixpo-logo">e</div></div>

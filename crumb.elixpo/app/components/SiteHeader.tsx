@@ -12,7 +12,7 @@ export async function SiteHeader() {
     <div className="nav-shell">
       <Link className="brand" href="/" aria-label="Crumb home">
         <img className="brand-logo" src="/favicon.ico" alt="" width="32" height="32" />
-        <span>crumb</span><span className="brand-badge">LNT</span>
+        <span>crumb</span><span className="brand-badge">NLT</span>
       </Link>
       <nav className="desktop-nav" aria-label="Main navigation">
         <Link href="/#features">Features</Link><Link href="/docs">Docs</Link><Link href="/about">About</Link>
@@ -26,7 +26,7 @@ export async function SiteHeader() {
           </summary>
           <div className="user-popover">
             <p>{user.email}</p>
-            <Link href="/connect">Pollinations connector</Link>
+            <Link href="/profiles">Profiles and connections</Link>
             <a href={`${accountsOrigin}/dashboard/services`}>Elixpo account</a>
             <form action="/api/auth/logout" method="post"><button type="submit">Sign out</button></form>
           </div>
