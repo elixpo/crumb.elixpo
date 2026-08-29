@@ -7,12 +7,16 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use crossterm::event::{
+    Event as TerminalEvent, KeyCode as TerminalKeyCode, KeyEventKind,
+    KeyModifiers as TerminalModifiers, poll as poll_terminal_event, read as read_terminal_event,
+};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crumb_agent::{
     AgentConfig, AgentMode, CancellationToken, CommandCatalog, ConfiguredApprovals, HarnessConfig,
-    InputRoute, LiveConfig, MistakePolicy, Modality, RouteDecision, ToolHost, TurnStatus,
-    UnknownInputPolicy, export_session, list_sessions, search_sessions, session_summary,
-    set_session_archived, set_session_label, trash_session,
+    InputRoute, LiveConfig, MistakePolicy, Modality, RouteDecision, SteeringAction, SteeringQueue,
+    ToolHost, TurnStatus, UnknownInputPolicy, export_session, list_sessions, search_sessions,
+    session_summary, set_session_archived, set_session_label, trash_session,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
@@ -246,6 +250,7 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
             context.agent_runtime,
             context.renderer,
             context.writer,
+            context.interactive,
         )?;
         record_history(
             context.history,
@@ -354,6 +359,7 @@ fn handle_agent_boundary(
     runtime: &mut Option<AgentRuntime>,
     renderer: Renderer,
     writer: &mut dyn Write,
+    interactive: bool,
 ) -> Result<()> {
     if matches!(decision.route, InputRoute::Native) {
         unreachable!("native input is handled by the shell path");
@@ -386,32 +392,22 @@ fn handle_agent_boundary(
         renderer.agent_header(&model, effort, agent_mode_name(config.mode), None)
     )?;
     writer.flush()?;
-    let activity_capacity = usize::try_from(config.limits.max_activity_events)
-        .context("max_activity_events exceeds this platform's address space")?;
-    let active_runtime = runtime.take().expect("agent runtime is initialized above");
-    let task = active_runtime.spawn_turn(
+    execute_agent_sequence(
         decision.payload.clone(),
-        config.clone(),
-        workspace.to_path_buf(),
-        activity_capacity,
-    )?;
-    let mut activity = Some(renderer.activity("Working through Harness"));
-    while !task.is_finished() {
-        match task.recv_timeout(Duration::from_millis(25)) {
-            Ok(event) => render_harness_activity(&event, &mut activity, writer)?,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    while let Ok(event) = task.recv_timeout(Duration::ZERO) {
-        render_harness_activity(&event, &mut activity, writer)?;
-    }
-    let (returned_runtime, result) = task.finish()?;
-    *runtime = Some(returned_runtime);
-    if let Some(indicator) = activity.take() {
-        indicator.finish();
-    }
+        config,
+        workspace,
+        runtime,
+        renderer,
+        writer,
+        interactive,
+    )
+}
 
+fn render_agent_result(
+    result: &Result<crumb_harness_dsh::RunResult>,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+) -> Result<()> {
     match result {
         Ok(result) if result.final_response.trim().is_empty() => {
             writeln!(
@@ -440,6 +436,227 @@ fn handle_agent_boundary(
         }
     }
     Ok(())
+}
+
+fn execute_agent_sequence(
+    initial_request: String,
+    config: &AgentConfig,
+    workspace: &Path,
+    runtime: &mut Option<AgentRuntime>,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    interactive: bool,
+) -> Result<()> {
+    let activity_capacity = usize::try_from(config.limits.max_activity_events)
+        .context("max_activity_events exceeds this platform's address space")?;
+    let steering_messages = usize::try_from(config.limits.max_steering_messages)
+        .context("max_steering_messages exceeds this platform's address space")?;
+    let steering_bytes = usize::try_from(config.limits.max_steering_bytes)
+        .context("max_steering_bytes exceeds this platform's address space")?;
+    let mut steering = SteeringQueue::new(steering_messages, steering_bytes)?;
+    let mut request = initial_request;
+    let mut active_runtime = runtime.take().context("agent runtime is unavailable")?;
+    loop {
+        let task = active_runtime.spawn_turn(
+            request,
+            config.clone(),
+            workspace.to_path_buf(),
+            activity_capacity,
+        )?;
+        let (returned_runtime, result) = observe_agent_turn(
+            task,
+            &mut steering,
+            steering_bytes,
+            renderer,
+            writer,
+            interactive,
+        )?;
+        active_runtime = returned_runtime;
+        let completed = result.is_ok();
+        render_agent_result(&result, renderer, writer)?;
+        if !completed {
+            steering.clear();
+            break;
+        }
+        let Some(queued) = steering.pop() else {
+            break;
+        };
+        writeln!(
+            writer,
+            "◇ Running queued follow-up · {} remaining",
+            steering.len()
+        )?;
+        request = queued;
+    }
+    *runtime = Some(active_runtime);
+    Ok(())
+}
+
+fn observe_agent_turn(
+    task: agent_runtime::AgentTurnTask,
+    steering: &mut SteeringQueue,
+    steering_bytes: usize,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    interactive: bool,
+) -> Result<(AgentRuntime, Result<crumb_harness_dsh::RunResult>)> {
+    let mut activity = Some(renderer.activity("Working through Harness"));
+    let mut input = SteeringInput::new(steering_bytes);
+    let raw_mode = interactive.then(RawModeGuard::enable).transpose()?;
+    while !task.is_finished() {
+        match task.recv_timeout(Duration::from_millis(15)) {
+            Ok(event) => {
+                input.clear_line(writer)?;
+                render_harness_activity(&event, &mut activity, writer)?;
+                input.redraw(writer)?;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if interactive
+            && poll_terminal_event(Duration::from_millis(10))?
+            && let TerminalEvent::Key(key) = read_terminal_event()?
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        {
+            if let Some(indicator) = activity.take() {
+                indicator.finish();
+            }
+            input.handle_key(key.code, key.modifiers, &task, steering, writer)?;
+        }
+    }
+    while let Ok(event) = task.recv_timeout(Duration::ZERO) {
+        input.clear_line(writer)?;
+        render_harness_activity(&event, &mut activity, writer)?;
+        input.redraw(writer)?;
+    }
+    input.clear_line(writer)?;
+    drop(raw_mode);
+    if let Some(indicator) = activity.take() {
+        indicator.finish();
+    }
+    task.finish()
+}
+
+struct SteeringInput {
+    buffer: String,
+    max_bytes: usize,
+    visible: bool,
+}
+
+impl SteeringInput {
+    const fn new(max_bytes: usize) -> Self {
+        Self {
+            buffer: String::new(),
+            max_bytes,
+            visible: false,
+        }
+    }
+
+    fn handle_key(
+        &mut self,
+        code: TerminalKeyCode,
+        modifiers: TerminalModifiers,
+        task: &agent_runtime::AgentTurnTask,
+        steering: &mut SteeringQueue,
+        writer: &mut dyn Write,
+    ) -> Result<()> {
+        if code == TerminalKeyCode::Char('c') && modifiers.contains(TerminalModifiers::CONTROL) {
+            task.cancel();
+            steering.clear();
+            self.buffer.clear();
+            self.clear_line(writer)?;
+            writeln!(writer, "◇ Cancelling active agent turn")?;
+            return Ok(());
+        }
+        match code {
+            TerminalKeyCode::Enter => self.submit(steering, task, writer)?,
+            TerminalKeyCode::Backspace => {
+                self.buffer.pop();
+                self.redraw(writer)?;
+            }
+            TerminalKeyCode::Esc => {
+                self.buffer.clear();
+                self.clear_line(writer)?;
+            }
+            TerminalKeyCode::Char('u') if modifiers.contains(TerminalModifiers::CONTROL) => {
+                self.buffer.clear();
+                self.clear_line(writer)?;
+            }
+            TerminalKeyCode::Char(character)
+                if !modifiers.intersects(TerminalModifiers::CONTROL | TerminalModifiers::ALT)
+                    && self.buffer.len().saturating_add(character.len_utf8()) <= self.max_bytes =>
+            {
+                self.buffer.push(character);
+                self.visible = true;
+                self.redraw(writer)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn submit(
+        &mut self,
+        steering: &mut SteeringQueue,
+        task: &agent_runtime::AgentTurnTask,
+        writer: &mut dyn Write,
+    ) -> Result<()> {
+        let input = self.buffer.trim().to_owned();
+        if input.is_empty() {
+            self.buffer.clear();
+            return self.clear_line(writer);
+        }
+        if input == "/cancel" {
+            task.cancel();
+            steering.clear();
+            self.buffer.clear();
+            self.clear_line(writer)?;
+            writeln!(writer, "◇ Cancelling active agent turn")?;
+            return Ok(());
+        }
+        let (action, message) = input
+            .strip_prefix("/replace ")
+            .map_or((SteeringAction::Queue, input.as_str()), |message| {
+                (SteeringAction::Replace, message)
+            });
+        self.clear_line(writer)?;
+        match steering.submit(action, message) {
+            Ok(()) => writeln!(
+                writer,
+                "◇ {} follow-up · {} queued",
+                if action == SteeringAction::Replace {
+                    "Replaced"
+                } else {
+                    "Queued"
+                },
+                steering.len()
+            )?,
+            Err(error) => writeln!(writer, "◇ Follow-up rejected · {error}")?,
+        }
+        self.buffer.clear();
+        self.visible = false;
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn clear_line(&mut self, writer: &mut dyn Write) -> Result<()> {
+        if self.visible {
+            write!(writer, "\r\x1b[2K")?;
+            writer.flush()?;
+            self.visible = false;
+        }
+        Ok(())
+    }
+
+    fn redraw(&mut self, writer: &mut dyn Write) -> Result<()> {
+        if self.buffer.is_empty() {
+            return self.clear_line(writer);
+        }
+        write!(writer, "\r\x1b[2K↪ steer> {}", self.buffer)?;
+        writer.flush()?;
+        self.visible = true;
+        Ok(())
+    }
 }
 
 fn harness_activity_label(activity: &HarnessActivity) -> String {

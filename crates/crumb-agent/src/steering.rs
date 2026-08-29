@@ -87,6 +87,11 @@ impl SteeringQueue {
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty()
     }
+
+    pub fn clear(&mut self) {
+        self.messages.clear();
+        self.bytes = 0;
+    }
 }
 
 #[cfg(test)]

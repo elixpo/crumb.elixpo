@@ -76,7 +76,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Stream real Harness notifications into the renderer instead of projecting them after completion.
 - [x] Expose bounded Pollinations web search through MCP with an explicit network-tool grant.
 - [x] Add bounded queue/replace steering state and redacted Harness activity projections.
-- [ ] Add queued steering and richer tool-specific event projection to the Harness stream.
+- [x] Add queued steering and richer tool-specific event projection to the Harness stream.
 - [ ] Add interactive approval, tool-call, patch, error, and completion components.
 - [ ] Add live model, effort, and mode selection backed by atomic configuration writes.
 - [ ] Add terminal-width snapshots, reduced-motion behavior, and accessibility checks.
@@ -84,7 +84,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ### Competitive terminal roadmap
 
-- [ ] [Stream Harness activity and support queued steering](https://github.com/elixpo/crumb.elixpo/issues/36)
+- [x] [Stream Harness activity and support queued steering](https://github.com/elixpo/crumb.elixpo/issues/36)
 - [ ] [Add reviewable diffs, checkpoints, and safe rewind](https://github.com/elixpo/crumb.elixpo/issues/37)
 - [ ] [Ship modern input editing, shell completions, and accessibility modes](https://github.com/elixpo/crumb.elixpo/issues/38)
 - [x] [Add resumable and searchable agent sessions](https://github.com/elixpo/crumb.elixpo/issues/35)

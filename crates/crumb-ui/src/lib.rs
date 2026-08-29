@@ -290,7 +290,10 @@ fn animate_activity(label: &str, color: bool, running: &AtomicBool) {
         } else {
             frames[frame].to_owned()
         };
-        let _ = write!(io::stderr(), "\r\x1b[2K{prefix} {label}  Ctrl+C to cancel");
+        let _ = write!(
+            io::stderr(),
+            "\r\x1b[2K{prefix} {label}  type to steer · Ctrl+C to cancel"
+        );
         let _ = io::stderr().flush();
         frame = (frame + 1) % frames.len();
         thread::sleep(Duration::from_millis(120));

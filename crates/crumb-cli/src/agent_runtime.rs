@@ -21,6 +21,7 @@ type TurnThreadResult = (AgentRuntime, Result<RunResult>);
 /// Background Harness turn whose public event stream is already redacted.
 pub struct AgentTurnTask {
     activities: Receiver<HarnessActivity>,
+    cancellation: CancellationToken,
     worker: JoinHandle<TurnThreadResult>,
 }
 
@@ -40,6 +41,10 @@ impl AgentTurnTask {
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.worker.is_finished()
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
     }
 
     /// Rejoins the runtime after its turn completes.
@@ -144,38 +149,42 @@ impl AgentRuntime {
             bail!("agent activity channel capacity must be positive");
         }
         let (activity_sender, activities) = sync_channel(activity_capacity);
+        let cancellation = CancellationToken::default();
+        let worker_cancellation = cancellation.clone();
         let worker = thread::Builder::new()
             .name("crumb-agent-turn".to_owned())
             .spawn(move || {
                 let mut runtime = self;
-                let result =
-                    runtime.run_with_events(&request, &config, &workspace, |notification| {
+                let result = runtime.run_with_events_using(
+                    &request,
+                    &config,
+                    &workspace,
+                    &worker_cancellation,
+                    |notification| {
                         if let Some(activity) = notification.activity() {
                             activity_sender
                                 .send(activity)
                                 .map_err(|_| anyhow::anyhow!("agent activity receiver closed"))?;
                         }
                         Ok(())
-                    });
+                    },
+                );
                 (runtime, result)
             })
             .context("failed to start agent turn worker")?;
-        Ok(AgentTurnTask { activities, worker })
+        Ok(AgentTurnTask {
+            activities,
+            cancellation,
+            worker,
+        })
     }
 
-    /// Executes one turn and forwards bounded Harness notifications as they
-    /// arrive.
-    ///
-    /// # Errors
-    ///
-    /// Returns a redacted error when configuration, credentials, persistence,
-    /// Harness startup, model execution, cancellation, or event observation
-    /// fails.
-    pub fn run_with_events(
+    fn run_with_events_using(
         &mut self,
         request: &str,
         config: &AgentConfig,
         workspace: &Path,
+        cancellation: &CancellationToken,
         on_notification: impl FnMut(&Notification) -> Result<()>,
     ) -> Result<RunResult> {
         let workspace = std::fs::canonicalize(workspace)
@@ -207,14 +216,13 @@ impl AgentRuntime {
             effort.clone(),
         )?;
         session.record_turn_start(request)?;
-        let cancellation = session.cancellation_token();
         let _active = ActiveCancellation::new(&self.active_cancellation, cancellation.clone())?;
         let session_id = session.id().as_str().to_owned();
         let result = self
             .supervisor
             .as_mut()
             .context("Harness supervisor unavailable")?
-            .run_text_with_events(launch, &session_id, request, &cancellation, on_notification);
+            .run_text_with_events(launch, &session_id, request, cancellation, on_notification);
         let status = match &result {
             Ok(_) => TurnStatus::Complete,
             Err(_) if cancellation.is_cancelled() => TurnStatus::Cancelled,
