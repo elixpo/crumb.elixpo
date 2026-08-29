@@ -6,7 +6,6 @@ interface CloudflareEnv {
   POLLINATIONS_APP_KEY: string
   CONNECTOR_ENCRYPTION_KEY: string
   ACCOUNTS_ORIGIN: string
-  PUBLIC_ORIGIN: string
 }
 
 declare module '@cloudflare/next-on-pages' {

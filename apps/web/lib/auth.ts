@@ -1,5 +1,5 @@
 import { cookies } from 'next/headers'
-import { bindings, originFor } from '@/lib/cloudflare'
+import { bindings, config, originFor } from '@/lib/cloudflare'
 import { randomToken } from '@/lib/encoding'
 
 export interface User {
@@ -26,11 +26,11 @@ export async function currentUser(): Promise<User | null> {
 }
 
 export function accountsAuthorizeUrl(state: string, requestUrl: string): string {
-  const env = bindings()
-  const url = new URL('/oauth/authorize', env.ACCOUNTS_ORIGIN || 'https://accounts.elixpo.com')
+  const env = config()
+  const url = new URL('/oauth/authorize', env.accountsOrigin)
   url.search = new URLSearchParams({
     response_type: 'code',
-    client_id: env.NEXT_PUBLIC_ELIXPO_CLIENT_ID,
+    client_id: env.accountsClientId,
     redirect_uri: `${originFor(requestUrl)}/api/auth/callback`,
     state,
     scope: 'openid profile email',
@@ -39,16 +39,16 @@ export function accountsAuthorizeUrl(state: string, requestUrl: string): string 
 }
 
 export async function finishAccountsLogin(code: string, requestUrl: string): Promise<User> {
-  const env = bindings()
-  const accounts = env.ACCOUNTS_ORIGIN || 'https://accounts.elixpo.com'
+  const env = config()
+  const accounts = env.accountsOrigin
   const tokenResponse = await fetch(new URL('/api/auth/token', accounts), {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json' },
     body: JSON.stringify({
       grant_type: 'authorization_code',
       code,
-      client_id: env.NEXT_PUBLIC_ELIXPO_CLIENT_ID,
-      client_secret: env.ELIXPO_CLIENT_SECRET,
+      client_id: env.accountsClientId,
+      client_secret: env.accountsClientSecret,
       redirect_uri: `${originFor(requestUrl)}/api/auth/callback`,
     }),
   })

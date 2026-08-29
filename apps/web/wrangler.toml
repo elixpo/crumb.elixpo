@@ -15,4 +15,3 @@ id = "REPLACE_WITH_KV_NAMESPACE_ID"
 
 [vars]
 ACCOUNTS_ORIGIN = "https://accounts.elixpo.com"
-PUBLIC_ORIGIN = "https://crumb.elixpo.com"

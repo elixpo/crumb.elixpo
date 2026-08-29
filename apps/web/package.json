@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev -p 3001",
     "build": "next build",
     "pages:build": "next-on-pages",
     "db:migrate:local": "wrangler d1 migrations apply crumb-web --local"

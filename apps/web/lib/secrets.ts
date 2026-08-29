@@ -1,8 +1,8 @@
-import { bindings } from '@/lib/cloudflare'
+import { config } from '@/lib/cloudflare'
 import { decode, encode, string, text } from '@/lib/encoding'
 
 async function key(): Promise<CryptoKey> {
-  const secret = bindings().CONNECTOR_ENCRYPTION_KEY
+  const secret = config().connectorEncryptionKey
   if (!secret) throw new Error('Connector encryption is not configured')
   const digest = await crypto.subtle.digest('SHA-256', text(secret))
   return crypto.subtle.importKey('raw', digest, 'AES-GCM', false, ['encrypt', 'decrypt'])
