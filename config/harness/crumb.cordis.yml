@@ -24,6 +24,14 @@
             name: Qwen Coder
             contextWindow: 262144
             reasoningEfforts: false
+          - id: Circuit-Overtime/OreoLook
+            name: OreoLook
+            contextWindow: 256000
+            reasoningEfforts: true
+          - id: perplexity
+            name: Perplexity Search
+            contextWindow: 200000
+            reasoningEfforts: false
 
 - id: llm-retry
   name: '@deepseek-ai/dsh-llm-retry'

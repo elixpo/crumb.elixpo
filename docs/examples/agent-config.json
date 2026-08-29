@@ -28,7 +28,11 @@
   "models": {
     "text": [
       { "provider": "pollinations", "model": "nova-fast", "effort": null },
-      { "provider": "pollinations", "model": "qwen-coder", "effort": null }
+      { "provider": "pollinations", "model": "qwen-coder", "effort": null },
+      { "provider": "pollinations", "model": "Circuit-Overtime/OreoLook", "effort": null }
+    ],
+    "web_search": [
+      { "provider": "pollinations", "model": "perplexity", "effort": null }
     ],
     "image": [
       { "provider": "pollinations", "model": "flux", "effort": null },

@@ -727,6 +727,7 @@ fn show_plugins(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
 const fn modality_name(modality: Modality) -> &'static str {
     match modality {
         Modality::Text => "text",
+        Modality::WebSearch => "web search",
         Modality::Image => "image",
         Modality::Video => "video",
         Modality::Audio => "audio",

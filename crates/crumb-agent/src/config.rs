@@ -63,6 +63,7 @@ pub enum HarnessConfig {
 #[serde(rename_all = "snake_case")]
 pub enum Modality {
     Text,
+    WebSearch,
     Image,
     Video,
     Audio,
