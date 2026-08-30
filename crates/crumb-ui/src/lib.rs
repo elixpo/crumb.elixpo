@@ -368,7 +368,7 @@ impl Renderer {
             body.push(' ');
             body.push_str(line);
         }
-        let header = format!("╭─❯ {username}");
+        let header = format!("╭─[◆ {username}]");
         let timestamp = timestamp.unwrap_or_default();
         let padding = usize::from(terminal_width)
             .saturating_sub(header.chars().count())
@@ -379,11 +379,16 @@ impl Renderer {
         } else {
             format!("{}{}", " ".repeat(padding), self.paint(timestamp, "2"))
         };
-        format!(
-            "{} {}{timestamp}\n{body}",
-            self.paint("╭─❯", "36;1"),
-            self.paint(username, "1")
-        )
+        format!("{}{timestamp}\n{body}", self.paint(&header, "36;1"))
+    }
+
+    /// Starts raw native output with a shell-specific transcript branch.
+    #[must_use]
+    pub fn native_output_prefix(&self) -> String {
+        if self.settings.output == OutputMode::ScreenReader {
+            return "Shell output: ".to_owned();
+        }
+        format!("{} ", self.paint("╰──▶", "35;1"))
     }
 
     /// Renders a compact, non-blocking startup readiness summary.
@@ -998,8 +1003,9 @@ mod tests {
         assert_eq!(renderer.agent_response("done\n"), "│ done\n╰─");
         assert_eq!(
             renderer.transcript_input("elixpo", "fix this"),
-            "╭─❯ elixpo\n╰──▶ fix this"
+            "╭─[◆ elixpo]\n╰──▶ fix this"
         );
+        assert_eq!(renderer.native_output_prefix(), "╰──▶ ");
     }
 
     #[test]

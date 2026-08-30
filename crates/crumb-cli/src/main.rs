@@ -48,9 +48,9 @@ use crumb_tools::{
 use crumb_ui::{GitSegment, PromptContext, Renderer, StartupContext, UiSettings};
 use nu_ansi_term::{Color, Style};
 use reedline::{
-    ColumnarMenu, DefaultHinter, EditCommand, Emacs, FileBackedHistory, Hinter, History,
-    HistoryItem, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
-    PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal,
+    DefaultHinter, DescriptionMode, EditCommand, Emacs, FileBackedHistory, Hinter, History,
+    HistoryItem, IdeMenu, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode,
+    PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal,
     default_emacs_keybindings,
 };
 
@@ -704,14 +704,16 @@ struct CapturedOutput<'a> {
     writer: &'a mut dyn Write,
     bytes: Vec<u8>,
     limit: usize,
+    display_prefix: Option<String>,
 }
 
 impl<'a> CapturedOutput<'a> {
-    fn new(writer: &'a mut dyn Write, limit: usize) -> Self {
+    fn new(writer: &'a mut dyn Write, limit: usize, display_prefix: Option<String>) -> Self {
         Self {
             writer,
             bytes: Vec::with_capacity(limit),
             limit,
+            display_prefix,
         }
     }
 
@@ -740,6 +742,11 @@ impl<'a> CapturedOutput<'a> {
 
 impl Write for CapturedOutput<'_> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if !buffer.is_empty()
+            && let Some(prefix) = self.display_prefix.take()
+        {
+            self.writer.write_all(prefix.as_bytes())?;
+        }
         let written = self.writer.write(buffer)?;
         self.capture(&buffer[..written]);
         Ok(written)
@@ -801,21 +808,17 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
         )?;
         return Ok(None);
     }
-    if context.session.is_none() {
-        let (cols, rows) = size()?;
-        let shell = shell_for(context.platform);
-        *context.session = Some(ShellSession::start(
-            shell.as_ref(),
-            &SystemPty,
-            TerminalSize::new(rows, cols),
-        )?);
-    }
-    let shell = context
-        .session
-        .as_mut()
-        .expect("shell session is initialized above");
-    let (outcome, captured_output) =
-        execute_and_capture(shell, command, context.writer, context.interactive)?;
+    let shell = ensure_shell_session(context.session, context.platform)?;
+    let output_prefix = context
+        .fullscreen
+        .then(|| context.renderer.native_output_prefix());
+    let (outcome, captured_output) = execute_and_capture(
+        shell,
+        command,
+        context.writer,
+        context.interactive,
+        output_prefix,
+    )?;
     match outcome {
         CommandOutcome::Completed(completion) => {
             *context.last_exit_code = Some(completion.exit_code);
@@ -872,6 +875,24 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
             Ok(Some(ReplOutcome::Exit))
         }
     }
+}
+
+fn ensure_shell_session(
+    session: &mut Option<ShellSession>,
+    platform: Platform,
+) -> Result<&mut ShellSession> {
+    if session.is_none() {
+        let (cols, rows) = size()?;
+        let shell = shell_for(platform);
+        *session = Some(ShellSession::start(
+            shell.as_ref(),
+            &SystemPty,
+            TerminalSize::new(rows, cols),
+        )?);
+    }
+    Ok(session
+        .as_mut()
+        .expect("shell session is initialized above"))
 }
 
 fn load_agent_config(cwd: &Path, writer: &mut dyn Write) -> AgentConfig {
@@ -3593,8 +3614,9 @@ fn execute_and_capture(
     command: &str,
     output: &mut dyn Write,
     interactive: bool,
+    display_prefix: Option<String>,
 ) -> Result<(CommandOutcome, Vec<u8>)> {
-    let mut captured = CapturedOutput::new(output, SESSION_OUTPUT_CAPTURE_BYTES);
+    let mut captured = CapturedOutput::new(output, SESSION_OUTPUT_CAPTURE_BYTES, display_prefix);
     let outcome = if interactive {
         execute_foreground(shell, command, &mut captured)?
     } else {
@@ -3745,10 +3767,20 @@ fn create_line_editor(
         ReedlineEvent::OpenEditor,
     );
     let terminal_width = suggestion_width(size()?.0);
-    let menu = ColumnarMenu::default()
+    let menu_width = u16::try_from(terminal_width).unwrap_or(COMPLETION_PALETTE_MAX_WIDTH);
+    let menu = IdeMenu::default()
         .with_name("completion_menu")
-        .with_columns(1)
-        .with_column_width(Some(terminal_width));
+        .with_min_completion_width(menu_width.min(32))
+        .with_max_completion_width(menu_width)
+        .with_max_completion_height(COMPLETION_PALETTE_MAX_ROWS)
+        .with_padding(1)
+        .with_default_border()
+        .with_description_mode(DescriptionMode::PreferRight)
+        .with_min_description_width(20)
+        .with_max_description_width(48)
+        .with_max_description_height(4)
+        .with_description_offset(1)
+        .with_correct_cursor_pos(true);
     let editor = Reedline::create()
         .with_history(Box::new(interactive_history))
         .with_hinter(Box::new(CrumbHinter::default()))
@@ -3758,8 +3790,15 @@ fn create_line_editor(
     Ok(InteractiveLineEditor { editor, workspace })
 }
 
+const COMPLETION_PALETTE_MAX_ROWS: u16 = 12;
+const COMPLETION_PALETTE_MAX_WIDTH: u16 = 72;
+
 fn suggestion_width(terminal_columns: u16) -> usize {
-    usize::from(terminal_columns.saturating_sub(4).max(1))
+    usize::from(
+        terminal_columns
+            .saturating_sub(8)
+            .clamp(1, COMPLETION_PALETTE_MAX_WIDTH),
+    )
 }
 
 struct CrumbPrompt {
