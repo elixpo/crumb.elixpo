@@ -38,6 +38,15 @@ Use `"backend": "claude"` with an explicit Claude model and its supported
 efforts for Claude Code. Credentials remain owned by the selected CLI through
 its environment or credential store; they are not fields in `agent.json`.
 
+Each invocation receives only Crumb's stdio MCP server (`crumb mcp serve`).
+Claude uses strict inline MCP configuration without ambient built-in tools;
+Codex ignores ambient user configuration and receives the same server through
+per-invocation overrides. Crumb remains the owner of tool permissions,
+workspace confinement, cancellation, and output filtering.
+
+`/doctor` reports the selected backend, local executable availability, exact
+model and effort, and optimizer status without contacting a provider.
+
 Capability values should follow the current provider documentation because
 effort support varies by model:
 

@@ -14,11 +14,11 @@ use crossterm::event::{
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crumb_agent::{
-    AgentConfig, AgentMode, CancellationToken, CommandCatalog, ConfiguredApprovals, HarnessConfig,
-    InputRoute, JobId, JobSchedule, JobState, JobStore, LiveConfig, MistakePolicy, Modality,
-    NewJob, RouteDecision, SteeringAction, SteeringQueue, TokenOptimizer, ToolHost, TurnStatus,
-    UnknownInputPolicy, export_session, list_sessions, search_sessions, session_summary,
-    set_session_archived, set_session_label, trash_session,
+    AgentConfig, AgentMode, BackendDiscovery, CancellationToken, CommandCatalog,
+    ConfiguredApprovals, HarnessConfig, InputRoute, JobId, JobSchedule, JobState, JobStore,
+    LiveConfig, MistakePolicy, Modality, NewJob, RouteDecision, SteeringAction, SteeringQueue,
+    TokenOptimizer, ToolHost, TurnStatus, UnknownInputPolicy, export_session, list_sessions,
+    search_sessions, session_summary, set_session_archived, set_session_label, trash_session,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
@@ -1254,7 +1254,7 @@ fn show_reserved(
             writeln!(writer, "  {effort}")?;
         }
         "/config" => show_config_summary(cwd, writer)?,
-        "/doctor" => show_optimizer_diagnostics(cwd, writer)?,
+        "/doctor" => show_doctor(cwd, writer)?,
         "/plugins" => show_plugins(cwd, writer)?,
         command if command == "/review" || command.starts_with("/review ") => {
             show_reviews(command, cwd, runtime, writer)?;
@@ -1430,8 +1430,48 @@ const fn job_state_name(state: &JobState) -> &'static str {
     }
 }
 
-fn show_optimizer_diagnostics(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+fn show_doctor(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     let config = read_agent_config(cwd)?;
+    writeln!(writer, "◆ Agent backend")?;
+    match &config.harness {
+        Some(HarnessConfig::CodingCli {
+            backend, command, ..
+        }) => {
+            let discovery = BackendDiscovery::discover(*backend, command);
+            let route = config
+                .models
+                .get(&Modality::Text)
+                .and_then(|routes| routes.first())
+                .context("coding backend has no selected text model")?;
+            let effort = config
+                .reasoning_effort_for(route)
+                .unwrap_or("provider default");
+            writeln!(
+                writer,
+                "  {backend:?}  {}  {}/{} · effort {effort}",
+                if discovery.is_available() {
+                    "available"
+                } else {
+                    "missing"
+                },
+                route.provider,
+                route.model
+            )?;
+            writeln!(
+                writer,
+                "  authentication is provider-managed and verified when a turn starts"
+            )?;
+        }
+        Some(HarnessConfig::Process { command, .. }) => {
+            writeln!(
+                writer,
+                "  DeepSeek Harness  configured  {}",
+                command.display()
+            )?;
+        }
+        Some(HarnessConfig::Native) => writeln!(writer, "  native Harness  unavailable")?,
+        None => writeln!(writer, "  none configured · native shell remains available")?,
+    }
     writeln!(writer, "◆ Token optimizers")?;
     if config.optimizers.is_empty() {
         writeln!(

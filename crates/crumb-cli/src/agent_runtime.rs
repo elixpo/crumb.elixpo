@@ -422,10 +422,12 @@ impl AgentRuntime {
             params: serde_json::json!({ "sessionId": session_id, "status": "running" }),
         };
         on_notification(&running)?;
+        let crumb_program = std::env::current_exe().context("failed to locate crumb executable")?;
         let launch = CodingCliLaunch {
             backend,
             executable: &executable,
             workspace,
+            mcp_command: &crumb_program,
             session_id,
             model: &route.model,
             reasoning_effort: effort,

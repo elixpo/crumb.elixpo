@@ -21,6 +21,7 @@ pub struct CodingCliLaunch<'a> {
     pub backend: CodingBackend,
     pub executable: &'a Path,
     pub workspace: &'a Path,
+    pub mcp_command: &'a Path,
     pub session_id: &'a str,
     pub model: &'a str,
     pub reasoning_effort: Option<&'a str>,
@@ -41,10 +42,11 @@ impl CodingCliLaunch<'_> {
     /// effort syntax.
     pub fn validate(&self) -> Result<()> {
         if self.executable.as_os_str().is_empty()
+            || self.mcp_command.as_os_str().is_empty()
             || self.model.trim().is_empty()
             || self.session_id.trim().is_empty()
         {
-            bail!("coding CLI launch requires executable, model, and session identifiers");
+            bail!("coding CLI launch requires backend, MCP, model, and session identifiers");
         }
         if self.max_turns == 0 || self.timeout.is_zero() || self.output_limit == 0 {
             bail!("coding CLI launch limits must be positive");
@@ -235,6 +237,8 @@ fn codex_arguments(launch: &CodingCliLaunch<'_>) -> Vec<String> {
         }
         .to_owned(),
         "--ephemeral".to_owned(),
+        "--ignore-user-config".to_owned(),
+        "--ignore-rules".to_owned(),
         "--color".to_owned(),
         "never".to_owned(),
         "--json".to_owned(),
@@ -247,6 +251,14 @@ fn codex_arguments(launch: &CodingCliLaunch<'_>) -> Vec<String> {
             format!("model_reasoning_effort=\"{effort}\""),
         ]);
     }
+    let command = serde_json::to_string(&launch.mcp_command.display().to_string())
+        .expect("serializing a path display string cannot fail");
+    arguments.extend([
+        "--config".to_owned(),
+        format!("mcp_servers.crumb.command={command}"),
+        "--config".to_owned(),
+        "mcp_servers.crumb.args=[\"mcp\",\"serve\"]".to_owned(),
+    ]);
     arguments.push("-".to_owned());
     arguments
 }
@@ -268,6 +280,14 @@ fn claude_arguments(launch: &CodingCliLaunch<'_>) -> Vec<String> {
         "--max-turns".to_owned(),
         launch.max_turns.to_string(),
         "--no-session-persistence".to_owned(),
+        "--safe-mode".to_owned(),
+        "--strict-mcp-config".to_owned(),
+        "--mcp-config".to_owned(),
+        claude_mcp_config(launch.mcp_command),
+        "--tools".to_owned(),
+        String::new(),
+        "--allowedTools".to_owned(),
+        "mcp__crumb__*".to_owned(),
         "--permission-mode".to_owned(),
         permission_mode.to_owned(),
     ];
@@ -275,6 +295,20 @@ fn claude_arguments(launch: &CodingCliLaunch<'_>) -> Vec<String> {
         arguments.extend(["--effort".to_owned(), effort.to_owned()]);
     }
     arguments
+}
+
+fn claude_mcp_config(command: &Path) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            "crumb": {
+                "type": "stdio",
+                "command": command.display().to_string(),
+                "args": ["mcp", "serve"],
+                "env": {}
+            }
+        }
+    })
+    .to_string()
 }
 
 #[cfg(unix)]
@@ -336,6 +370,7 @@ mod tests {
             backend,
             executable: Path::new("fixture"),
             workspace: Path::new("/workspace"),
+            mcp_command: Path::new("/usr/bin/crumb"),
             session_id: "fixture-session",
             model: "fixture-model",
             reasoning_effort: Some("high"),
@@ -365,6 +400,12 @@ mod tests {
                 .iter()
                 .any(|argument| argument.contains("dangerously"))
         );
+        assert!(arguments.contains(&"--ignore-user-config".to_owned()));
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "mcp_servers.crumb.args=[\"mcp\",\"serve\"]")
+        );
     }
 
     #[test]
@@ -381,6 +422,8 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["--permission-mode", "plan"])
         );
+        assert!(arguments.contains(&"--strict-mcp-config".to_owned()));
+        assert!(arguments.windows(2).any(|pair| pair == ["--tools", ""]));
     }
 
     #[test]
