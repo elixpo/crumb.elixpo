@@ -11,11 +11,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crumb_platform::Platform;
 
-const FULL_LOGO: &str = r#"   _____ ____  _   _ __  __ ____        .-""-.
-  / ____|  _ \| | | |  \/  |  _ \     _/(o)(o)\_
- | |    | |_) | | | | |\/| | |_) |   /    ^    \
- | |____|  _ <| |_| | |  | |  _ <   |   \___/   |
-  \_____|_| \_\ \___/|_|  |_|_| \_\   \_________/"#;
+const WORDMARK: &str = r"   _____ ____  _   _ __  __ ____
+  / ____|  _ \| | | |  \/  |  _ \
+ | |    | |_) | | | | |\/| | |_) |
+ | |____|  _ <| |_| | |  | |  _ <
+  \_____|_| \_\ \___/|_|  |_|_| \_\";
+const PANDA_LARGE: &str = include_str!("../assets/panda-large.txt");
+const PANDA_MEDIUM: &str = include_str!("../assets/panda-medium.txt");
+const PANDA_SMALL: &str = include_str!("../assets/panda-small.txt");
 const COOKIE_SPINNER: [&str; 4] = ["(.:)", "(:.)", "(o.)", "(.o)"];
 
 const PUNCHLINES: &[&str] = &[
@@ -169,11 +172,17 @@ impl Renderer {
 
     #[must_use]
     pub fn branding(&self) -> String {
+        self.branding_for_width(120)
+    }
+
+    /// Renders the startup brand with a panda sized for the terminal width.
+    #[must_use]
+    pub fn branding_for_width(&self, terminal_width: u16) -> String {
         let punchline = startup_punchline();
         match self.settings.branding {
             BrandingMode::Full => format!(
-                "{}\n  {}  {}",
-                self.paint(FULL_LOGO, "36"),
+                "{}\n  {}\n  {}",
+                self.paint(&responsive_brand(terminal_width), "36"),
                 self.paint(punchline, "1"),
                 self.paint("Type naturally · : forces AI · /help opens commands", "2")
             ),
@@ -317,6 +326,53 @@ impl Renderer {
             text.to_owned()
         }
     }
+}
+
+fn responsive_brand(terminal_width: u16) -> String {
+    let panda = if terminal_width >= 120 {
+        PANDA_LARGE
+    } else if terminal_width >= 88 {
+        PANDA_MEDIUM
+    } else {
+        PANDA_SMALL
+    };
+    if terminal_width < 72 {
+        return format!("CRUMB\n{}", trim_art(panda));
+    }
+    compose_art(WORDMARK, trim_art(panda), 4)
+}
+
+fn trim_art(art: &str) -> &str {
+    art.trim()
+}
+
+fn compose_art(left: &str, right: &str, gap: usize) -> String {
+    let left = left.lines().collect::<Vec<_>>();
+    let right = right.lines().collect::<Vec<_>>();
+    let height = left.len().max(right.len());
+    let left_width = left
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    let left_offset = height.saturating_sub(left.len()) / 2;
+    let right_offset = height.saturating_sub(right.len()) / 2;
+    (0..height)
+        .map(|row| {
+            let left_line = row
+                .checked_sub(left_offset)
+                .and_then(|index| left.get(index))
+                .copied()
+                .unwrap_or("");
+            let right_line = row
+                .checked_sub(right_offset)
+                .and_then(|index| right.get(index))
+                .copied()
+                .unwrap_or("");
+            format!("{left_line:<left_width$}{}{right_line}", " ".repeat(gap))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn startup_punchline() -> &'static str {
@@ -551,7 +607,9 @@ mod tests {
             branding: BrandingMode::Full,
         });
 
-        let branding = renderer.branding();
+        let branding = renderer.branding_for_width(120);
+        let narrow = renderer.branding_for_width(60);
+        let wide = renderer.branding_for_width(180);
 
         assert!(branding.contains("_____ ____"));
         assert!(
@@ -559,7 +617,8 @@ mod tests {
                 .iter()
                 .any(|punchline| branding.contains(punchline))
         );
-        assert_eq!(branding.lines().count(), 6);
+        assert!(narrow.contains("CRUMB"));
+        assert!(wide.lines().count() > narrow.lines().count());
     }
 
     #[test]

@@ -4,6 +4,10 @@ Crumb keeps native shell programs in their PTY and uses Reedline only for its
 own top-level input. Full-screen applications therefore retain their native key
 handling, alternate-screen behavior, and resize events.
 
+Interactive Crumb sessions also enter the terminal's alternate screen so the
+CLI owns the full viewport and restores the caller's scrollback on exit. Set
+`CRUMB_INLINE=1` to keep Crumb in the normal scrolling buffer.
+
 ## Editing shortcuts
 
 - `Enter` submits the current command or natural-language request.

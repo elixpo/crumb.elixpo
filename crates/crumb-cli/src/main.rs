@@ -8,11 +8,15 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use crossterm::cursor::{MoveTo, Show};
 use crossterm::event::{
     Event as TerminalEvent, KeyCode as TerminalKeyCode, KeyEventKind,
     KeyModifiers as TerminalModifiers, poll as poll_terminal_event, read as read_terminal_event,
 };
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
+use crossterm::terminal::{
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode, size,
+};
 use crumb_agent::{
     AgentConfig, AgentMode, BackendDiscovery, CacheRetention, CancellationToken, CommandCatalog,
     CompatibilityFlag, ConfiguredApprovals, CredentialReference, HarnessConfig, InputRoute, JobId,
@@ -330,6 +334,8 @@ fn run_managed_repl() -> Result<ReplOutcome> {
     let stdout = io::stdout();
     let interactive = stdin.is_terminal() && stdout.is_terminal();
     let renderer = Renderer::new(UiSettings::from_environment(interactive));
+    let _screen =
+        AlternateScreenGuard::enter(interactive && std::env::var_os("CRUMB_INLINE").is_none())?;
     let platform = Platform::current();
     let mut command_catalog = CommandCatalog::discover();
     command_catalog.extend(
@@ -364,11 +370,16 @@ fn run_managed_repl() -> Result<ReplOutcome> {
         mode: agent_mode_name(startup_config.mode),
         agent_configured: startup_config.harness.is_some() && startup_model.is_some(),
     };
-    let branding = renderer.branding();
+    let terminal_width = if interactive {
+        size().map_or(100, |(columns, _)| columns)
+    } else {
+        80
+    };
+    let branding = renderer.branding_for_width(terminal_width);
     if !branding.is_empty() {
         writeln!(
             stdout.lock(),
-            "{branding}\n{}",
+            "{branding}\n\n{}\n",
             renderer.startup_status(&startup)
         )?;
     }
@@ -380,7 +391,8 @@ fn run_managed_repl() -> Result<ReplOutcome> {
         let prompt = render_prompt(renderer, &cwd, platform, last_exit_code);
         let event = if let Some(editor) = line_editor.as_mut() {
             editor.workspace.set(&cwd);
-            match editor.editor.read_line(&CrumbPrompt::new(prompt))? {
+            let right = prompt_model_status(&cwd);
+            match editor.editor.read_line(&CrumbPrompt::new(prompt, right))? {
                 Signal::Success(command) => Some(crumb_repl::classify_input(&command)),
                 Signal::CtrlD => None,
                 _ => continue,
@@ -3160,11 +3172,12 @@ fn suggestion_width(terminal_columns: u16) -> usize {
 
 struct CrumbPrompt {
     rendered: String,
+    right: String,
 }
 
 impl CrumbPrompt {
-    const fn new(rendered: String) -> Self {
-        Self { rendered }
+    const fn new(rendered: String, right: String) -> Self {
+        Self { rendered, right }
     }
 }
 
@@ -3174,7 +3187,7 @@ impl Prompt for CrumbPrompt {
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
-        Cow::Borrowed("")
+        Cow::Borrowed(&self.right)
     }
 
     fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
@@ -3195,6 +3208,20 @@ impl Prompt for CrumbPrompt {
         };
         Cow::Owned(format!("({status}: {}) ", history_search.term))
     }
+}
+
+fn prompt_model_status(cwd: &Path) -> String {
+    let Ok(config) = read_agent_config(cwd) else {
+        return "native".to_owned();
+    };
+    config
+        .models
+        .get(&Modality::Text)
+        .and_then(|routes| routes.first())
+        .map_or_else(
+            || "native".to_owned(),
+            |route| format!("{} · {}", route.model, agent_mode_name(config.mode)),
+        )
 }
 
 fn show_history(
@@ -3335,6 +3362,33 @@ fn relay_output(reader: &mut dyn Read, writer: &mut dyn Write) -> io::Result<()>
 }
 
 struct RawModeGuard;
+
+struct AlternateScreenGuard {
+    active: bool,
+}
+
+impl AlternateScreenGuard {
+    fn enter(active: bool) -> io::Result<Self> {
+        if active {
+            crossterm::execute!(
+                io::stdout(),
+                EnterAlternateScreen,
+                Clear(ClearType::All),
+                MoveTo(0, 0),
+                Show
+            )?;
+        }
+        Ok(Self { active })
+    }
+}
+
+impl Drop for AlternateScreenGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = crossterm::execute!(io::stdout(), Show, LeaveAlternateScreen);
+        }
+    }
+}
 
 impl RawModeGuard {
     fn enable() -> io::Result<Self> {

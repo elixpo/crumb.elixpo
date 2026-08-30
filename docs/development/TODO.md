@@ -110,6 +110,7 @@ This is the local source of truth for implementation order. GitHub issues provid
   - [x] Add compact panda branding, startup readiness, and model/mode status.
   - [x] Add inline history autosuggestions alongside `/` and `@` completion.
   - [x] Add a one-line activity surface with live tool-state labels.
+  - [x] Add alternate-screen terminal takeover with an inline-mode escape hatch.
   - [ ] Add the final panda application icon and platform launcher metadata.
   - [ ] Add responsive composer borders and a right-aligned context/model meter.
   - [ ] Add installer, signed release binaries, and desktop launch entries.
