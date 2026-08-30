@@ -151,6 +151,7 @@ pub struct PromptContext<'a> {
     pub platform: Platform,
     pub git: Option<&'a GitSegment>,
     pub last_exit_code: Option<i32>,
+    pub terminal_width: u16,
 }
 
 /// Non-secret state rendered once when the standalone terminal starts.
@@ -160,6 +161,10 @@ pub struct StartupContext<'a> {
     pub platform: Platform,
     pub model: Option<&'a str>,
     pub mode: &'a str,
+    pub effort: Option<&'a str>,
+    pub session_budget_tokens: u64,
+    pub context_tokens: u64,
+    pub auto_compaction: bool,
     pub agent_configured: bool,
 }
 
@@ -213,8 +218,18 @@ impl Renderer {
             "Native shell ready · run /auth login for AI".to_owned()
         };
         let copy = format!(
-            "Crumb CLI v{} uses AI.\nNative commands stay native. Review AI actions.\n\n{}\n\nTip: type naturally · : forces AI · / opens actions",
-            context.version, state
+            "Crumb CLI v{} uses AI.\nNative commands stay native. Review AI actions.\n\n{}\nEffort · {}\nSession budget · {} tokens\nContext · {} / {}{}\n\nTip: type naturally · : forces AI · / opens actions",
+            context.version,
+            state,
+            context.effort.unwrap_or("default"),
+            compact_tokens(context.session_budget_tokens),
+            compact_tokens(context.context_tokens),
+            compact_tokens(context.session_budget_tokens),
+            if context.auto_compaction {
+                " · auto compact at 80%"
+            } else {
+                ""
+            }
         );
         if terminal_width < 64 {
             return format!(
@@ -224,6 +239,61 @@ impl Renderer {
             );
         }
         compose_welcome(*self, trim_art(panda), &copy)
+    }
+
+    /// Renders the interactive workspace trust boundary.
+    #[must_use]
+    pub fn folder_trust(
+        &self,
+        workspace: &Path,
+        allow_selected: bool,
+        terminal_width: u16,
+    ) -> String {
+        let yes = if allow_selected { "›" } else { " " };
+        let no = if allow_selected { " " } else { "›" };
+        let yes_line = format!("{yes} 1. Yes, trust this folder for this session");
+        let no_line = format!("{no} 2. No (Esc)");
+        let width = usize::from(terminal_width.clamp(56, 100));
+        let inner = width.saturating_sub(4);
+        let row = |text: &str| format!("│ {:<inner$} │", fit_terminal_text(text, inner));
+        let yes_line = if allow_selected {
+            self.paint(&row(&yes_line), "30;44;1")
+        } else {
+            row(&yes_line)
+        };
+        let no_line = if allow_selected {
+            row(&no_line)
+        } else {
+            self.paint(&row(&no_line), "30;44;1")
+        };
+        [
+            self.paint(&format!("╭{}╮", "─".repeat(width - 2)), "2"),
+            self.paint(&row("Confirm folder trust"), "1"),
+            self.paint(&row(""), "2"),
+            self.paint(&row(&workspace.display().to_string()), "2"),
+            self.paint(
+                &row("Crumb may read, edit, and run commands here with your permission."),
+                "2",
+            ),
+            self.paint(&row(""), "2"),
+            yes_line,
+            no_line,
+            self.paint(&row(""), "2"),
+            self.paint(&row("↑/↓ navigate · Enter select · Esc cancel"), "2"),
+            self.paint(&format!("╰{}╯", "─".repeat(width - 2)), "2"),
+        ]
+        .join("\n")
+    }
+
+    /// Renders the persistent keyboard guide below the full-screen composer.
+    #[must_use]
+    pub fn composer_hotkeys(&self, terminal_width: u16) -> String {
+        let guide = if terminal_width < 80 {
+            "Tab complete · @ context · / commands · Ctrl+C cancel"
+        } else {
+            "←/→ move · ↑ history · Tab complete · @ add context · / commands · Ctrl+C cancel"
+        };
+        self.paint(guide, "2")
     }
 
     /// Renders a compact, non-blocking startup readiness summary.
@@ -352,7 +422,12 @@ impl Renderer {
         {
             context_line.push_str(&self.paint(&format!("  exit:{exit_code}"), "31"));
         }
-        format!("{context_line}\n{} ", self.paint("❯", "36;1"))
+        let rule_width = usize::from(context.terminal_width.saturating_sub(2).clamp(20, 160));
+        format!(
+            "{context_line}\n{}\n{} ",
+            self.paint(&format!("┌{}", "─".repeat(rule_width)), "2"),
+            self.paint("│", "36;1")
+        )
     }
 
     fn paint(self, text: &str, color: &str) -> String {
@@ -426,6 +501,25 @@ fn paint_panda_line(renderer: Renderer, line: &str) -> String {
 
 fn trim_art(art: &str) -> &str {
     art.trim()
+}
+
+fn compact_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{}.{}m", tokens / 1_000_000, tokens % 1_000_000 / 100_000)
+    } else if tokens >= 1_000 {
+        format!("{}.{}k", tokens / 1_000, tokens % 1_000 / 100)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn fit_terminal_text(text: &str, width: usize) -> String {
+    let mut fitted = text.chars().take(width).collect::<String>();
+    if text.chars().count() > width && width > 1 {
+        fitted.pop();
+        fitted.push('…');
+    }
+    fitted
 }
 
 fn compose_styled_art(renderer: Renderer, left: &str, right: &str, gap: usize) -> String {
@@ -680,6 +774,7 @@ mod tests {
             platform: Platform::Linux,
             git: Some(&git),
             last_exit_code: Some(2),
+            terminal_width: 80,
         });
 
         assert_eq!(
@@ -702,9 +797,11 @@ mod tests {
             platform: Platform::MacOs,
             git: None,
             last_exit_code: Some(0),
+            terminal_width: 80,
         });
 
-        assert_eq!(prompt, "/workspace\n❯ ");
+        assert!(prompt.starts_with("/workspace\n┌"));
+        assert!(prompt.ends_with("\n│ "));
         assert!(!prompt.contains("exit:"));
     }
 
@@ -761,6 +858,10 @@ mod tests {
             platform: Platform::Linux,
             model: Some("pollinations/nova-fast"),
             mode: "auto",
+            effort: Some("medium"),
+            session_budget_tokens: 64_000,
+            context_tokens: 0,
+            auto_compaction: true,
             agent_configured: true,
         });
 
@@ -774,6 +875,10 @@ mod tests {
                 platform: Platform::Linux,
                 model: Some("pollinations/nova-fast"),
                 mode: "auto",
+                effort: Some("medium"),
+                session_budget_tokens: 64_000,
+                context_tokens: 0,
+                auto_compaction: true,
                 agent_configured: true,
             },
             120,
@@ -781,6 +886,22 @@ mod tests {
         assert!(welcome.contains("Crumb CLI v0.1.0 uses AI."));
         assert!(welcome.contains("Ready · pollinations/nova-fast · auto"));
         assert!(welcome.contains("╭▄█▄╮"));
+    }
+
+    #[test]
+    fn folder_trust_keeps_the_workspace_and_selection_visible() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Rich,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Full,
+        });
+        let dialog = renderer.folder_trust(Path::new("/workspace/crumb"), true, 80);
+
+        assert!(dialog.contains("Confirm folder trust"));
+        assert!(dialog.contains("/workspace/crumb"));
+        assert!(dialog.contains("› 1. Yes"));
+        assert!(dialog.contains("2. No (Esc)"));
     }
 
     #[test]

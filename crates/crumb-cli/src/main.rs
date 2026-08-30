@@ -337,17 +337,21 @@ fn run_managed_repl() -> Result<ReplOutcome> {
     let fullscreen = interactive && std::env::var_os("CRUMB_INLINE").is_none();
     let _screen = AlternateScreenGuard::enter(fullscreen)?;
     let platform = Platform::current();
+    let initial_cwd = current_process_dir()?;
+    if interactive && !confirm_folder_trust(renderer, &initial_cwd, fullscreen)? {
+        return Ok(ReplOutcome::Exit);
+    }
     let command_catalog = native_command_catalog(platform);
     let mut session: Option<ShellSession> = None;
     let mut agent_runtime: Option<AgentRuntime> = None;
     let mut last_exit_code = None;
     let history = open_history(&mut stdout.lock())?;
-    let completion_workspace = CompletionWorkspace::new(current_process_dir()?);
+    let completion_workspace = CompletionWorkspace::new(initial_cwd);
     let mut line_editor = interactive
         .then(|| create_line_editor(history.as_ref(), completion_workspace.clone()))
         .transpose()?;
 
-    render_startup(
+    let header_rows = render_startup(
         renderer,
         platform,
         interactive,
@@ -359,14 +363,21 @@ fn run_managed_repl() -> Result<ReplOutcome> {
         let cwd = session
             .as_ref()
             .map_or_else(current_process_dir, |shell| Ok(shell.cwd().to_path_buf()))?;
-        let prompt = render_prompt(renderer, &cwd, platform, last_exit_code);
+        let terminal_width = size().map_or(80, |(columns, _)| columns);
+        let status = prompt_model_status(&cwd, agent_runtime.as_ref());
+        let prompt = with_composer_status(
+            render_prompt(renderer, &cwd, platform, last_exit_code, terminal_width),
+            &status,
+        );
         let event = if let Some(editor) = line_editor.as_mut() {
             editor.workspace.set(&cwd);
             if fullscreen {
-                position_composer()?;
+                position_composer(renderer, header_rows)?;
             }
-            let right = prompt_model_status(&cwd);
-            match editor.editor.read_line(&CrumbPrompt::new(prompt, right))? {
+            match editor
+                .editor
+                .read_line(&CrumbPrompt::new(prompt, String::new()))?
+            {
                 Signal::Success(command) => Some(crumb_repl::classify_input(&command)),
                 Signal::CtrlD => None,
                 _ => continue,
@@ -381,6 +392,9 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             shutdown_session(session)?;
             return Ok(ReplOutcome::Exit);
         };
+        if fullscreen {
+            position_transcript(header_rows)?;
+        }
         let mut writer = stdout.lock();
 
         match event {
@@ -439,7 +453,7 @@ fn render_startup(
     interactive: bool,
     fullscreen: bool,
     writer: &mut dyn Write,
-) -> Result<()> {
+) -> Result<u16> {
     let cwd = current_process_dir()?;
     let config = read_agent_config(&cwd).unwrap_or_default();
     let model = config
@@ -447,11 +461,19 @@ fn render_startup(
         .get(&Modality::Text)
         .and_then(|routes| routes.first())
         .map(|route| format!("{}/{}", route.provider, route.model));
+    let text_route = config
+        .models
+        .get(&Modality::Text)
+        .and_then(|routes| routes.first());
     let startup = StartupContext {
         version: env!("CARGO_PKG_VERSION"),
         platform,
         model: model.as_deref(),
         mode: agent_mode_name(config.mode),
+        effort: text_route.and_then(|route| config.reasoning_effort_for(route)),
+        session_budget_tokens: context_token_budget(&config, text_route),
+        context_tokens: 0,
+        auto_compaction: matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
         agent_configured: config.harness.is_some() && model.is_some(),
     };
     let terminal_width = if interactive {
@@ -460,7 +482,9 @@ fn render_startup(
         80
     };
     if fullscreen {
-        writeln!(writer, "{}", renderer.welcome(&startup, terminal_width))?;
+        let welcome = renderer.welcome(&startup, terminal_width);
+        writeln!(writer, "{welcome}")?;
+        return Ok(u16::try_from(welcome.lines().count()).unwrap_or(u16::MAX));
     } else {
         let branding = renderer.branding_for_width(terminal_width);
         if !branding.is_empty() {
@@ -471,7 +495,59 @@ fn render_startup(
             )?;
         }
     }
-    Ok(())
+    Ok(0)
+}
+
+fn confirm_folder_trust(renderer: Renderer, workspace: &Path, fullscreen: bool) -> Result<bool> {
+    if !fullscreen {
+        write!(
+            io::stdout(),
+            "{}\nTrust this folder for this session? [y/N] ",
+            workspace.display()
+        )?;
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        return Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"));
+    }
+
+    let width = size().map_or(100, |(columns, _)| columns);
+    writeln!(io::stdout(), "{}", renderer.branding_for_width(width))?;
+    let mut allow_selected = true;
+    let _raw_mode = RawModeGuard::enable()?;
+    loop {
+        let (_, rows) = size()?;
+        crossterm::execute!(
+            io::stdout(),
+            MoveTo(0, rows.saturating_sub(12)),
+            Clear(ClearType::FromCursorDown)
+        )?;
+        let dialog = renderer
+            .folder_trust(workspace, allow_selected, size()?.0)
+            .replace('\n', "\r\n");
+        write!(io::stdout(), "{dialog}\r\n")?;
+        io::stdout().flush()?;
+        if let TerminalEvent::Key(key) = read_terminal_event()?
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        {
+            match key.code {
+                TerminalKeyCode::Up | TerminalKeyCode::Down => {
+                    allow_selected = !allow_selected;
+                }
+                TerminalKeyCode::Char('1' | 'y' | 'Y') => return clear_trust_screen(true),
+                TerminalKeyCode::Char('2' | 'n' | 'N') | TerminalKeyCode::Esc => {
+                    return clear_trust_screen(false);
+                }
+                TerminalKeyCode::Enter => return clear_trust_screen(allow_selected),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn clear_trust_screen(allowed: bool) -> Result<bool> {
+    crossterm::execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
+    Ok(allowed)
 }
 
 struct InputContext<'a> {
@@ -1206,6 +1282,7 @@ fn render_prompt(
     cwd: &Path,
     platform: Platform,
     last_exit_code: Option<i32>,
+    terminal_width: u16,
 ) -> String {
     let git = GitSegment::discover(cwd);
     renderer.prompt(&PromptContext {
@@ -1213,6 +1290,7 @@ fn render_prompt(
         platform,
         git: git.as_ref(),
         last_exit_code,
+        terminal_width,
     })
 }
 
@@ -3227,7 +3305,8 @@ impl Hinter for CrumbHinter {
     ) -> String {
         self.placeholder_visible = line.is_empty();
         if self.placeholder_visible {
-            let placeholder = "Describe a task or type a command · @ context · / actions";
+            let placeholder =
+                "Ask Crumb anything or type a command · @ context · / commands · Tab complete";
             return if use_ansi_coloring {
                 Style::new()
                     .fg(Color::DarkGray)
@@ -3293,27 +3372,135 @@ impl Prompt for CrumbPrompt {
     }
 }
 
-fn prompt_model_status(cwd: &Path) -> String {
+fn prompt_model_status(cwd: &Path, runtime: Option<&AgentRuntime>) -> String {
     let Ok(config) = read_agent_config(cwd) else {
         return "native".to_owned();
     };
+    let (context_tokens, session_tokens, compactions) =
+        runtime.map(AgentRuntime::token_usage).unwrap_or((0, 0, 0));
     config
         .models
         .get(&Modality::Text)
         .and_then(|routes| routes.first())
         .map_or_else(
             || "native".to_owned(),
-            |route| format!("{} · {}", route.model, agent_mode_name(config.mode)),
+            |route| {
+                let effort = config.reasoning_effort_for(route).unwrap_or("default");
+                let compaction =
+                    if matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })) {
+                        "compact auto"
+                    } else {
+                        "compact provider"
+                    };
+                format!(
+                    "{} · {} · effort {effort} · ctx ~{}/{} · session ~{} · {compaction}{}",
+                    route.model,
+                    agent_mode_name(config.mode),
+                    compact_token_count(context_tokens),
+                    compact_token_count(context_token_budget(&config, Some(route))),
+                    compact_token_count(session_tokens),
+                    if compactions == 0 {
+                        String::new()
+                    } else {
+                        format!(" ({compactions})")
+                    }
+                )
+            },
         )
 }
 
-fn position_composer() -> io::Result<()> {
+fn with_composer_status(prompt: String, status: &str) -> String {
+    if let Some((head, tail)) = prompt.split_once('\n') {
+        format!("{head}  {status}\n{tail}")
+    } else {
+        prompt
+    }
+}
+
+fn compact_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{}.{}m", tokens / 1_000_000, tokens % 1_000_000 / 100_000)
+    } else if tokens >= 1_000 {
+        format!("{}.{}k", tokens / 1_000, tokens % 1_000 / 100)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn context_token_budget(config: &AgentConfig, route: Option<&ModelRoute>) -> u64 {
+    let provider_limit = route.and_then(|route| {
+        let provider = config.providers.get(&route.provider)?;
+        provider
+            .models
+            .iter()
+            .find(|model| model.id == route.model)
+            .and_then(|model| model.context_window)
+            .or(provider.default_context_window)
+    });
+    provider_limit.map_or(config.limits.max_context_tokens, |limit| {
+        limit.min(config.limits.max_context_tokens)
+    })
+}
+
+const FULLSCREEN_COMPOSER_ROWS: u16 = 5;
+
+fn fullscreen_rows(header_rows: u16) -> io::Result<(u16, u16, u16, u16)> {
     let (_, rows) = size()?;
-    crossterm::execute!(
-        io::stdout(),
-        MoveTo(0, rows.saturating_sub(3)),
-        Clear(ClearType::FromCursorDown)
+    let composer_row = rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
+    let transcript_bottom = composer_row.saturating_sub(1);
+    let transcript_top = header_rows.min(transcript_bottom);
+    Ok((
+        transcript_top,
+        transcript_bottom,
+        composer_row,
+        rows.saturating_sub(1),
+    ))
+}
+
+fn set_transcript_scroll_region(
+    writer: &mut impl Write,
+    transcript_top: u16,
+    transcript_bottom: u16,
+) -> io::Result<()> {
+    write!(
+        writer,
+        "\x1b[{};{}r",
+        transcript_top.saturating_add(1),
+        transcript_bottom.saturating_add(1)
     )
+}
+
+fn position_composer(renderer: Renderer, header_rows: u16) -> io::Result<()> {
+    let (columns, _) = size()?;
+    let (transcript_top, transcript_bottom, composer_row, footer_row) =
+        fullscreen_rows(header_rows)?;
+    let mut writer = io::stdout();
+    set_transcript_scroll_region(&mut writer, transcript_top, transcript_bottom)?;
+    crossterm::execute!(
+        writer,
+        MoveTo(0, composer_row),
+        Clear(ClearType::FromCursorDown),
+        MoveTo(0, footer_row),
+        Clear(ClearType::CurrentLine)
+    )?;
+    write!(writer, "{}", renderer.composer_hotkeys(columns))?;
+    writer.flush()?;
+    crossterm::execute!(writer, MoveTo(0, composer_row))
+}
+
+fn position_transcript(header_rows: u16) -> io::Result<()> {
+    let (transcript_top, transcript_bottom, composer_row, _) = fullscreen_rows(header_rows)?;
+    let mut writer = io::stdout();
+    set_transcript_scroll_region(&mut writer, transcript_top, transcript_bottom)?;
+    crossterm::execute!(
+        writer,
+        MoveTo(0, composer_row),
+        Clear(ClearType::FromCursorDown),
+        MoveTo(0, transcript_bottom)
+    )?;
+    write!(writer, "\r\n")?;
+    crossterm::execute!(writer, Clear(ClearType::CurrentLine))?;
+    Ok(())
 }
 
 fn show_history(
@@ -3477,6 +3664,7 @@ impl AlternateScreenGuard {
 impl Drop for AlternateScreenGuard {
     fn drop(&mut self) {
         if self.active {
+            let _ = write!(io::stdout(), "\x1b[r");
             let _ = crossterm::execute!(io::stdout(), Show, LeaveAlternateScreen);
         }
     }

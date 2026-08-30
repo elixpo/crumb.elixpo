@@ -112,8 +112,10 @@ This is the local source of truth for implementation order. GitHub issues provid
   - [x] Add a muted empty-composer placeholder that cannot be accepted as input.
   - [x] Add a one-line activity surface with live tool-state labels.
   - [x] Add alternate-screen terminal takeover with an inline-mode escape hatch.
+  - [x] Gate interactive startup on explicit current-folder trust.
+  - [x] Surface effort, session budget, estimated context use, and Harness auto-compaction.
   - [ ] Add the final panda application icon and platform launcher metadata.
-  - [ ] Add responsive composer borders and a right-aligned context/model meter.
+  - [x] Add responsive composer borders and a context/model status meter.
   - [ ] Add installer, signed release binaries, and desktop launch entries.
 - [ ] Resume the `crumb.elixpo` web UI after the CLI UI.
 - [ ] WP-011 — streamed AI question mode.

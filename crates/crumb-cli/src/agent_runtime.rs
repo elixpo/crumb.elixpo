@@ -79,6 +79,9 @@ pub struct AgentRuntime {
     supervisor: Option<HarnessSupervisor>,
     supervisor_limits: Option<SupervisorLimits>,
     environment_revision: u64,
+    context_tokens_estimate: u64,
+    session_tokens_estimate: u64,
+    compactions: u32,
     review_notes: Vec<ReviewNote>,
     review_note_bytes: usize,
 }
@@ -118,6 +121,9 @@ impl AgentRuntime {
             supervisor: None,
             supervisor_limits: None,
             environment_revision: 1,
+            context_tokens_estimate: 0,
+            session_tokens_estimate: 0,
+            compactions: 0,
             review_notes: Vec::new(),
             review_note_bytes: 0,
         })
@@ -193,6 +199,16 @@ impl AgentRuntime {
     #[must_use]
     pub fn active_session_id(&self) -> Option<&str> {
         self.session.as_ref().map(|session| session.id().as_str())
+    }
+
+    /// Returns estimated context, total session tokens, and compaction count.
+    #[must_use]
+    pub const fn token_usage(&self) -> (u64, u64, u32) {
+        (
+            self.context_tokens_estimate,
+            self.session_tokens_estimate,
+            self.compactions,
+        )
     }
 
     /// Runs a turn off the terminal input thread and emits only bounded,
@@ -352,11 +368,35 @@ impl AgentRuntime {
             Err(_) if cancellation.is_cancelled() => TurnStatus::Cancelled,
             Err(_) => TurnStatus::Failed,
         };
+        self.record_token_estimate(
+            request,
+            result.as_ref().ok(),
+            context_token_budget(config, route),
+            matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
+        );
         self.session
             .as_mut()
             .context("agent session unavailable")?
             .record_turn_end(status, 0, 0)?;
         result
+    }
+
+    fn record_token_estimate(
+        &mut self,
+        request: &str,
+        result: Option<&RunResult>,
+        limit: u64,
+        auto_compaction: bool,
+    ) {
+        let response = result.map_or("", |result| result.final_response.as_str());
+        let tokens = estimate_tokens(request).saturating_add(estimate_tokens(response));
+        self.session_tokens_estimate = self.session_tokens_estimate.saturating_add(tokens);
+        self.context_tokens_estimate = self.context_tokens_estimate.saturating_add(tokens);
+        let threshold = limit.saturating_mul(4) / 5;
+        if auto_compaction && threshold > 0 && self.context_tokens_estimate >= threshold {
+            self.context_tokens_estimate = limit.saturating_mul(16) / 100;
+            self.compactions = self.compactions.saturating_add(1);
+        }
     }
 
     fn start_turn(
@@ -494,6 +534,24 @@ impl AgentRuntime {
         self.supervisor_limits = None;
         Ok(())
     }
+}
+
+fn estimate_tokens(text: &str) -> u64 {
+    u64::try_from(text.len()).unwrap_or(u64::MAX).div_ceil(4)
+}
+
+fn context_token_budget(config: &AgentConfig, route: &crumb_agent::ModelRoute) -> u64 {
+    let provider_limit = config.providers.get(&route.provider).and_then(|provider| {
+        provider
+            .models
+            .iter()
+            .find(|model| model.id == route.model)
+            .and_then(|model| model.context_window)
+            .or(provider.default_context_window)
+    });
+    provider_limit.map_or(config.limits.max_context_tokens, |limit| {
+        limit.min(config.limits.max_context_tokens)
+    })
 }
 
 fn session_root(workspace: &Path) -> PathBuf {
