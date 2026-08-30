@@ -399,21 +399,17 @@ fn run_managed_repl() -> Result<ReplOutcome> {
         )?;
         let mut writer = stdout.lock();
 
-        match event {
-            InputEvent::BuiltIn(command) => {
-                if let Some(outcome) = handle_builtin(
-                    command,
-                    &mut session,
-                    &mut agent_runtime,
-                    history.as_ref(),
-                    &cwd,
-                    platform,
-                    &mut writer,
-                )? {
-                    return Ok(outcome);
-                }
-            }
-            InputEvent::NativeInput(command) if command.trim().is_empty() => {}
+        let outcome = match event {
+            InputEvent::BuiltIn(command) => handle_builtin(
+                command,
+                &mut session,
+                &mut agent_runtime,
+                history.as_ref(),
+                &cwd,
+                platform,
+                &mut writer,
+            ),
+            InputEvent::NativeInput(command) if command.trim().is_empty() => Ok(None),
             InputEvent::NativeInput(command) => {
                 let mut context = InputContext {
                     command_catalog: &command_catalog,
@@ -429,11 +425,15 @@ fn run_managed_repl() -> Result<ReplOutcome> {
                     last_exit_code: &mut last_exit_code,
                     command_context: &mut command_context,
                 };
-                if let Some(outcome) = handle_input(&command, &mut context)? {
-                    return Ok(outcome);
-                }
+                handle_input(&command, &mut context)
             }
+        };
+        match outcome {
+            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(None) => {}
+            Err(error) => writeln!(writer, "{}", renderer.command_error(&error.to_string()))?,
         }
+        writer.flush()?;
     }
 }
 

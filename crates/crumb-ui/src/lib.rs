@@ -507,6 +507,20 @@ impl Renderer {
         body
     }
 
+    /// Renders a recoverable command failure without ending the terminal session.
+    #[must_use]
+    pub fn command_error(&self, message: &str) -> String {
+        if self.settings.output == OutputMode::ScreenReader {
+            return format!("Crumb command failed: {message}");
+        }
+        format!(
+            "  {}  {}\n  {} {message}",
+            self.paint("[ CRUMB ]", "38;2;255;255;204;48;5;53;1"),
+            self.paint("Command failed", "31;1"),
+            self.paint("╰──▶", "31;1")
+        )
+    }
+
     /// Renders a Harness failure without conflating it with native shell output.
     #[must_use]
     pub fn agent_error(&self, message: &str, cancelled: bool) -> String {
@@ -1036,6 +1050,10 @@ mod tests {
             "  [ CRUMB ]  model qwen-coder · mode auto · effort high"
         );
         assert_eq!(renderer.agent_response("done\n"), "\n  ╰──▶ done");
+        assert_eq!(
+            renderer.command_error("connector unavailable"),
+            "  [ CRUMB ]  Command failed\n  ╰──▶ connector unavailable"
+        );
         assert_eq!(
             renderer.transcript_input("elixpo", "fix this"),
             "  ◆ > fix this"
