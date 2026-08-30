@@ -1,4 +1,4 @@
-<h1>
+<h1 align="center>
   <img src="crumb.elixpo/public/favicon.png" width="30" height="30" alt="Crumb panda" />
   Crumb
 </h1>
@@ -7,7 +7,7 @@
   <img src="crumb.elixpo/public/og-image.png" alt="Crumb — the natural language terminal" width="100%" />
 </p>
 
-Crumb is a terminal you can talk to.
+> Crumb is a terminal you can talk to.
 
 Use the commands you already know, ask for help in everyday language, and bring useful tools into one focused workspace. Crumb is designed to feel familiar when you want a normal terminal and genuinely helpful when you want more.
 
