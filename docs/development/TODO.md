@@ -5,19 +5,18 @@ This is the local source of truth for implementation order. GitHub issues provid
 ## Completed milestones
 
 - [x] [WP-001 — workspace bootstrap](https://github.com/elixpo/crumb.elixpo/issues/1)
+- [x] [WP-002 — persistent Linux Bash PTY](https://github.com/elixpo/crumb.elixpo/issues/4)
 
-## Current milestone: [WP-002 — persistent Linux Bash PTY](https://github.com/elixpo/crumb.elixpo/issues/4)
+## Current milestone: [WP-003 — macOS Zsh parity](https://github.com/elixpo/crumb.elixpo/issues/6)
 
-- [x] Add isolated `crumb-pty` and `crumb-native` crates.
-- [x] Define PTY and native-shell lifecycle abstractions.
-- [x] Launch interactive Bash inside a PTY on Linux.
-- [x] Forward terminal input and output.
-- [x] Preserve working-directory and environment state between commands.
-- [x] Forward terminal resize events.
-- [x] Forward Ctrl+C without terminating crumb.
-- [x] Add focused unit and Linux integration tests.
-- [x] Pass formatting, clippy, and workspace tests.
-- [ ] Merge WP-002.
+- [x] Add a typed macOS Zsh implementation.
+- [x] Select interactive Zsh for `Platform::MacOs`.
+- [x] Reuse the portable PTY lifecycle and terminal relay.
+- [x] Preserve cwd and environment state in one Zsh process.
+- [x] Add deterministic macOS integration coverage.
+- [ ] Keep Linux and Windows workspace builds green.
+- [ ] Pass formatting, clippy, and workspace tests.
+- [ ] Merge WP-003.
 
 <details>
 <summary>WP-001 completion details</summary>
@@ -36,7 +35,6 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Planned work packages
 
-- [ ] WP-003 — macOS Zsh parity.
 - [ ] WP-004 — Windows PowerShell parity.
 - [ ] WP-005 — shell lifecycle and completion protocol.
 - [ ] WP-006 — terminal UI layer.

@@ -48,6 +48,20 @@ impl NativeShell for LinuxBash {
     }
 }
 
+/// macOS Zsh implementation for WP-003.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MacOsZsh;
+
+impl NativeShell for MacOsZsh {
+    fn kind(&self) -> ShellKind {
+        ShellKind::Zsh
+    }
+
+    fn command_spec(&self) -> CommandSpec {
+        CommandSpec::new("zsh").arg("-i")
+    }
+}
+
 /// Error returned when the active platform's shell backend is not built yet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UnsupportedPlatform(pub Platform);
@@ -64,16 +78,16 @@ impl fmt::Display for UnsupportedPlatform {
 
 impl Error for UnsupportedPlatform {}
 
-/// Selects the WP-002 native shell for a platform.
+/// Selects the native shell implemented for a platform.
 ///
 /// # Errors
 ///
-/// Returns [`UnsupportedPlatform`] until the macOS and Windows parity work
-/// packages are implemented.
+/// Returns [`UnsupportedPlatform`] until Windows parity is implemented.
 pub fn shell_for(platform: Platform) -> Result<Box<dyn NativeShell>, UnsupportedPlatform> {
     match platform {
         Platform::Linux => Ok(Box::new(LinuxBash)),
-        Platform::MacOs | Platform::Windows => Err(UnsupportedPlatform(platform)),
+        Platform::MacOs => Ok(Box::new(MacOsZsh)),
+        Platform::Windows => Err(UnsupportedPlatform(platform)),
     }
 }
 
@@ -94,8 +108,17 @@ mod tests {
     }
 
     #[test]
-    fn parity_platforms_are_explicitly_deferred() {
-        assert!(shell_for(Platform::MacOs).is_err());
+    fn macos_selects_interactive_zsh() {
+        let shell = shell_for(Platform::MacOs).expect("macOS should be supported");
+        let command = shell.command_spec();
+
+        assert_eq!(shell.kind(), ShellKind::Zsh);
+        assert_eq!(command.program(), "zsh");
+        assert_eq!(command.args(), ["-i"]);
+    }
+
+    #[test]
+    fn windows_parity_is_explicitly_deferred() {
         assert!(shell_for(Platform::Windows).is_err());
     }
 }
