@@ -49,7 +49,7 @@ impl Default for RoutePolicy {
     fn default() -> Self {
         Self {
             unknown_input: UnknownInputPolicy::Agent,
-            typo_distance: 2,
+            typo_distance: 1,
         }
     }
 }
@@ -153,14 +153,7 @@ impl CommandCatalog {
                 Some(suggestion),
             );
         }
-        if trimmed.split_whitespace().count() == 1 {
-            return decision(
-                InputRoute::Native,
-                RouteReason::SingleUnknownToken,
-                input,
-                None,
-            );
-        }
+        let single_token = trimmed.split_whitespace().count() == 1;
         let route = match policy.unknown_input {
             UnknownInputPolicy::Agent => InputRoute::Agent,
             UnknownInputPolicy::Negotiate => InputRoute::Negotiate,
@@ -168,7 +161,9 @@ impl CommandCatalog {
         };
         decision(
             route,
-            if matches!(route, InputRoute::Agent) {
+            if single_token {
+                RouteReason::SingleUnknownToken
+            } else if matches!(route, InputRoute::Agent) {
                 RouteReason::NaturalLanguageCandidate
             } else {
                 RouteReason::PolicyFallback
@@ -290,18 +285,35 @@ fn is_executable(path: &Path) -> bool {
 }
 
 fn edit_distance(left: &str, right: &str) -> usize {
-    let mut previous = (0..=right.chars().count()).collect::<Vec<_>>();
-    let mut current = vec![0; previous.len()];
-    for (left_index, left_character) in left.chars().enumerate() {
-        current[0] = left_index + 1;
-        for (right_index, right_character) in right.chars().enumerate() {
-            current[right_index + 1] = (previous[right_index + 1] + 1)
-                .min(current[right_index] + 1)
-                .min(previous[right_index] + usize::from(left_character != right_character));
-        }
-        previous.clone_from_slice(&current);
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    let mut distance = vec![vec![0; right.len() + 1]; left.len() + 1];
+    for (index, row) in distance.iter_mut().enumerate() {
+        row[0] = index;
     }
-    previous[right.chars().count()]
+    for (index, cell) in distance[0].iter_mut().enumerate() {
+        *cell = index;
+    }
+    for (left_index, left_character) in left.iter().enumerate() {
+        for (right_index, right_character) in right.iter().enumerate() {
+            let row = left_index + 1;
+            let column = right_index + 1;
+            distance[row][column] = (distance[row - 1][column] + 1)
+                .min(distance[row][column - 1] + 1)
+                .min(
+                    distance[row - 1][column - 1] + usize::from(left_character != right_character),
+                );
+            if row > 1
+                && column > 1
+                && left[row - 1] == right[column - 2]
+                && left[row - 2] == right[column - 1]
+            {
+                distance[row][column] =
+                    distance[row][column].min(distance[row - 2][column - 2] + 1);
+            }
+        }
+    }
+    distance[left.len()][right.len()]
 }
 
 #[cfg(test)]
@@ -327,6 +339,16 @@ mod tests {
         assert_eq!(decision.route, InputRoute::Agent);
         assert_eq!(decision.payload, "explain this error");
         assert_eq!(decision.reason, RouteReason::NaturalLanguageCandidate);
+    }
+
+    #[test]
+    fn conversational_single_word_uses_the_unknown_input_policy() {
+        let catalog = CommandCatalog::with_commands(["help".to_owned()]);
+        let decision = catalog.route("hello", &RoutePolicy::default());
+
+        assert_eq!(decision.route, InputRoute::Agent);
+        assert_eq!(decision.reason, RouteReason::SingleUnknownToken);
+        assert!(decision.suggestion.is_none());
     }
 
     #[test]
@@ -386,6 +408,7 @@ mod tests {
 
     #[test]
     fn edit_distance_is_deterministic() {
-        assert_eq!(edit_distance("gti", "git"), 2);
+        assert_eq!(edit_distance("gti", "git"), 1);
+        assert_eq!(edit_distance("hello", "help"), 2);
     }
 }

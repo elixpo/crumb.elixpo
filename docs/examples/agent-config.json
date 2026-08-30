@@ -3,7 +3,7 @@
   "mistakes": "prompt",
   "routing": {
     "unknown_input": "agent",
-    "typo_distance": 2
+    "typo_distance": 1
   },
   "structured_encoding": "auto",
   "effort": null,

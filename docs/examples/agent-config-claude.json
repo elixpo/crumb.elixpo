@@ -2,7 +2,7 @@
   "mode": "plan",
   "routing": {
     "unknown_input": "agent",
-    "typo_distance": 2
+    "typo_distance": 1
   },
   "harness": {
     "kind": "coding_cli",

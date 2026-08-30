@@ -11,7 +11,8 @@
   config:
     # Crumb projects one validated provider dictionary into the isolated child.
     # Secret headers remain env references until this final in-process step.
-    providers: !!js (() => { const providers = JSON.parse(process.env.CRUMB_HARNESS_PROVIDERS ?? '{}'); for (const profile of Object.values(providers)) for (const [name, value] of Object.entries(profile.headers ?? {})) if (value && typeof value === 'object' && '$env' in value) profile.headers[name] = process.env[value.$env] ?? ''; return providers })()
+    providers: !!js >-
+      (() => { const providers = JSON.parse(process.env.CRUMB_HARNESS_PROVIDERS ?? '{}'); for (const profile of Object.values(providers)) for (const [name, value] of Object.entries(profile.headers ?? {})) if (value && typeof value === 'object' && '$env' in value) profile.headers[name] = process.env[value.$env] ?? ''; return providers })()
 
 - id: llm-retry
   name: '@deepseek-ai/dsh-llm-retry'
@@ -19,7 +20,22 @@
 - id: agent-spine
   name: '@deepseek-ai/dsh-agent-spine-demo'
   config:
-    persona: Crumb is a concise coding agent. Use only tools supplied by the crumb MCP server.
+    includeHarnessIdentity: false
+    includeRuntimeContext: false
+    persona: |
+      You are Crumb, a concise terminal-native assistant.
+
+      Follow the user's request directly. Do not inspect the workspace or call a
+      tool unless the request requires information or an action that is not
+      already available in the conversation. Repeating, transforming, or
+      answering from supplied text never requires a tool. If the user asks for
+      an exact reply, output exactly that reply with no preamble, explanation,
+      Markdown fence, or XML wrapper.
+
+      When tools are necessary, use only tools supplied by the crumb MCP server.
+      Make the fewest purposeful calls needed and stop as soon as the request is
+      satisfied. Never invent tool results or claim an action was completed when
+      it was not.
     workspaceContext: false
     skills:
       enabled: false
@@ -43,7 +59,8 @@
     command: !!js process.env.CRUMB_MCP_COMMAND
     args: ['mcp', 'serve']
     cwd: !!js process.env.DSH_CWD
-    env: !!js process.env.POLLINATIONS_API_KEY ? { POLLINATIONS_API_KEY: process.env.POLLINATIONS_API_KEY } : {}
+    env:
+      POLLINATIONS_API_KEY: !!js process.env.POLLINATIONS_API_KEY ?? ''
     failOnStartupError: true
     reconnect:
       enabled: false

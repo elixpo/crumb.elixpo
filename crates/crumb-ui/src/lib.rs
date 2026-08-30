@@ -17,6 +17,7 @@ const FULL_LOGO: &str = r"   ██████╗██████╗ ██�
   ██║     ██╔══██╗██║   ██║██║╚██╔╝██║██╔══██╗
   ╚██████╗██║  ██║╚██████╔╝██║ ╚═╝ ██║██████╔╝
    ╚═════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝╚═════╝";
+const COOKIE_ART: &str = include_str!("../assets/cookie.txt");
 
 const PUNCHLINES: &[&str] = &[
     "Broken biscuit. Working terminal.",
@@ -295,6 +296,7 @@ pub struct ActivityIndicator {
     started: Instant,
     visible: bool,
     color: bool,
+    line_count: usize,
 }
 
 impl ActivityIndicator {
@@ -311,6 +313,7 @@ impl ActivityIndicator {
             started: Instant::now(),
             visible: animated,
             color,
+            line_count: COOKIE_ART.lines().count() + 1,
         }
     }
 
@@ -325,9 +328,9 @@ impl ActivityIndicator {
         if self.visible {
             let elapsed = self.started.elapsed().as_secs_f32();
             let crumb = if self.color {
-                "\x1b[35;1m·\x1b[0m"
+                "\x1b[35;1m.\x1b[0m"
             } else {
-                "·"
+                "."
             };
             let _ = writeln!(io::stderr(), "{crumb} Worked for {elapsed:.1}s");
             let _ = io::stderr().flush();
@@ -338,7 +341,7 @@ impl ActivityIndicator {
         self.running.store(false, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
-            clear_activity_line();
+            clear_activity_lines(self.line_count);
         }
     }
 }
@@ -350,26 +353,73 @@ impl Drop for ActivityIndicator {
 }
 
 fn animate_activity(label: &str, color: bool, running: &AtomicBool) {
-    let frames = ["🍪", "◕", "◑", "◔", "·"];
+    let mirrored = mirror_cookie(COOKIE_ART);
+    let frames = [
+        (COOKIE_ART, 0_usize),
+        (COOKIE_ART, 1),
+        (mirrored.as_str(), 2),
+        (mirrored.as_str(), 1),
+    ];
     let mut frame = 0_usize;
+    let mut drawn = false;
     while running.load(Ordering::Acquire) {
-        let prefix = if color {
-            format!("\x1b[35m{}\x1b[0m", frames[frame])
-        } else {
-            frames[frame].to_owned()
-        };
-        let _ = write!(
-            io::stderr(),
-            "\r\x1b[2K{prefix} {label}  type to steer · Ctrl+C to cancel"
-        );
+        if drawn {
+            clear_activity_lines(COOKIE_ART.lines().count() + 1);
+        }
+        draw_activity_frame(frames[frame].0, frames[frame].1, label, color);
         let _ = io::stderr().flush();
+        drawn = true;
         frame = (frame + 1) % frames.len();
-        thread::sleep(Duration::from_millis(120));
+        thread::sleep(Duration::from_millis(220));
     }
 }
 
-fn clear_activity_line() {
-    let _ = write!(io::stderr(), "\r\x1b[2K");
+fn draw_activity_frame(art: &str, offset: usize, label: &str, color: bool) {
+    let indent = " ".repeat(offset);
+    for line in art.lines() {
+        if color {
+            let _ = write!(io::stderr(), "\r\x1b[2K{indent}\x1b[35m{line}\x1b[0m\r\n");
+        } else {
+            let _ = write!(io::stderr(), "\r\x1b[2K{indent}{line}\r\n");
+        }
+    }
+    let _ = write!(
+        io::stderr(),
+        "\r\x1b[2K{indent}{label}  type to steer · Ctrl+C to cancel"
+    );
+}
+
+fn mirror_cookie(art: &str) -> String {
+    art.lines()
+        .map(|line| line.chars().rev().map(mirror_braille).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn mirror_braille(character: char) -> char {
+    let code = u32::from(character);
+    if !(0x2800..=0x28ff).contains(&code) {
+        return character;
+    }
+    let dots = code - 0x2800;
+    let mirrored = ((dots & 0b0000_0001) << 3)
+        | ((dots & 0b0000_0010) << 3)
+        | ((dots & 0b0000_0100) << 3)
+        | ((dots & 0b0000_1000) >> 3)
+        | ((dots & 0b0001_0000) >> 3)
+        | ((dots & 0b0010_0000) >> 3)
+        | ((dots & 0b0100_0000) << 1)
+        | ((dots & 0b1000_0000) >> 1);
+    char::from_u32(0x2800 + mirrored).unwrap_or(character)
+}
+
+fn clear_activity_lines(line_count: usize) {
+    for line in 0..line_count {
+        let _ = write!(io::stderr(), "\r\x1b[2K");
+        if line + 1 < line_count {
+            let _ = write!(io::stderr(), "\x1b[1A");
+        }
+    }
     let _ = io::stderr().flush();
 }
 
@@ -386,7 +436,11 @@ pub fn visible_agent_text(response: &str) -> String {
             visible.replace_range(start..end, "");
         }
     }
-    visible.trim().to_owned()
+    let visible = visible.trim();
+    visible
+        .strip_prefix("<response>")
+        .and_then(|body| body.strip_suffix("</response>"))
+        .map_or_else(|| visible.to_owned(), |body| body.trim().to_owned())
 }
 
 fn append_optional_segments(segments: &mut Vec<String>, context: &PromptContext<'_>) {
@@ -445,8 +499,8 @@ mod tests {
     use crumb_platform::Platform;
 
     use super::{
-        BrandingMode, GitSegment, MotionMode, OutputMode, PUNCHLINES, PromptContext, Renderer,
-        UiSettings,
+        BrandingMode, COOKIE_ART, GitSegment, MotionMode, OutputMode, PUNCHLINES, PromptContext,
+        Renderer, UiSettings, mirror_cookie,
     };
 
     #[test]
@@ -541,6 +595,19 @@ mod tests {
             super::visible_agent_text("answer<think>unfinished"),
             "answer"
         );
+        assert_eq!(
+            super::visible_agent_text("<response>\nexact answer\n</response>"),
+            "exact answer"
+        );
+    }
+
+    #[test]
+    fn cookie_activity_uses_the_asset_and_mirrors_cleanly() {
+        let mirrored = mirror_cookie(COOKIE_ART);
+
+        assert_eq!(COOKIE_ART.lines().count(), 15);
+        assert_ne!(mirrored, COOKIE_ART.trim_end());
+        assert_eq!(mirror_cookie(&mirrored), COOKIE_ART.trim_end());
     }
 
     #[test]
