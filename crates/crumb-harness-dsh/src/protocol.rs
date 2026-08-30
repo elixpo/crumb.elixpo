@@ -120,15 +120,43 @@ impl Notification {
 }
 
 fn turn_end_activity(data: &Value) -> HarnessActivity {
-    let reason = data
+    let kind = data
         .pointer("/reason/kind")
         .and_then(Value::as_str)
         .and_then(safe_label)
         .unwrap_or_else(|| "completed".to_owned());
-    match reason.as_str() {
+    match kind.as_str() {
         "cancelled" | "canceled" => HarnessActivity::Cancelled,
-        "failed" | "error" => HarnessActivity::Failed { reason },
-        _ => HarnessActivity::Completed { reason },
+        "failed" | "error" => HarnessActivity::Failed {
+            reason: failure_summary(data),
+        },
+        _ => HarnessActivity::Completed { reason: kind },
+    }
+}
+
+fn failure_summary(data: &Value) -> String {
+    let code = data
+        .pointer("/reason/error/code")
+        .and_then(Value::as_str)
+        .and_then(safe_label)
+        .unwrap_or_else(|| "error".to_owned());
+    let message = data
+        .pointer("/reason/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let detail = if message.contains("maximum tokens") || message.contains("max tokens") {
+        Some("output token limit exceeded")
+    } else if message.contains("unauthorized") || message.contains("authentication") {
+        Some("provider authentication failed")
+    } else if message.contains("rate limit") || message.contains("too many requests") {
+        Some("provider rate limit reached")
+    } else {
+        None
+    };
+    match detail {
+        Some(detail) => format!("{code} · {detail}"),
+        None => code,
     }
 }
 
@@ -356,5 +384,33 @@ mod tests {
             params: json!({"event":{"type":"turn/end","data":{"reason":{"kind":"cancelled"}}}}),
         };
         assert_eq!(notification.activity(), Some(HarnessActivity::Cancelled));
+    }
+
+    #[test]
+    fn failure_activity_is_actionable_without_exposing_provider_text() {
+        let notification = Notification {
+            method: "session.event".to_owned(),
+            params: json!({
+                "event": {
+                    "type": "turn/end",
+                    "data": {
+                        "reason": {
+                            "kind": "error",
+                            "error": {
+                                "code": "INVALID_REQUEST",
+                                "message": "maximum tokens exceeded; credential sk-secret"
+                            }
+                        }
+                    }
+                }
+            }),
+        };
+        assert_eq!(
+            notification.activity(),
+            Some(HarnessActivity::Failed {
+                reason: "INVALID REQUEST · output token limit exceeded".to_owned()
+            })
+        );
+        assert!(!format!("{:?}", notification.activity()).contains("sk-secret"));
     }
 }

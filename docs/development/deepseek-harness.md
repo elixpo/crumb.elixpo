@@ -42,6 +42,8 @@ tool rows.
 Reasoning-capable routes declare an explicit effort map because the Harness
 uses those values both as selectable capabilities and as the exact
 `reasoning_effort` values sent to the OpenAI-compatible endpoint.
+All Pollinations text routes use an 8,192-token output ceiling so provider
+defaults cannot silently request an oversized and unnecessarily costly reply.
 
 For repository-local development, `config/harness/launch_runtime.py` asks the
 installed `deepseek-harness-runtime-bin` wheel to resolve its platform binary
