@@ -515,12 +515,17 @@ fn read_agent_config(cwd: &Path) -> Result<AgentConfig> {
     let (path, config_root) = agent_config_location(cwd);
     let mut config = LiveConfig::new(path).load_or_default()?;
     if let Some(HarnessConfig::Process {
-        cordis: Some(cordis),
-        ..
+        command, cordis, ..
     }) = &mut config.harness
-        && cordis.is_relative()
     {
-        *cordis = config_root.join(cordis.as_path());
+        if command.is_relative() && command.components().count() > 1 {
+            *command = config_root.join(command.as_path());
+        }
+        if let Some(cordis) = cordis
+            && cordis.is_relative()
+        {
+            *cordis = config_root.join(cordis.as_path());
+        }
     }
     Ok(config)
 }

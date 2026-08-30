@@ -340,7 +340,7 @@ impl Drop for ActivityIndicator {
 }
 
 fn animate_activity(label: &str, color: bool, running: &AtomicBool) {
-    let frames = ["[.  ]", "[.. ]", "[...]"];
+    let frames = ["🍪", "◕", "◑", "◔", "·"];
     let mut frame = 0_usize;
     while running.load(Ordering::Acquire) {
         let prefix = if color {

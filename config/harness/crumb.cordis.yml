@@ -27,7 +27,12 @@
           - id: Circuit-Overtime/OreoLook
             name: OreoLook
             contextWindow: 256000
-            reasoningEfforts: true
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+            compat:
+              supportsReasoningEffort: true
           - id: perplexity
             name: Perplexity Search
             contextWindow: 200000

@@ -39,6 +39,16 @@ uses the generic `llm-pi-ai` OpenAI-compatible route for `nova-fast` and
 `perplexity` search routes. It contains no Harness-native shell or filesystem
 tool rows.
 
+Reasoning-capable routes declare an explicit effort map because the Harness
+uses those values both as selectable capabilities and as the exact
+`reasoning_effort` values sent to the OpenAI-compatible endpoint.
+
+For repository-local development, `config/harness/launch_runtime.py` asks the
+installed `deepseek-harness-runtime-bin` wheel to resolve its platform binary
+and replaces itself with that process. The agent configuration selects the
+Python interpreter from `crumb.elixpo/.venv-harness`; no Python-version or
+platform-specific runtime path is stored in Git.
+
 ## Web search permission
 
 The MCP server exposes `web_search` only when a Pollinations web-search model
