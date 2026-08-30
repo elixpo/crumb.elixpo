@@ -17,6 +17,7 @@ crumb-history = { path = "../crumb-history" }
 crumb-harness-dsh = { path = "../crumb-harness-dsh" }
 crumb-mcp = { path = "../crumb-mcp" }
 crumb-native = { path = "../crumb-native" }
+crumb-optimize = { path = "../crumb-optimize" }
 crumb-platform = { path = "../crumb-platform" }
 crumb-pollinations = { path = "../crumb-pollinations" }
 crumb-pty = { path = "../crumb-pty" }

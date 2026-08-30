@@ -15,7 +15,7 @@ pub mod tools;
 pub use approvals::{ApprovalInbox, InteractiveApprovalBroker, PendingApproval, approval_channel};
 pub use config::{
     AgentConfig, AgentLimits, AgentMode, HarnessConfig, LiveConfig, MistakePolicy, Modality,
-    ModelRoute, StructuredEncoding, ToolPermissions,
+    ModelRoute, OptimizerConfig, StructuredEncoding, ToolPermissions,
 };
 pub use harness::{HarnessTurnRequest, ModelCapabilities};
 pub use routing::{

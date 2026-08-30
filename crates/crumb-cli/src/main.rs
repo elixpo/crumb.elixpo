@@ -15,8 +15,8 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crumb_agent::{
     AgentConfig, AgentMode, CancellationToken, CommandCatalog, ConfiguredApprovals, HarnessConfig,
     InputRoute, LiveConfig, MistakePolicy, Modality, RouteDecision, SteeringAction, SteeringQueue,
-    ToolHost, TurnStatus, UnknownInputPolicy, export_session, list_sessions, search_sessions,
-    session_summary, set_session_archived, set_session_label, trash_session,
+    TokenOptimizer, ToolHost, TurnStatus, UnknownInputPolicy, export_session, list_sessions,
+    search_sessions, session_summary, set_session_archived, set_session_label, trash_session,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
@@ -25,6 +25,7 @@ use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_mcp::{McpDispatcher, serve_stdio};
 use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::shell_for;
+use crumb_optimize::RtkOptimizer;
 use crumb_platform::Platform;
 use crumb_pollinations::{PollinationsSearchConfig, register_web_search_tool};
 use crumb_pty::{PtyInput, PtyResizer, SystemPty, TerminalSize};
@@ -983,6 +984,7 @@ fn show_reserved(
             writeln!(writer, "  {effort}")?;
         }
         "/config" => show_config_summary(cwd, writer)?,
+        "/doctor" => show_optimizer_diagnostics(cwd, writer)?,
         "/plugins" => show_plugins(cwd, writer)?,
         command if command == "/review" || command.starts_with("/review ") => {
             show_reviews(command, cwd, runtime, writer)?;
@@ -995,6 +997,44 @@ fn show_reserved(
             writeln!(writer, "  Reserved by Crumb; not available in this build.")?;
         }
     }
+    Ok(())
+}
+
+fn show_optimizer_diagnostics(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    writeln!(writer, "◆ Token optimizers")?;
+    if config.optimizers.is_empty() {
+        writeln!(
+            writer,
+            "  none configured · native filtering remains active"
+        )?;
+        return Ok(());
+    }
+    let timeout = Duration::from_secs(2);
+    for configured in &config.optimizers {
+        let state = RtkOptimizer::from_config(configured, timeout).map_or("unsupported", |rtk| {
+            if rtk.available() {
+                "available"
+            } else {
+                "missing"
+            }
+        });
+        writeln!(
+            writer,
+            "  {}  {}  {}",
+            configured.id,
+            if configured.enabled {
+                "enabled "
+            } else {
+                "disabled"
+            },
+            state
+        )?;
+    }
+    writeln!(
+        writer,
+        "  TOON requires a smaller, verified round trip; otherwise JSON wins"
+    )?;
     Ok(())
 }
 

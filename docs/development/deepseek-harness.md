@@ -1,5 +1,7 @@
 # DeepSeek Harness adapter
 
+Agent-bound output follows the measured [token optimization pipeline](token-optimization.md).
+
 Branch: `feat/wp-013-deepseek-harness`
 
 Crumb treats the Harness as an optional subprocess outside terminal startup and

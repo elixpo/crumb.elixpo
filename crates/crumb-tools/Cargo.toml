@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 crumb-agent = { path = "../crumb-agent" }
+crumb-optimize = { path = "../crumb-optimize" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -8,8 +8,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use crumb_agent::{
-    CancellationToken, RiskClass, ToolDescriptor, ToolHandler, ToolHost, ToolOutput, ToolTransport,
+    CancellationToken, OutputKind, RiskClass, ToolDescriptor, ToolHandler, ToolHost, ToolOutput,
+    ToolTransport,
 };
+use crumb_optimize::{OptimizationPipeline, OptimizationResult};
 use serde_json::{Value, json};
 
 use crate::bounded_text;
@@ -41,6 +43,32 @@ pub fn register_shell_tool(
     workspace: &Path,
     config: AgentShellConfig,
 ) -> Result<()> {
+    register_shell_tool_inner(host, workspace, config, None)
+}
+
+/// Registers the isolated shell with an agent-output optimization pipeline.
+///
+/// Native interactive output never reaches this pipeline.
+///
+/// # Errors
+///
+/// Returns the same validation and registration errors as
+/// [`register_shell_tool`].
+pub fn register_shell_tool_with_optimizer(
+    host: &mut ToolHost,
+    workspace: &Path,
+    config: AgentShellConfig,
+    optimizer: Arc<OptimizationPipeline>,
+) -> Result<()> {
+    register_shell_tool_inner(host, workspace, config, Some(optimizer))
+}
+
+fn register_shell_tool_inner(
+    host: &mut ToolHost,
+    workspace: &Path,
+    config: AgentShellConfig,
+    optimizer: Option<Arc<OptimizationPipeline>>,
+) -> Result<()> {
     if !config.program.is_absolute() {
         bail!("agent shell program must be an absolute path");
     }
@@ -55,18 +83,32 @@ pub fn register_shell_tool(
     if !workspace.is_dir() {
         bail!("agent shell workspace must be a directory");
     }
-    host.register(descriptor(), Arc::new(ShellTool { workspace, config }))?;
+    host.register(
+        descriptor(),
+        Arc::new(ShellTool {
+            workspace,
+            config,
+            optimizer,
+        }),
+    )?;
     Ok(())
 }
 
 struct ShellTool {
     workspace: PathBuf,
     config: AgentShellConfig,
+    optimizer: Option<Arc<OptimizationPipeline>>,
 }
 
 impl ToolHandler for ShellTool {
     fn call(&self, arguments: &Value, cancellation: &CancellationToken) -> Result<ToolOutput> {
-        match run_shell(&self.workspace, &self.config, arguments, cancellation) {
+        match run_shell(
+            &self.workspace,
+            &self.config,
+            self.optimizer.as_deref(),
+            arguments,
+            cancellation,
+        ) {
             Ok(output) => Ok(output),
             Err(error) if cancellation.is_cancelled() => Err(error),
             Err(error) => Ok(ToolOutput::error(error.to_string())),
@@ -77,6 +119,7 @@ impl ToolHandler for ShellTool {
 fn run_shell(
     workspace: &Path,
     config: &AgentShellConfig,
+    optimizer: Option<&OptimizationPipeline>,
     arguments: &Value,
     cancellation: &CancellationToken,
 ) -> Result<ToolOutput> {
@@ -145,25 +188,80 @@ fn run_shell(
     let stderr = join_capture(stderr_reader)?;
     match outcome {
         ProcessOutcome::Cancelled => bail!("tool call cancelled"),
-        ProcessOutcome::TimedOut => Ok(ToolOutput::error(render_output(
-            "timed_out",
-            &stdout,
-            &stderr,
+        ProcessOutcome::TimedOut => Ok(render_tool_output(
+            render_output("timed_out", &stdout, &stderr, true, config.max_output_bytes),
             true,
+            optimizer,
+            classify_output(command),
             config.max_output_bytes,
-        ))),
+        )),
         ProcessOutcome::Exited(status) => {
             let failed = !status.success();
             let status = status
                 .code()
                 .map_or_else(|| "signal".to_owned(), |code| code.to_string());
             let text = render_output(&status, &stdout, &stderr, failed, config.max_output_bytes);
-            Ok(if failed {
-                ToolOutput::error(text)
-            } else {
-                ToolOutput::text(text)
-            })
+            Ok(render_tool_output(
+                text,
+                failed,
+                optimizer,
+                classify_output(command),
+                config.max_output_bytes,
+            ))
         }
+    }
+}
+
+fn render_tool_output(
+    text: String,
+    is_error: bool,
+    optimizer: Option<&OptimizationPipeline>,
+    kind: OutputKind,
+    budget: usize,
+) -> ToolOutput {
+    let Some(optimizer) = optimizer else {
+        return if is_error {
+            ToolOutput::error(text)
+        } else {
+            ToolOutput::text(text)
+        };
+    };
+    let result = optimizer.optimize(kind, text.as_bytes(), budget);
+    let text = String::from_utf8_lossy(&result.bytes).into_owned();
+    ToolOutput {
+        text,
+        structured: Some(optimization_metadata(&result)),
+        is_error,
+    }
+}
+
+fn optimization_metadata(result: &OptimizationResult) -> Value {
+    json!({
+        "optimization": {
+            "optimizer": result.optimizer.as_deref(),
+            "input_bytes": result.input_bytes,
+            "output_bytes": result.output_bytes,
+            "saved_bytes": result.saved_bytes,
+            "redacted_lines": result.redacted_lines
+        }
+    })
+}
+
+fn classify_output(command: &str) -> OutputKind {
+    let command = command.trim_start();
+    if command.starts_with("cargo ") {
+        OutputKind::Cargo
+    } else if command.starts_with("git diff") {
+        OutputKind::GitDiff
+    } else if ["npm install", "npm i ", "pnpm install", "yarn install"]
+        .iter()
+        .any(|prefix| command.starts_with(prefix))
+    {
+        OutputKind::PackageInstall
+    } else if command.contains(" test") || command.starts_with("test ") {
+        OutputKind::Test
+    } else {
+        OutputKind::Generic
     }
 }
 
@@ -330,13 +428,35 @@ mod tests {
 
     use crumb_agent::{
         AgentMode, ApprovalBroker, ApprovalDecision, ApprovalRequest, CancellationToken,
-        DenyAllApprovals, RiskClass, ToolCallErrorKind, ToolHost,
+        DenyAllApprovals, OutputKind, RiskClass, TokenOptimizer, ToolCallErrorKind, ToolHost,
     };
+    use crumb_optimize::OptimizationPipeline;
     use serde_json::json;
 
-    use super::{AgentShellConfig, register_shell_tool};
+    use super::{AgentShellConfig, register_shell_tool, register_shell_tool_with_optimizer};
 
     struct AllowOnce;
+
+    struct Shortener;
+
+    impl TokenOptimizer for Shortener {
+        fn name(&self) -> &'static str {
+            "fixture"
+        }
+
+        fn available(&self) -> bool {
+            true
+        }
+
+        fn optimize(
+            &self,
+            _kind: OutputKind,
+            _input: &[u8],
+            _budget: usize,
+        ) -> anyhow::Result<Vec<u8>> {
+            Ok(b"optimized\n".to_vec())
+        }
+    }
 
     impl ApprovalBroker for AllowOnce {
         fn decide(
@@ -367,6 +487,18 @@ mod tests {
             config(timeout),
         )
         .expect("shell tool is registered");
+        host
+    }
+
+    fn optimized_host(timeout: Duration) -> ToolHost {
+        let mut host = ToolHost::default();
+        register_shell_tool_with_optimizer(
+            &mut host,
+            &std::env::current_dir().expect("current directory is available"),
+            config(timeout),
+            Arc::new(OptimizationPipeline::new(vec![Box::new(Shortener)])),
+        )
+        .expect("optimized shell tool is registered");
         host
     }
 
@@ -404,6 +536,32 @@ mod tests {
         assert!(output.text.contains("PATH=/usr/bin:/bin"));
         assert!(!output.text.contains("HOME="));
         assert!(output.text.len() <= 256);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optimized_shell_reports_measured_savings() {
+        let output = optimized_host(Duration::from_secs(1))
+            .call(
+                "run_shell",
+                &json!({"command":"printf 'repeated output repeated output'"}),
+                AgentMode::Auto,
+                &AllowOnce,
+                &CancellationToken::default(),
+            )
+            .expect("optimized shell call succeeds");
+        assert_eq!(output.text, "optimized\n");
+        let optimization = output
+            .structured
+            .as_ref()
+            .and_then(|value| value.get("optimization"))
+            .expect("optimization metadata is present");
+        assert_eq!(optimization["optimizer"], "fixture");
+        assert!(
+            optimization["saved_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > 0)
+        );
     }
 
     #[cfg(unix)]

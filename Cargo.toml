@@ -9,6 +9,7 @@ members = [
     "crates/crumb-llm",
     "crates/crumb-mcp",
     "crates/crumb-native",
+    "crates/crumb-optimize",
     "crates/crumb-platform",
     "crates/crumb-pollinations",
     "crates/crumb-pty",

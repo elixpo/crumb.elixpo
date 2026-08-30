@@ -511,6 +511,7 @@ dependencies = [
  "crumb-history",
  "crumb-mcp",
  "crumb-native",
+ "crumb-optimize",
  "crumb-platform",
  "crumb-pollinations",
  "crumb-pty",
@@ -574,6 +575,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "crumb-optimize"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crumb-agent",
+]
+
+[[package]]
 name = "crumb-platform"
 version = "0.1.0"
 
@@ -614,6 +623,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crumb-agent",
+ "crumb-optimize",
  "rustix",
  "serde",
  "serde_json",
