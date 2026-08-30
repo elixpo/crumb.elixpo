@@ -20,6 +20,7 @@ const WORDMARK: &str = r"░█████╗░██████╗░██�
 const PANDA_AWAKE: &str = include_str!("../assets/panda-awake.txt");
 const PANDA_COOL: &str = include_str!("../assets/panda-cool.txt");
 const COOKIE_SPINNER: [&str; 4] = ["(.:)", "(:.)", "(o.)", "(.o)"];
+const TRANSCRIPT_INPUT_MAX_ROWS: usize = 4;
 
 const PUNCHLINES: &[&str] = &[
     "Broken biscuit. Working terminal.",
@@ -359,31 +360,54 @@ impl Renderer {
         if self.settings.output == OutputMode::ScreenReader {
             return format!("{username}: {input}");
         }
-        let mut lines = input.lines();
-        let first = lines.next().unwrap_or_default();
-        let mut body = format!(
-            "  {} {}",
-            self.paint("╰──▶", "36;1"),
-            self.paint(first, "1")
-        );
-        for line in lines {
-            body.push('\n');
-            body.push_str(&self.paint("      │", "36"));
-            body.push(' ');
-            body.push_str(line);
+        let card_width = usize::from(terminal_width.saturating_sub(4));
+        let content_width = card_width.saturating_sub(2);
+        let mut body = Vec::new();
+        for line in input.lines().take(TRANSCRIPT_INPUT_MAX_ROWS) {
+            let marker = if body.is_empty() { "▶" } else { "│" };
+            let line = if content_width == 0 {
+                line.to_owned()
+            } else {
+                fit_terminal_text(line, content_width.saturating_sub(2))
+            };
+            body.push(format!("{marker} {line}"));
         }
-        let header = format!("  ╭─[◆ {username}]");
+        if input.lines().count() > TRANSCRIPT_INPUT_MAX_ROWS
+            && let Some(last) = body.last_mut()
+        {
+            if content_width == 0 {
+                last.push_str(" …");
+            } else {
+                *last = fit_terminal_text(&format!("{last} …"), content_width);
+            }
+        }
+        let header = format!("◆ {username}");
         let timestamp = timestamp.unwrap_or_default();
-        let padding = usize::from(terminal_width)
-            .saturating_sub(header.chars().count())
-            .saturating_sub(timestamp.chars().count())
-            .saturating_sub(1);
-        let timestamp = if timestamp.is_empty() {
-            String::new()
+        let header = if timestamp.is_empty() {
+            header
         } else {
-            format!("{}{}", " ".repeat(padding), self.paint(timestamp, "2"))
+            let padding = content_width
+                .saturating_sub(header.chars().count())
+                .saturating_sub(timestamp.chars().count())
+                .max(1);
+            format!("{header}{}{timestamp}", " ".repeat(padding))
         };
-        format!("{}{timestamp}\n{body}", self.paint(&header, "36;1"))
+        let mut card = Vec::with_capacity(body.len().saturating_add(1));
+        card.push(self.transcript_card_line(&header, card_width, "36;1"));
+        card.extend(
+            body.into_iter()
+                .map(|line| self.transcript_card_line(&line, card_width, "1")),
+        );
+        card.join("\n")
+    }
+
+    fn transcript_card_line(self, line: &str, width: usize, style: &str) -> String {
+        if width == 0 {
+            return format!("  {}", self.paint(line, style));
+        }
+        let line = fit_terminal_text(line, width);
+        let padded = format!("{line:<width$}");
+        format!("  {}", self.paint(&padded, &format!("{style};48;5;236")))
     }
 
     /// Starts raw native output with a shell-specific transcript branch.
@@ -464,16 +488,16 @@ impl Renderer {
         if self.settings.output == OutputMode::ScreenReader {
             return response;
         }
-        let body = response
-            .lines()
-            .map(|line| format!("  {} {line}", self.paint("│", "35")))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if body.is_empty() {
-            format!("  {}", self.paint("╰─", "35"))
-        } else {
-            format!("{body}\n  {}", self.paint("╰─", "35"))
+        let mut lines = response.lines();
+        let Some(first) = lines.next() else {
+            return format!("\n  {}", self.paint("╰──▶", "35"));
+        };
+        let mut body = format!("\n  {} {first}", self.paint("╰──▶", "35;1"));
+        for line in lines {
+            body.push_str("\n        ");
+            body.push_str(line);
         }
+        body
     }
 
     /// Renders a Harness failure without conflating it with native shell output.
@@ -1004,10 +1028,10 @@ mod tests {
             renderer.agent_header("qwen-coder", Some("high"), "auto", None),
             "  ╭─◆ CRUMB  model qwen-coder · mode auto · effort high"
         );
-        assert_eq!(renderer.agent_response("done\n"), "  │ done\n  ╰─");
+        assert_eq!(renderer.agent_response("done\n"), "\n  ╰──▶ done");
         assert_eq!(
             renderer.transcript_input("elixpo", "fix this"),
-            "  ╭─[◆ elixpo]\n  ╰──▶ fix this"
+            "  ◆ elixpo\n  ▶ fix this"
         );
         assert_eq!(renderer.native_output_prefix(), "  ╰──▶ ");
     }

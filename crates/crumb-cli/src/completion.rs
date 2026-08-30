@@ -5,21 +5,7 @@ use crumb_agent::LiveConfig;
 use nu_ansi_term::{Color, Style};
 use reedline::{Completer, CompletionResult, Span, Suggestion};
 
-const STATIC_REFERENCES: &[(&str, &str)] = &[
-    ("@file:", "reference a workspace file"),
-    ("@folder:", "reference a workspace folder"),
-    ("@selection", "reference the active selection"),
-    ("@clipboard", "reference confirmed clipboard content"),
-    ("@last-error", "reference the previous native error"),
-    ("@diff", "reference the current repository diff"),
-    ("@session:", "reference a Crumb session"),
-    ("@skill:", "reference a configured skill"),
-    ("@plugin:", "reference a configured plugin or MCP server"),
-    (
-        "@connector:pollinations",
-        "reference the Pollinations connector",
-    ),
-];
+pub const COMPLETION_PALETTE_ROWS: u16 = 9;
 
 #[derive(Clone, Debug)]
 pub struct CompletionWorkspace(Arc<RwLock<PathBuf>>);
@@ -59,42 +45,83 @@ impl Completer for CrumbCompleter {
         };
         let (_, token) = current_token(prefix);
         let suggestions = if prefix.starts_with('/') && !prefix.contains('\n') {
-            slash_suggestions(prefix, pos, &self.workspace.get())
+            slash_suggestions(prefix, pos)
         } else if token.starts_with('@') {
             reference_suggestions(prefix, pos, &self.workspace.get())
         } else if token.starts_with('?') {
-            help_suggestions(prefix, pos)
+            help_suggestions(prefix, pos, &self.workspace.get())
         } else {
             native_path_suggestions(prefix, pos, &self.workspace.get())
         };
         CompletionResult::fresh(if suggestions.is_empty() {
             vec![no_records_suggestion(prefix, pos)]
         } else {
-            suggestions
+            fill_palette(suggestions)
         })
     }
 }
 
-fn help_suggestions(line: &str, pos: usize) -> Vec<Suggestion> {
+fn fill_palette(mut suggestions: Vec<Suggestion>) -> Vec<Suggestion> {
+    let visible_rows = usize::from(COMPLETION_PALETTE_ROWS);
+    if suggestions.len() >= visible_rows {
+        return suggestions;
+    }
+    let cycle = suggestions.clone();
+    let target_len = visible_rows.div_ceil(cycle.len()) * cycle.len();
+    suggestions.extend(
+        cycle
+            .into_iter()
+            .cycle()
+            .take(target_len - suggestions.len()),
+    );
+    suggestions
+}
+
+fn help_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Suggestion> {
     let (start, token) = current_token(line);
     if !token.starts_with('?') {
         return Vec::new();
     }
-    [
-        ("?", "open help, keyboard shortcuts, and command guidance"),
+    let mut settings = vec![
         (
-            "? config",
-            "show active model, mode, effort, context, tokens, and session",
+            "? help".to_owned(),
+            "/help".to_owned(),
+            "help, keyboard shortcuts, and command guidance".to_owned(),
         ),
-    ]
-    .into_iter()
-    .filter(|(value, _)| value.starts_with(token))
-    .map(|(value, description)| {
-        let mut help = suggestion(value, description, Span::new(start, pos));
-        help.append_whitespace = false;
-        help
-    })
-    .collect()
+        (
+            "? session info".to_owned(),
+            "? config".to_owned(),
+            "active model, effort, context, tokens, and session".to_owned(),
+        ),
+    ];
+    settings.extend(
+        crumb_repl::SLASH_COMMANDS
+            .iter()
+            .filter(|command| is_setting_command(command.usage))
+            .map(|command| {
+                (
+                    format!("? {}", command.usage.trim_start_matches('/')),
+                    command.usage.to_owned(),
+                    command.description.to_owned(),
+                )
+            }),
+    );
+    settings.extend(configured_skill_actions(workspace).into_iter().map(
+        |(command, description)| {
+            (
+                format!("? {}", command.trim_start_matches('/')),
+                command,
+                description,
+            )
+        },
+    ));
+    settings
+        .into_iter()
+        .filter(|(display, _, _)| display.starts_with(token))
+        .map(|(display, value, description)| {
+            routed_suggestion(&display, &value, &description, Span::new(start, pos))
+        })
+        .collect()
 }
 
 fn current_token(line: &str) -> (usize, &str) {
@@ -106,17 +133,41 @@ fn current_token(line: &str) -> (usize, &str) {
     (start, &line[start..])
 }
 
-fn slash_suggestions(prefix: &str, pos: usize, workspace: &Path) -> Vec<Suggestion> {
-    let mut commands = crumb_repl::SLASH_COMMANDS
+fn slash_suggestions(prefix: &str, pos: usize) -> Vec<Suggestion> {
+    let commands = crumb_repl::SLASH_COMMANDS
         .iter()
+        .filter(|command| !is_setting_command(command.usage))
         .map(|command| (command.usage.to_owned(), command.description.to_owned()))
         .collect::<Vec<_>>();
-    commands.extend(configured_skill_actions(workspace));
     commands
         .into_iter()
         .filter(|(usage, _)| usage.starts_with(prefix))
         .map(|(usage, description)| suggestion(&usage, &description, Span::new(0, pos)))
         .collect()
+}
+
+fn is_setting_command(usage: &str) -> bool {
+    [
+        "/auth",
+        "/connectors",
+        "/skills",
+        "/context",
+        "/mode",
+        "/model",
+        "/effort",
+        "/session",
+        "/plugins",
+        "/tools",
+        "/permissions",
+        "/memory",
+        "/config",
+        "/doctor",
+        "/cost",
+        "/platform",
+        "/version",
+    ]
+    .iter()
+    .any(|prefix| usage == *prefix || usage.starts_with(&format!("{prefix} ")))
 }
 
 fn configured_skill_actions(workspace: &Path) -> Vec<(String, String)> {
@@ -157,20 +208,14 @@ fn reference_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Sugges
     if let Some(path) = token.strip_prefix("@folder:") {
         return path_suggestions(workspace, path, true, span);
     }
-
-    let mut candidates = STATIC_REFERENCES
-        .iter()
-        .map(|(value, description)| ((*value).to_owned(), (*description).to_owned()))
-        .collect::<Vec<_>>();
-    if token.starts_with("@skill:") {
-        candidates.extend(configured_references(workspace, true));
-    } else if token.starts_with("@plugin:") {
-        candidates.extend(configured_references(workspace, false));
-    }
-    candidates
+    path_suggestions(workspace, token.trim_start_matches('@'), false, span)
         .into_iter()
-        .filter(|(value, _)| value.starts_with(token))
-        .map(|(value, description)| suggestion(&value, &description, span))
+        .chain(path_suggestions(
+            workspace,
+            token.trim_start_matches('@'),
+            true,
+            span,
+        ))
         .collect()
 }
 
@@ -248,39 +293,6 @@ fn no_records_suggestion(line: &str, pos: usize) -> Suggestion {
     }
 }
 
-fn configured_references(workspace: &Path, skills: bool) -> Vec<(String, String)> {
-    let Some(path) = config_path(workspace) else {
-        return Vec::new();
-    };
-    let Ok(config) = LiveConfig::new(path).load() else {
-        return Vec::new();
-    };
-    if skills {
-        config
-            .skills
-            .into_iter()
-            .filter(|skill| skill.enabled)
-            .map(|skill| {
-                (
-                    format!("@skill:{}", skill.id),
-                    "configured skill".to_owned(),
-                )
-            })
-            .collect()
-    } else {
-        config
-            .mcp_servers
-            .into_iter()
-            .map(|server| {
-                (
-                    format!("@plugin:{}", server.id),
-                    "configured plugin or MCP server".to_owned(),
-                )
-            })
-            .collect()
-    }
-}
-
 fn config_path(workspace: &Path) -> Option<PathBuf> {
     workspace.ancestors().find_map(|directory| {
         let candidate = directory.join(".crumb/agent.json");
@@ -354,6 +366,16 @@ fn suggestion(value: &str, description: &str, span: Span) -> Suggestion {
     }
 }
 
+fn routed_suggestion(display: &str, value: &str, description: &str, span: Span) -> Suggestion {
+    Suggestion {
+        value: value.to_owned(),
+        display_override: Some(palette_row(display, description)),
+        span,
+        append_whitespace: false,
+        ..Suggestion::default()
+    }
+}
+
 fn palette_row(value: &str, description: &str) -> String {
     let width = crossterm::terminal::size()
         .map_or(80, |(columns, _)| usize::from(columns))
@@ -374,9 +396,31 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use reedline::Completer;
+    use reedline::{Completer, Suggestion};
 
-    use super::{CompletionWorkspace, CrumbCompleter};
+    use super::{COMPLETION_PALETTE_ROWS, CompletionWorkspace, CrumbCompleter, fill_palette};
+
+    #[test]
+    fn short_palettes_repeat_complete_cycles() {
+        let suggestions = ["one", "two", "three", "four"]
+            .into_iter()
+            .map(|value| Suggestion {
+                value: value.to_owned(),
+                ..Suggestion::default()
+            })
+            .collect();
+
+        let filled = fill_palette(suggestions);
+
+        assert!(filled.len() >= usize::from(COMPLETION_PALETTE_ROWS));
+        assert_eq!(filled.len() % 4, 0);
+        assert!(
+            filled
+                .iter()
+                .enumerate()
+                .all(|(index, item)| item.value == ["one", "two", "three", "four"][index % 4])
+        );
+    }
 
     #[test]
     fn slash_completion_includes_help() {
@@ -391,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_palette_exposes_the_available_skill_action() {
+    fn settings_palette_exposes_the_available_skill_action() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is valid")
@@ -405,7 +449,7 @@ mod tests {
         .expect("skill config can be written");
         let mut completer = CrumbCompleter::new(CompletionWorkspace::new(workspace.clone()));
 
-        let result = completer.complete("/skills ", 8);
+        let result = completer.complete("?", 1);
 
         let skill = result
             .suggestions()
@@ -416,16 +460,17 @@ mod tests {
             skill
                 .display_override
                 .as_deref()
-                .is_some_and(|display| display.starts_with("/skills load review"))
+                .is_some_and(|display| display.starts_with("? skills load review"))
         );
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
     }
 
     #[test]
-    fn references_complete_inside_plain_language() {
-        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
-        let result = completer.complete("explain @last", 13);
-        assert_eq!(result.suggestions()[0].value, "@last-error");
+    fn file_references_complete_inside_plain_language() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(workspace));
+        let result = completer.complete("explain @Car", 12);
+        assert_eq!(result.suggestions()[0].value, "@file:Cargo.lock");
         assert_eq!(result.suggestions()[0].span.start, 8);
     }
 
@@ -434,7 +479,7 @@ mod tests {
         let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
         let result = completer.complete("?", 1);
 
-        assert_eq!(result.suggestions()[0].value, "?");
+        assert_eq!(result.suggestions()[0].value, "/help");
         assert!(
             result.suggestions()[0]
                 .display_override
@@ -446,6 +491,25 @@ mod tests {
                 .suggestions()
                 .iter()
                 .any(|suggestion| suggestion.value == "? config")
+        );
+        assert!(
+            result
+                .suggestions()
+                .iter()
+                .any(|suggestion| suggestion.value == "/plugins")
+        );
+    }
+
+    #[test]
+    fn slash_palette_excludes_settings() {
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
+        let result = completer.complete("/", 1);
+
+        assert!(
+            result
+                .suggestions()
+                .iter()
+                .all(|suggestion| suggestion.value != "/config")
         );
     }
 

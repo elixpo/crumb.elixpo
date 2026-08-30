@@ -62,7 +62,7 @@ mod provider_projection;
 mod shell_completion;
 
 use agent_runtime::AgentRuntime;
-use completion::{CompletionWorkspace, CrumbCompleter};
+use completion::{COMPLETION_PALETTE_ROWS, CompletionWorkspace, CrumbCompleter};
 use shell_completion::{CompletionShell, write_completion};
 
 const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
@@ -3784,7 +3784,7 @@ impl CompletionOverlay {
         let (columns, rows) = size().unwrap_or((80, 24));
         let composer_row = rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
         let top = composer_row
-            .saturating_sub(COMPLETION_PALETTE_MAX_ROWS)
+            .saturating_sub(COMPLETION_PALETTE_ROWS)
             .max(self.header_rows.min(composer_row));
         (columns, top, composer_row)
     }
@@ -3845,6 +3845,11 @@ impl Menu for CompletionOverlay {
 
     fn menu_event(&mut self, event: MenuEvent) {
         let closing = matches!(event, MenuEvent::Deactivate);
+        let event = match event {
+            MenuEvent::MoveUp => MenuEvent::PreviousElement,
+            MenuEvent::MoveDown => MenuEvent::NextElement,
+            event => event,
+        };
         self.menu.menu_event(event);
         if closing {
             self.clear_overlay();
@@ -3894,7 +3899,7 @@ impl Menu for CompletionOverlay {
         self.paint_overlay(
             &self
                 .menu
-                .menu_string(COMPLETION_PALETTE_MAX_ROWS, use_ansi_coloring),
+                .menu_string(COMPLETION_PALETTE_ROWS, use_ansi_coloring),
         )
     }
 
@@ -4008,7 +4013,7 @@ fn create_line_editor(
         )
         .with_min_completion_width(menu_width)
         .with_max_completion_width(menu_width)
-        .with_max_completion_height(COMPLETION_PALETTE_MAX_ROWS)
+        .with_max_completion_height(COMPLETION_PALETTE_ROWS)
         .with_padding(0)
         .with_cursor_offset(i16::try_from(FULLSCREEN_SIDE_GUTTER).unwrap_or(2))
         .with_correct_cursor_pos(true);
@@ -4021,8 +4026,6 @@ fn create_line_editor(
         .with_edit_mode(Box::new(Emacs::new(keybindings)));
     Ok(InteractiveLineEditor { editor, workspace })
 }
-
-const COMPLETION_PALETTE_MAX_ROWS: u16 = 12;
 
 fn suggestion_width(terminal_columns: u16) -> usize {
     usize::from(terminal_columns.saturating_sub(4).max(1))
@@ -4180,7 +4183,7 @@ fn fullscreen_rows(header_rows: u16) -> io::Result<(u16, u16, u16, u16)> {
     let (_, rows) = size()?;
     let composer_row = rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
     let palette_top = composer_row
-        .saturating_sub(COMPLETION_PALETTE_MAX_ROWS)
+        .saturating_sub(COMPLETION_PALETTE_ROWS)
         .max(header_rows.min(composer_row));
     let transcript_bottom = palette_top.saturating_sub(1);
     let transcript_top = header_rows.min(transcript_bottom);
