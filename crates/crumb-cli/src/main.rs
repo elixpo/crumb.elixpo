@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Local;
@@ -70,14 +70,35 @@ const FULLSCREEN_SIDE_GUTTER: u16 = 2;
 const FULLSCREEN_TOP_GUTTER: u16 = 1;
 
 fn main() -> Result<()> {
-    if run_command_line_action()? {
+    let resume_session = resume_session_argument()?;
+    if resume_session.is_none() && run_command_line_action()? {
         return Ok(());
     }
-    if run_managed_repl()? == ReplOutcome::LaunchNativeShell {
+    if run_managed_repl(resume_session.as_deref())? == ReplOutcome::LaunchNativeShell {
         run_native_shell()?;
     }
 
     Ok(())
+}
+
+fn resume_session_argument() -> Result<Option<String>> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    parse_resume_session_argument(&arguments)
+}
+
+fn parse_resume_session_argument(arguments: &[String]) -> Result<Option<String>> {
+    match arguments {
+        [argument] if argument.starts_with("--resume=") => Ok(Some(
+            argument
+                .strip_prefix("--resume=")
+                .filter(|id| !id.trim().is_empty())
+                .context("--resume requires a session id")?
+                .to_owned(),
+        )),
+        [flag, id] if flag == "--resume" && !id.trim().is_empty() => Ok(Some(id.to_owned())),
+        [flag] if flag == "--resume" => Err(anyhow!("--resume requires a session id")),
+        _ => Ok(None),
+    }
 }
 
 fn run_command_line_action() -> Result<bool> {
@@ -335,21 +356,22 @@ fn workspace_read_host(
     Ok(host)
 }
 
-fn run_managed_repl() -> Result<ReplOutcome> {
+fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
+    let started_at = Instant::now();
     let stdin = io::stdin();
     let stdout = io::stdout();
     let interactive = stdin.is_terminal() && stdout.is_terminal();
     let renderer = Renderer::new(UiSettings::from_environment(interactive));
     let fullscreen = interactive && std::env::var_os("CRUMB_INLINE").is_none();
-    let _screen = AlternateScreenGuard::enter(fullscreen)?;
+    let screen = AlternateScreenGuard::enter(fullscreen)?;
     let platform = Platform::current();
     let initial_cwd = current_process_dir()?;
     if interactive && !confirm_folder_trust(renderer, &initial_cwd, fullscreen)? {
         return Ok(ReplOutcome::Exit);
     }
     let command_catalog = native_command_catalog(platform);
-    let (mut session, mut agent_runtime): (Option<ShellSession>, Option<AgentRuntime>) =
-        (None, None);
+    let (mut session, mut agent_runtime) =
+        (None, resume_agent_runtime(&initial_cwd, resume_session)?);
     let (mut last_exit_code, mut command_context) = (None, SessionCommandContext::default());
     let history = open_history(&mut stdout.lock())?;
     let completion_workspace = CompletionWorkspace::new(initial_cwd);
@@ -368,6 +390,7 @@ fn run_managed_repl() -> Result<ReplOutcome> {
         header_rows,
     )?;
     let mut transcript = FullscreenTranscript::new(fullscreen, renderer, header_rows);
+    let mut exit_gesture = ExitGesture::default();
 
     loop {
         transcript.capture_cursor();
@@ -385,11 +408,22 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             &status,
         )?;
         let (event, submitted_input) = match submission {
-            ReplSubmission::Input(event, input) => (event, input),
-            ReplSubmission::Retry => continue,
+            ReplSubmission::Input(event, input) => {
+                exit_gesture.reset();
+                (event, input)
+            }
+            ReplSubmission::Interrupt if exit_gesture.register_interrupt() => {
+                shutdown_session(session.take())?;
+                return finish_managed_repl(screen, renderer, started_at, agent_runtime.as_ref());
+            }
+            ReplSubmission::Interrupt => continue,
+            ReplSubmission::Retry => {
+                exit_gesture.reset();
+                continue;
+            }
             ReplSubmission::Exit => {
-                shutdown_session(session)?;
-                return Ok(ReplOutcome::Exit);
+                shutdown_session(session.take())?;
+                return finish_managed_repl(screen, renderer, started_at, agent_runtime.as_ref());
             }
         };
         transcript.submit(
@@ -398,37 +432,25 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             submitted_input.as_deref().unwrap_or_default(),
         )?;
         let mut writer = stdout.lock();
-
-        let outcome = match event {
-            InputEvent::BuiltIn(command) => handle_builtin(
-                command,
-                &mut session,
-                &mut agent_runtime,
-                history.as_ref(),
-                &cwd,
-                platform,
-                &mut writer,
-            ),
-            InputEvent::NativeInput(command) if command.trim().is_empty() => Ok(None),
-            InputEvent::NativeInput(command) => {
-                let mut context = InputContext {
-                    command_catalog: &command_catalog,
-                    agent_runtime: &mut agent_runtime,
-                    session: &mut session,
-                    history: history.as_ref(),
-                    cwd: &cwd,
-                    platform,
-                    interactive,
-                    fullscreen,
-                    renderer,
-                    writer: &mut writer,
-                    last_exit_code: &mut last_exit_code,
-                    command_context: &mut command_context,
-                };
-                handle_input(&command, &mut context)
-            }
+        let mut context = InputContext {
+            command_catalog: &command_catalog,
+            agent_runtime: &mut agent_runtime,
+            session: &mut session,
+            history: history.as_ref(),
+            cwd: &cwd,
+            platform,
+            interactive,
+            fullscreen,
+            renderer,
+            writer: &mut writer,
+            last_exit_code: &mut last_exit_code,
+            command_context: &mut command_context,
         };
+        let outcome = handle_repl_event(event, &mut context);
         match outcome {
+            Ok(Some(ReplOutcome::Exit)) => {
+                return finish_managed_repl(screen, renderer, started_at, agent_runtime.as_ref());
+            }
             Ok(Some(outcome)) => return Ok(outcome),
             Ok(None) => {}
             Err(error) => writeln!(writer, "{}", renderer.command_error(&error.to_string()))?,
@@ -437,10 +459,63 @@ fn run_managed_repl() -> Result<ReplOutcome> {
     }
 }
 
+fn resume_agent_runtime(cwd: &Path, session_id: Option<&str>) -> Result<Option<AgentRuntime>> {
+    let Some(session_id) = session_id else {
+        return Ok(None);
+    };
+    let mut runtime = AgentRuntime::new()?;
+    runtime.resume(cwd, session_id)?;
+    Ok(Some(runtime))
+}
+
+fn handle_repl_event(
+    event: InputEvent,
+    context: &mut InputContext<'_>,
+) -> Result<Option<ReplOutcome>> {
+    match event {
+        InputEvent::BuiltIn(command) => handle_builtin(
+            command,
+            context.session,
+            context.agent_runtime,
+            context.history,
+            context.cwd,
+            context.platform,
+            context.writer,
+        ),
+        InputEvent::NativeInput(command) if command.trim().is_empty() => Ok(None),
+        InputEvent::NativeInput(command) => handle_input(&command, context),
+    }
+}
+
 enum ReplSubmission {
     Input(InputEvent, Option<String>),
+    Interrupt,
     Retry,
     Exit,
+}
+
+#[derive(Default)]
+struct ExitGesture {
+    last_interrupt: Option<Instant>,
+}
+
+impl ExitGesture {
+    fn register_interrupt(&mut self) -> bool {
+        self.register_interrupt_at(Instant::now())
+    }
+
+    fn register_interrupt_at(&mut self, now: Instant) -> bool {
+        const DOUBLE_INTERRUPT_WINDOW: Duration = Duration::from_secs(2);
+        let should_exit = self
+            .last_interrupt
+            .is_some_and(|previous| now.duration_since(previous) <= DOUBLE_INTERRUPT_WINDOW);
+        self.last_interrupt = (!should_exit).then_some(now);
+        should_exit
+    }
+
+    fn reset(&mut self) {
+        self.last_interrupt = None;
+    }
 }
 
 struct FullscreenTranscript {
@@ -516,9 +591,29 @@ fn read_repl_submission(
         Signal::Success(command) => {
             ReplSubmission::Input(crumb_repl::classify_input(&command), Some(command))
         }
+        Signal::CtrlC => ReplSubmission::Interrupt,
         Signal::CtrlD => ReplSubmission::Exit,
         _ => ReplSubmission::Retry,
     })
+}
+
+fn finish_managed_repl(
+    screen: AlternateScreenGuard,
+    renderer: Renderer,
+    started_at: Instant,
+    runtime: Option<&AgentRuntime>,
+) -> Result<ReplOutcome> {
+    let session_id = runtime
+        .and_then(AgentRuntime::active_session_id)
+        .map(str::to_owned);
+    let session_tokens = runtime.map_or(0, |runtime| runtime.token_usage().1);
+    drop(screen);
+    writeln!(
+        io::stdout(),
+        "\n{}\n",
+        renderer.session_handoff(started_at.elapsed(), session_id.as_deref(), session_tokens)
+    )?;
+    Ok(ReplOutcome::Exit)
 }
 
 fn active_cwd(session: Option<&ShellSession>) -> Result<PathBuf> {
@@ -4606,17 +4701,38 @@ impl Drop for RawModeGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use crumb_agent::{
         AgentConfig, CredentialReference, ProviderHeader, ProviderProtocol, RiskClass,
     };
 
     use super::{
-        SessionCommandContext, agent_config_location, effort_display_name, effort_wire_name,
-        failed_command_recovery, initial_agent_activity, openrouter_preset,
-        parse_credential_reference, parse_provider_header, suggestion_width, workspace_read_host,
+        ExitGesture, SessionCommandContext, agent_config_location, effort_display_name,
+        effort_wire_name, failed_command_recovery, initial_agent_activity, openrouter_preset,
+        parse_credential_reference, parse_provider_header, parse_resume_session_argument,
+        suggestion_width, workspace_read_host,
     };
+
+    #[test]
+    fn resume_argument_accepts_the_handoff_command() {
+        assert_eq!(
+            parse_resume_session_argument(&["--resume=crumb-session-1".to_owned()])
+                .expect("resume argument is valid")
+                .as_deref(),
+            Some("crumb-session-1")
+        );
+        assert!(parse_resume_session_argument(&["--resume".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn consecutive_interrupts_request_exit() {
+        let started = Instant::now();
+        let mut gesture = ExitGesture::default();
+
+        assert!(!gesture.register_interrupt_at(started));
+        assert!(gesture.register_interrupt_at(started + Duration::from_secs(1)));
+    }
 
     #[test]
     fn friendly_effort_names_map_to_harness_values() {

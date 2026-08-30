@@ -19,6 +19,7 @@ const WORDMARK: &str = r"░█████╗░██████╗░██�
 ░╚════╝░╚═╝░░╚═╝░╚═════╝░╚═╝░░░░░╚═╝╚═════╝░";
 const PANDA_AWAKE: &str = include_str!("../assets/panda-awake.txt");
 const PANDA_COOL: &str = include_str!("../assets/panda-cool.txt");
+const PANDA_SMALL: &str = include_str!("../assets/panda-small.txt");
 const COOKIE_SPINNER: [&str; 4] = ["(.:)", "(:.)", "(o.)", "(.o)"];
 const TRANSCRIPT_INPUT_MAX_ROWS: usize = 4;
 
@@ -521,6 +522,43 @@ impl Renderer {
         )
     }
 
+    /// Renders the persistent handoff shown after leaving the alternate screen.
+    #[must_use]
+    pub fn session_handoff(
+        self,
+        elapsed: Duration,
+        session_id: Option<&str>,
+        session_tokens: u64,
+    ) -> String {
+        let runtime = format!("Runtime  {:.1}s", elapsed.as_secs_f32());
+        let session = session_id.map_or_else(
+            || "Session  no agent session".to_owned(),
+            |id| format!("Session  {id} · ~{} tokens", compact_tokens(session_tokens)),
+        );
+        let resume = session_id.map_or_else(
+            || "Resume   start crumb to begin a session".to_owned(),
+            |id| format!("Resume   crumb --resume={id}"),
+        );
+        if self.settings.output == OutputMode::ScreenReader {
+            return format!("{runtime}\n{session}\n{resume}");
+        }
+        let details = [runtime, session, resume];
+        let art = trim_art(PANDA_SMALL);
+        let art_width = art.lines().map(str::len).max().unwrap_or_default();
+        art.lines()
+            .enumerate()
+            .map(|(index, line)| {
+                let detail = details.get(index).map_or("", String::as_str);
+                format!(
+                    "{}  {}",
+                    self.paint(&format!("{line:<art_width$}"), "90"),
+                    self.paint(detail, "2")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Renders a Harness failure without conflating it with native shell output.
     #[must_use]
     pub fn agent_error(&self, message: &str, cancelled: bool) -> String {
@@ -949,6 +987,7 @@ fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::time::Duration;
 
     use crumb_platform::Platform;
 
@@ -1059,6 +1098,11 @@ mod tests {
             "  ◆ > fix this"
         );
         assert_eq!(renderer.native_output_prefix(), "  ╰──▶ ");
+        let handoff =
+            renderer.session_handoff(Duration::from_secs(10), Some("crumb-session-1"), 1_200);
+        assert!(handoff.contains("Runtime  10.0s"));
+        assert!(handoff.contains("Session  crumb-session-1 · ~1.2k tokens"));
+        assert!(handoff.contains("Resume   crumb --resume=crumb-session-1"));
     }
 
     #[test]

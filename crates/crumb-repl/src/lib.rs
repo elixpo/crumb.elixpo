@@ -267,7 +267,7 @@ pub fn classify_input(input: &str) -> InputEvent {
         "/auth logout" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Logout)),
         "/connectors" => InputEvent::BuiltIn(BuiltInCommand::Connectors),
         "/context" => InputEvent::BuiltIn(BuiltInCommand::Context),
-        "/exit" => InputEvent::BuiltIn(BuiltInCommand::Exit),
+        "/exit" | "exit" => InputEvent::BuiltIn(BuiltInCommand::Exit),
         "/help" | "?" => InputEvent::BuiltIn(BuiltInCommand::Help),
         _ if command.trim_end() == "? config" => {
             InputEvent::BuiltIn(BuiltInCommand::Reserved("? config".to_owned()))
@@ -433,6 +433,10 @@ mod tests {
     fn classifies_supported_built_ins() {
         assert_eq!(
             classify_input("/exit\n"),
+            InputEvent::BuiltIn(BuiltInCommand::Exit)
+        );
+        assert_eq!(
+            classify_input("exit"),
             InputEvent::BuiltIn(BuiltInCommand::Exit)
         );
         assert_eq!(
