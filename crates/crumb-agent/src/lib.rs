@@ -7,6 +7,7 @@
 pub mod approvals;
 pub mod config;
 pub mod harness;
+pub mod jobs;
 pub mod routing;
 pub mod session;
 pub mod steering;
@@ -18,6 +19,9 @@ pub use config::{
     ModelRoute, OptimizerConfig, StructuredEncoding, ToolPermissions,
 };
 pub use harness::{HarnessTurnRequest, ModelCapabilities};
+pub use jobs::{
+    JobDefinition, JobId, JobSchedule, JobState, JobStore, JobSummary, NewJob, ScheduledRun,
+};
 pub use routing::{
     CommandCatalog, InputRoute, RouteDecision, RoutePolicy, RouteReason, UnknownInputPolicy,
 };

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -14,9 +15,10 @@ use crossterm::event::{
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crumb_agent::{
     AgentConfig, AgentMode, CancellationToken, CommandCatalog, ConfiguredApprovals, HarnessConfig,
-    InputRoute, LiveConfig, MistakePolicy, Modality, RouteDecision, SteeringAction, SteeringQueue,
-    TokenOptimizer, ToolHost, TurnStatus, UnknownInputPolicy, export_session, list_sessions,
-    search_sessions, session_summary, set_session_archived, set_session_label, trash_session,
+    InputRoute, JobSchedule, JobState, JobStore, LiveConfig, MistakePolicy, Modality, NewJob,
+    RouteDecision, SteeringAction, SteeringQueue, TokenOptimizer, ToolHost, TurnStatus,
+    UnknownInputPolicy, export_session, list_sessions, search_sessions, session_summary,
+    set_session_archived, set_session_label, trash_session,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
@@ -78,6 +80,26 @@ fn run_command_line_action() -> Result<bool> {
         return Ok(true);
     }
     if let [group, action, id] = arguments.as_slice()
+        && group == "jobs"
+        && action == "run"
+    {
+        let id = id.to_str().context("job identifier must be UTF-8")?;
+        run_job_worker(&current_process_dir()?, id, &mut io::stdout().lock())?;
+        return Ok(true);
+    }
+    if matches!(arguments.as_slice(), [group, action] if group == "jobs" && action == "tick") {
+        launch_due_jobs(&current_process_dir()?, &mut io::stdout().lock())?;
+        return Ok(true);
+    }
+    if matches!(arguments.as_slice(), [group, action] if group == "jobs" && action == "list") {
+        serde_json::to_writer(
+            &mut io::stdout().lock(),
+            &JobStore::new(current_process_dir()?).list()?,
+        )?;
+        writeln!(io::stdout().lock())?;
+        return Ok(true);
+    }
+    if let [group, action, id] = arguments.as_slice()
         && group == "review"
         && action == "export"
     {
@@ -92,7 +114,7 @@ fn run_command_line_action() -> Result<bool> {
         [group, action] if group == "auth" && action == "logout" => AuthAction::Logout,
         _ => {
             return Err(anyhow!(
-                "usage: crumb [auth <login|status|logout> | mcp serve | review export <id|all> | completions <bash|zsh|fish|powershell>]"
+                "usage: crumb [auth <login|status|logout> | mcp serve | review export <id|all> | completions <shell> | jobs <list|run <id>|tick>]"
             ));
         }
     };
@@ -111,6 +133,121 @@ fn export_reviews(cwd: &Path, id: &str, writer: &mut dyn Write) -> Result<()> {
         serde_json::to_writer(&mut *writer, &store.load(id)?)?;
     }
     writeln!(writer)?;
+    Ok(())
+}
+
+fn run_job_worker(cwd: &Path, id: &str, writer: &mut dyn Write) -> Result<()> {
+    let store = JobStore::new(cwd.to_path_buf());
+    let definition = store.claim_due(id, std::process::id())?;
+    let mut runtime = match AgentRuntime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            store.finish(id, Some(&error.to_string()))?;
+            return Err(error);
+        }
+    };
+    let session_id = match runtime.prepare_local_job(definition.config.mode, &definition.workspace)
+    {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            store.finish(id, Some(&error.to_string()))?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = store.attach_session(id, session_id) {
+        store.finish(id, Some(&error.to_string()))?;
+        return Err(error);
+    }
+    let cancellation = CancellationToken::default();
+    let monitoring = monitor_job_cancellation(store.clone(), id.to_owned(), cancellation.clone());
+    let result = runtime.run_local_job(
+        definition.request(),
+        &definition.config,
+        &definition.workspace,
+        &cancellation,
+    );
+    monitoring.stop();
+    match result {
+        Ok(result) => {
+            store.finish(id, None)?;
+            writeln!(writer, "{}", result.final_response.trim())?;
+            Ok(())
+        }
+        Err(error) => {
+            if cancellation.is_cancelled()
+                && matches!(store.inspect(id)?.state, JobState::Running { .. })
+            {
+                store.request_cancel(id)?;
+            }
+            store.finish(id, Some(&error.to_string()))?;
+            Err(error)
+        }
+    }
+}
+
+struct JobCancellationMonitor {
+    stopped: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl JobCancellationMonitor {
+    fn stop(mut self) {
+        self.stopped.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn monitor_job_cancellation(
+    store: JobStore,
+    id: String,
+    cancellation: CancellationToken,
+) -> JobCancellationMonitor {
+    let stopped = Arc::new(AtomicBool::new(false));
+    let monitor_stopped = Arc::clone(&stopped);
+    let worker = thread::spawn(move || {
+        while !monitor_stopped.load(Ordering::Acquire) {
+            if let Ok(job) = store.inspect(&id)
+                && matches!(job.state, JobState::CancellationRequested { .. })
+            {
+                cancellation.cancel();
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    JobCancellationMonitor {
+        stopped,
+        worker: Some(worker),
+    }
+}
+
+fn launch_job_worker(cwd: &Path, id: &str) -> Result<()> {
+    let executable = std::env::current_exe().context("failed to locate crumb executable")?;
+    let mut child = Command::new(executable)
+        .args(["jobs", "run", id])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to launch local job worker")?;
+    drop(thread::spawn(move || {
+        let _ = child.wait();
+    }));
+    Ok(())
+}
+
+fn launch_due_jobs(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let store = JobStore::new(cwd.to_path_buf());
+    let due = store.due_now()?;
+    let mut launched = 0_usize;
+    for job in due {
+        launch_job_worker(cwd, job.definition.id.as_str())?;
+        launched += 1;
+    }
+    writeln!(writer, "launched {launched} due jobs")?;
     Ok(())
 }
 
@@ -890,7 +1027,7 @@ fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
         (
             "AGENT",
             &[
-                "/mode", "/model", "/effort", "/session", "/review", "/cancel", "/cost",
+                "/mode", "/model", "/effort", "/session", "/review", "/jobs", "/cancel", "/cost",
             ][..],
         ),
         (
@@ -1008,6 +1145,9 @@ fn show_reserved(
         command if command == "/review" || command.starts_with("/review ") => {
             show_reviews(command, cwd, runtime, writer)?;
         }
+        command if command == "/jobs" || command.starts_with("/jobs ") => {
+            show_jobs(command, cwd, runtime, writer)?;
+        }
         command if command == "/session" || command.starts_with("/session ") => {
             show_sessions(command, cwd, runtime, writer)?;
         }
@@ -1017,6 +1157,163 @@ fn show_reserved(
         }
     }
     Ok(())
+}
+
+fn show_jobs(
+    command: &str,
+    cwd: &Path,
+    runtime: &mut Option<AgentRuntime>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let store = JobStore::new(cwd.to_path_buf());
+    if let Some(request) = command.strip_prefix("/jobs create ") {
+        let created = create_job(cwd, request, JobSchedule::Immediate, false)?;
+        launch_job_worker(cwd, created.id.as_str())?;
+        writeln!(writer, "◆ Background job {} launched", created.id.as_str())?;
+        return Ok(());
+    }
+    if let Some(arguments) = command.strip_prefix("/jobs schedule once ") {
+        let (run_at_ms, request) = split_job_argument(arguments, "run_at_ms")?;
+        let run_at_ms = run_at_ms
+            .parse::<u64>()
+            .context("run_at_ms must be an integer")?;
+        let created = create_job(cwd, request, JobSchedule::Once { run_at_ms }, true)?;
+        writeln!(writer, "◆ Scheduled one-shot job {}", created.id.as_str())?;
+        return Ok(());
+    }
+    if let Some(arguments) = command.strip_prefix("/jobs schedule recurring ") {
+        let (every_seconds, remaining) = split_job_argument(arguments, "every_seconds")?;
+        let (next_run_at_ms, request) = split_job_argument(remaining, "next_run_at_ms")?;
+        let schedule = JobSchedule::Recurring {
+            every_seconds: every_seconds
+                .parse::<u64>()
+                .context("every_seconds must be an integer")?,
+            next_run_at_ms: next_run_at_ms
+                .parse::<u64>()
+                .context("next_run_at_ms must be an integer")?,
+        };
+        let created = create_job(cwd, request, schedule, true)?;
+        writeln!(writer, "◆ Scheduled recurring job {}", created.id.as_str())?;
+        return Ok(());
+    }
+    let arguments = command.split_whitespace().skip(1).collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [] | ["list"] => show_job_list(&store, writer)?,
+        ["inspect", id] => {
+            serde_json::to_writer_pretty(&mut *writer, &store.inspect(id)?)?;
+            writeln!(writer)?;
+        }
+        ["cancel", id] => {
+            let job = store.request_cancel(id)?;
+            writeln!(
+                writer,
+                "◆ Job {} is {}",
+                job.id.as_str(),
+                job_state_name(&job.state)
+            )?;
+        }
+        ["run", id] => {
+            launch_job_worker(cwd, id)?;
+            writeln!(writer, "◆ Job worker launched for {id}")?;
+        }
+        ["tick"] => launch_due_jobs(cwd, writer)?,
+        ["reattach", id] => reattach_job(&store, id, cwd, runtime, writer)?,
+        _ => writeln!(
+            writer,
+            "usage: /jobs [list | inspect <id> | create <request> | schedule once <run_at_ms> <request> | schedule recurring <seconds> <next_ms> <request> | run <id> | cancel <id> | reattach <id> | tick]"
+        )?,
+    }
+    Ok(())
+}
+
+fn create_job(
+    cwd: &Path,
+    request: &str,
+    schedule: JobSchedule,
+    scheduler_opt_in: bool,
+) -> Result<crumb_agent::JobSummary> {
+    JobStore::new(cwd.to_path_buf()).create(NewJob {
+        request: request.to_owned(),
+        config: read_agent_config(cwd)?,
+        schedule,
+        scheduler_opt_in,
+    })
+}
+
+fn split_job_argument<'a>(input: &'a str, name: &str) -> Result<(&'a str, &'a str)> {
+    let input = input.trim();
+    let boundary = input
+        .find(char::is_whitespace)
+        .with_context(|| format!("missing {name} or job request"))?;
+    let (value, remaining) = input.split_at(boundary);
+    let remaining = remaining.trim();
+    if remaining.is_empty() {
+        return Err(anyhow!("job request cannot be empty"));
+    }
+    Ok((value, remaining))
+}
+
+fn show_job_list(store: &JobStore, writer: &mut dyn Write) -> Result<()> {
+    let jobs = store.list()?;
+    writeln!(writer, "◆ Local agent jobs")?;
+    if jobs.is_empty() {
+        writeln!(writer, "  No jobs configured")?;
+    }
+    for job in jobs.into_iter().take(20) {
+        writeln!(
+            writer,
+            "  {}  {:<22}  {} bytes",
+            job.id.as_str(),
+            job_state_name(&job.state),
+            job.request_bytes
+        )?;
+    }
+    Ok(())
+}
+
+fn reattach_job(
+    store: &JobStore,
+    id: &str,
+    cwd: &Path,
+    runtime: &mut Option<AgentRuntime>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let job = store.inspect(id)?;
+    if matches!(
+        &job.state,
+        JobState::Running { .. } | JobState::CancellationRequested { .. }
+    ) {
+        writeln!(
+            writer,
+            "◆ Job {id} is still active; its cancellation and limits remain attached"
+        )?;
+        return Ok(());
+    }
+    let session_id = job.session_id.context("job has no resumable session")?;
+    if runtime.is_none() {
+        *runtime = Some(AgentRuntime::new()?);
+    }
+    runtime
+        .as_mut()
+        .context("agent runtime is unavailable")?
+        .resume(cwd, session_id.as_str())?;
+    writeln!(
+        writer,
+        "◆ Reattached session {} from job {id}",
+        session_id.as_str()
+    )?;
+    Ok(())
+}
+
+const fn job_state_name(state: &JobState) -> &'static str {
+    match state {
+        JobState::Queued => "queued",
+        JobState::Running { .. } => "running",
+        JobState::CancellationRequested { .. } => "cancelling",
+        JobState::Completed { .. } => "completed",
+        JobState::Failed { .. } => "failed",
+        JobState::Cancelled { .. } => "cancelled",
+    }
 }
 
 fn show_optimizer_diagnostics(cwd: &Path, writer: &mut dyn Write) -> Result<()> {

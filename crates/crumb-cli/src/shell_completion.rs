@@ -52,13 +52,14 @@ const BASH: &str = r#"_crumb() {
     current="${COMP_WORDS[COMP_CWORD]}"
     previous="${COMP_WORDS[COMP_CWORD-1]}"
     if [[ ${COMP_CWORD} -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "auth mcp review completions" -- "${current}") )
+        COMPREPLY=( $(compgen -W "auth mcp review jobs completions" -- "${current}") )
         return
     fi
     case "${COMP_WORDS[1]}" in
         auth) COMPREPLY=( $(compgen -W "login status logout" -- "${current}") ) ;;
         mcp) COMPREPLY=( $(compgen -W "serve" -- "${current}") ) ;;
         review) COMPREPLY=( $(compgen -W "export" -- "${current}") ) ;;
+        jobs) COMPREPLY=( $(compgen -W "list run tick" -- "${current}") ) ;;
         completions) COMPREPLY=( $(compgen -W "bash zsh fish powershell" -- "${current}") ) ;;
     esac
 }
@@ -72,6 +73,7 @@ _crumb() {
         'auth:manage connector authentication'
         'mcp:serve the Crumb MCP boundary'
         'review:export edit checkpoint metadata'
+        'jobs:manage local agent jobs'
         'completions:generate a shell completion script'
     )
     if (( CURRENT == 2 )); then
@@ -82,6 +84,7 @@ _crumb() {
         auth) _values 'action' login status logout ;;
         mcp) _values 'action' serve ;;
         review) _values 'action' export ;;
+        jobs) _values 'action' list run tick ;;
         completions) _values 'shell' bash zsh fish powershell ;;
     esac
 }
@@ -92,10 +95,12 @@ const FISH: &str = r"complete -c crumb -f
 complete -c crumb -n '__fish_use_subcommand' -a auth -d 'Manage connector authentication'
 complete -c crumb -n '__fish_use_subcommand' -a mcp -d 'Serve the Crumb MCP boundary'
 complete -c crumb -n '__fish_use_subcommand' -a review -d 'Review edit checkpoints'
+complete -c crumb -n '__fish_use_subcommand' -a jobs -d 'Manage local agent jobs'
 complete -c crumb -n '__fish_use_subcommand' -a completions -d 'Generate shell completions'
 complete -c crumb -n '__fish_seen_subcommand_from auth' -a 'login status logout'
 complete -c crumb -n '__fish_seen_subcommand_from mcp' -a serve
 complete -c crumb -n '__fish_seen_subcommand_from review' -a export
+complete -c crumb -n '__fish_seen_subcommand_from jobs' -a 'list run tick'
 complete -c crumb -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish powershell'
 ";
 
@@ -103,12 +108,13 @@ const POWERSHELL: &str = r#"Register-ArgumentCompleter -Native -CommandName crum
     param($wordToComplete, $commandAst, $cursorPosition)
     $words = @($commandAst.CommandElements | ForEach-Object { $_.Extent.Text })
     $choices = if ($words.Count -le 1) {
-        @('auth', 'mcp', 'review', 'completions')
+        @('auth', 'mcp', 'review', 'jobs', 'completions')
     } else {
         switch ($words[1]) {
             'auth' { @('login', 'status', 'logout') }
             'mcp' { @('serve') }
             'review' { @('export') }
+            'jobs' { @('list', 'run', 'tick') }
             'completions' { @('bash', 'zsh', 'fish', 'powershell') }
             default { @() }
         }

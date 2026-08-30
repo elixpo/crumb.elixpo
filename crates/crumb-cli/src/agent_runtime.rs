@@ -223,6 +223,35 @@ impl AgentRuntime {
         })
     }
 
+    /// Runs one explicitly selected local job with the foreground policy and
+    /// cancellation boundary, but without terminal rendering.
+    ///
+    /// # Errors
+    ///
+    /// Returns Harness, policy, credential, or session failures.
+    pub fn run_local_job(
+        &mut self,
+        request: &str,
+        config: &AgentConfig,
+        workspace: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<RunResult> {
+        self.run_with_events_using(request, config, workspace, cancellation, |_| Ok(()))
+    }
+
+    /// Creates or selects the redacted session journal before a local job runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workspace or session journal is unavailable.
+    pub fn prepare_local_job(&mut self, mode: AgentMode, workspace: &Path) -> Result<SessionId> {
+        self.ensure_session(workspace, mode)?;
+        self.session
+            .as_ref()
+            .map(|session| session.id().clone())
+            .context("agent session is unavailable")
+    }
+
     fn attach_review_notes(&mut self, request: String) -> String {
         if self.review_notes.is_empty() {
             return request;

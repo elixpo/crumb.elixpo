@@ -140,6 +140,38 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "print checkpoint metadata as JSON",
     },
     SlashCommand {
+        usage: "/jobs",
+        description: "list local agent jobs",
+    },
+    SlashCommand {
+        usage: "/jobs inspect ",
+        description: "inspect redacted job metadata",
+    },
+    SlashCommand {
+        usage: "/jobs create ",
+        description: "start an approved background request",
+    },
+    SlashCommand {
+        usage: "/jobs schedule once ",
+        description: "opt in to one scheduled run",
+    },
+    SlashCommand {
+        usage: "/jobs schedule recurring ",
+        description: "opt in to a recurring local run",
+    },
+    SlashCommand {
+        usage: "/jobs cancel ",
+        description: "cancel a queued or running job",
+    },
+    SlashCommand {
+        usage: "/jobs reattach ",
+        description: "resume a completed job session",
+    },
+    SlashCommand {
+        usage: "/jobs tick",
+        description: "launch due opted-in schedules",
+    },
+    SlashCommand {
         usage: "/attach ",
         description: "attach a typed @ reference",
     },
