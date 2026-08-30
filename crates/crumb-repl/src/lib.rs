@@ -29,15 +29,15 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         usage: "/auth login",
-        description: "connect Pollinations",
+        description: "connect your crumb.elixpo account",
     },
     SlashCommand {
         usage: "/auth status",
-        description: "show connector authentication",
+        description: "show Crumb account access",
     },
     SlashCommand {
         usage: "/auth logout",
-        description: "remove the stored connector",
+        description: "remove local Crumb account access",
     },
     SlashCommand {
         usage: "/connectors",
@@ -81,7 +81,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         usage: "/effort use ",
-        description: "set an exact effort or provider default",
+        description: "set light, medium, high, extra high, ultra, or default",
     },
     SlashCommand {
         usage: "/session",
@@ -261,6 +261,9 @@ pub fn classify_input(input: &str) -> InputEvent {
         "/context" => InputEvent::BuiltIn(BuiltInCommand::Context),
         "/exit" => InputEvent::BuiltIn(BuiltInCommand::Exit),
         "/help" | "?" => InputEvent::BuiltIn(BuiltInCommand::Help),
+        _ if command.trim_end() == "? config" => {
+            InputEvent::BuiltIn(BuiltInCommand::Reserved("? config".to_owned()))
+        }
         "/history" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Recent)),
         "/history search" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
             String::new(),
@@ -453,6 +456,10 @@ mod tests {
         assert_eq!(
             classify_input("?"),
             InputEvent::BuiltIn(BuiltInCommand::Help)
+        );
+        assert_eq!(
+            classify_input("? config  "),
+            InputEvent::BuiltIn(BuiltInCommand::Reserved("? config".to_owned()))
         );
         assert_eq!(
             classify_input("/mode auto"),

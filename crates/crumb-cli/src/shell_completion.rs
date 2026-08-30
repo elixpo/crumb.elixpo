@@ -70,7 +70,7 @@ const ZSH: &str = r#"#compdef crumb
 _crumb() {
     local -a root
     root=(
-        'auth:manage connector authentication'
+        'auth:manage crumb.elixpo account access'
         'mcp:serve the Crumb MCP boundary'
         'review:export edit checkpoint metadata'
         'jobs:manage local agent jobs'
@@ -92,7 +92,7 @@ compdef _crumb crumb
 "#;
 
 const FISH: &str = r"complete -c crumb -f
-complete -c crumb -n '__fish_use_subcommand' -a auth -d 'Manage connector authentication'
+complete -c crumb -n '__fish_use_subcommand' -a auth -d 'Manage crumb.elixpo account access'
 complete -c crumb -n '__fish_use_subcommand' -a mcp -d 'Serve the Crumb MCP boundary'
 complete -c crumb -n '__fish_use_subcommand' -a review -d 'Review edit checkpoints'
 complete -c crumb -n '__fish_use_subcommand' -a jobs -d 'Manage local agent jobs'

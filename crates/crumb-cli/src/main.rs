@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Local;
-use crossterm::cursor::{MoveTo, RestorePosition, SavePosition, Show};
+use crossterm::cursor::{MoveTo, Show};
 use crossterm::event::{
     Event as TerminalEvent, KeyCode as TerminalKeyCode, KeyEventKind,
     KeyModifiers as TerminalModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
@@ -65,6 +65,8 @@ use completion::{CompletionWorkspace, CrumbCompleter};
 use shell_completion::{CompletionShell, write_completion};
 
 const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
+const FULLSCREEN_SIDE_GUTTER: u16 = 2;
+const FULLSCREEN_TOP_GUTTER: u16 = 1;
 
 fn main() -> Result<()> {
     if run_command_line_action()? {
@@ -350,9 +352,8 @@ fn run_managed_repl() -> Result<ReplOutcome> {
     let (mut last_exit_code, mut command_context) = (None, SessionCommandContext::default());
     let history = open_history(&mut stdout.lock())?;
     let completion_workspace = CompletionWorkspace::new(initial_cwd);
-    let mut line_editor = interactive
-        .then(|| create_line_editor(history.as_ref(), completion_workspace.clone()))
-        .transpose()?;
+    let mut line_editor =
+        optional_line_editor(interactive, history.as_ref(), completion_workspace)?;
 
     let header_rows = render_startup(
         renderer,
@@ -363,11 +364,9 @@ fn run_managed_repl() -> Result<ReplOutcome> {
     )?;
 
     loop {
-        let cwd = session
-            .as_ref()
-            .map_or_else(current_process_dir, |shell| Ok(shell.cwd().to_path_buf()))?;
+        let cwd = active_cwd(session.as_ref())?;
         let terminal_width = size().map_or(80, |(columns, _)| columns);
-        let status = prompt_model_status(&cwd, agent_runtime.as_ref(), terminal_width);
+        let status = prompt_model_status(&cwd);
         let prompt = render_prompt(renderer, &cwd, platform, last_exit_code, terminal_width);
         let event = if let Some(editor) = line_editor.as_mut() {
             editor.workspace.set(&cwd);
@@ -435,6 +434,10 @@ fn run_managed_repl() -> Result<ReplOutcome> {
     }
 }
 
+fn active_cwd(session: Option<&ShellSession>) -> Result<PathBuf> {
+    session.map_or_else(current_process_dir, |shell| Ok(shell.cwd().to_path_buf()))
+}
+
 fn native_command_catalog(platform: Platform) -> CommandCatalog {
     let mut commands = CommandCatalog::discover();
     commands.extend(
@@ -484,9 +487,17 @@ fn render_startup(
         80
     };
     if fullscreen {
-        let welcome = renderer.welcome(&startup, terminal_width);
+        let content_width = terminal_width.saturating_sub(FULLSCREEN_SIDE_GUTTER * 2);
+        let welcome = indent_terminal_block(
+            &renderer.welcome(&startup, content_width),
+            FULLSCREEN_SIDE_GUTTER,
+        );
+        for _ in 0..FULLSCREEN_TOP_GUTTER {
+            writeln!(writer)?;
+        }
         writeln!(writer, "{welcome}")?;
-        return Ok(u16::try_from(welcome.lines().count()).unwrap_or(u16::MAX));
+        let content_rows = u16::try_from(welcome.lines().count()).unwrap_or(u16::MAX);
+        return Ok(content_rows.saturating_add(FULLSCREEN_TOP_GUTTER));
     }
     let branding = renderer.branding_for_width(terminal_width);
     if !branding.is_empty() {
@@ -513,20 +524,29 @@ fn confirm_folder_trust(renderer: Renderer, workspace: &Path, fullscreen: bool) 
     }
 
     let width = size().map_or(100, |(columns, _)| columns);
-    writeln!(io::stdout(), "{}", renderer.branding_for_width(width))?;
+    let content_width = width.saturating_sub(FULLSCREEN_SIDE_GUTTER * 2);
+    let branding = indent_terminal_block(
+        &renderer.branding_for_width(content_width),
+        FULLSCREEN_SIDE_GUTTER,
+    );
+    writeln!(io::stdout(), "\n{branding}")?;
     let mut allow_selected = true;
     let _raw_mode = RawModeGuard::enable()?;
     loop {
-        let (_, rows) = size()?;
+        let (columns, rows) = size()?;
+        let dialog = renderer.folder_trust(
+            workspace,
+            allow_selected,
+            columns.saturating_sub(FULLSCREEN_SIDE_GUTTER * 2),
+        );
+        let dialog = indent_terminal_block(&dialog, FULLSCREEN_SIDE_GUTTER).replace('\n', "\r\n");
+        let dialog_rows = u16::try_from(dialog.lines().count()).unwrap_or(u16::MAX);
         crossterm::execute!(
             io::stdout(),
-            MoveTo(0, rows.saturating_sub(12)),
+            MoveTo(0, rows.saturating_sub(dialog_rows)),
             Clear(ClearType::FromCursorDown)
         )?;
-        let dialog = renderer
-            .folder_trust(workspace, allow_selected, size()?.0)
-            .replace('\n', "\r\n");
-        write!(io::stdout(), "{dialog}\r\n")?;
+        write!(io::stdout(), "{dialog}")?;
         io::stdout().flush()?;
         if let TerminalEvent::Key(key) = read_terminal_event()?
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
@@ -544,6 +564,23 @@ fn confirm_folder_trust(renderer: Renderer, workspace: &Path, fullscreen: bool) 
             }
         }
     }
+}
+
+fn indent_terminal_block(block: &str, columns: u16) -> String {
+    let indent = " ".repeat(usize::from(columns));
+    let mut indented = String::with_capacity(
+        block
+            .len()
+            .saturating_add(indent.len().saturating_mul(block.lines().count())),
+    );
+    for (index, line) in block.lines().enumerate() {
+        if index > 0 {
+            indented.push('\n');
+        }
+        indented.push_str(&indent);
+        indented.push_str(line);
+    }
+    indented
 }
 
 fn clear_trust_screen(allowed: bool) -> Result<bool> {
@@ -728,6 +765,12 @@ struct InputContext<'a> {
     command_context: &'a mut SessionCommandContext,
 }
 
+#[derive(Clone, Copy)]
+struct AgentTerminal {
+    interactive: bool,
+    fullscreen: bool,
+}
+
 fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<ReplOutcome>> {
     let agent_config = load_agent_config(context.cwd, context.writer);
     let decision = context
@@ -742,8 +785,10 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
             context.agent_runtime,
             context.renderer,
             context.writer,
-            context.interactive,
-            context.fullscreen,
+            AgentTerminal {
+                interactive: context.interactive,
+                fullscreen: context.fullscreen,
+            },
         )?;
         record_history(
             context.history,
@@ -806,8 +851,10 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
                     context.agent_runtime,
                     context.renderer,
                     context.writer,
-                    context.interactive,
-                    context.fullscreen,
+                    AgentTerminal {
+                        interactive: context.interactive,
+                        fullscreen: context.fullscreen,
+                    },
                 )?;
             }
             Ok(None)
@@ -878,8 +925,7 @@ fn handle_agent_boundary(
     runtime: &mut Option<AgentRuntime>,
     renderer: Renderer,
     writer: &mut dyn Write,
-    interactive: bool,
-    fullscreen: bool,
+    terminal: AgentTerminal,
 ) -> Result<()> {
     if matches!(decision.route, InputRoute::Native) {
         unreachable!("native input is handled by the shell path");
@@ -919,8 +965,7 @@ fn handle_agent_boundary(
         runtime,
         renderer,
         writer,
-        interactive,
-        fullscreen,
+        terminal,
     )
 }
 
@@ -939,7 +984,7 @@ fn render_agent_result(
                 matches!(reason, "error" | "failed" | "cancelled" | "canceled")
             }) =>
         {
-            writeln!(writer, "{}", renderer.agent_response(""))?
+            writeln!(writer, "{}", renderer.agent_response(""))?;
         }
         Ok(_) if visible.as_deref().is_none_or(str::is_empty) => {
             writeln!(
@@ -969,8 +1014,7 @@ fn execute_agent_sequence(
     runtime: &mut Option<AgentRuntime>,
     renderer: Renderer,
     writer: &mut dyn Write,
-    interactive: bool,
-    fullscreen: bool,
+    terminal: AgentTerminal,
 ) -> Result<()> {
     let activity_capacity = usize::try_from(config.limits.max_activity_events)
         .context("max_activity_events exceeds this platform's address space")?;
@@ -984,6 +1028,7 @@ fn execute_agent_sequence(
     loop {
         let session_id = active_runtime.prepare_local_job(config.mode, workspace)?;
         let persisted_request = request.clone();
+        let initial_activity = initial_agent_activity(&persisted_request);
         let mut task = active_runtime.spawn_turn(
             request,
             config.clone(),
@@ -997,8 +1042,8 @@ fn execute_agent_sequence(
                 steering_bytes,
                 renderer,
                 writer,
-                interactive,
-                fullscreen,
+                terminal,
+                initial_activity,
             )? {
                 TurnObservation::Finished(runtime, result, steered) => {
                     break (*runtime, result, steered);
@@ -1121,26 +1166,40 @@ fn observe_agent_turn(
     steering_bytes: usize,
     renderer: Renderer,
     writer: &mut dyn Write,
-    interactive: bool,
-    fullscreen: bool,
+    terminal: AgentTerminal,
+    initial_activity: &str,
 ) -> Result<TurnObservation> {
-    let mut activity = Some(start_activity(renderer, "Thinking", fullscreen));
+    let mut activity = Some(start_activity(
+        renderer,
+        initial_activity,
+        terminal.fullscreen,
+    ));
     let mut input = SteeringInput::new(renderer, steering_bytes);
-    let raw_mode = interactive.then(RawModeGuard::enable).transpose()?;
-    let enhanced_keys = interactive
+    let raw_mode = terminal
+        .interactive
+        .then(RawModeGuard::enable)
+        .transpose()?;
+    let enhanced_keys = terminal
+        .interactive
         .then(KeyboardEnhancementGuard::enable)
         .transpose()?;
     while !task.is_finished() {
         match task.recv_timeout(Duration::from_millis(15)) {
             Ok(event) => {
                 input.clear_line(writer)?;
-                render_harness_activity(&event, &mut activity, renderer, writer, fullscreen)?;
+                render_harness_activity(
+                    &event,
+                    &mut activity,
+                    renderer,
+                    writer,
+                    terminal.fullscreen,
+                )?;
                 input.redraw(writer)?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        if interactive
+        if terminal.interactive
             && poll_terminal_event(Duration::from_millis(10))?
             && let TerminalEvent::Key(key) = read_terminal_event()?
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
@@ -1164,7 +1223,7 @@ fn observe_agent_turn(
     }
     while let Ok(event) = task.recv_timeout(Duration::ZERO) {
         input.clear_line(writer)?;
-        render_harness_activity(&event, &mut activity, renderer, writer, fullscreen)?;
+        render_harness_activity(&event, &mut activity, renderer, writer, terminal.fullscreen)?;
         input.redraw(writer)?;
     }
     let steered = input.steer_requested;
@@ -1180,6 +1239,17 @@ fn observe_agent_turn(
         result,
         steered,
     ))
+}
+
+fn initial_agent_activity(request: &str) -> &'static str {
+    if request
+        .split_whitespace()
+        .any(|token| token.starts_with('@') && token.len() > 1)
+    {
+        "Attaching context"
+    } else {
+        "Thinking"
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1346,15 +1416,16 @@ impl SteeringInput {
     fn redraw_composer(&self, input: Option<&str>, writer: &mut dyn Write) -> Result<()> {
         let (columns, rows) = size()?;
         let available_width = columns.saturating_sub(7);
+        let input_row = rows.saturating_sub(3).saturating_add(1);
         let rendered = input.map_or_else(
             || self.renderer.composer_placeholder(available_width),
             |input| self.renderer.composer_follow_up(input, available_width),
         );
-        crossterm::execute!(writer, SavePosition, MoveTo(4, rows.saturating_sub(4)))?;
+        write!(writer, "\x1b7\x1b[{input_row};5H")?;
         write!(writer, "{}", " ".repeat(usize::from(available_width)))?;
-        crossterm::execute!(writer, MoveTo(4, rows.saturating_sub(4)))?;
+        write!(writer, "\x1b[{input_row};5H")?;
         write!(writer, "{rendered}")?;
-        crossterm::execute!(writer, RestorePosition)?;
+        write!(writer, "\x1b8")?;
         writer.flush()?;
         Ok(())
     }
@@ -1762,9 +1833,10 @@ fn show_reserved(
                 .and_then(|route| config.reasoning_effort_for(route))
                 .unwrap_or("provider default");
             writeln!(writer, "◆ Reasoning effort")?;
-            writeln!(writer, "  {effort}")?;
+            writeln!(writer, "  {}", effort_display_name(effort))?;
         }
         "/config" => show_config_summary(cwd, writer)?,
+        "? config" => show_session_config(cwd, runtime.as_ref(), writer)?,
         command if command.starts_with("/mode use ") => {
             set_agent_mode(command, cwd, writer)?;
         }
@@ -1860,7 +1932,8 @@ fn set_reasoning_effort(command: &str, cwd: &Path, writer: &mut dyn Write) -> Re
     if value.is_empty() {
         return Err(anyhow!("usage: /effort use <level|default>"));
     }
-    let selected = (value != "default").then(|| value.to_owned());
+    let selected = effort_wire_name(value)?;
+    let display = selected.as_deref().map_or("default", effort_display_name);
     update_agent_config(cwd, |config| {
         let route = config
             .models
@@ -1870,8 +1943,35 @@ fn set_reasoning_effort(command: &str, cwd: &Path, writer: &mut dyn Write) -> Re
         route.reasoning_effort.clone_from(&selected);
         Ok(())
     })?;
-    writeln!(writer, "◆ Reasoning effort · {value}")?;
+    writeln!(writer, "◆ Reasoning effort · {display}")?;
     Ok(())
+}
+
+fn effort_wire_name(value: &str) -> Result<Option<String>> {
+    let normalized = value.trim().to_ascii_lowercase().replace(['_', '-'], " ");
+    let wire = match normalized.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["default"] => return Ok(None),
+        ["light" | "low"] => "low",
+        ["medium"] => "medium",
+        ["high"] => "high",
+        ["extra", "high"] | ["xhigh"] => "xhigh",
+        ["ultra" | "max"] => "max",
+        _ => {
+            return Err(anyhow!(
+                "effort must be light, medium, high, extra high, ultra, or default"
+            ));
+        }
+    };
+    Ok(Some(wire.to_owned()))
+}
+
+fn effort_display_name(effort: &str) -> &str {
+    match effort {
+        "low" => "light",
+        "xhigh" => "extra high",
+        "max" => "ultra",
+        value => value,
+    }
 }
 
 fn configure_provider(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
@@ -3314,6 +3414,71 @@ fn show_config_summary(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     Ok(())
 }
 
+fn show_session_config(
+    cwd: &Path,
+    runtime: Option<&AgentRuntime>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    let route = config
+        .models
+        .get(&Modality::Text)
+        .and_then(|routes| routes.first());
+    let (context_tokens, session_tokens, compactions) =
+        runtime.map_or((0, 0, 0), AgentRuntime::token_usage);
+    writeln!(writer, "◆ Session configuration")?;
+    if let Some(route) = route {
+        let effort = config
+            .reasoning_effort_for(route)
+            .map_or("default", effort_display_name);
+        writeln!(writer, "  model       {}/{}", route.provider, route.model)?;
+        writeln!(writer, "  mode        {}", agent_mode_name(config.mode))?;
+        writeln!(writer, "  effort      {effort}")?;
+        writeln!(
+            writer,
+            "  context     ~{} / {} tokens",
+            compact_token_count(context_tokens),
+            compact_token_count(context_token_budget(&config, Some(route)))
+        )?;
+        let efforts = config
+            .providers
+            .get(&route.provider)
+            .and_then(|provider| provider.models.iter().find(|model| model.id == route.model))
+            .map(|model| {
+                model
+                    .reasoning_efforts
+                    .keys()
+                    .map(|effort| effort_display_name(effort))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        writeln!(
+            writer,
+            "  efforts     {}",
+            if efforts.is_empty() {
+                "not supported by this model".to_owned()
+            } else {
+                efforts.join(" · ")
+            }
+        )?;
+    } else {
+        writeln!(writer, "  model       native only")?;
+    }
+    writeln!(
+        writer,
+        "  session     ~{} tokens · {compactions} compactions",
+        compact_token_count(session_tokens)
+    )?;
+    writeln!(
+        writer,
+        "  id          {}",
+        runtime
+            .and_then(AgentRuntime::active_session_id)
+            .unwrap_or("not started")
+    )?;
+    Ok(())
+}
+
 fn show_plugins(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     let config = read_agent_config(cwd)?;
     writeln!(writer, "◆ Plugins and MCP servers")?;
@@ -3354,24 +3519,37 @@ fn handle_auth(action: AuthAction, writer: &mut dyn Write) -> Result<()> {
             login(&store, &secret)?;
             writeln!(
                 writer,
-                "Pollinations account connected and saved in the OS credential store"
+                "crumb.elixpo account connected; Pollinations connector access was saved in the OS credential store"
+            )?;
+            writeln!(
+                writer,
+                "Manage Pollinations and future connectors from your crumb.elixpo account"
             )?;
         }
         AuthAction::Status => {
             if pollinations_environment_key().is_some() {
-                writeln!(writer, "Pollinations BYOK configured (environment)")?;
+                writeln!(
+                    writer,
+                    "Pollinations development connector configured (environment)"
+                )?;
                 return Ok(());
             }
             let store = OsCredentialStore::new()?;
             let status = credential_status(&store, None)?;
             match status.source {
                 Some(CredentialSource::Keyring) => {
-                    writeln!(writer, "Pollinations BYOK configured (OS credential store)")?;
+                    writeln!(
+                        writer,
+                        "crumb.elixpo account connector access configured (OS credential store)"
+                    )?;
                 }
                 Some(CredentialSource::Environment) => {
                     unreachable!("handled before keyring access")
                 }
-                None => writeln!(writer, "Pollinations BYOK is not configured")?,
+                None => writeln!(
+                    writer,
+                    "crumb.elixpo account is not connected; run `/auth login`"
+                )?,
             }
         }
         AuthAction::Logout => {
@@ -3379,10 +3557,10 @@ fn handle_auth(action: AuthAction, writer: &mut dyn Write) -> Result<()> {
             if store.delete()? {
                 writeln!(
                     writer,
-                    "Pollinations BYOK removed from the OS credential store"
+                    "Local crumb.elixpo connector access removed from the OS credential store"
                 )?;
             } else {
-                writeln!(writer, "Pollinations BYOK was not stored")?;
+                writeln!(writer, "No local crumb.elixpo connector access was stored")?;
             }
             let active = ["POLLINATIONS_API_KEY", "POLLINATIONS_KEY"]
                 .into_iter()
@@ -3503,6 +3681,16 @@ struct InteractiveLineEditor {
     workspace: CompletionWorkspace,
 }
 
+fn optional_line_editor(
+    interactive: bool,
+    history: Option<&HistoryStore>,
+    workspace: CompletionWorkspace,
+) -> Result<Option<InteractiveLineEditor>> {
+    interactive
+        .then(|| create_line_editor(history, workspace))
+        .transpose()
+}
+
 fn create_line_editor(
     history: Option<&HistoryStore>,
     workspace: CompletionWorkspace,
@@ -3518,6 +3706,24 @@ fn create_line_editor(
         }
     }
     let mut keybindings = default_emacs_keybindings();
+    for trigger in ['/', '@', '?'] {
+        keybindings.add_binding(
+            KeyModifiers::NONE,
+            KeyCode::Char(trigger),
+            ReedlineEvent::Multiple(vec![
+                ReedlineEvent::Edit(vec![EditCommand::InsertChar(trigger)]),
+                ReedlineEvent::Menu("completion_menu".to_owned()),
+            ]),
+        );
+    }
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Char(' '),
+        ReedlineEvent::Multiple(vec![
+            ReedlineEvent::Edit(vec![EditCommand::InsertChar(' ')]),
+            ReedlineEvent::Esc,
+        ]),
+    );
     keybindings.add_binding(
         KeyModifiers::NONE,
         KeyCode::Tab,
@@ -3654,12 +3860,10 @@ impl Prompt for CrumbPrompt {
     }
 }
 
-fn prompt_model_status(cwd: &Path, runtime: Option<&AgentRuntime>, terminal_width: u16) -> String {
+fn prompt_model_status(cwd: &Path) -> String {
     let Ok(config) = read_agent_config(cwd) else {
         return "native".to_owned();
     };
-    let (context_tokens, session_tokens, compactions) =
-        runtime.map_or((0, 0, 0), AgentRuntime::token_usage);
     config
         .models
         .get(&Modality::Text)
@@ -3667,38 +3871,13 @@ fn prompt_model_status(cwd: &Path, runtime: Option<&AgentRuntime>, terminal_widt
         .map_or_else(
             || "native".to_owned(),
             |route| {
-                let effort = config.reasoning_effort_for(route).unwrap_or("default");
-                if terminal_width < 96 {
-                    return format!("{} · {}", route.model, agent_mode_name(config.mode));
-                }
-                let context = format!(
-                    "ctx ~{}/{}",
-                    compact_token_count(context_tokens),
-                    compact_token_count(context_token_budget(&config, Some(route)))
-                );
-                if terminal_width < 152 {
-                    return format!(
-                        "{} · {} · {effort} · {context}",
-                        route.model,
-                        agent_mode_name(config.mode)
-                    );
-                }
-                let compaction =
-                    if matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })) {
-                        "compact auto"
-                    } else {
-                        "compact provider"
-                    };
+                let effort = config
+                    .reasoning_effort_for(route)
+                    .map_or("default", effort_display_name);
                 format!(
-                    "{} · {} · effort {effort} · {context} · session ~{} · {compaction}{}",
+                    "{} · {} · {effort}",
                     route.model,
-                    agent_mode_name(config.mode),
-                    compact_token_count(session_tokens),
-                    if compactions == 0 {
-                        String::new()
-                    } else {
-                        format!(" ({compactions})")
-                    }
+                    agent_mode_name(config.mode)
                 )
             },
         )
@@ -3729,7 +3908,7 @@ fn context_token_budget(config: &AgentConfig, route: Option<&ModelRoute>) -> u64
     })
 }
 
-const FULLSCREEN_COMPOSER_ROWS: u16 = 6;
+const FULLSCREEN_COMPOSER_ROWS: u16 = 5;
 
 fn fullscreen_rows(header_rows: u16) -> io::Result<(u16, u16, u16, u16)> {
     let (_, rows) = size()?;
@@ -3777,12 +3956,6 @@ fn position_composer(renderer: Renderer, header_rows: u16) -> io::Result<()> {
     crossterm::execute!(
         writer,
         MoveTo(0, composer_row.saturating_add(3)),
-        Clear(ClearType::CurrentLine)
-    )?;
-    write!(writer, "{}", renderer.composer_bottom_border(columns))?;
-    crossterm::execute!(
-        writer,
-        MoveTo(0, composer_row.saturating_add(4)),
         Clear(ClearType::CurrentLine)
     )?;
     write!(writer, "{}", renderer.composer_idle_status())?;
@@ -4081,9 +4254,43 @@ mod tests {
     };
 
     use super::{
-        agent_config_location, failed_command_recovery, openrouter_preset,
+        SessionCommandContext, agent_config_location, effort_display_name, effort_wire_name,
+        failed_command_recovery, initial_agent_activity, openrouter_preset,
         parse_credential_reference, parse_provider_header, suggestion_width, workspace_read_host,
     };
+
+    #[test]
+    fn friendly_effort_names_map_to_harness_values() {
+        for (friendly, wire) in [
+            ("light", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("extra high", "xhigh"),
+            ("ultra", "max"),
+        ] {
+            assert_eq!(
+                effort_wire_name(friendly)
+                    .expect("friendly effort is valid")
+                    .as_deref(),
+                Some(wire)
+            );
+            assert_eq!(effort_display_name(wire), friendly);
+        }
+        assert_eq!(
+            effort_wire_name("default").expect("default effort is valid"),
+            None
+        );
+        assert!(effort_wire_name("unbounded").is_err());
+    }
+
+    #[test]
+    fn inline_references_start_with_context_activity() {
+        assert_eq!(
+            initial_agent_activity("review @src/main.rs"),
+            "Attaching context"
+        );
+        assert_eq!(initial_agent_activity("review the project"), "Thinking");
+    }
 
     #[test]
     fn failed_command_recovery_preserves_context_without_authorizing_changes() {
@@ -4093,6 +4300,26 @@ mod tests {
         assert!(recovery.payload.contains("magick image.png output.webp"));
         assert!(recovery.payload.contains("Exit code: 127"));
         assert!(recovery.payload.contains("request approval"));
+    }
+
+    #[test]
+    fn agent_context_contains_only_bounded_redacted_native_activity() {
+        let mut context = SessionCommandContext::default();
+        context.record("pwd", 0, b"/workspace\nTOKEN=secret-value\n");
+        context.record("export API_KEY=secret-value", 0, b"");
+        let decision = context.attach_to(crumb_agent::RouteDecision {
+            route: crumb_agent::InputRoute::Agent,
+            reason: crumb_agent::RouteReason::PolicyFallback,
+            payload: "what happened?".to_owned(),
+            suggestion: None,
+        });
+
+        assert!(decision.payload.contains("$ pwd"));
+        assert!(decision.payload.contains("/workspace"));
+        assert!(decision.payload.contains("[sensitive output redacted]"));
+        assert!(!decision.payload.contains("secret-value"));
+        assert!(!decision.payload.contains("export API_KEY"));
+        assert!(decision.payload.ends_with("what happened?"));
     }
 
     #[test]

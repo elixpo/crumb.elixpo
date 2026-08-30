@@ -362,10 +362,12 @@ impl Renderer {
         let mut lines = input.lines();
         let first = lines.next().unwrap_or_default();
         let mut body = format!("{} {}", self.paint("╰──▶", "36;1"), self.paint(first, "1"));
-        let continuation = lines
-            .map(|line| format!("\n{} {line}", self.paint("    │", "36")))
-            .collect::<String>();
-        body.push_str(&continuation);
+        for line in lines {
+            body.push('\n');
+            body.push_str(&self.paint("    │", "36"));
+            body.push(' ');
+            body.push_str(line);
+        }
         let header = format!("╭─❯ {username}");
         let timestamp = timestamp.unwrap_or_default();
         let padding = usize::from(terminal_width)

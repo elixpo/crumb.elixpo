@@ -57,10 +57,13 @@ impl Completer for CrumbCompleter {
         let Some(prefix) = line.get(..pos) else {
             return CompletionResult::fresh(Vec::new());
         };
+        let (_, token) = current_token(prefix);
         let suggestions = if prefix.starts_with('/') && !prefix.contains('\n') {
             slash_suggestions(prefix, pos)
-        } else if current_token(prefix).1.starts_with('@') {
+        } else if token.starts_with('@') {
             reference_suggestions(prefix, pos, &self.workspace.get())
+        } else if token.starts_with('?') {
+            help_suggestions(prefix, pos)
         } else {
             native_path_suggestions(prefix, pos, &self.workspace.get())
         };
@@ -70,6 +73,28 @@ impl Completer for CrumbCompleter {
             suggestions
         })
     }
+}
+
+fn help_suggestions(line: &str, pos: usize) -> Vec<Suggestion> {
+    let (start, token) = current_token(line);
+    if !token.starts_with('?') {
+        return Vec::new();
+    }
+    [
+        ("?", "open help, keyboard shortcuts, and command guidance"),
+        (
+            "? config",
+            "show active model, mode, effort, context, tokens, and session",
+        ),
+    ]
+    .into_iter()
+    .filter(|(value, _)| value.starts_with(token))
+    .map(|(value, description)| {
+        let mut help = suggestion(value, description, Span::new(start, pos));
+        help.append_whitespace = false;
+        help
+    })
+    .collect()
 }
 
 fn current_token(line: &str) -> (usize, &str) {
@@ -325,6 +350,26 @@ mod tests {
         let result = completer.complete("explain @last", 13);
         assert_eq!(result.suggestions()[0].value, "@last-error");
         assert_eq!(result.suggestions()[0].span.start, 8);
+    }
+
+    #[test]
+    fn question_mark_opens_the_help_completion() {
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
+        let result = completer.complete("?", 1);
+
+        assert_eq!(result.suggestions()[0].value, "?");
+        assert!(
+            result.suggestions()[0]
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("keyboard shortcuts"))
+        );
+        assert!(
+            result
+                .suggestions()
+                .iter()
+                .any(|suggestion| suggestion.value == "? config")
+        );
     }
 
     #[test]
