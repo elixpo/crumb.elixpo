@@ -44,6 +44,11 @@ Codex ignores ambient user configuration and receives the same server through
 per-invocation overrides. Crumb remains the owner of tool permissions,
 workspace confinement, cancellation, and output filtering.
 
+Codex runs through its documented non-interactive `exec` surface with JSONL
+output, ephemeral session storage, an explicit sandbox, ignored ambient config
+and rules, and per-invocation MCP overrides. See the
+[official Codex command reference](https://developers.openai.com/codex/cli/reference).
+
 `/doctor` reports the selected backend, local executable availability, exact
 model and effort, and optimizer status without contacting a provider.
 

@@ -60,16 +60,28 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "search native history",
     },
     SlashCommand {
-        usage: "/mode ",
+        usage: "/mode",
         description: "select auto, negotiate, or plan mode",
+    },
+    SlashCommand {
+        usage: "/mode use ",
+        description: "set auto, negotiate, or plan mode",
     },
     SlashCommand {
         usage: "/model",
         description: "inspect or select a model",
     },
     SlashCommand {
+        usage: "/model use ",
+        description: "select an exact provider/model",
+    },
+    SlashCommand {
         usage: "/effort",
         description: "inspect or set reasoning effort",
+    },
+    SlashCommand {
+        usage: "/effort use ",
+        description: "set an exact effort or provider default",
     },
     SlashCommand {
         usage: "/session",
@@ -202,6 +214,10 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         usage: "/config",
         description: "inspect live configuration",
+    },
+    SlashCommand {
+        usage: "/config provider ",
+        description: "configure Harness providers and models",
     },
     SlashCommand {
         usage: "/cancel",

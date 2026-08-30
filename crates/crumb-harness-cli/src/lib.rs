@@ -438,6 +438,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn incompatible_provider_output_fails_without_echoing_payloads() {
+        let codex = parse_codex_response(
+            br#"{"type":"turn.failed","error":{"message":"credential sk-secret"}}
+"#,
+        )
+        .expect_err("Codex output without a final message is rejected");
+        assert!(!codex.to_string().contains("sk-secret"));
+
+        let claude = parse_claude_response(br#"{"error":"credential sk-secret"}"#)
+            .expect_err("Claude output without a final result is rejected");
+        assert!(!claude.to_string().contains("sk-secret"));
+    }
+
+    #[test]
+    fn invalid_launch_fails_before_starting_a_backend() {
+        let mut invalid = launch(CodingBackend::Codex);
+        invalid.model = "";
+        assert!(invalid.validate().is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn cancellation_terminates_the_backend_process_group() {

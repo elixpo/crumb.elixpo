@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -77,6 +78,198 @@ pub enum Modality {
     ThreeD,
     Transcription,
     Embeddings,
+}
+
+/// Wire protocol spoken by a configurable Harness provider.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderProtocol {
+    OpenAiCompletions,
+    OpenAiResponses,
+    AnthropicMessages,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTransport {
+    Sse,
+    Websocket,
+    WebsocketCached,
+    Auto,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheRetention {
+    None,
+    Short,
+    Long,
+}
+
+/// Non-secret reference used to resolve a provider credential at turn time.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CredentialReference {
+    Environment { name: String },
+    Keyring { service: String, account: String },
+}
+
+/// Header material that is either explicitly public or resolved from an
+/// environment variable. Secret header values cannot be represented directly.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderHeader {
+    Public { value: String },
+    Environment { name: String },
+}
+
+/// Boolean compatibility switch understood by the provider adapter.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompatibilityFlag {
+    Store,
+    DeveloperRole,
+    ReasoningEffort,
+    UsageInStreaming,
+    StrictTools,
+    Temperature,
+}
+
+/// OpenAI-compatible transport behavior advertised by a provider or model.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderCompatibility {
+    pub flags: BTreeMap<CompatibilityFlag, bool>,
+    pub max_tokens_field: Option<String>,
+    pub thinking_format: Option<String>,
+    pub cache_control_format: Option<String>,
+}
+
+/// Configurable retry policy owned by the provider adapter.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderRetryPolicy {
+    pub max_retries: u32,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+}
+
+/// Exact model metadata used for local compatibility checks.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderModel {
+    pub id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub input: BTreeSet<Modality>,
+    #[serde(default)]
+    pub tool_calling: bool,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub reasoning_efforts: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    pub compatibility: ProviderCompatibility,
+}
+
+impl ProviderModel {
+    /// Creates explicit model metadata with no inferred capabilities.
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            display_name: None,
+            input: BTreeSet::new(),
+            tool_calling: false,
+            context_window: None,
+            max_output_tokens: None,
+            reasoning_efforts: BTreeMap::new(),
+            compatibility: ProviderCompatibility::default(),
+        }
+    }
+}
+
+/// Provider-neutral endpoint configuration. It contains references and public
+/// metadata only; credential and secret header values live outside this file.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderConfig {
+    pub display_name: String,
+    pub protocol: ProviderProtocol,
+    pub base_url: String,
+    #[serde(default)]
+    pub credential: Option<CredentialReference>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, ProviderHeader>,
+    #[serde(default)]
+    pub models: Vec<ProviderModel>,
+    #[serde(default)]
+    pub default_input: BTreeSet<Modality>,
+    #[serde(default)]
+    pub default_context_window: Option<u64>,
+    #[serde(default)]
+    pub default_max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub compatibility: ProviderCompatibility,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    #[serde(default)]
+    pub thinking_budgets: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub cache_retention: Option<CacheRetention>,
+    #[serde(default)]
+    pub transport: Option<ProviderTransport>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub websocket_connect_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub stream_idle_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub max_request_image_bytes: Option<u64>,
+    #[serde(default)]
+    pub retry: ProviderRetryPolicy,
+    #[serde(default)]
+    pub pricing: BTreeMap<String, String>,
+    #[serde(default)]
+    pub optimizer: Option<String>,
+}
+
+impl ProviderConfig {
+    /// Creates a provider with safe defaults and no credential material.
+    #[must_use]
+    pub fn new(
+        display_name: impl Into<String>,
+        protocol: ProviderProtocol,
+        base_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            display_name: display_name.into(),
+            protocol,
+            base_url: base_url.into(),
+            credential: None,
+            headers: BTreeMap::new(),
+            models: Vec::new(),
+            default_input: BTreeSet::new(),
+            default_context_window: None,
+            default_max_output_tokens: None,
+            compatibility: ProviderCompatibility::default(),
+            reasoning: None,
+            thinking_budgets: BTreeMap::new(),
+            cache_retention: None,
+            transport: None,
+            timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            stream_idle_timeout_ms: None,
+            max_request_image_bytes: None,
+            retry: ProviderRetryPolicy::default(),
+            pricing: BTreeMap::new(),
+            optimizer: None,
+        }
+    }
 }
 
 /// One configurable provider/model route.
@@ -175,6 +368,7 @@ pub struct AgentConfig {
     pub reasoning_effort: Option<String>,
     pub limits: AgentLimits,
     pub harness: Option<HarnessConfig>,
+    pub providers: BTreeMap<String, ProviderConfig>,
     pub models: BTreeMap<Modality, Vec<ModelRoute>>,
     pub skills: Vec<SkillConfig>,
     pub mcp_servers: Vec<crate::tools::McpServer>,
@@ -189,12 +383,36 @@ impl AgentConfig {
     ///
     /// Returns an error when a configured identifier or required value is empty.
     pub fn validate(&self) -> Result<()> {
+        for (id, provider) in &self.providers {
+            validate_provider(id, provider)?;
+        }
         for routes in self.models.values() {
             for route in routes {
                 if route.provider.trim().is_empty() || route.model.trim().is_empty() {
                     bail!("model routes require non-empty provider and model identifiers");
                 }
                 validate_effort(route.reasoning_effort.as_deref())?;
+                if let Some(provider) = self.providers.get(&route.provider) {
+                    let model = provider
+                        .models
+                        .iter()
+                        .find(|model| model.id == route.model)
+                        .with_context(|| {
+                            format!(
+                                "selected model `{}` is not configured for provider `{}`",
+                                route.model, route.provider
+                            )
+                        })?;
+                    if let Some(effort) = self.reasoning_effort_for(route)
+                        && !model.reasoning_efforts.contains_key(effort)
+                    {
+                        bail!(
+                            "selected provider model `{}/{}` does not support effort `{effort}`",
+                            route.provider,
+                            route.model
+                        );
+                    }
+                }
             }
         }
         validate_effort(self.reasoning_effort.as_deref())?;
@@ -300,6 +518,159 @@ impl AgentConfig {
     }
 }
 
+fn validate_provider(id: &str, provider: &ProviderConfig) -> Result<()> {
+    if !valid_identifier(id) || provider.display_name.trim().is_empty() {
+        bail!("providers require a valid identifier and display name");
+    }
+    let endpoint = url::Url::parse(&provider.base_url)
+        .with_context(|| format!("provider `{id}` has an invalid base URL"))?;
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        bail!(
+            "provider `{id}` base URL must be an HTTP origin or path without credentials, query, or fragment"
+        );
+    }
+    if let Some(credential) = &provider.credential {
+        let local = endpoint
+            .host_str()
+            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"));
+        if endpoint.scheme() != "https" && !local {
+            bail!("provider `{id}` credentials require HTTPS except on loopback");
+        }
+        validate_credential_reference(credential)?;
+    }
+    for (name, value) in &provider.headers {
+        validate_provider_header(name, value)?;
+    }
+    for limit in [
+        provider.default_context_window,
+        provider.default_max_output_tokens,
+        provider.timeout_ms,
+        provider.websocket_connect_timeout_ms,
+        provider.stream_idle_timeout_ms,
+        provider.max_request_image_bytes,
+    ] {
+        if limit == Some(0) {
+            bail!("provider `{id}` limits must be positive when configured");
+        }
+    }
+    if provider.retry.max_retries > 0
+        && (provider.retry.base_delay_ms == 0
+            || provider.retry.max_delay_ms < provider.retry.base_delay_ms)
+    {
+        bail!("provider `{id}` retry delays must be positive and ordered");
+    }
+    validate_effort(provider.reasoning.as_deref())?;
+    for (effort, budget) in &provider.thinking_budgets {
+        validate_effort(Some(effort))?;
+        if *budget == 0 {
+            bail!("provider `{id}` thinking budgets must be positive");
+        }
+    }
+    validate_compatibility(id, &provider.compatibility)?;
+    let mut models = BTreeSet::new();
+    for model in &provider.models {
+        if model.id.trim().is_empty() || !models.insert(model.id.as_str()) {
+            bail!("provider `{id}` models require unique non-empty identifiers");
+        }
+        if model.context_window == Some(0) || model.max_output_tokens == Some(0) {
+            bail!("provider `{id}` model limits must be positive when configured");
+        }
+        for (effort, wire_value) in &model.reasoning_efforts {
+            validate_effort(Some(effort))?;
+            validate_effort(wire_value.as_deref())?;
+            if wire_value.is_none() && effort != "off" {
+                bail!("only the `off` reasoning effort may omit its wire value");
+            }
+        }
+        validate_compatibility(id, &model.compatibility)?;
+    }
+    if let Some(optimizer) = &provider.optimizer
+        && !valid_identifier(optimizer)
+    {
+        bail!("provider `{id}` optimizer must be a valid identifier");
+    }
+    for (metric, value) in &provider.pricing {
+        let Ok(parsed) = value.parse::<f64>() else {
+            bail!("provider `{id}` pricing entries require identifier keys and numeric values");
+        };
+        if !valid_identifier(metric) || !parsed.is_finite() || parsed < 0.0 {
+            bail!("provider `{id}` pricing entries require identifier keys and numeric values");
+        }
+    }
+    Ok(())
+}
+
+fn validate_compatibility(id: &str, compatibility: &ProviderCompatibility) -> Result<()> {
+    for value in [
+        compatibility.max_tokens_field.as_deref(),
+        compatibility.thinking_format.as_deref(),
+        compatibility.cache_control_format.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if value.is_empty() || value.len() > 64 {
+            bail!("provider `{id}` compatibility values must contain 1-64 bytes");
+        }
+    }
+    Ok(())
+}
+
+fn validate_credential_reference(reference: &CredentialReference) -> Result<()> {
+    match reference {
+        CredentialReference::Environment { name } => validate_environment_name(name),
+        CredentialReference::Keyring { service, account } => {
+            if service.trim().is_empty() || account.trim().is_empty() {
+                bail!("keyring credential references require service and account names");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_provider_header(name: &str, value: &ProviderHeader) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+    {
+        bail!("provider header names must be valid HTTP tokens");
+    }
+    match value {
+        ProviderHeader::Environment { name } => validate_environment_name(name),
+        ProviderHeader::Public { value } => {
+            if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
+                bail!("public provider header values must contain 1-4096 bytes");
+            }
+            let sensitive = matches!(
+                name.to_ascii_lowercase().as_str(),
+                "authorization" | "proxy-authorization" | "x-api-key" | "api-key"
+            );
+            if sensitive {
+                bail!("sensitive provider headers must use an environment reference");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_environment_name(name: &str) -> Result<()> {
+    let mut bytes = name.bytes();
+    let first = bytes.next();
+    if !first.is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        bail!("environment references must use portable variable names");
+    }
+    Ok(())
+}
+
 fn valid_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -364,13 +735,71 @@ impl LiveConfig {
             Ok(AgentConfig::default())
         }
     }
+
+    /// Validates and atomically replaces the live configuration.
+    ///
+    /// The temporary file is created beside the destination so the final
+    /// rename cannot cross a filesystem boundary. The original remains intact
+    /// when mutation, validation, serialization, or persistence fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current configuration is invalid, the
+    /// mutation fails, or the replacement cannot be persisted.
+    pub fn update<F>(&self, mutate: F) -> Result<AgentConfig>
+    where
+        F: FnOnce(&mut AgentConfig) -> Result<()>,
+    {
+        let mut config = self.load_or_default()?;
+        mutate(&mut config)?;
+        config.validate()?;
+        let mut encoded = serde_json::to_vec_pretty(&config)
+            .context("failed to serialize agent configuration")?;
+        encoded.push(b'\n');
+
+        let parent = self
+            .path
+            .parent()
+            .context("agent configuration path has no parent directory")?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create agent config directory at {}",
+                parent.display()
+            )
+        })?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+            format!(
+                "failed to create temporary agent config beside {}",
+                self.path.display()
+            )
+        })?;
+        temporary
+            .write_all(&encoded)
+            .context("failed to write temporary agent configuration")?;
+        temporary
+            .as_file_mut()
+            .sync_all()
+            .context("failed to sync temporary agent configuration")?;
+        temporary
+            .persist(&self.path)
+            .map_err(|error| error.error)
+            .with_context(|| {
+                format!(
+                    "failed to atomically replace agent config at {}",
+                    self.path.display()
+                )
+            })?;
+        Ok(config)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{AgentConfig, AgentMode, HarnessConfig, MistakePolicy, Modality, ModelRoute};
+    use super::{
+        AgentConfig, AgentMode, HarnessConfig, LiveConfig, MistakePolicy, Modality, ModelRoute,
+    };
     use crate::{CodingBackend, ModelCapabilities};
 
     #[test]
@@ -403,6 +832,105 @@ mod tests {
     fn secrets_are_not_part_of_the_config_schema() {
         let result = serde_json::from_str::<AgentConfig>(r#"{"api_key":"secret"}"#);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn live_updates_are_validated_before_atomic_replacement() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(".crumb").join("agent.json");
+        let live = LiveConfig::new(&path);
+        live.update(|config| {
+            config.mode = AgentMode::Plan;
+            Ok(())
+        })
+        .expect("initial update");
+        let original = std::fs::read(&path).expect("persisted config");
+        assert_eq!(live.load().expect("load").mode, AgentMode::Plan);
+
+        let result = live.update(|config| {
+            config.limits.max_output_bytes = 0;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(path).expect("preserved config"), original);
+    }
+
+    #[test]
+    fn arbitrary_provider_configuration_is_validated_without_secrets() {
+        let config = serde_json::from_str::<AgentConfig>(
+            r#"{
+                "providers": {
+                    "custom_gateway": {
+                        "display_name": "Custom Gateway",
+                        "protocol": "open_ai_completions",
+                        "base_url": "https://models.example.test/v1",
+                        "credential": {"source": "environment", "name": "CUSTOM_API_KEY"},
+                        "headers": {
+                            "HTTP-Referer": {"source": "public", "value": "https://crumb.elixpo.com"},
+                            "X-API-Key": {"source": "environment", "name": "CUSTOM_API_KEY"}
+                        },
+                        "models": [{
+                            "id": "coding-model",
+                            "input": ["text", "image"],
+                            "tool_calling": true,
+                            "context_window": 131072,
+                            "max_output_tokens": 8192,
+                            "reasoning_efforts": {"low": "low", "high": "high"}
+                        }],
+                        "pricing": {"input_tokens": "0.25", "output_tokens": "1.00"}
+                    }
+                },
+                "models": {
+                    "text": [{"provider": "custom_gateway", "model": "coding-model", "effort": "high"}]
+                }
+            }"#,
+        )
+        .expect("provider schema parses");
+        config.validate().expect("provider configuration validates");
+        let encoded = serde_json::to_string(&config).expect("config serializes");
+        assert!(!encoded.contains("secret"));
+        assert!(!encoded.contains("CUSTOM_API_KEY\":"));
+    }
+
+    #[test]
+    fn sensitive_headers_cannot_store_literal_values() {
+        let config = serde_json::from_str::<AgentConfig>(
+            r#"{
+                "providers": {
+                    "fixture": {
+                        "display_name": "Fixture",
+                        "protocol": "open_ai_responses",
+                        "base_url": "https://example.test/v1",
+                        "headers": {
+                            "Authorization": {"source": "public", "value": "Bearer secret"}
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("shape parses");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn selected_custom_model_and_effort_must_exist() {
+        let config = serde_json::from_str::<AgentConfig>(
+            r#"{
+                "providers": {
+                    "fixture": {
+                        "display_name": "Fixture",
+                        "protocol": "anthropic_messages",
+                        "base_url": "https://example.test/v1",
+                        "models": [{"id": "known", "reasoning_efforts": {"high": "high"}}]
+                    }
+                },
+                "models": {
+                    "text": [{"provider": "fixture", "model": "missing", "effort": "max"}]
+                }
+            }"#,
+        )
+        .expect("shape parses");
+        assert!(config.validate().is_err());
     }
 
     #[test]

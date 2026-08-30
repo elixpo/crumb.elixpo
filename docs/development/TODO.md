@@ -89,8 +89,14 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] [Ship modern input editing, shell completions, and accessibility modes](https://github.com/elixpo/crumb.elixpo/issues/38)
 - [x] [Add resumable and searchable agent sessions](https://github.com/elixpo/crumb.elixpo/issues/35)
 - [x] [Add opt-in background jobs and scheduled agent work](https://github.com/elixpo/crumb.elixpo/issues/34)
-- [ ] [Add pluggable Codex and Claude coding-agent backends](https://github.com/elixpo/crumb.elixpo/issues/39)
-- [ ] [Add OpenRouter-compatible BYOK providers and explicit model selection](https://github.com/elixpo/crumb.elixpo/issues/40)
+- [x] [Add pluggable Codex and Claude coding-agent backends](https://github.com/elixpo/crumb.elixpo/issues/39)
+- [ ] [Add terminal-configurable Harness providers and explicit model selection](https://github.com/elixpo/crumb.elixpo/issues/40)
+  - [x] Add the provider-neutral, non-secret endpoint and capability schema.
+  - [x] Add validated atomic terminal mutations for providers, models, mode, and effort.
+  - [x] Add OpenRouter/Pollinations presets and typed credential/header references.
+  - [ ] Add advanced provider-field mutations.
+  - [ ] Project selected providers into the replaceable Harness adapter.
+  - [ ] Add lazy model discovery and local compatibility diagnostics.
 
 ## Planned work packages
 

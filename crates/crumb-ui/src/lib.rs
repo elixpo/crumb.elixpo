@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crumb_platform::Platform;
 
@@ -206,24 +206,10 @@ impl Renderer {
         }
     }
 
-    /// Renders one committed Harness response and its bounded session metadata.
+    /// Renders one committed Harness response without protocol metadata.
     #[must_use]
-    pub fn agent_response(&self, response: &str, session_id: &str, event_count: usize) -> String {
-        if self.settings.output == OutputMode::ScreenReader {
-            return format!(
-                "{}\nsession {session_id}, {event_count} committed events",
-                response.trim()
-            );
-        }
-        format!(
-            "{}\n{} {}",
-            response.trim(),
-            self.paint("─", "2"),
-            self.paint(
-                &format!("session {session_id} · {event_count} committed events"),
-                "2"
-            )
-        )
+    pub fn agent_response(response: &str) -> String {
+        visible_agent_text(response)
     }
 
     /// Renders a Harness failure without conflating it with native shell output.
@@ -306,6 +292,9 @@ fn startup_punchline() -> &'static str {
 pub struct ActivityIndicator {
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    started: Instant,
+    visible: bool,
+    color: bool,
 }
 
 impl ActivityIndicator {
@@ -316,12 +305,33 @@ impl ActivityIndicator {
             let label = label.to_owned();
             thread::spawn(move || animate_activity(&label, color, &running))
         });
-        Self { running, thread }
+        Self {
+            running,
+            thread,
+            started: Instant::now(),
+            visible: animated,
+            color,
+        }
     }
 
     /// Stops and clears the activity line before another message is rendered.
     pub fn finish(mut self) {
         self.stop();
+    }
+
+    /// Stops the animation and leaves one compact completion crumb.
+    pub fn complete(mut self) {
+        self.stop();
+        if self.visible {
+            let elapsed = self.started.elapsed().as_secs_f32();
+            let crumb = if self.color {
+                "\x1b[35;1m·\x1b[0m"
+            } else {
+                "·"
+            };
+            let _ = writeln!(io::stderr(), "{crumb} Worked for {elapsed:.1}s");
+            let _ = io::stderr().flush();
+        }
     }
 
     fn stop(&mut self) {
@@ -361,6 +371,22 @@ fn animate_activity(label: &str, color: bool, running: &AtomicBool) {
 fn clear_activity_line() {
     let _ = write!(io::stderr(), "\r\x1b[2K");
     let _ = io::stderr().flush();
+}
+
+/// Removes provider reasoning wrappers from text intended for the terminal.
+#[must_use]
+pub fn visible_agent_text(response: &str) -> String {
+    let mut visible = response.to_owned();
+    for (opening, closing) in [("<thinking>", "</thinking>"), ("<think>", "</think>")] {
+        while let Some(start) = visible.find(opening) {
+            let tail = &visible[start + opening.len()..];
+            let end = tail.find(closing).map_or(visible.len(), |offset| {
+                start + opening.len() + offset + closing.len()
+            });
+            visible.replace_range(start..end, "");
+        }
+    }
+    visible.trim().to_owned()
 }
 
 fn append_optional_segments(segments: &mut Vec<String>, context: &PromptContext<'_>) {
@@ -502,9 +528,18 @@ mod tests {
             renderer.agent_header("qwen-coder", Some("high"), "auto", None),
             "◆ Crumb agent\n  model qwen-coder · mode auto · effort high"
         );
+        assert_eq!(Renderer::agent_response("done\n"), "done");
+    }
+
+    #[test]
+    fn hidden_reasoning_is_not_rendered() {
         assert_eq!(
-            renderer.agent_response("done\n", "session-1", 4),
-            "done\n─ session session-1 · 4 committed events"
+            super::visible_agent_text("<thinking>private chain</thinking>\nanswer"),
+            "answer"
+        );
+        assert_eq!(
+            super::visible_agent_text("answer<think>unfinished"),
+            "answer"
         );
     }
 

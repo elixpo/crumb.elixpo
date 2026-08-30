@@ -15,8 +15,9 @@ use crossterm::event::{
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crumb_agent::{
     AgentConfig, AgentMode, BackendDiscovery, CancellationToken, CommandCatalog,
-    ConfiguredApprovals, HarnessConfig, InputRoute, JobId, JobSchedule, JobState, JobStore,
-    LiveConfig, MistakePolicy, Modality, NewJob, RouteDecision, SteeringAction, SteeringQueue,
+    ConfiguredApprovals, CredentialReference, HarnessConfig, InputRoute, JobId, JobSchedule,
+    JobState, JobStore, LiveConfig, MistakePolicy, Modality, ModelRoute, NewJob, ProviderConfig,
+    ProviderHeader, ProviderModel, ProviderProtocol, RouteDecision, SteeringAction, SteeringQueue,
     TokenOptimizer, ToolHost, TurnStatus, UnknownInputPolicy, export_session, list_sessions,
     search_sessions, session_summary, set_session_archived, set_session_label, trash_session,
 };
@@ -170,7 +171,11 @@ fn run_job_worker(cwd: &Path, id: &str, writer: &mut dyn Write) -> Result<()> {
     match result {
         Ok(result) => {
             store.finish(id, None)?;
-            writeln!(writer, "{}", result.final_response.trim())?;
+            writeln!(
+                writer,
+                "{}",
+                crumb_ui::visible_agent_text(&result.final_response)
+            )?;
             Ok(())
         }
         Err(error) => {
@@ -596,26 +601,26 @@ fn render_agent_result(
     renderer: Renderer,
     writer: &mut dyn Write,
 ) -> Result<()> {
+    let visible = result
+        .as_ref()
+        .ok()
+        .map(|result| crumb_ui::visible_agent_text(&result.final_response));
     match result {
-        Ok(result) if result.final_response.trim().is_empty() => {
+        Ok(result)
+            if result.finish_reason.as_deref().is_some_and(|reason| {
+                matches!(reason, "error" | "failed" | "cancelled" | "canceled")
+            }) => {}
+        Ok(_) if visible.as_deref().is_none_or(str::is_empty) => {
             writeln!(
                 writer,
                 "{}",
-                renderer.agent_response(
-                    "Turn completed without a text response.",
-                    &result.session_id,
-                    result.events.len(),
-                )
+                Renderer::agent_response("Turn completed without a text response.")
             )?;
         }
-        Ok(result) => writeln!(
+        Ok(_) => writeln!(
             writer,
             "{}",
-            renderer.agent_response(
-                &result.final_response,
-                &result.session_id,
-                result.events.len(),
-            )
+            Renderer::agent_response(visible.as_deref().unwrap_or_default())
         )?,
         Err(error) => {
             let message = error.to_string();
@@ -771,7 +776,7 @@ fn observe_agent_turn(
     writer: &mut dyn Write,
     interactive: bool,
 ) -> Result<TurnObservation> {
-    let mut activity = Some(renderer.activity("Working through Harness"));
+    let mut activity = Some(renderer.activity("Working"));
     let mut input = SteeringInput::new(steering_bytes);
     let raw_mode = interactive.then(RawModeGuard::enable).transpose()?;
     while !task.is_finished() {
@@ -813,7 +818,7 @@ fn observe_agent_turn(
     input.clear_line(writer)?;
     drop(raw_mode);
     if let Some(indicator) = activity.take() {
-        indicator.finish();
+        indicator.complete();
     }
     let (runtime, result) = task.finish()?;
     Ok(TurnObservation::Finished(Box::new(runtime), result))
@@ -980,15 +985,34 @@ fn render_harness_activity(
     renderer: Renderer,
     writer: &mut dyn Write,
 ) -> Result<()> {
+    if matches!(
+        activity,
+        HarnessActivity::RequestAccepted
+            | HarnessActivity::Status { .. }
+            | HarnessActivity::Completed { .. }
+            | HarnessActivity::Progress { .. }
+    ) {
+        return Ok(());
+    }
     if let Some(indicator) = indicator.take() {
         indicator.finish();
     }
+    write!(writer, "\r\x1b[2K")?;
     writeln!(
         writer,
         "{}",
         renderer.agent_activity(&harness_activity_label(activity))
     )?;
     writer.flush()?;
+    if matches!(
+        activity,
+        HarnessActivity::ToolStarted { .. }
+            | HarnessActivity::ToolOutput { .. }
+            | HarnessActivity::ToolFinished { .. }
+            | HarnessActivity::ApprovalRequired { .. }
+    ) {
+        *indicator = Some(renderer.activity("Working"));
+    }
     Ok(())
 }
 
@@ -1259,6 +1283,18 @@ fn show_reserved(
             writeln!(writer, "  {effort}")?;
         }
         "/config" => show_config_summary(cwd, writer)?,
+        command if command.starts_with("/mode use ") => {
+            set_agent_mode(command, cwd, writer)?;
+        }
+        command if command.starts_with("/model use ") => {
+            set_text_model(command, cwd, writer)?;
+        }
+        command if command.starts_with("/effort use ") => {
+            set_reasoning_effort(command, cwd, writer)?;
+        }
+        command if command == "/config provider" || command.starts_with("/config provider ") => {
+            configure_provider(command, cwd, writer)?;
+        }
         "/doctor" => show_doctor(cwd, writer)?,
         "/plugins" => show_plugins(cwd, writer)?,
         command if command == "/review" || command.starts_with("/review ") => {
@@ -1276,6 +1312,457 @@ fn show_reserved(
         }
     }
     Ok(())
+}
+
+fn set_agent_mode(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let value = command
+        .strip_prefix("/mode use ")
+        .context("usage: /mode use <auto|negotiate|plan>")?
+        .trim();
+    let mode = match value {
+        "auto" => AgentMode::Auto,
+        "negotiate" => AgentMode::Negotiate,
+        "plan" => AgentMode::Plan,
+        _ => return Err(anyhow!("usage: /mode use <auto|negotiate|plan>")),
+    };
+    update_agent_config(cwd, |config| {
+        config.mode = mode;
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Agent mode · {}", agent_mode_name(mode))?;
+    Ok(())
+}
+
+fn set_text_model(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let selection = command
+        .strip_prefix("/model use ")
+        .context("usage: /model use <provider>/<model>")?
+        .trim();
+    let (provider_id, model_id) = selection
+        .split_once('/')
+        .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
+        .context("usage: /model use <provider>/<model>")?;
+    update_agent_config(cwd, |config| {
+        let provider = config
+            .providers
+            .get(provider_id)
+            .with_context(|| format!("provider `{provider_id}` is not configured"))?;
+        provider
+            .models
+            .iter()
+            .find(|model| model.id == model_id)
+            .with_context(|| {
+                format!("model `{model_id}` is not configured for provider `{provider_id}`")
+            })?;
+        let routes = config.models.entry(Modality::Text).or_default();
+        routes.retain(|route| route.provider != provider_id || route.model != model_id);
+        routes.insert(
+            0,
+            ModelRoute {
+                provider: provider_id.to_owned(),
+                model: model_id.to_owned(),
+                reasoning_effort: None,
+            },
+        );
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Text model · {provider_id}/{model_id}")?;
+    Ok(())
+}
+
+fn set_reasoning_effort(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let value = command
+        .strip_prefix("/effort use ")
+        .context("usage: /effort use <level|default>")?
+        .trim();
+    if value.is_empty() {
+        return Err(anyhow!("usage: /effort use <level|default>"));
+    }
+    let selected = (value != "default").then(|| value.to_owned());
+    update_agent_config(cwd, |config| {
+        let route = config
+            .models
+            .get_mut(&Modality::Text)
+            .and_then(|routes| routes.first_mut())
+            .context("select a text model before setting reasoning effort")?;
+        route.reasoning_effort.clone_from(&selected);
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Reasoning effort · {value}")?;
+    Ok(())
+}
+
+fn configure_provider(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let arguments = command.split_whitespace().skip(2).collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [] | ["list"] => show_providers(cwd, writer),
+        ["show", id] => show_provider(cwd, id, writer),
+        ["remove", id] => remove_provider(cwd, id, writer),
+        ["preset", preset] => add_provider_preset(cwd, preset, preset, writer),
+        ["preset", preset, id] => add_provider_preset(cwd, preset, id, writer),
+        ["credential", "set", provider, reference] => {
+            set_provider_credential(cwd, provider, Some(reference), writer)
+        }
+        ["credential", "clear", provider] => set_provider_credential(cwd, provider, None, writer),
+        ["header", "set", provider, name, reference] => {
+            set_provider_header(cwd, provider, name, reference, writer)
+        }
+        ["header", "remove", provider, name] => remove_provider_header(cwd, provider, name, writer),
+        ["model", "add", provider, model] => {
+            add_provider_model(cwd, provider, model, None, None, false, writer)
+        }
+        ["model", "add", provider, model, context, output, tools] => add_provider_model(
+            cwd,
+            provider,
+            model,
+            Some(parse_positive_u64(context, "context window")?),
+            Some(parse_positive_u64(output, "maximum output tokens")?),
+            parse_tool_capability(tools)?,
+            writer,
+        ),
+        ["model", "remove", provider, model] => remove_provider_model(cwd, provider, model, writer),
+        ["add", id, protocol, base_url] => add_provider(cwd, id, protocol, base_url, None, writer),
+        ["add", id, protocol, base_url, credential] => {
+            add_provider(cwd, id, protocol, base_url, Some(credential), writer)
+        }
+        _ => Err(anyhow!(
+            "usage: /config provider <list|show ID|remove ID|preset PRESET [ID]|add ID PROTOCOL BASE_URL [env:NAME|keyring:SERVICE/ACCOUNT]|credential set ID REFERENCE|credential clear ID|header set ID NAME env:NAME|public:VALUE|header remove ID NAME|model add PROVIDER MODEL [CONTEXT MAX_OUTPUT tools|no-tools]|model remove PROVIDER MODEL>"
+        )),
+    }
+}
+
+fn show_providers(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let config = raw_agent_config(cwd).load_or_default()?;
+    writeln!(writer, "◆ Harness providers")?;
+    if config.providers.is_empty() {
+        writeln!(writer, "  No configurable providers")?;
+        return Ok(());
+    }
+    for (id, provider) in config.providers {
+        writeln!(
+            writer,
+            "  {id:<18} {} · {} models",
+            provider.display_name,
+            provider.models.len()
+        )?;
+    }
+    Ok(())
+}
+
+fn show_provider(cwd: &Path, id: &str, writer: &mut dyn Write) -> Result<()> {
+    let config = raw_agent_config(cwd).load_or_default()?;
+    let provider = config
+        .providers
+        .get(id)
+        .with_context(|| format!("provider `{id}` is not configured"))?;
+    serde_json::to_writer_pretty(&mut *writer, provider)?;
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn remove_provider(cwd: &Path, id: &str, writer: &mut dyn Write) -> Result<()> {
+    update_agent_config(cwd, |config| {
+        if config
+            .models
+            .values()
+            .flatten()
+            .any(|route| route.provider == id)
+        {
+            return Err(anyhow!(
+                "provider `{id}` is selected by a model route; select another model first"
+            ));
+        }
+        config
+            .providers
+            .remove(id)
+            .with_context(|| format!("provider `{id}` is not configured"))?;
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Removed provider · {id}")?;
+    Ok(())
+}
+
+fn add_provider(
+    cwd: &Path,
+    id: &str,
+    protocol: &str,
+    base_url: &str,
+    credential: Option<&str>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let protocol = parse_provider_protocol(protocol)?;
+    let credential = credential.map(parse_credential_reference).transpose()?;
+    update_agent_config(cwd, |config| {
+        if config.providers.contains_key(id) {
+            return Err(anyhow!("provider `{id}` is already configured"));
+        }
+        let mut provider = ProviderConfig::new(id.replace(['_', '-'], " "), protocol, base_url);
+        provider.credential = credential;
+        config.providers.insert(id.to_owned(), provider);
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Added provider · {id}")?;
+    Ok(())
+}
+
+fn add_provider_preset(cwd: &Path, preset: &str, id: &str, writer: &mut dyn Write) -> Result<()> {
+    let provider = match preset {
+        "openrouter" => openrouter_preset(),
+        "pollinations" => pollinations_preset(),
+        _ => return Err(anyhow!("preset must be openrouter or pollinations")),
+    };
+    update_agent_config(cwd, |config| {
+        if config.providers.contains_key(id) {
+            return Err(anyhow!("provider `{id}` is already configured"));
+        }
+        config.providers.insert(id.to_owned(), provider);
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Added {preset} preset · {id}")?;
+    writeln!(writer, "  Add and explicitly select a model before use.")?;
+    Ok(())
+}
+
+fn openrouter_preset() -> ProviderConfig {
+    let mut provider = ProviderConfig::new(
+        "OpenRouter",
+        ProviderProtocol::OpenAiCompletions,
+        "https://openrouter.ai/api/v1",
+    );
+    provider.credential = Some(CredentialReference::Environment {
+        name: "OPENROUTER_API_KEY".to_owned(),
+    });
+    provider.headers.insert(
+        "HTTP-Referer".to_owned(),
+        ProviderHeader::Public {
+            value: "https://crumb.elixpo.com".to_owned(),
+        },
+    );
+    provider.headers.insert(
+        "X-OpenRouter-Title".to_owned(),
+        ProviderHeader::Public {
+            value: "Crumb".to_owned(),
+        },
+    );
+    provider
+}
+
+fn pollinations_preset() -> ProviderConfig {
+    let mut provider = ProviderConfig::new(
+        "Pollinations",
+        ProviderProtocol::OpenAiCompletions,
+        "https://gen.pollinations.ai/v1",
+    );
+    provider.credential = Some(CredentialReference::Environment {
+        name: "POLLINATIONS_API_KEY".to_owned(),
+    });
+    provider
+}
+
+fn set_provider_credential(
+    cwd: &Path,
+    provider_id: &str,
+    reference: Option<&str>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let reference = reference.map(parse_credential_reference).transpose()?;
+    let configured = reference.is_some();
+    update_agent_config(cwd, |config| {
+        config
+            .providers
+            .get_mut(provider_id)
+            .with_context(|| format!("provider `{provider_id}` is not configured"))?
+            .credential = reference;
+        Ok(())
+    })?;
+    writeln!(
+        writer,
+        "◆ Provider credential reference {} · {provider_id}",
+        if configured { "updated" } else { "cleared" }
+    )?;
+    Ok(())
+}
+
+fn set_provider_header(
+    cwd: &Path,
+    provider_id: &str,
+    name: &str,
+    reference: &str,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let header = parse_provider_header(reference)?;
+    update_agent_config(cwd, |config| {
+        config
+            .providers
+            .get_mut(provider_id)
+            .with_context(|| format!("provider `{provider_id}` is not configured"))?
+            .headers
+            .insert(name.to_owned(), header);
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Provider header updated · {provider_id}/{name}")?;
+    Ok(())
+}
+
+fn remove_provider_header(
+    cwd: &Path,
+    provider_id: &str,
+    name: &str,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    update_agent_config(cwd, |config| {
+        config
+            .providers
+            .get_mut(provider_id)
+            .with_context(|| format!("provider `{provider_id}` is not configured"))?
+            .headers
+            .remove(name)
+            .with_context(|| format!("header `{name}` is not configured"))?;
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Provider header removed · {provider_id}/{name}")?;
+    Ok(())
+}
+
+fn add_provider_model(
+    cwd: &Path,
+    provider_id: &str,
+    model_id: &str,
+    context_window: Option<u64>,
+    max_output_tokens: Option<u64>,
+    tool_calling: bool,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    update_agent_config(cwd, |config| {
+        let provider = config
+            .providers
+            .get_mut(provider_id)
+            .with_context(|| format!("provider `{provider_id}` is not configured"))?;
+        if provider.models.iter().any(|model| model.id == model_id) {
+            return Err(anyhow!(
+                "model `{model_id}` is already configured for provider `{provider_id}`"
+            ));
+        }
+        let mut model = ProviderModel::new(model_id);
+        model.input.insert(Modality::Text);
+        model.context_window = context_window;
+        model.max_output_tokens = max_output_tokens;
+        model.tool_calling = tool_calling;
+        provider.models.push(model);
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Added model · {provider_id}/{model_id}")?;
+    Ok(())
+}
+
+fn remove_provider_model(
+    cwd: &Path,
+    provider_id: &str,
+    model_id: &str,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    update_agent_config(cwd, |config| {
+        if config
+            .models
+            .values()
+            .flatten()
+            .any(|route| route.provider == provider_id && route.model == model_id)
+        {
+            return Err(anyhow!(
+                "model `{provider_id}/{model_id}` is selected; choose another model first"
+            ));
+        }
+        let provider = config
+            .providers
+            .get_mut(provider_id)
+            .with_context(|| format!("provider `{provider_id}` is not configured"))?;
+        let count = provider.models.len();
+        provider.models.retain(|model| model.id != model_id);
+        if count == provider.models.len() {
+            return Err(anyhow!(
+                "model `{model_id}` is not configured for provider `{provider_id}`"
+            ));
+        }
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Removed model · {provider_id}/{model_id}")?;
+    Ok(())
+}
+
+fn parse_positive_u64(value: &str, label: &str) -> Result<u64> {
+    let parsed = value
+        .parse::<u64>()
+        .with_context(|| format!("{label} must be a positive integer"))?;
+    if parsed == 0 {
+        return Err(anyhow!("{label} must be a positive integer"));
+    }
+    Ok(parsed)
+}
+
+fn parse_tool_capability(value: &str) -> Result<bool> {
+    match value {
+        "tools" => Ok(true),
+        "no-tools" => Ok(false),
+        _ => Err(anyhow!("tool capability must be tools or no-tools")),
+    }
+}
+
+fn parse_provider_protocol(value: &str) -> Result<ProviderProtocol> {
+    match value {
+        "openai" | "open_ai_completions" => Ok(ProviderProtocol::OpenAiCompletions),
+        "responses" | "open_ai_responses" => Ok(ProviderProtocol::OpenAiResponses),
+        "anthropic" | "anthropic_messages" => Ok(ProviderProtocol::AnthropicMessages),
+        _ => Err(anyhow!("protocol must be openai, responses, or anthropic")),
+    }
+}
+
+fn parse_credential_reference(value: &str) -> Result<CredentialReference> {
+    if let Some(name) = value.strip_prefix("env:") {
+        return Ok(CredentialReference::Environment {
+            name: name.to_owned(),
+        });
+    }
+    if let Some(reference) = value.strip_prefix("keyring:") {
+        let (service, account) = reference
+            .split_once('/')
+            .filter(|(service, account)| !service.is_empty() && !account.is_empty())
+            .context("keyring references use keyring:SERVICE/ACCOUNT")?;
+        return Ok(CredentialReference::Keyring {
+            service: service.to_owned(),
+            account: account.to_owned(),
+        });
+    }
+    Err(anyhow!(
+        "credentials must be references: env:NAME or keyring:SERVICE/ACCOUNT"
+    ))
+}
+
+fn parse_provider_header(value: &str) -> Result<ProviderHeader> {
+    if let Some(name) = value.strip_prefix("env:") {
+        return Ok(ProviderHeader::Environment {
+            name: name.to_owned(),
+        });
+    }
+    if let Some(value) = value.strip_prefix("public:") {
+        return Ok(ProviderHeader::Public {
+            value: value.to_owned(),
+        });
+    }
+    Err(anyhow!(
+        "headers must use env:NAME or public:VALUE; raw secret values are rejected"
+    ))
+}
+
+fn raw_agent_config(cwd: &Path) -> LiveConfig {
+    let (path, _) = agent_config_location(cwd);
+    LiveConfig::new(path)
+}
+
+fn update_agent_config<F>(cwd: &Path, mutate: F) -> Result<AgentConfig>
+where
+    F: FnOnce(&mut AgentConfig) -> Result<()>,
+{
+    raw_agent_config(cwd).update(mutate)
 }
 
 fn show_jobs(
@@ -2249,9 +2736,38 @@ impl Drop for RawModeGuard {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crumb_agent::{AgentConfig, RiskClass};
+    use crumb_agent::{
+        AgentConfig, CredentialReference, ProviderHeader, ProviderProtocol, RiskClass,
+    };
 
-    use super::{agent_config_location, suggestion_width, workspace_read_host};
+    use super::{
+        agent_config_location, openrouter_preset, parse_credential_reference,
+        parse_provider_header, suggestion_width, workspace_read_host,
+    };
+
+    #[test]
+    fn openrouter_preset_contains_only_public_metadata_and_secret_references() {
+        let provider = openrouter_preset();
+        assert_eq!(provider.protocol, ProviderProtocol::OpenAiCompletions);
+        assert_eq!(provider.base_url, "https://openrouter.ai/api/v1");
+        assert!(matches!(
+            provider.credential,
+            Some(CredentialReference::Environment { ref name }) if name == "OPENROUTER_API_KEY"
+        ));
+        assert!(matches!(
+            provider.headers.get("HTTP-Referer"),
+            Some(ProviderHeader::Public { .. })
+        ));
+        assert!(provider.models.is_empty());
+    }
+
+    #[test]
+    fn terminal_provider_values_require_typed_references() {
+        assert!(parse_credential_reference("raw-secret").is_err());
+        assert!(parse_provider_header("Bearer raw-secret").is_err());
+        assert!(parse_credential_reference("env:CUSTOM_API_KEY").is_ok());
+        assert!(parse_provider_header("public:Crumb").is_ok());
+    }
 
     #[test]
     fn stdio_mcp_host_exposes_rust_owned_tool_risk() {

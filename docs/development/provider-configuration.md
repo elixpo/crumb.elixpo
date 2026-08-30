@@ -1,0 +1,91 @@
+# Terminal-configurable providers
+
+Crumb treats OpenRouter as a preset, not a special runtime path. Every custom
+provider uses the same non-secret schema in `.crumb/agent.json`; terminal
+commands will validate and atomically update that schema.
+
+```json
+{
+  "providers": {
+    "my_gateway": {
+      "display_name": "My Gateway",
+      "protocol": "open_ai_completions",
+      "base_url": "https://models.example.com/v1",
+      "credential": {
+        "source": "environment",
+        "name": "MY_GATEWAY_API_KEY"
+      },
+      "headers": {
+        "HTTP-Referer": {
+          "source": "public",
+          "value": "https://crumb.elixpo.com"
+        }
+      },
+      "models": [
+        {
+          "id": "coding-model",
+          "input": ["text", "image"],
+          "tool_calling": true,
+          "context_window": 131072,
+          "max_output_tokens": 8192,
+          "reasoning_efforts": {
+            "off": null,
+            "low": "low",
+            "high": "high"
+          }
+        }
+      ]
+    }
+  },
+  "models": {
+    "text": [
+      {
+        "provider": "my_gateway",
+        "model": "coding-model",
+        "effort": "high"
+      }
+    ]
+  }
+}
+```
+
+The schema also carries provider and model compatibility switches, default
+modalities and token limits, reasoning budgets, cache retention, SSE/WebSocket
+transport, timeouts, bounded image payloads, retries, pricing metadata, and an
+optimizer selection. Sensitive headers must reference environment variables.
+Credentialed remote endpoints require HTTPS; loopback development may use
+HTTP.
+
+Provider IDs and exact models are selected explicitly. When a selected route
+names a configured provider, Crumb validates the model and effort locally
+before any Harness process or network request starts.
+
+## Terminal mutation surface
+
+The live terminal mutation surface includes:
+
+- `/config provider add|show|remove`
+- `/config provider preset <openrouter|pollinations> [provider-id]`
+- `/config provider credential set|clear`
+- `/config provider header set|remove`
+- `/config provider model add|remove`
+- `/model use <provider>/<model>`
+- `/effort use <level|default>`
+- `/mode use <auto|negotiate|plan>`
+
+Provider creation accepts only `env:NAME` or `keyring:SERVICE/ACCOUNT`
+credential references. Raw secrets are never accepted as command arguments,
+history, JSON, sessions, or diagnostics. Every mutation validates the complete
+configuration and atomically replaces the workspace file; a rejected mutation
+leaves the previous file intact.
+
+The OpenRouter preset uses its OpenAI-compatible
+`https://openrouter.ai/api/v1` endpoint, an `OPENROUTER_API_KEY` environment
+reference, and public Crumb attribution headers. The Pollinations preset uses
+`https://gen.pollinations.ai/v1` and a `POLLINATIONS_API_KEY` environment
+reference. Presets intentionally contain no models: users add an exact model
+and select it explicitly.
+
+Compatibility, transport, retry, pricing, optimizer, reasoning-budget, and
+modality mutation commands remain in the next slice. These fields can already
+be represented and validated by the provider-neutral schema.

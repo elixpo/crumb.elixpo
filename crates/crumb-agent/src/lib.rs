@@ -17,8 +17,10 @@ pub mod tools;
 pub use approvals::{ApprovalInbox, InteractiveApprovalBroker, PendingApproval, approval_channel};
 pub use backend::{BackendDiscovery, CodingBackend};
 pub use config::{
-    AgentConfig, AgentLimits, AgentMode, HarnessConfig, LiveConfig, MistakePolicy, Modality,
-    ModelRoute, OptimizerConfig, StructuredEncoding, ToolPermissions,
+    AgentConfig, AgentLimits, AgentMode, CacheRetention, CompatibilityFlag, CredentialReference,
+    HarnessConfig, LiveConfig, MistakePolicy, Modality, ModelRoute, OptimizerConfig,
+    ProviderCompatibility, ProviderConfig, ProviderHeader, ProviderModel, ProviderProtocol,
+    ProviderRetryPolicy, ProviderTransport, StructuredEncoding, ToolPermissions,
 };
 pub use harness::{HarnessTurnRequest, ModelCapabilities};
 pub use jobs::{
