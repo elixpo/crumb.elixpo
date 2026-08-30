@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 crumb-agent = { path = "../crumb-agent" }
 crumb-auth = { path = "../crumb-auth" }
 crumb-core = { path = "../crumb-core" }

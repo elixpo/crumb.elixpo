@@ -288,11 +288,21 @@ impl Renderer {
     #[must_use]
     pub fn composer_hotkeys(&self, terminal_width: u16) -> String {
         let guide = if terminal_width < 80 {
-            "Enter send · Tab complete · / commands · Ctrl+C cancel"
+            "Enter send · Tab complete · / commands · ? help"
         } else {
-            "Enter send/steer · Ctrl+Enter queue · Tab complete · @ context · / commands · Ctrl+C cancel"
+            "Enter send/steer · Ctrl+Enter queue · Tab complete · @ context · / commands · ? help · Ctrl+C cancel"
         };
         self.paint(&format!("  {guide}"), "2")
+    }
+
+    /// Renders the persistent state row immediately below the composer.
+    #[must_use]
+    pub fn composer_idle_status(&self) -> String {
+        format!(
+            "  {} {}",
+            self.paint("●", "36"),
+            self.paint("Ready · / commands · ? help", "2")
+        )
     }
 
     /// Renders the bottom edge of the full-width composer.
@@ -334,6 +344,18 @@ impl Renderer {
     /// Renders a submitted line as part of the scrolling transcript.
     #[must_use]
     pub fn transcript_input(&self, username: &str, input: &str) -> String {
+        self.transcript_input_at(username, input, None, 0)
+    }
+
+    /// Renders a submitted line with an optional right-aligned local timestamp.
+    #[must_use]
+    pub fn transcript_input_at(
+        &self,
+        username: &str,
+        input: &str,
+        timestamp: Option<&str>,
+        terminal_width: u16,
+    ) -> String {
         if self.settings.output == OutputMode::ScreenReader {
             return format!("{username}: {input}");
         }
@@ -344,8 +366,19 @@ impl Renderer {
             .map(|line| format!("\n{} {line}", self.paint("    │", "36")))
             .collect::<String>();
         body.push_str(&continuation);
+        let header = format!("╭─❯ {username}");
+        let timestamp = timestamp.unwrap_or_default();
+        let padding = usize::from(terminal_width)
+            .saturating_sub(header.chars().count())
+            .saturating_sub(timestamp.chars().count())
+            .saturating_sub(1);
+        let timestamp = if timestamp.is_empty() {
+            String::new()
+        } else {
+            format!("{}{}", " ".repeat(padding), self.paint(timestamp, "2"))
+        };
         format!(
-            "{} {}\n{body}",
+            "{} {}{timestamp}\n{body}",
             self.paint("╭─❯", "36;1"),
             self.paint(username, "1")
         )
@@ -471,6 +504,18 @@ impl Renderer {
             label,
             self.settings.output == OutputMode::Rich && self.settings.motion == MotionMode::Full,
             self.settings.color,
+            None,
+        )
+    }
+
+    /// Starts an activity animation pinned to a zero-based terminal row.
+    #[must_use]
+    pub fn activity_at(&self, label: &str, row: u16) -> ActivityIndicator {
+        ActivityIndicator::start(
+            label,
+            self.settings.output == OutputMode::Rich && self.settings.motion == MotionMode::Full,
+            self.settings.color,
+            Some(row),
         )
     }
 
@@ -685,15 +730,16 @@ pub struct ActivityIndicator {
     started: Instant,
     visible: bool,
     color: bool,
+    row: Option<u16>,
 }
 
 impl ActivityIndicator {
-    fn start(label: &str, animated: bool, color: bool) -> Self {
+    fn start(label: &str, animated: bool, color: bool, row: Option<u16>) -> Self {
         let running = Arc::new(AtomicBool::new(animated));
         let thread = animated.then(|| {
             let running = Arc::clone(&running);
             let label = label.to_owned();
-            thread::spawn(move || animate_activity(&label, color, &running))
+            thread::spawn(move || animate_activity(&label, color, &running, row))
         });
         Self {
             running,
@@ -701,6 +747,7 @@ impl ActivityIndicator {
             started: Instant::now(),
             visible: animated,
             color,
+            row,
         }
     }
 
@@ -712,7 +759,7 @@ impl ActivityIndicator {
     /// Stops the animation and leaves one compact completion crumb.
     pub fn complete(mut self) {
         self.stop();
-        if self.visible {
+        if self.visible && self.row.is_none() {
             let elapsed = self.started.elapsed().as_secs_f32();
             let summary = if self.color {
                 format!("\x1b[90m. Worked for {elapsed:.1}s\x1b[0m")
@@ -728,7 +775,7 @@ impl ActivityIndicator {
         self.running.store(false, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
-            clear_activity_line();
+            clear_activity_line(self.row);
         }
     }
 }
@@ -739,29 +786,38 @@ impl Drop for ActivityIndicator {
     }
 }
 
-fn animate_activity(label: &str, color: bool, running: &AtomicBool) {
+fn animate_activity(label: &str, color: bool, running: &AtomicBool, row: Option<u16>) {
     let mut frame = 0_usize;
     while running.load(Ordering::Acquire) {
         let cookie = COOKIE_SPINNER[frame];
-        if color {
-            let _ = write!(
-                io::stderr(),
-                "\r\x1b[2K\x1b[35;1m{cookie}\x1b[0m \x1b[90m{label} · type to steer · Ctrl+C to cancel\x1b[0m"
-            );
+        let line = if color {
+            format!(
+                "\x1b[35;1m{cookie}\x1b[0m \x1b[90m{label} · type to steer · Ctrl+C to cancel\x1b[0m"
+            )
         } else {
-            let _ = write!(
-                io::stderr(),
-                "\r\x1b[2K{cookie} {label} · type to steer · Ctrl+C to cancel"
-            );
-        }
+            format!("{cookie} {label} · type to steer · Ctrl+C to cancel")
+        };
+        write_activity_line(&line, row);
         let _ = io::stderr().flush();
         frame = (frame + 1) % COOKIE_SPINNER.len();
         thread::sleep(Duration::from_millis(140));
     }
 }
 
-fn clear_activity_line() {
-    let _ = write!(io::stderr(), "\r\x1b[2K");
+fn write_activity_line(line: &str, row: Option<u16>) {
+    if let Some(row) = row {
+        let _ = write!(
+            io::stderr(),
+            "\x1b7\x1b[{};1H\x1b[2K  {line}\x1b8",
+            row.saturating_add(1)
+        );
+    } else {
+        let _ = write!(io::stderr(), "\r\x1b[2K{line}");
+    }
+}
+
+fn clear_activity_line(row: Option<u16>) {
+    write_activity_line("", row);
     let _ = io::stderr().flush();
 }
 

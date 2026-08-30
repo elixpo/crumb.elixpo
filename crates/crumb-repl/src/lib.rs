@@ -260,7 +260,7 @@ pub fn classify_input(input: &str) -> InputEvent {
         "/connectors" => InputEvent::BuiltIn(BuiltInCommand::Connectors),
         "/context" => InputEvent::BuiltIn(BuiltInCommand::Context),
         "/exit" => InputEvent::BuiltIn(BuiltInCommand::Exit),
-        "/help" => InputEvent::BuiltIn(BuiltInCommand::Help),
+        "/help" | "?" => InputEvent::BuiltIn(BuiltInCommand::Help),
         "/history" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Recent)),
         "/history search" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
             String::new(),
@@ -449,6 +449,10 @@ mod tests {
         assert_eq!(
             classify_input("/skills"),
             InputEvent::BuiltIn(BuiltInCommand::Skills)
+        );
+        assert_eq!(
+            classify_input("?"),
+            InputEvent::BuiltIn(BuiltInCommand::Help)
         );
         assert_eq!(
             classify_input("/mode auto"),
