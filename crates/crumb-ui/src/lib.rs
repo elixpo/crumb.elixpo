@@ -16,9 +16,8 @@ const WORDMARK: &str = r"   _____ ____  _   _ __  __ ____
  | |    | |_) | | | | |\/| | |_) |
  | |____|  _ <| |_| | |  | |  _ <
   \_____|_| \_\ \___/|_|  |_|_| \_\";
-const PANDA_LARGE: &str = include_str!("../assets/panda-large.txt");
-const PANDA_MEDIUM: &str = include_str!("../assets/panda-medium.txt");
-const PANDA_SMALL: &str = include_str!("../assets/panda-small.txt");
+const PANDA_AWAKE: &str = include_str!("../assets/panda-awake.txt");
+const PANDA_COOL: &str = include_str!("../assets/panda-cool.txt");
 const COOKIE_SPINNER: [&str; 4] = ["(.:)", "(:.)", "(o.)", "(.o)"];
 
 const PUNCHLINES: &[&str] = &[
@@ -75,6 +74,12 @@ pub enum OutputMode {
 pub enum MotionMode {
     Full,
     Reduced,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PandaMood {
+    Awake,
+    Cool,
 }
 
 /// Presentation settings resolved once during startup.
@@ -200,11 +205,7 @@ impl Renderer {
     /// Renders the application-style ready screen used in full-screen mode.
     #[must_use]
     pub fn welcome(&self, context: &StartupContext<'_>, terminal_width: u16) -> String {
-        let panda = if terminal_width >= 92 {
-            PANDA_MEDIUM
-        } else {
-            PANDA_SMALL
-        };
+        let panda = panda_art(panda_mood(Some(context.agent_configured)));
         let model = context.model.unwrap_or("model not configured");
         let state = if context.agent_configured {
             format!("Ready · {model} · {}", context.mode)
@@ -215,6 +216,13 @@ impl Renderer {
             "Crumb CLI v{} uses AI.\nNative commands stay native. Review AI actions.\n\n{}\n\nTip: type naturally · : forces AI · / opens actions",
             context.version, state
         );
+        if terminal_width < 64 {
+            return format!(
+                "{}\n\n{}",
+                self.paint_panda(trim_art(panda)),
+                self.paint(&copy, "2")
+            );
+        }
         compose_welcome(*self, trim_art(panda), &copy)
     }
 
@@ -356,13 +364,7 @@ impl Renderer {
     }
 
     fn brand_art(self, terminal_width: u16) -> String {
-        let panda = if terminal_width >= 240 {
-            PANDA_LARGE
-        } else if terminal_width >= 88 {
-            PANDA_MEDIUM
-        } else {
-            PANDA_SMALL
-        };
+        let panda = panda_art(panda_mood(None));
         if terminal_width < 72 {
             return format!(
                 "{}\n{}",
@@ -376,20 +378,50 @@ impl Renderer {
     fn paint_panda(self, panda: &str) -> String {
         panda
             .lines()
-            .map(|line| {
-                let parts = line.split('*').collect::<Vec<_>>();
-                let mut painted = String::new();
-                for (index, part) in parts.iter().enumerate() {
-                    painted.push_str(&self.paint(part, "37;1"));
-                    if index + 1 < parts.len() {
-                        painted.push_str(&self.paint("*", "38;5;203;1"));
-                    }
-                }
-                painted
-            })
+            .map(|line| paint_panda_line(self, line))
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+fn panda_mood(agent_configured: Option<bool>) -> PandaMood {
+    match env::var("CRUMB_MOOD").as_deref() {
+        Ok("awake") => PandaMood::Awake,
+        Ok("cool") => PandaMood::Cool,
+        _ if agent_configured == Some(true) => PandaMood::Cool,
+        _ => PandaMood::Awake,
+    }
+}
+
+const fn panda_art(mood: PandaMood) -> &'static str {
+    match mood {
+        PandaMood::Awake => PANDA_AWAKE,
+        PandaMood::Cool => PANDA_COOL,
+    }
+}
+
+fn paint_panda_line(renderer: Renderer, line: &str) -> String {
+    let mut painted = String::new();
+    for character in line.chars() {
+        let color = match character {
+            '╭' | '╮' | '╯' | '╰' | '─' | '│' => "38;2;255;253;241",
+            '█' | '═' => "38;2;96;80;122",
+            '▛' | '▀' | '▜' => "38;2;151;119;188",
+            '▌' | '▐' => "38;2;119;93;154",
+            '▙' | '▄' | '▟' => "38;2;76;61;99",
+            '●' => "38;2;157;128;193;1",
+            '░' => "38;2;255;190;195",
+            '▒' => "38;2;255;125;139",
+            '▓' => "38;2;255;88;110",
+            '▆' | '▃' | '▂' => "38;2;255;154;171",
+            _ => {
+                painted.push(character);
+                continue;
+            }
+        };
+        painted.push_str(&renderer.paint(&character.to_string(), color));
+    }
+    painted
 }
 
 fn trim_art(art: &str) -> &str {
@@ -696,7 +728,8 @@ mod tests {
                 .any(|punchline| branding.contains(punchline))
         );
         assert!(narrow.contains("CRUMB"));
-        assert!(wide.lines().count() > narrow.lines().count());
+        assert!(narrow.contains("╭▄█▄╮"));
+        assert!(wide.contains("╭▄█▄╮"));
     }
 
     #[test]
@@ -747,6 +780,7 @@ mod tests {
         );
         assert!(welcome.contains("Crumb CLI v0.1.0 uses AI."));
         assert!(welcome.contains("Ready · pollinations/nova-fast · auto"));
+        assert!(welcome.contains("╭▄█▄╮"));
     }
 
     #[test]
