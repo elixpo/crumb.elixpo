@@ -65,6 +65,13 @@ pub struct AgentRuntime {
     supervisor: Option<HarnessSupervisor>,
     supervisor_limits: Option<SupervisorLimits>,
     environment_revision: u64,
+    review_notes: Vec<ReviewNote>,
+    review_note_bytes: usize,
+}
+
+struct ReviewNote {
+    checkpoint: String,
+    comment: String,
 }
 
 impl AgentRuntime {
@@ -91,7 +98,43 @@ impl AgentRuntime {
             supervisor: None,
             supervisor_limits: None,
             environment_revision: 1,
+            review_notes: Vec::new(),
+            review_note_bytes: 0,
         })
+    }
+
+    /// Queues bounded review feedback for the next agent turn only.
+    ///
+    /// The note remains process-local and is never written to a session journal
+    /// or checkpoint manifest by Crumb.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured message or byte ceiling is reached.
+    pub fn queue_review_note(
+        &mut self,
+        checkpoint: &str,
+        comment: &str,
+        max_messages: usize,
+        max_bytes: usize,
+    ) -> Result<()> {
+        let comment = comment.trim();
+        if comment.is_empty() {
+            bail!("review comment cannot be empty");
+        }
+        if self.review_notes.len() >= max_messages {
+            bail!("review comment queue is full");
+        }
+        let added = checkpoint.len().saturating_add(comment.len());
+        if self.review_note_bytes.saturating_add(added) > max_bytes {
+            bail!("review comments exceed the configured byte limit");
+        }
+        self.review_notes.push(ReviewNote {
+            checkpoint: checkpoint.to_owned(),
+            comment: comment.to_owned(),
+        });
+        self.review_note_bytes = self.review_note_bytes.saturating_add(added);
+        Ok(())
     }
 
     /// Selects a previous redacted session journal for the next agent turn.
@@ -139,7 +182,7 @@ impl AgentRuntime {
     ///
     /// Returns an error for a zero channel capacity or worker spawn failure.
     pub fn spawn_turn(
-        self,
+        mut self,
         request: String,
         config: AgentConfig,
         workspace: PathBuf,
@@ -148,6 +191,7 @@ impl AgentRuntime {
         if activity_capacity == 0 {
             bail!("agent activity channel capacity must be positive");
         }
+        let request = self.attach_review_notes(request);
         let (activity_sender, activities) = sync_channel(activity_capacity);
         let cancellation = CancellationToken::default();
         let worker_cancellation = cancellation.clone();
@@ -177,6 +221,24 @@ impl AgentRuntime {
             cancellation,
             worker,
         })
+    }
+
+    fn attach_review_notes(&mut self, request: String) -> String {
+        if self.review_notes.is_empty() {
+            return request;
+        }
+        let mut combined = String::from("Review feedback for this turn:\n");
+        for note in self.review_notes.drain(..) {
+            combined.push_str("- checkpoint ");
+            combined.push_str(&note.checkpoint);
+            combined.push_str(": ");
+            combined.push_str(&note.comment);
+            combined.push('\n');
+        }
+        self.review_note_bytes = 0;
+        combined.push_str("\nUser request:\n");
+        combined.push_str(&request);
+        combined
     }
 
     fn run_with_events_using(

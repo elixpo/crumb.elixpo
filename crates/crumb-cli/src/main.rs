@@ -963,7 +963,7 @@ fn show_reserved(
         "/config" => show_config_summary(cwd, writer)?,
         "/plugins" => show_plugins(cwd, writer)?,
         command if command == "/review" || command.starts_with("/review ") => {
-            show_reviews(command, cwd, writer)?;
+            show_reviews(command, cwd, runtime, writer)?;
         }
         command if command == "/session" || command.starts_with("/session ") => {
             show_sessions(command, cwd, runtime, writer)?;
@@ -976,13 +976,21 @@ fn show_reserved(
     Ok(())
 }
 
-fn show_reviews(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+fn show_reviews(
+    command: &str,
+    cwd: &Path,
+    runtime: &mut Option<AgentRuntime>,
+    writer: &mut dyn Write,
+) -> Result<()> {
     let config = read_agent_config(cwd)?;
     let max_file_bytes = usize::try_from(config.limits.max_file_write_bytes)
         .context("max_file_write_bytes exceeds this platform's address space")?;
     let max_output_bytes = usize::try_from(config.limits.max_output_bytes)
         .context("max_output_bytes exceeds this platform's address space")?;
     let store = CheckpointStore::new(cwd, max_file_bytes)?;
+    if let Some(comment) = command.strip_prefix("/review comment ") {
+        return queue_review_comment(comment, runtime, &store, &config, writer);
+    }
     let arguments = command.split_whitespace().skip(1).collect::<Vec<_>>();
     match arguments.as_slice() {
         [] | ["list"] => show_review_list(&store, writer)?,
@@ -991,9 +999,17 @@ fn show_reviews(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()>
             show_review_summary(&checkpoint, writer)?;
             writeln!(writer, "{}", store.render_diff(id, max_output_bytes)?)?;
         }
+        ["approve", "all"] => {
+            let decided = store.decide_pending(CheckpointDecision::Approve)?;
+            writeln!(writer, "◆ Approved {} pending checkpoints", decided.len())?;
+        }
         ["approve", id] => {
             let checkpoint = store.decide(id, CheckpointDecision::Approve)?;
             writeln!(writer, "◆ Approved checkpoint {}", checkpoint.id)?;
+        }
+        ["reject" | "rewind", "all"] => {
+            let decided = store.decide_pending(CheckpointDecision::Reject)?;
+            writeln!(writer, "◆ Rewound {} pending checkpoints", decided.len())?;
         }
         ["reject" | "rewind", id] => {
             let checkpoint = store.decide(id, CheckpointDecision::Reject)?;
@@ -1005,14 +1021,49 @@ fn show_reviews(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()>
             )?;
         }
         ["export", id] => {
-            serde_json::to_writer_pretty(&mut *writer, &store.load(id)?)?;
+            if *id == "all" {
+                serde_json::to_writer_pretty(&mut *writer, &store.list()?)?;
+            } else {
+                serde_json::to_writer_pretty(&mut *writer, &store.load(id)?)?;
+            }
             writeln!(writer)?;
         }
         _ => writeln!(
             writer,
-            "usage: /review [list | diff <id> | approve <id> | reject <id> | rewind <id> | export <id>]"
+            "usage: /review [list | diff <id> | approve <id|all> | reject <id|all> | comment <id> <feedback> | export <id|all>]"
         )?,
     }
+    Ok(())
+}
+
+fn queue_review_comment(
+    input: &str,
+    runtime: &mut Option<AgentRuntime>,
+    store: &CheckpointStore,
+    config: &AgentConfig,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let (id, comment) = input
+        .trim()
+        .split_once(char::is_whitespace)
+        .context("usage: /review comment <id> <feedback>")?;
+    let checkpoint = store.load(id)?;
+    let max_messages = usize::try_from(config.limits.max_steering_messages)
+        .context("max_steering_messages exceeds this platform's address space")?;
+    let max_bytes = usize::try_from(config.limits.max_steering_bytes)
+        .context("max_steering_bytes exceeds this platform's address space")?;
+    if runtime.is_none() {
+        *runtime = Some(AgentRuntime::new()?);
+    }
+    runtime
+        .as_mut()
+        .context("agent runtime is unavailable")?
+        .queue_review_note(&checkpoint.id, comment, max_messages, max_bytes)?;
+    writeln!(
+        writer,
+        "◆ Queued feedback for {} on the next agent turn",
+        checkpoint.id
+    )?;
     Ok(())
 }
 

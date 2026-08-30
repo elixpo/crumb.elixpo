@@ -132,6 +132,10 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "safely rewind a checkpoint",
     },
     SlashCommand {
+        usage: "/review comment ",
+        description: "attach feedback to the next agent turn",
+    },
+    SlashCommand {
         usage: "/review export ",
         description: "print checkpoint metadata as JSON",
     },
