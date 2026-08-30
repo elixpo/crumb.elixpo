@@ -334,19 +334,10 @@ fn run_managed_repl() -> Result<ReplOutcome> {
     let stdout = io::stdout();
     let interactive = stdin.is_terminal() && stdout.is_terminal();
     let renderer = Renderer::new(UiSettings::from_environment(interactive));
-    let _screen =
-        AlternateScreenGuard::enter(interactive && std::env::var_os("CRUMB_INLINE").is_none())?;
+    let fullscreen = interactive && std::env::var_os("CRUMB_INLINE").is_none();
+    let _screen = AlternateScreenGuard::enter(fullscreen)?;
     let platform = Platform::current();
-    let mut command_catalog = CommandCatalog::discover();
-    command_catalog.extend(
-        shell_for(platform)
-            .builtin_commands()
-            .iter()
-            .map(|command| (*command).to_owned()),
-    );
-    if matches!(platform, Platform::Windows) {
-        command_catalog.enable_powershell_commands();
-    }
+    let command_catalog = native_command_catalog(platform);
     let mut session: Option<ShellSession> = None;
     let mut agent_runtime: Option<AgentRuntime> = None;
     let mut last_exit_code = None;
@@ -356,33 +347,13 @@ fn run_managed_repl() -> Result<ReplOutcome> {
         .then(|| create_line_editor(history.as_ref(), completion_workspace.clone()))
         .transpose()?;
 
-    let startup_cwd = current_process_dir()?;
-    let startup_config = read_agent_config(&startup_cwd).unwrap_or_default();
-    let startup_model = startup_config
-        .models
-        .get(&Modality::Text)
-        .and_then(|routes| routes.first())
-        .map(|route| format!("{}/{}", route.provider, route.model));
-    let startup = StartupContext {
-        version: env!("CARGO_PKG_VERSION"),
+    render_startup(
+        renderer,
         platform,
-        model: startup_model.as_deref(),
-        mode: agent_mode_name(startup_config.mode),
-        agent_configured: startup_config.harness.is_some() && startup_model.is_some(),
-    };
-    let terminal_width = if interactive {
-        size().map_or(100, |(columns, _)| columns)
-    } else {
-        80
-    };
-    let branding = renderer.branding_for_width(terminal_width);
-    if !branding.is_empty() {
-        writeln!(
-            stdout.lock(),
-            "{branding}\n\n{}\n",
-            renderer.startup_status(&startup)
-        )?;
-    }
+        interactive,
+        fullscreen,
+        &mut stdout.lock(),
+    )?;
 
     loop {
         let cwd = session
@@ -391,6 +362,9 @@ fn run_managed_repl() -> Result<ReplOutcome> {
         let prompt = render_prompt(renderer, &cwd, platform, last_exit_code);
         let event = if let Some(editor) = line_editor.as_mut() {
             editor.workspace.set(&cwd);
+            if fullscreen {
+                position_composer()?;
+            }
             let right = prompt_model_status(&cwd);
             match editor.editor.read_line(&CrumbPrompt::new(prompt, right))? {
                 Signal::Success(command) => Some(crumb_repl::classify_input(&command)),
@@ -443,6 +417,61 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             }
         }
     }
+}
+
+fn native_command_catalog(platform: Platform) -> CommandCatalog {
+    let mut commands = CommandCatalog::discover();
+    commands.extend(
+        shell_for(platform)
+            .builtin_commands()
+            .iter()
+            .map(|command| (*command).to_owned()),
+    );
+    if matches!(platform, Platform::Windows) {
+        commands.enable_powershell_commands();
+    }
+    commands
+}
+
+fn render_startup(
+    renderer: Renderer,
+    platform: Platform,
+    interactive: bool,
+    fullscreen: bool,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let cwd = current_process_dir()?;
+    let config = read_agent_config(&cwd).unwrap_or_default();
+    let model = config
+        .models
+        .get(&Modality::Text)
+        .and_then(|routes| routes.first())
+        .map(|route| format!("{}/{}", route.provider, route.model));
+    let startup = StartupContext {
+        version: env!("CARGO_PKG_VERSION"),
+        platform,
+        model: model.as_deref(),
+        mode: agent_mode_name(config.mode),
+        agent_configured: config.harness.is_some() && model.is_some(),
+    };
+    let terminal_width = if interactive {
+        size().map_or(100, |(columns, _)| columns)
+    } else {
+        80
+    };
+    if fullscreen {
+        writeln!(writer, "{}", renderer.welcome(&startup, terminal_width))?;
+    } else {
+        let branding = renderer.branding_for_width(terminal_width);
+        if !branding.is_empty() {
+            writeln!(
+                writer,
+                "{branding}\n\n{}\n",
+                renderer.startup_status(&startup)
+            )?;
+        }
+    }
+    Ok(())
 }
 
 struct InputContext<'a> {
@@ -3276,6 +3305,15 @@ fn prompt_model_status(cwd: &Path) -> String {
             || "native".to_owned(),
             |route| format!("{} · {}", route.model, agent_mode_name(config.mode)),
         )
+}
+
+fn position_composer() -> io::Result<()> {
+    let (_, rows) = size()?;
+    crossterm::execute!(
+        io::stdout(),
+        MoveTo(0, rows.saturating_sub(3)),
+        Clear(ClearType::FromCursorDown)
+    )
 }
 
 fn show_history(

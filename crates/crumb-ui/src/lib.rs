@@ -197,6 +197,27 @@ impl Renderer {
         }
     }
 
+    /// Renders the application-style ready screen used in full-screen mode.
+    #[must_use]
+    pub fn welcome(&self, context: &StartupContext<'_>, terminal_width: u16) -> String {
+        let panda = if terminal_width >= 92 {
+            PANDA_MEDIUM
+        } else {
+            PANDA_SMALL
+        };
+        let model = context.model.unwrap_or("model not configured");
+        let state = if context.agent_configured {
+            format!("Ready · {model} · {}", context.mode)
+        } else {
+            "Native shell ready · run /auth login for AI".to_owned()
+        };
+        let copy = format!(
+            "Crumb CLI v{} uses AI.\nNative commands stay native. Review AI actions.\n\n{}\n\nTip: type naturally · : forces AI · / opens actions",
+            context.version, state
+        );
+        compose_welcome(*self, trim_art(panda), &copy)
+    }
+
     /// Renders a compact, non-blocking startup readiness summary.
     #[must_use]
     pub fn startup_status(&self, context: &StartupContext<'_>) -> String {
@@ -313,13 +334,17 @@ impl Renderer {
             return format!("{}\n> ", segments.join(" | "));
         }
 
-        let mut segments = vec![
-            self.paint("crumb", "36"),
-            self.paint(&cwd, "34"),
-            context.platform.to_string(),
-        ];
-        append_optional_segments(&mut segments, context);
-        format!("╭─[ {} ]\n╰─❯ ", segments.join(" ]─[ "))
+        let mut context_line = self.paint(&cwd, "34;1");
+        if let Some(git) = context.git {
+            let dirty = if git.dirty { " *" } else { "" };
+            context_line.push_str(&self.paint(&format!("  git:{}{dirty}", git.branch), "2"));
+        }
+        if let Some(exit_code) = context.last_exit_code
+            && exit_code != 0
+        {
+            context_line.push_str(&self.paint(&format!("  exit:{exit_code}"), "31"));
+        }
+        format!("{context_line}\n{} ", self.paint("❯", "36;1"))
     }
 
     fn paint(self, text: &str, color: &str) -> String {
@@ -399,6 +424,29 @@ fn compose_styled_art(renderer: Renderer, left: &str, right: &str, gap: usize) -
                 renderer.paint(&format!("{left_line:<left_width$}"), "36"),
                 " ".repeat(gap),
                 renderer.paint_panda(right_line)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn compose_welcome(renderer: Renderer, panda: &str, copy: &str) -> String {
+    let panda = panda.lines().collect::<Vec<_>>();
+    let copy = copy.lines().collect::<Vec<_>>();
+    let height = panda.len().max(copy.len());
+    let panda_width = panda
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    (0..height)
+        .map(|row| {
+            let panda_line = panda.get(row).copied().unwrap_or("");
+            let copy_line = copy.get(row).copied().unwrap_or("");
+            format!(
+                "{}   {}",
+                renderer.paint_panda(&format!("{panda_line:<panda_width$}")),
+                renderer.paint(copy_line, if row == 0 { "1" } else { "2" })
             )
         })
         .collect::<Vec<_>>()
@@ -624,7 +672,7 @@ mod tests {
             last_exit_code: Some(0),
         });
 
-        assert_eq!(prompt, "╭─[ crumb ]─[ /workspace ]─[ macos ]\n╰─❯ ");
+        assert_eq!(prompt, "/workspace\n❯ ");
         assert!(!prompt.contains("exit:"));
     }
 
@@ -687,6 +735,18 @@ mod tests {
             status,
             " SESSION   crumb 0.1.0 · linux\n●  agent ready · pollinations/nova-fast · auto"
         );
+        let welcome = renderer.welcome(
+            &StartupContext {
+                version: "0.1.0",
+                platform: Platform::Linux,
+                model: Some("pollinations/nova-fast"),
+                mode: "auto",
+                agent_configured: true,
+            },
+            120,
+        );
+        assert!(welcome.contains("Crumb CLI v0.1.0 uses AI."));
+        assert!(welcome.contains("Ready · pollinations/nova-fast · auto"));
     }
 
     #[test]
