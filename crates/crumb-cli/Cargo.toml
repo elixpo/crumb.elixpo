@@ -15,6 +15,7 @@ crumb-agent = { path = "../crumb-agent" }
 crumb-auth = { path = "../crumb-auth" }
 crumb-core = { path = "../crumb-core" }
 crumb-history = { path = "../crumb-history" }
+crumb-marketplace = { path = "../crumb-marketplace" }
 crumb-harness-cli = { path = "../crumb-harness-cli" }
 crumb-harness-dsh = { path = "../crumb-harness-dsh" }
 crumb-mcp = { path = "../crumb-mcp" }
@@ -28,6 +29,7 @@ crumb-tools = { path = "../crumb-tools" }
 crumb-ui = { path = "../crumb-ui" }
 crossterm.workspace = true
 ctrlc.workspace = true
+directories.workspace = true
 nu-ansi-term.workspace = true
 reedline.workspace = true
 reqwest.workspace = true

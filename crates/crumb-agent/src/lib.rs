@@ -20,7 +20,7 @@ pub use config::{
     AgentConfig, AgentLimits, AgentMode, CacheRetention, CompatibilityFlag, CredentialReference,
     HarnessConfig, LiveConfig, MistakePolicy, Modality, ModelRoute, OptimizerConfig,
     ProviderCompatibility, ProviderConfig, ProviderHeader, ProviderModel, ProviderProtocol,
-    ProviderRetryPolicy, ProviderTransport, StructuredEncoding, ToolPermissions,
+    ProviderRetryPolicy, ProviderTransport, SkillConfig, StructuredEncoding, ToolPermissions,
 };
 pub use harness::{HarnessTurnRequest, ModelCapabilities};
 pub use jobs::{

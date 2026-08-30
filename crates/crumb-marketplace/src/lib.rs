@@ -265,6 +265,7 @@ impl Installer {
             .join(package.id.replace('/', "--"))
             .join(&package.version);
         if package_root.exists() {
+            verify_installed(package, &package_root)?;
             return Ok(InstalledPackage {
                 root: package_root,
                 package: package.clone(),
@@ -307,6 +308,36 @@ impl Installer {
             package: package.clone(),
         })
     }
+}
+
+fn verify_installed(package: &Package, root: &Path) -> Result<()> {
+    let mut total_bytes = 0_usize;
+    for artifact in &package.artifacts {
+        let path = root.join(&artifact.path);
+        let metadata = fs::symlink_metadata(&path).with_context(|| {
+            format!(
+                "installed artifact `{}` is unavailable",
+                artifact.path.display()
+            )
+        })?;
+        if !metadata.file_type().is_file() || metadata.len() > MAX_ARTIFACT_BYTES as u64 {
+            bail!(
+                "installed artifact `{}` is not a bounded file",
+                artifact.path.display()
+            );
+        }
+        let bytes = fs::read(path)?;
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        if total_bytes > MAX_PACKAGE_BYTES
+            || !format!("{:x}", Sha256::digest(&bytes)).eq_ignore_ascii_case(&artifact.sha256)
+        {
+            bail!(
+                "installed package `{}` failed integrity verification",
+                package.id
+            );
+        }
+    }
+    Ok(())
 }
 
 fn bundled_artifact(package_id: &str, path: &Path) -> Option<&'static [u8]> {

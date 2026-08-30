@@ -24,16 +24,18 @@ use crossterm::terminal::{
 use crumb_agent::{
     AgentConfig, AgentMode, BackendDiscovery, CacheRetention, CancellationToken, CommandCatalog,
     CompatibilityFlag, ConfiguredApprovals, CredentialReference, HarnessConfig, InputRoute, JobId,
-    JobSchedule, JobState, JobStore, LiveConfig, MistakePolicy, Modality, ModelRoute, NewJob,
-    OutputKind, ProviderCompatibility, ProviderConfig, ProviderHeader, ProviderModel,
-    ProviderProtocol, ProviderTransport, RouteDecision, RouteReason, SteeringAction, SteeringQueue,
-    TokenOptimizer, ToolHost, TurnStatus, UnknownInputPolicy, export_session, list_sessions,
-    search_sessions, session_summary, set_session_archived, set_session_label, trash_session,
+    JobSchedule, JobState, JobStore, LiveConfig, McpServer, MistakePolicy, Modality, ModelRoute,
+    NewJob, OutputKind, ProviderCompatibility, ProviderConfig, ProviderHeader, ProviderModel,
+    ProviderProtocol, ProviderTransport, RouteDecision, RouteReason, SkillConfig, SteeringAction,
+    SteeringQueue, TokenOptimizer, ToolHost, TurnStatus, UnknownInputPolicy, export_session,
+    list_sessions, search_sessions, session_summary, set_session_archived, set_session_label,
+    trash_session,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
 use crumb_harness_dsh::HarnessActivity;
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
+use crumb_marketplace::{InstallScope, Installer, Package, bundled_catalog};
 use crumb_mcp::{McpDispatcher, serve_stdio};
 use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::shell_for;
@@ -47,6 +49,7 @@ use crumb_tools::{
     WorkspaceWriteLimits, register_workspace_read_tools, register_workspace_write_tool,
 };
 use crumb_ui::{GitSegment, PromptContext, Renderer, StartupContext, UiSettings};
+use directories::BaseDirs;
 use nu_ansi_term::{Color, Style};
 use reedline::{
     Completer, DefaultHinter, EditCommand, Editor, Emacs, FileBackedHistory, Hinter, History,
@@ -1956,6 +1959,7 @@ fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
                 "/detach",
                 "/skills",
                 "/plugins",
+                "/marketplace",
                 "/tools",
                 "/permissions",
                 "/memory",
@@ -2081,6 +2085,9 @@ fn show_reserved(
         }
         "/doctor" => show_doctor(cwd, writer)?,
         "/plugins" => show_plugins(cwd, writer)?,
+        command if command == "/marketplace" || command.starts_with("/marketplace ") => {
+            show_marketplace(command, cwd, writer)?;
+        }
         command if command == "/review" || command.starts_with("/review ") => {
             show_reviews(command, cwd, runtime, writer)?;
         }
@@ -3758,6 +3765,217 @@ fn show_plugins(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     Ok(())
 }
 
+fn show_marketplace(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let catalog = bundled_catalog()?;
+    if command == "/marketplace" {
+        let config = read_agent_config(cwd)?;
+        writeln!(writer, "◆ Crumb public marketplace · offline catalog")?;
+        for package in &catalog.packages {
+            let installed = package
+                .skills
+                .iter()
+                .any(|entry| config.skills.iter().any(|skill| skill.id == entry.id))
+                || package.mcp_servers.iter().any(|entry| {
+                    config
+                        .mcp_servers
+                        .iter()
+                        .any(|server| server.id == entry.id)
+                });
+            writeln!(
+                writer,
+                "  {} {:<28} {:<7} {}",
+                if installed { "●" } else { "○" },
+                package.id,
+                package_kind_name(package),
+                package.description
+            )?;
+        }
+        writeln!(
+            writer,
+            "  `/marketplace inspect <publisher/name>` · `/marketplace install <publisher/name> [--scope project|user]`"
+        )?;
+        writeln!(
+            writer,
+            "  Installation verifies files; enabling capabilities is separate."
+        )?;
+        return Ok(());
+    }
+    if let Some(id) = command.strip_prefix("/marketplace inspect ") {
+        let package = catalog
+            .package(id.trim())
+            .with_context(|| format!("marketplace package `{}` was not found", id.trim()))?;
+        return show_marketplace_package(package, writer);
+    }
+    if let Some(arguments) = command.strip_prefix("/marketplace install ") {
+        return install_marketplace_package(&catalog, arguments, cwd, writer);
+    }
+    Err(anyhow!(
+        "usage: /marketplace [inspect <publisher/name> | install <publisher/name> [--scope project|user]]"
+    ))
+}
+
+fn show_marketplace_package(package: &Package, writer: &mut dyn Write) -> Result<()> {
+    writeln!(writer, "◆ {} · {}", package.display_name, package.id)?;
+    writeln!(
+        writer,
+        "  version {} · {} · {}",
+        package.version,
+        package_kind_name(package),
+        package.license
+    )?;
+    writeln!(writer, "  {}", package.description)?;
+    writeln!(writer, "  source {}", package.source)?;
+    let capabilities = package
+        .capabilities
+        .iter()
+        .map(|capability| format!("{capability:?}").to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    writeln!(
+        writer,
+        "  capabilities {}",
+        if capabilities.is_empty() {
+            "none".to_owned()
+        } else {
+            capabilities.join(" · ")
+        }
+    )?;
+    writeln!(
+        writer,
+        "  {} skills · {} MCP servers · {} verified files",
+        package.skills.len(),
+        package.mcp_servers.len(),
+        package.artifacts.len()
+    )?;
+    Ok(())
+}
+
+fn install_marketplace_package(
+    catalog: &crumb_marketplace::Catalog,
+    arguments: &str,
+    cwd: &Path,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let parts = arguments.split_whitespace().collect::<Vec<_>>();
+    let (id, scope) = match parts.as_slice() {
+        [id] | [id, "--scope", "project"] => (*id, InstallScope::Project),
+        [id, "--scope", "user"] => (*id, InstallScope::User),
+        _ => {
+            return Err(anyhow!(
+                "usage: /marketplace install <publisher/name> [--scope project|user]"
+            ));
+        }
+    };
+    let package = catalog
+        .package(id)
+        .with_context(|| format!("marketplace package `{id}` was not found"))?;
+    let (_, project_root) = agent_config_location(cwd);
+    let destination = match scope {
+        InstallScope::Project => project_root.join(".crumb/marketplace/packages"),
+        InstallScope::User => BaseDirs::new()
+            .context("home directory is unavailable")?
+            .home_dir()
+            .join(".crumb/marketplace/packages"),
+    };
+    let installed = Installer::new(destination).install_bundled(package)?;
+    register_installed_package(&installed, scope, &project_root, cwd)?;
+    writeln!(
+        writer,
+        "◆ Installed {} {} · {} scope",
+        package_kind_name(package),
+        package.id,
+        install_scope_name(scope)
+    )?;
+    writeln!(
+        writer,
+        "  Verified {} files into {}",
+        package.artifacts.len(),
+        installed.root.display()
+    )?;
+    writeln!(
+        writer,
+        "  Components are installed but disabled; use `/skills load <id>` to enable a skill."
+    )?;
+    if !package.mcp_servers.is_empty() {
+        writeln!(
+            writer,
+            "  MCP servers remain disabled until a future explicit permission command."
+        )?;
+    }
+    Ok(())
+}
+
+fn register_installed_package(
+    installed: &crumb_marketplace::InstalledPackage,
+    scope: InstallScope,
+    project_root: &Path,
+    cwd: &Path,
+) -> Result<()> {
+    let skill_path = |path: &Path| {
+        let absolute = installed.root.join(path);
+        if scope == InstallScope::Project {
+            absolute
+                .strip_prefix(project_root)
+                .map_or(absolute.clone(), Path::to_path_buf)
+        } else {
+            absolute
+        }
+    };
+    let current_executable = std::env::current_exe().context("Crumb executable is unavailable")?;
+    update_agent_config(cwd, |config| {
+        for entry in &installed.package.skills {
+            let path = skill_path(&entry.path);
+            if let Some(skill) = config.skills.iter_mut().find(|skill| skill.id == entry.id) {
+                skill.path = path;
+            } else {
+                config.skills.push(SkillConfig {
+                    id: entry.id.clone(),
+                    path,
+                    enabled: false,
+                });
+            }
+        }
+        for entry in &installed.package.mcp_servers {
+            let command = if entry.command == "crumb" {
+                current_executable.clone()
+            } else {
+                PathBuf::from(&entry.command)
+            };
+            if let Some(server) = config
+                .mcp_servers
+                .iter_mut()
+                .find(|server| server.id == entry.id)
+            {
+                server.command = command;
+                server.arguments.clone_from(&entry.arguments);
+            } else {
+                config.mcp_servers.push(McpServer {
+                    id: entry.id.clone(),
+                    command,
+                    arguments: entry.arguments.clone(),
+                    enabled: false,
+                });
+            }
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+const fn package_kind_name(package: &Package) -> &'static str {
+    match package.kind {
+        crumb_marketplace::PackageKind::Skill => "skill",
+        crumb_marketplace::PackageKind::Mcp => "MCP",
+        crumb_marketplace::PackageKind::Bundle => "bundle",
+    }
+}
+
+const fn install_scope_name(scope: InstallScope) -> &'static str {
+    match scope {
+        InstallScope::Project => "project",
+        InstallScope::User => "user",
+    }
+}
+
 const fn modality_name(modality: Modality) -> &'static str {
     match modality {
         Modality::Text => "text",
@@ -4711,7 +4929,7 @@ mod tests {
         ExitGesture, SessionCommandContext, agent_config_location, effort_display_name,
         effort_wire_name, failed_command_recovery, initial_agent_activity, openrouter_preset,
         parse_credential_reference, parse_provider_header, parse_resume_session_argument,
-        suggestion_width, workspace_read_host,
+        read_agent_config, show_marketplace, suggestion_width, workspace_read_host,
     };
 
     #[test]
@@ -4869,6 +5087,35 @@ mod tests {
         assert_eq!(root, workspace);
         assert_eq!(path, root.join(".crumb/agent.json"));
         std::fs::remove_dir_all(root).expect("temporary workspace can be removed");
+    }
+
+    #[test]
+    fn marketplace_install_is_verified_scoped_and_disabled_by_default() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-marketplace-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace can be created");
+        let mut output = Vec::new();
+
+        show_marketplace(
+            "/marketplace install crumb/code-review --scope project",
+            &workspace,
+            &mut output,
+        )
+        .expect("bundled package should install");
+
+        let config = read_agent_config(&workspace).expect("agent config should load");
+        let skill = config
+            .skills
+            .iter()
+            .find(|skill| skill.id == "code-review")
+            .expect("installed skill should be registered");
+        assert!(!skill.enabled);
+        assert!(skill.path.ends_with("skills/code-review/SKILL.md"));
+        assert!(workspace.join(&skill.path).is_file());
+        std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
     }
 
     #[test]

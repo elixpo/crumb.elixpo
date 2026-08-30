@@ -208,6 +208,18 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "inspect installed plugins",
     },
     SlashCommand {
+        usage: "/marketplace",
+        description: "browse installable skills and MCPs",
+    },
+    SlashCommand {
+        usage: "/marketplace inspect ",
+        description: "inspect a marketplace package",
+    },
+    SlashCommand {
+        usage: "/marketplace install ",
+        description: "verify and install a package",
+    },
+    SlashCommand {
         usage: "/tools",
         description: "inspect available tools",
     },
