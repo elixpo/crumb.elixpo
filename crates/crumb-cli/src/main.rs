@@ -14,12 +14,13 @@ use crossterm::event::{
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crumb_agent::{
-    AgentConfig, AgentMode, BackendDiscovery, CancellationToken, CommandCatalog,
-    ConfiguredApprovals, CredentialReference, HarnessConfig, InputRoute, JobId, JobSchedule,
-    JobState, JobStore, LiveConfig, MistakePolicy, Modality, ModelRoute, NewJob, ProviderConfig,
-    ProviderHeader, ProviderModel, ProviderProtocol, RouteDecision, SteeringAction, SteeringQueue,
-    TokenOptimizer, ToolHost, TurnStatus, UnknownInputPolicy, export_session, list_sessions,
-    search_sessions, session_summary, set_session_archived, set_session_label, trash_session,
+    AgentConfig, AgentMode, BackendDiscovery, CacheRetention, CancellationToken, CommandCatalog,
+    CompatibilityFlag, ConfiguredApprovals, CredentialReference, HarnessConfig, InputRoute, JobId,
+    JobSchedule, JobState, JobStore, LiveConfig, MistakePolicy, Modality, ModelRoute, NewJob,
+    ProviderCompatibility, ProviderConfig, ProviderHeader, ProviderModel, ProviderProtocol,
+    ProviderTransport, RouteDecision, SteeringAction, SteeringQueue, TokenOptimizer, ToolHost,
+    TurnStatus, UnknownInputPolicy, export_session, list_sessions, search_sessions,
+    session_summary, set_session_archived, set_session_label, trash_session,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
@@ -1408,10 +1409,51 @@ fn configure_provider(command: &str, cwd: &Path, writer: &mut dyn Write) -> Resu
             set_provider_header(cwd, provider, name, reference, writer)
         }
         ["header", "remove", provider, name] => remove_provider_header(cwd, provider, name, writer),
-        ["model", "add", provider, model] => {
+        ["set", provider, field, value] => set_provider_field(cwd, provider, field, value, writer),
+        ["retry", provider, retries, base_delay, max_delay] => {
+            set_provider_retry(cwd, provider, retries, base_delay, max_delay, writer)
+        }
+        ["pricing", "set", provider, metric, value] => {
+            set_provider_pricing(cwd, provider, metric, Some(value), writer)
+        }
+        ["pricing", "remove", provider, metric] => {
+            set_provider_pricing(cwd, provider, metric, None, writer)
+        }
+        ["compatibility", "set", provider, flag, value] => {
+            set_provider_compatibility(cwd, provider, flag, value, writer)
+        }
+        ["compatibility-field", "set", provider, field, value] => {
+            set_provider_compatibility_field(cwd, provider, field, Some(value), writer)
+        }
+        ["compatibility-field", "clear", provider, field] => {
+            set_provider_compatibility_field(cwd, provider, field, None, writer)
+        }
+        ["modality", action, provider, modality] => {
+            set_provider_default_modality(cwd, provider, action, modality, writer)
+        }
+        ["thinking-budget", "set", provider, effort, tokens] => {
+            set_provider_thinking_budget(cwd, provider, effort, Some(tokens), writer)
+        }
+        ["thinking-budget", "remove", provider, effort] => {
+            set_provider_thinking_budget(cwd, provider, effort, None, writer)
+        }
+        ["model", model_arguments @ ..] => configure_provider_model(model_arguments, cwd, writer),
+        ["add", id, protocol, base_url] => add_provider(cwd, id, protocol, base_url, None, writer),
+        ["add", id, protocol, base_url, credential] => {
+            add_provider(cwd, id, protocol, base_url, Some(credential), writer)
+        }
+        _ => Err(anyhow!(
+            "usage: /config provider <list|show|add|remove|preset|set|retry|pricing|compatibility|credential|header|model ...>"
+        )),
+    }
+}
+
+fn configure_provider_model(arguments: &[&str], cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    match arguments {
+        ["add", provider, model] => {
             add_provider_model(cwd, provider, model, None, None, false, writer)
         }
-        ["model", "add", provider, model, context, output, tools] => add_provider_model(
+        ["add", provider, model, context, output, tools] => add_provider_model(
             cwd,
             provider,
             model,
@@ -1420,13 +1462,30 @@ fn configure_provider(command: &str, cwd: &Path, writer: &mut dyn Write) -> Resu
             parse_tool_capability(tools)?,
             writer,
         ),
-        ["model", "remove", provider, model] => remove_provider_model(cwd, provider, model, writer),
-        ["add", id, protocol, base_url] => add_provider(cwd, id, protocol, base_url, None, writer),
-        ["add", id, protocol, base_url, credential] => {
-            add_provider(cwd, id, protocol, base_url, Some(credential), writer)
+        ["remove", provider, model] => remove_provider_model(cwd, provider, model, writer),
+        ["set", provider, model, field, value] => {
+            set_provider_model_field(cwd, provider, model, field, value, writer)
+        }
+        ["modality", action, provider, model, modality] => {
+            set_provider_model_modality(cwd, provider, model, action, modality, writer)
+        }
+        ["effort", "set", provider, model, effort, wire] => {
+            set_provider_model_effort(cwd, provider, model, effort, Some(wire), writer)
+        }
+        ["effort", "remove", provider, model, effort] => {
+            set_provider_model_effort(cwd, provider, model, effort, None, writer)
+        }
+        ["compatibility", "set", provider, model, flag, value] => {
+            set_provider_model_compatibility(cwd, provider, model, flag, value, writer)
+        }
+        ["compatibility-field", "set", provider, model, field, value] => {
+            set_provider_model_compatibility_field(cwd, provider, model, field, Some(value), writer)
+        }
+        ["compatibility-field", "clear", provider, model, field] => {
+            set_provider_model_compatibility_field(cwd, provider, model, field, None, writer)
         }
         _ => Err(anyhow!(
-            "usage: /config provider <list|show ID|remove ID|preset PRESET [ID]|add ID PROTOCOL BASE_URL [env:NAME|keyring:SERVICE/ACCOUNT]|credential set ID REFERENCE|credential clear ID|header set ID NAME env:NAME|public:VALUE|header remove ID NAME|model add PROVIDER MODEL [CONTEXT MAX_OUTPUT tools|no-tools]|model remove PROVIDER MODEL>"
+            "usage: /config provider model <add|remove|set|modality|effort|compatibility|compatibility-field ...>"
         )),
     }
 }
@@ -1624,6 +1683,221 @@ fn remove_provider_header(
     Ok(())
 }
 
+fn set_provider_field(
+    cwd: &Path,
+    provider_id: &str,
+    field: &str,
+    value: &str,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    update_agent_config(cwd, |config| {
+        let provider = config
+            .providers
+            .get_mut(provider_id)
+            .with_context(|| format!("provider `{provider_id}` is not configured"))?;
+        match field {
+            "display-name" => provider.display_name = value.replace('_', " "),
+            "protocol" => provider.protocol = parse_provider_protocol(value)?,
+            "base-url" => value.clone_into(&mut provider.base_url),
+            "transport" => provider.transport = parse_provider_transport(value)?,
+            "cache-retention" => provider.cache_retention = parse_cache_retention(value)?,
+            "optimizer" => provider.optimizer = parse_optional_string(value),
+            "reasoning" => provider.reasoning = parse_optional_string(value),
+            "timeout-ms" => provider.timeout_ms = parse_optional_u64(value, field)?,
+            "websocket-connect-timeout-ms" => {
+                provider.websocket_connect_timeout_ms = parse_optional_u64(value, field)?;
+            }
+            "stream-idle-timeout-ms" => {
+                provider.stream_idle_timeout_ms = parse_optional_u64(value, field)?;
+            }
+            "max-request-image-bytes" => {
+                provider.max_request_image_bytes = parse_optional_u64(value, field)?;
+            }
+            "default-context-window" => {
+                provider.default_context_window = parse_optional_u64(value, field)?;
+            }
+            "default-max-output-tokens" => {
+                provider.default_max_output_tokens = parse_optional_u64(value, field)?;
+            }
+            _ => {
+                return Err(anyhow!(
+                    "provider field must be display-name, protocol, base-url, transport, cache-retention, optimizer, reasoning, timeout-ms, websocket-connect-timeout-ms, stream-idle-timeout-ms, max-request-image-bytes, default-context-window, or default-max-output-tokens"
+                ));
+            }
+        }
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Provider field updated · {provider_id}/{field}")?;
+    Ok(())
+}
+
+fn set_provider_retry(
+    cwd: &Path,
+    provider_id: &str,
+    retries: &str,
+    base_delay: &str,
+    max_delay: &str,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let max_retries = retries
+        .parse::<u32>()
+        .context("maximum retries must be a non-negative integer")?;
+    let base_delay_ms = base_delay
+        .parse::<u64>()
+        .context("base retry delay must be a non-negative integer")?;
+    let max_delay_ms = max_delay
+        .parse::<u64>()
+        .context("maximum retry delay must be a non-negative integer")?;
+    update_agent_config(cwd, |config| {
+        let retry = &mut config
+            .providers
+            .get_mut(provider_id)
+            .with_context(|| format!("provider `{provider_id}` is not configured"))?
+            .retry;
+        retry.max_retries = max_retries;
+        retry.base_delay_ms = base_delay_ms;
+        retry.max_delay_ms = max_delay_ms;
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Provider retry policy updated · {provider_id}")?;
+    Ok(())
+}
+
+fn set_provider_pricing(
+    cwd: &Path,
+    provider_id: &str,
+    metric: &str,
+    value: Option<&str>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    update_agent_config(cwd, |config| {
+        let pricing = &mut config
+            .providers
+            .get_mut(provider_id)
+            .with_context(|| format!("provider `{provider_id}` is not configured"))?
+            .pricing;
+        if let Some(value) = value {
+            pricing.insert(metric.to_owned(), value.to_owned());
+        } else {
+            pricing
+                .remove(metric)
+                .with_context(|| format!("pricing metric `{metric}` is not configured"))?;
+        }
+        Ok(())
+    })?;
+    writeln!(
+        writer,
+        "◆ Provider pricing updated · {provider_id}/{metric}"
+    )?;
+    Ok(())
+}
+
+fn set_provider_compatibility(
+    cwd: &Path,
+    provider_id: &str,
+    flag: &str,
+    value: &str,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let flag = parse_compatibility_flag(flag)?;
+    let enabled = parse_bool(value)?;
+    update_agent_config(cwd, |config| {
+        config
+            .providers
+            .get_mut(provider_id)
+            .with_context(|| format!("provider `{provider_id}` is not configured"))?
+            .compatibility
+            .flags
+            .insert(flag, enabled);
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Provider compatibility updated · {provider_id}")?;
+    Ok(())
+}
+
+fn set_provider_compatibility_field(
+    cwd: &Path,
+    provider_id: &str,
+    field: &str,
+    value: Option<&str>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    update_agent_config(cwd, |config| {
+        let compatibility = &mut config
+            .providers
+            .get_mut(provider_id)
+            .with_context(|| format!("provider `{provider_id}` is not configured"))?
+            .compatibility;
+        set_compatibility_field(compatibility, field, value)
+    })?;
+    writeln!(
+        writer,
+        "◆ Provider compatibility field updated · {provider_id}/{field}"
+    )?;
+    Ok(())
+}
+
+fn set_provider_default_modality(
+    cwd: &Path,
+    provider_id: &str,
+    action: &str,
+    modality: &str,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let modality = parse_modality(modality)?;
+    update_agent_config(cwd, |config| {
+        let input = &mut config
+            .providers
+            .get_mut(provider_id)
+            .with_context(|| format!("provider `{provider_id}` is not configured"))?
+            .default_input;
+        match action {
+            "add" => {
+                input.insert(modality);
+            }
+            "remove" => {
+                input.remove(&modality);
+            }
+            _ => return Err(anyhow!("modality action must be add or remove")),
+        }
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Provider modalities updated · {provider_id}")?;
+    Ok(())
+}
+
+fn set_provider_thinking_budget(
+    cwd: &Path,
+    provider_id: &str,
+    effort: &str,
+    tokens: Option<&str>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let tokens = tokens
+        .map(|value| parse_positive_u64(value, "thinking budget"))
+        .transpose()?;
+    update_agent_config(cwd, |config| {
+        let budgets = &mut config
+            .providers
+            .get_mut(provider_id)
+            .with_context(|| format!("provider `{provider_id}` is not configured"))?
+            .thinking_budgets;
+        if let Some(tokens) = tokens {
+            budgets.insert(effort.to_owned(), tokens);
+        } else {
+            budgets
+                .remove(effort)
+                .with_context(|| format!("thinking budget `{effort}` is not configured"))?;
+        }
+        Ok(())
+    })?;
+    writeln!(
+        writer,
+        "◆ Provider thinking budget updated · {provider_id}/{effort}"
+    )?;
+    Ok(())
+}
+
 fn add_provider_model(
     cwd: &Path,
     provider_id: &str,
@@ -1689,6 +1963,176 @@ fn remove_provider_model(
     Ok(())
 }
 
+fn set_provider_model_field(
+    cwd: &Path,
+    provider_id: &str,
+    model_id: &str,
+    field: &str,
+    value: &str,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    update_agent_config(cwd, |config| {
+        let model = provider_model_mut(config, provider_id, model_id)?;
+        match field {
+            "display-name" => {
+                model.display_name =
+                    parse_optional_string(value).map(|name| name.replace('_', " "));
+            }
+            "context-window" => model.context_window = parse_optional_u64(value, field)?,
+            "max-output-tokens" => {
+                model.max_output_tokens = parse_optional_u64(value, field)?;
+            }
+            "tool-calling" => model.tool_calling = parse_bool(value)?,
+            _ => {
+                return Err(anyhow!(
+                    "model field must be display-name, context-window, max-output-tokens, or tool-calling"
+                ));
+            }
+        }
+        Ok(())
+    })?;
+    writeln!(
+        writer,
+        "◆ Model field updated · {provider_id}/{model_id}/{field}"
+    )?;
+    Ok(())
+}
+
+fn set_provider_model_modality(
+    cwd: &Path,
+    provider_id: &str,
+    model_id: &str,
+    action: &str,
+    modality: &str,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let modality = parse_modality(modality)?;
+    update_agent_config(cwd, |config| {
+        let input = &mut provider_model_mut(config, provider_id, model_id)?.input;
+        match action {
+            "add" => {
+                input.insert(modality);
+            }
+            "remove" => {
+                input.remove(&modality);
+            }
+            _ => return Err(anyhow!("modality action must be add or remove")),
+        }
+        Ok(())
+    })?;
+    writeln!(
+        writer,
+        "◆ Model modalities updated · {provider_id}/{model_id}"
+    )?;
+    Ok(())
+}
+
+fn set_provider_model_effort(
+    cwd: &Path,
+    provider_id: &str,
+    model_id: &str,
+    effort: &str,
+    wire: Option<&str>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let wire = wire.map(|wire| (wire != "none").then(|| wire.to_owned()));
+    update_agent_config(cwd, |config| {
+        let efforts = &mut provider_model_mut(config, provider_id, model_id)?.reasoning_efforts;
+        if let Some(wire) = wire {
+            efforts.insert(effort.to_owned(), wire);
+        } else {
+            efforts
+                .remove(effort)
+                .with_context(|| format!("reasoning effort `{effort}` is not configured"))?;
+        }
+        Ok(())
+    })?;
+    writeln!(
+        writer,
+        "◆ Model effort map updated · {provider_id}/{model_id}"
+    )?;
+    Ok(())
+}
+
+fn set_provider_model_compatibility(
+    cwd: &Path,
+    provider_id: &str,
+    model_id: &str,
+    flag: &str,
+    value: &str,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let flag = parse_compatibility_flag(flag)?;
+    let enabled = parse_bool(value)?;
+    update_agent_config(cwd, |config| {
+        provider_model_mut(config, provider_id, model_id)?
+            .compatibility
+            .flags
+            .insert(flag, enabled);
+        Ok(())
+    })?;
+    writeln!(
+        writer,
+        "◆ Model compatibility updated · {provider_id}/{model_id}"
+    )?;
+    Ok(())
+}
+
+fn set_provider_model_compatibility_field(
+    cwd: &Path,
+    provider_id: &str,
+    model_id: &str,
+    field: &str,
+    value: Option<&str>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    update_agent_config(cwd, |config| {
+        let compatibility = &mut provider_model_mut(config, provider_id, model_id)?.compatibility;
+        set_compatibility_field(compatibility, field, value)
+    })?;
+    writeln!(
+        writer,
+        "◆ Model compatibility field updated · {provider_id}/{model_id}/{field}"
+    )?;
+    Ok(())
+}
+
+fn set_compatibility_field(
+    compatibility: &mut ProviderCompatibility,
+    field: &str,
+    value: Option<&str>,
+) -> Result<()> {
+    let value = value.map(str::to_owned);
+    match field {
+        "max-tokens-field" => compatibility.max_tokens_field = value,
+        "thinking-format" => compatibility.thinking_format = value,
+        "cache-control-format" => compatibility.cache_control_format = value,
+        _ => {
+            return Err(anyhow!(
+                "compatibility field must be max-tokens-field, thinking-format, or cache-control-format"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn provider_model_mut<'a>(
+    config: &'a mut AgentConfig,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<&'a mut ProviderModel> {
+    config
+        .providers
+        .get_mut(provider_id)
+        .with_context(|| format!("provider `{provider_id}` is not configured"))?
+        .models
+        .iter_mut()
+        .find(|model| model.id == model_id)
+        .with_context(|| {
+            format!("model `{model_id}` is not configured for provider `{provider_id}`")
+        })
+}
+
 fn parse_positive_u64(value: &str, label: &str) -> Result<u64> {
     let parsed = value
         .parse::<u64>()
@@ -1704,6 +2148,80 @@ fn parse_tool_capability(value: &str) -> Result<bool> {
         "tools" => Ok(true),
         "no-tools" => Ok(false),
         _ => Err(anyhow!("tool capability must be tools or no-tools")),
+    }
+}
+
+fn parse_bool(value: &str) -> Result<bool> {
+    match value {
+        "true" | "on" | "yes" => Ok(true),
+        "false" | "off" | "no" => Ok(false),
+        _ => Err(anyhow!("value must be true or false")),
+    }
+}
+
+fn parse_optional_string(value: &str) -> Option<String> {
+    (value != "default" && value != "none").then(|| value.to_owned())
+}
+
+fn parse_optional_u64(value: &str, label: &str) -> Result<Option<u64>> {
+    if matches!(value, "default" | "none") {
+        return Ok(None);
+    }
+    parse_positive_u64(value, label).map(Some)
+}
+
+fn parse_provider_transport(value: &str) -> Result<Option<ProviderTransport>> {
+    match value {
+        "default" | "none" => Ok(None),
+        "sse" => Ok(Some(ProviderTransport::Sse)),
+        "websocket" => Ok(Some(ProviderTransport::Websocket)),
+        "websocket-cached" | "websocket_cached" => Ok(Some(ProviderTransport::WebsocketCached)),
+        "auto" => Ok(Some(ProviderTransport::Auto)),
+        _ => Err(anyhow!(
+            "transport must be sse, websocket, websocket-cached, auto, or default"
+        )),
+    }
+}
+
+fn parse_cache_retention(value: &str) -> Result<Option<CacheRetention>> {
+    match value {
+        "default" => Ok(None),
+        "none" => Ok(Some(CacheRetention::None)),
+        "short" => Ok(Some(CacheRetention::Short)),
+        "long" => Ok(Some(CacheRetention::Long)),
+        _ => Err(anyhow!(
+            "cache retention must be none, short, long, or default"
+        )),
+    }
+}
+
+fn parse_compatibility_flag(value: &str) -> Result<CompatibilityFlag> {
+    match value {
+        "store" => Ok(CompatibilityFlag::Store),
+        "developer-role" | "developer_role" => Ok(CompatibilityFlag::DeveloperRole),
+        "reasoning-effort" | "reasoning_effort" => Ok(CompatibilityFlag::ReasoningEffort),
+        "usage-in-streaming" | "usage_in_streaming" => Ok(CompatibilityFlag::UsageInStreaming),
+        "strict-tools" | "strict_tools" => Ok(CompatibilityFlag::StrictTools),
+        "temperature" => Ok(CompatibilityFlag::Temperature),
+        _ => Err(anyhow!(
+            "compatibility flag must be store, developer-role, reasoning-effort, usage-in-streaming, strict-tools, or temperature"
+        )),
+    }
+}
+
+fn parse_modality(value: &str) -> Result<Modality> {
+    match value {
+        "text" => Ok(Modality::Text),
+        "web-search" | "web_search" => Ok(Modality::WebSearch),
+        "image" => Ok(Modality::Image),
+        "video" => Ok(Modality::Video),
+        "audio" => Ok(Modality::Audio),
+        "3d" | "three-d" | "three_d" => Ok(Modality::ThreeD),
+        "transcription" => Ok(Modality::Transcription),
+        "embeddings" => Ok(Modality::Embeddings),
+        _ => Err(anyhow!(
+            "modality must be text, web-search, image, video, audio, 3d, transcription, or embeddings"
+        )),
     }
 }
 

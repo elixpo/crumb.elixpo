@@ -68,7 +68,15 @@ The live terminal mutation surface includes:
 - `/config provider preset <openrouter|pollinations> [provider-id]`
 - `/config provider credential set|clear`
 - `/config provider header set|remove`
+- `/config provider set <provider> <field> <value>`
+- `/config provider retry <provider> <count> <base-ms> <max-ms>`
+- `/config provider pricing set|remove`
+- `/config provider compatibility set`
+- `/config provider compatibility-field set|clear`
+- `/config provider modality add|remove`
+- `/config provider thinking-budget set|remove`
 - `/config provider model add|remove`
+- `/config provider model set|modality|effort|compatibility|compatibility-field`
 - `/model use <provider>/<model>`
 - `/effort use <level|default>`
 - `/mode use <auto|negotiate|plan>`
@@ -86,6 +94,23 @@ reference, and public Crumb attribution headers. The Pollinations preset uses
 reference. Presets intentionally contain no models: users add an exact model
 and select it explicitly.
 
-Compatibility, transport, retry, pricing, optimizer, reasoning-budget, and
-modality mutation commands remain in the next slice. These fields can already
-be represented and validated by the provider-neutral schema.
+The typed `set` surface covers protocol and endpoint changes, display names,
+SSE/WebSocket transport, cache retention, optimizer selection, reasoning,
+timeouts, payload ceilings, and default context/output limits. Provider and
+model compatibility switches and wire-field names, retry policy, pricing,
+thinking budgets, modalities, tool calling, exact model limits, and effort wire
+mappings are independently mutable. Use `default` to clear optional scalar
+settings. Display names use underscores for spaces because configuration
+commands do not run through the native shell parser.
+
+```text
+/config provider set openrouter transport sse
+/config provider retry openrouter 3 250 4000
+/config provider compatibility set openrouter strict-tools true
+/config provider pricing set openrouter input_tokens 0.25
+/config provider model set openrouter vendor/model tool-calling true
+/config provider model modality add openrouter vendor/model image
+/config provider model effort set openrouter vendor/model high high
+/model use openrouter/vendor/model
+/effort use high
+```
