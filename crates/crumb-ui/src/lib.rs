@@ -310,11 +310,19 @@ impl Renderer {
 
     /// Renders the inactive prompt hint while a submitted turn is running.
     #[must_use]
-    pub fn composer_placeholder(&self) -> String {
-        self.paint(
+    pub fn composer_placeholder(&self, available_width: u16) -> String {
+        let placeholder = fit_terminal_text(
             "Ask Crumb anything or type a command · @ context · / commands · Tab complete",
-            "2;1",
-        )
+            usize::from(available_width),
+        );
+        self.paint(&placeholder, "2;1")
+    }
+
+    /// Renders bounded follow-up text inside the active composer.
+    #[must_use]
+    pub fn composer_follow_up(&self, input: &str, available_width: u16) -> String {
+        let input = fit_terminal_text(input, usize::from(available_width));
+        self.paint(&input, "1")
     }
 
     /// Renders right-aligned, non-secret composer status.

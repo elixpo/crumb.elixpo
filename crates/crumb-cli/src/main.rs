@@ -8,10 +8,11 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use crossterm::cursor::{MoveTo, Show};
+use crossterm::cursor::{MoveTo, RestorePosition, SavePosition, Show};
 use crossterm::event::{
     Event as TerminalEvent, KeyCode as TerminalKeyCode, KeyEventKind,
-    KeyModifiers as TerminalModifiers, poll as poll_terminal_event, read as read_terminal_event,
+    KeyModifiers as TerminalModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags, poll as poll_terminal_event, read as read_terminal_event,
 };
 use crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
@@ -852,7 +853,11 @@ fn execute_agent_sequence(
         active_runtime = returned_runtime;
         let completed = result.is_ok() || steered;
         if steered {
-            writeln!(writer, "{}", renderer.agent_response("Steering to your latest instruction."))?;
+            writeln!(
+                writer,
+                "{}",
+                renderer.agent_response("Steering to your latest instruction.")
+            )?;
         } else {
             render_agent_result(&result, renderer, writer)?;
         }
@@ -942,8 +947,11 @@ fn observe_agent_turn(
     interactive: bool,
 ) -> Result<TurnObservation> {
     let mut activity = Some(renderer.activity("Thinking"));
-    let mut input = SteeringInput::new(steering_bytes);
+    let mut input = SteeringInput::new(renderer, steering_bytes);
     let raw_mode = interactive.then(RawModeGuard::enable).transpose()?;
+    let enhanced_keys = interactive
+        .then(KeyboardEnhancementGuard::enable)
+        .transpose()?;
     while !task.is_finished() {
         match task.recv_timeout(Duration::from_millis(15)) {
             Ok(event) => {
@@ -962,17 +970,11 @@ fn observe_agent_turn(
             if let Some(indicator) = activity.take() {
                 indicator.finish();
             }
-            if input.handle_key(
-                key.code,
-                key.modifiers,
-                &task,
-                steering,
-                renderer,
-                writer,
-            )?
+            if input.handle_key(key.code, key.modifiers, &task, steering, writer)?
                 == SteeringInputAction::Background
             {
                 input.clear_line(writer)?;
+                drop(enhanced_keys);
                 drop(raw_mode);
                 if let Some(indicator) = activity.take() {
                     indicator.finish();
@@ -989,6 +991,7 @@ fn observe_agent_turn(
     }
     let steered = input.steer_requested;
     input.clear_line(writer)?;
+    drop(enhanced_keys);
     drop(raw_mode);
     if let Some(indicator) = activity.take() {
         indicator.complete();
@@ -1008,6 +1011,7 @@ enum SteeringInputAction {
 }
 
 struct SteeringInput {
+    renderer: Renderer,
     buffer: String,
     max_bytes: usize,
     visible: bool,
@@ -1015,8 +1019,9 @@ struct SteeringInput {
 }
 
 impl SteeringInput {
-    const fn new(max_bytes: usize) -> Self {
+    const fn new(renderer: Renderer, max_bytes: usize) -> Self {
         Self {
+            renderer,
             buffer: String::new(),
             max_bytes,
             visible: false,
@@ -1030,7 +1035,6 @@ impl SteeringInput {
         modifiers: TerminalModifiers,
         task: &agent_runtime::AgentTurnTask,
         steering: &mut SteeringQueue,
-        renderer: Renderer,
         writer: &mut dyn Write,
     ) -> Result<SteeringInputAction> {
         if code == TerminalKeyCode::Char('c') && modifiers.contains(TerminalModifiers::CONTROL) {
@@ -1043,10 +1047,10 @@ impl SteeringInput {
         }
         match code {
             TerminalKeyCode::Enter if modifiers.contains(TerminalModifiers::CONTROL) => {
-                return self.submit(SteeringAction::Queue, steering, task, renderer, writer);
+                return self.submit(SteeringAction::Queue, steering, task, writer);
             }
             TerminalKeyCode::Enter => {
-                return self.submit(SteeringAction::Steer, steering, task, renderer, writer);
+                return self.submit(SteeringAction::Steer, steering, task, writer);
             }
             TerminalKeyCode::Backspace => {
                 self.buffer.pop();
@@ -1078,7 +1082,6 @@ impl SteeringInput {
         requested_action: SteeringAction,
         steering: &mut SteeringQueue,
         task: &agent_runtime::AgentTurnTask,
-        renderer: Renderer,
         writer: &mut dyn Write,
     ) -> Result<SteeringInputAction> {
         let input = self.buffer.trim().to_owned();
@@ -1100,18 +1103,24 @@ impl SteeringInput {
             self.clear_line(writer)?;
             return Ok(SteeringInputAction::Background);
         }
-        let (action, message) = input
-            .strip_prefix("/replace ")
-            .map_or((requested_action, input.as_str()), |message| {
-                (SteeringAction::Replace, message)
-            });
+        let (action, message) = input.strip_prefix("/replace ").map_or_else(
+            || {
+                input
+                    .strip_prefix("/queue ")
+                    .map_or((requested_action, input.as_str()), |message| {
+                        (SteeringAction::Queue, message)
+                    })
+            },
+            |message| (SteeringAction::Replace, message),
+        );
         self.clear_line(writer)?;
         match steering.submit(action, message) {
             Ok(()) => {
                 writeln!(
                     writer,
                     "{}",
-                    renderer.transcript_input(&terminal_username(), message)
+                    self.renderer
+                        .transcript_input(&terminal_username(), message)
                 )?;
                 match action {
                     SteeringAction::Steer => {
@@ -1137,8 +1146,7 @@ impl SteeringInput {
 
     fn clear_line(&mut self, writer: &mut dyn Write) -> Result<()> {
         if self.visible {
-            write!(writer, "\r\x1b[2K")?;
-            writer.flush()?;
+            self.redraw_composer(None, writer)?;
             self.visible = false;
         }
         Ok(())
@@ -1148,13 +1156,24 @@ impl SteeringInput {
         if self.buffer.is_empty() {
             return self.clear_line(writer);
         }
-        write!(
-            writer,
-            "\r\x1b[2K↪ follow-up [Enter steer · Ctrl+Enter queue]  {}",
-            self.buffer
-        )?;
-        writer.flush()?;
+        self.redraw_composer(Some(&self.buffer), writer)?;
         self.visible = true;
+        Ok(())
+    }
+
+    fn redraw_composer(&self, input: Option<&str>, writer: &mut dyn Write) -> Result<()> {
+        let (columns, rows) = size()?;
+        let available_width = columns.saturating_sub(7);
+        let rendered = input.map_or_else(
+            || self.renderer.composer_placeholder(available_width),
+            |input| self.renderer.composer_follow_up(input, available_width),
+        );
+        crossterm::execute!(writer, SavePosition, MoveTo(4, rows.saturating_sub(3)))?;
+        write!(writer, "{}", " ".repeat(usize::from(available_width)))?;
+        crossterm::execute!(writer, MoveTo(4, rows.saturating_sub(3)))?;
+        write!(writer, "{rendered}")?;
+        crossterm::execute!(writer, RestorePosition)?;
+        writer.flush()?;
         Ok(())
     }
 }
@@ -3561,7 +3580,11 @@ fn render_idle_composer(
     let (_, _, composer_row, _) = fullscreen_rows(header_rows)?;
     let mut writer = io::stdout();
     crossterm::execute!(writer, MoveTo(0, composer_row))?;
-    write!(writer, "{prompt}{}", renderer.composer_placeholder())?;
+    write!(
+        writer,
+        "{prompt}{}",
+        renderer.composer_placeholder(columns.saturating_sub(7))
+    )?;
     let status_width = u16::try_from(status.chars().count()).unwrap_or(u16::MAX);
     let status_column = columns.saturating_sub(status_width.saturating_add(2));
     crossterm::execute!(writer, MoveTo(status_column, composer_row))?;
@@ -3756,6 +3779,8 @@ fn relay_output(reader: &mut dyn Read, writer: &mut dyn Write) -> io::Result<()>
 
 struct RawModeGuard;
 
+struct KeyboardEnhancementGuard;
+
 struct AlternateScreenGuard {
     active: bool,
 }
@@ -3789,6 +3814,25 @@ impl RawModeGuard {
     fn enable() -> io::Result<Self> {
         enable_raw_mode()?;
         Ok(Self)
+    }
+}
+
+impl KeyboardEnhancementGuard {
+    fn enable() -> io::Result<Self> {
+        crossterm::execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
+        )?;
+        Ok(Self)
+    }
+}
+
+impl Drop for KeyboardEnhancementGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
 }
 

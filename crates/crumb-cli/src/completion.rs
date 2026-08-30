@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crumb_agent::LiveConfig;
+use nu_ansi_term::{Color, Style};
 use reedline::{Completer, CompletionResult, Span, Suggestion};
 
 const STATIC_REFERENCES: &[(&str, &str)] = &[
@@ -58,11 +59,26 @@ impl Completer for CrumbCompleter {
         };
         let suggestions = if prefix.starts_with('/') && !prefix.contains('\n') {
             slash_suggestions(prefix, pos)
-        } else {
+        } else if current_token(prefix).1.starts_with('@') {
             reference_suggestions(prefix, pos, &self.workspace.get())
+        } else {
+            native_path_suggestions(prefix, pos, &self.workspace.get())
         };
-        CompletionResult::fresh(suggestions)
+        CompletionResult::fresh(if suggestions.is_empty() {
+            vec![no_records_suggestion(prefix, pos)]
+        } else {
+            suggestions
+        })
     }
+}
+
+fn current_token(line: &str) -> (usize, &str) {
+    let start = line
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| character.is_whitespace().then_some(index + 1))
+        .unwrap_or(0);
+    (start, &line[start..])
 }
 
 fn slash_suggestions(prefix: &str, pos: usize) -> Vec<Suggestion> {
@@ -74,12 +90,7 @@ fn slash_suggestions(prefix: &str, pos: usize) -> Vec<Suggestion> {
 }
 
 fn reference_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Suggestion> {
-    let start = line
-        .char_indices()
-        .rev()
-        .find_map(|(index, character)| character.is_whitespace().then_some(index + 1))
-        .unwrap_or(0);
-    let token = &line[start..];
+    let (start, token) = current_token(line);
     if !token.starts_with('@') {
         return Vec::new();
     }
@@ -105,6 +116,80 @@ fn reference_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Sugges
         .filter(|(value, _)| value.starts_with(token))
         .map(|(value, description)| suggestion(&value, &description, span))
         .collect()
+}
+
+fn native_path_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Suggestion> {
+    let (start, token) = current_token(line);
+    if start == 0 || token.starts_with('-') || token.contains('=') || token.contains('\n') {
+        return Vec::new();
+    }
+    let typed_path = Path::new(token);
+    let parent = typed_path.parent().unwrap_or_else(|| Path::new(""));
+    let fragment = typed_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let directory = if token.starts_with("~/") {
+        let Some(home) = std::env::var_os("HOME") else {
+            return Vec::new();
+        };
+        PathBuf::from(home).join(parent.strip_prefix("~").unwrap_or(parent))
+    } else {
+        workspace.join(parent)
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let show_hidden = fragment.starts_with('.');
+    let mut suggestions = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if !name.starts_with(fragment) || (!show_hidden && name.starts_with('.')) {
+                return None;
+            }
+            let is_directory = entry.file_type().ok()?.is_dir();
+            let mut value = parent.join(name).display().to_string();
+            if is_directory {
+                value.push('/');
+            }
+            Some(Suggestion {
+                display_override: Some(value.clone()),
+                description: Some(if is_directory { "folder" } else { "file" }.to_owned()),
+                span: Span::new(start, pos),
+                append_whitespace: !is_directory,
+                value,
+                ..Suggestion::default()
+            })
+        })
+        .take(100)
+        .collect::<Vec<_>>();
+    suggestions.sort_by(|left, right| left.value.cmp(&right.value));
+    suggestions
+}
+
+fn no_records_suggestion(line: &str, pos: usize) -> Suggestion {
+    let (start, token) = current_token(line);
+    let label = " NO RECORDS FOUND ";
+    let width = crossterm::terminal::size().map_or(80, |(columns, _)| usize::from(columns));
+    let padding = width.saturating_sub(label.len()).saturating_div(2);
+    let chip = if std::env::var_os("NO_COLOR").is_some() {
+        label.to_owned()
+    } else {
+        Style::new()
+            .fg(Color::Black)
+            .on(Color::Rgb(255, 255, 204))
+            .bold()
+            .paint(label)
+            .to_string()
+    };
+    Suggestion {
+        value: token.to_owned(),
+        display_override: Some(format!("{}{chip}", " ".repeat(padding))),
+        span: Span::new(start, pos),
+        append_whitespace: false,
+        ..Suggestion::default()
+    }
 }
 
 fn configured_references(workspace: &Path, skills: bool) -> Vec<(String, String)> {
@@ -240,5 +325,35 @@ mod tests {
         let result = completer.complete("explain @last", 13);
         assert_eq!(result.suggestions()[0].value, "@last-error");
         assert_eq!(result.suggestions()[0].span.start, 8);
+    }
+
+    #[test]
+    fn native_arguments_complete_relative_directories() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(workspace));
+        let result = completer.complete("cd do", 5);
+
+        assert!(
+            result
+                .suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "docs/")
+        );
+    }
+
+    #[test]
+    fn empty_completion_uses_a_non_inserting_footer_chip() {
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
+        let result = completer.complete("cd this-path-does-not-exist", 27);
+        let suggestion = &result.suggestions()[0];
+
+        assert_eq!(suggestion.value, "this-path-does-not-exist");
+        assert!(
+            suggestion
+                .display_override
+                .as_deref()
+                .is_some_and(|display| display.contains("NO RECORDS FOUND"))
+        );
+        assert!(!suggestion.append_whitespace);
     }
 }
