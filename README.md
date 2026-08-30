@@ -1,40 +1,42 @@
-# crumb
+<h1>
+  <img src="crumb.elixpo/public/favicon.png" width="30" height="30" alt="Crumb panda" />
+  Crumb
+</h1>
 
-`crumb` is a cross-platform, AI-native terminal layer over Bash on Linux, Zsh on macOS, and PowerShell on Windows. Native shell behavior remains available even when AI is disabled or offline.
+<p>
+  <img src="crumb.elixpo/public/og-image.png" alt="Crumb — the natural language terminal" width="100%" />
+</p>
 
-The project is in its initial bootstrap phase. See [the documentation index](docs/README.md), [the master plan](docs/product/master-plan.md), and [the Pollinations reference](docs/reference/pollinations.md).
+Crumb is a terminal you can talk to.
 
-## Workspace
+Use the commands you already know, ask for help in everyday language, and bring useful tools into one focused workspace. Crumb is designed to feel familiar when you want a normal terminal and genuinely helpful when you want more.
 
-```text
-crates/
-├── crumb-cli       # `crumb` executable and startup lifecycle
-├── crumb-core      # provider-neutral domain types
-├── crumb-platform  # typed host-platform detection
-└── crumb-repl      # prompt, built-ins, and input classification
+## Your terminal, with more range
 
-docs/
-├── development     # active roadmap and engineering notes
-├── product         # product and architecture specifications
-└── reference       # external integration references
-```
+- Run ordinary commands without changing how your shell works.
+- Ask questions, describe a task, or steer work as it happens.
+- Add focused skills for the jobs you do often.
+- Connect outside services only when you choose.
+- Keep sessions, context, and progress visible.
 
-## Development
+## Calm by default
 
-Install Rust with [rustup](https://rustup.rs/), including `rustfmt` and `clippy`:
+Crumb keeps important choices in your hands. It shows what is connected, asks before sensitive actions, and keeps the terminal useful even when its connected features are unavailable.
 
-```bash
-rustup component add rustfmt clippy
-```
+Nothing should install itself, grant itself access, or get between you and the command line.
 
-Then validate the workspace:
+## A growing ecosystem
 
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
-```
+The Crumb marketplace is being shaped as a home for community-built skills, connectors, and MCP tools. Add-ons will be easy to discover and connect while remaining inspectable, removable, and separate from Crumb itself.
 
-## Status
+Explore the ideas behind [skills](https://crumb.elixpo.com/skills), [plugins](https://crumb.elixpo.com/plugins), and [connectors](https://crumb.elixpo.com/profile/connectors).
 
-WP-001 builds the workspace, platform detection, typed input events, and a minimal REPL. Native command execution and Pollinations integration intentionally begin in later work packages. Current progress is tracked in [the development TODO](docs/development/TODO.md).
+## Current status
+
+Crumb is under active development. Public installers and downloadable terminal builds are not available yet. Windows, Linux, and macOS releases will arrive after the terminal has passed its release-readiness and security checks.
+
+Follow the [development roadmap](docs/development/TODO.md), read the [documentation](https://crumb.elixpo.com/docs), or share an idea through [GitHub Issues](https://github.com/elixpo/crumb.elixpo/issues).
+
+---
+
+Made with care for people who live in the terminal.
