@@ -548,13 +548,17 @@ impl Renderer {
         }
         let details = [runtime, session, resume];
         let art = trim_art(PANDA_CLOSING);
-        let art_width = art.lines().map(str::len).max().unwrap_or_default();
+        let art_width = art
+            .lines()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or_default();
         art.lines()
             .enumerate()
             .map(|(index, line)| {
                 let detail = details.get(index).map_or("", String::as_str);
                 format!(
-                    "{}  {}",
+                    "  {}   {}",
                     self.paint(&format!("{line:<art_width$}"), "38;2;128;128;128"),
                     self.paint(detail, "2")
                 )
@@ -1108,6 +1112,19 @@ mod tests {
         assert!(handoff.contains("╭───╮   ╭───╮"));
         assert!(handoff.contains("Session  crumb-session-1 · ~1.2k tokens"));
         assert!(handoff.contains("Resume   crumb --resume=crumb-session-1"));
+        let lines = handoff.lines().collect::<Vec<_>>();
+        assert!(lines[0].starts_with("  ╭───╮"));
+        let detail_column = |line: &str, detail: &str| {
+            line.split_once(detail)
+                .expect("handoff detail")
+                .0
+                .chars()
+                .count()
+        };
+        let runtime_column = detail_column(lines[0], "Runtime");
+        assert_eq!(detail_column(lines[1], "Session"), runtime_column);
+        assert_eq!(detail_column(lines[2], "Resume"), runtime_column);
+        assert!(runtime_column <= 20);
     }
 
     #[test]
