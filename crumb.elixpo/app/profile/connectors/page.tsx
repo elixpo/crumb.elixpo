@@ -12,7 +12,7 @@ export default async function ConnectorsPage({ searchParams }: { searchParams: P
   const params = await searchParams
   const user = await currentUser()
   if (!user) redirect('/login?return_to=%2Fprofile%2Fconnectors')
-  const connection = await bindings().DB.prepare(`
+  const connection = await (await bindings()).DB.prepare(`
     SELECT token_expires_at, oauth_scope, updated_at FROM pollinations_connections
     WHERE user_id = ? AND token_expires_at > unixepoch()
   `).bind(user.id).first<{ token_expires_at: number; oauth_scope: string; updated_at: number }>()

@@ -8,9 +8,10 @@ export async function GET(request: Request) {
   const state = url.searchParams.get('state')
   if (!code || !state || url.searchParams.has('error')) return NextResponse.redirect(new URL('/?auth=denied', request.url))
   const key = `accounts:${state}`
-  const returnTo = await bindings().KV.get(key)
+  const env = await bindings()
+  const returnTo = await env.KV.get(key)
   if (!returnTo) return NextResponse.redirect(new URL('/?auth=invalid_state', request.url))
-  await bindings().KV.delete(key)
+  await env.KV.delete(key)
   try {
     await finishAccountsLogin(code, request.url)
     return NextResponse.redirect(new URL(returnTo, request.url))

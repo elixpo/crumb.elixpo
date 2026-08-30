@@ -14,7 +14,7 @@ export async function POST(request: Request) {
   } catch {
     return NextResponse.json({ error: 'invalid_accounts_authorization' }, { status: 401 })
   }
-  const row = await bindings().DB.prepare(`
+  const row = await (await bindings()).DB.prepare(`
     SELECT access_token_encrypted, token_expires_at
     FROM pollinations_connections
     WHERE user_id = ? AND token_expires_at > unixepoch()

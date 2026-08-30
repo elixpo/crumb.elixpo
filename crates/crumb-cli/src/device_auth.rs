@@ -49,7 +49,7 @@ struct ConnectorResponse {
     access_token: String,
 }
 
-/// Authenticates with Accounts device flow and returns the linked Pollinations credential.
+/// Authenticates a crumb.elixpo account and returns its linked Pollinations credential.
 ///
 /// # Errors
 ///
@@ -91,13 +91,13 @@ pub(crate) fn connect(writer: &mut dyn Write) -> Result<SecretString> {
         .verification_uri_complete
         .as_deref()
         .unwrap_or(&device.verification_uri);
-    writeln!(writer, "Authorize Crumb in your browser:")?;
+    writeln!(writer, "Connect your crumb.elixpo account in your browser:")?;
     writeln!(writer, "{verification_url}")?;
     writeln!(writer, "Device code: {}", device.user_code)?;
     if !open_browser(verification_url) {
         writeln!(writer, "Open the URL above manually to continue.")?;
     }
-    writeln!(writer, "Waiting for Accounts approval…")?;
+    writeln!(writer, "Waiting for crumb.elixpo account approval…")?;
     writer.flush()?;
 
     let access_token = poll_accounts(&client, &accounts, &config.client_id, &device)?;
@@ -108,7 +108,7 @@ pub(crate) fn connect(writer: &mut dyn Write) -> Result<SecretString> {
         .context("Crumb connector exchange failed")?;
     if response.status() == StatusCode::CONFLICT {
         bail!(
-            "connect Pollinations at {}/connect, then run `crumb auth login` again",
+            "your crumb.elixpo account is authorized, but Pollinations is not connected; enable it at {}/connect, then run `crumb auth login` again",
             crumb.origin().ascii_serialization()
         );
     }

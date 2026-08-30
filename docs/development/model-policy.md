@@ -6,7 +6,8 @@ in `crumb.elixpo/lib/model-policy.ts`.
 
 | Modality | Initial model |
 | --- | --- |
-| Harness text | `nova-fast`, `qwen-coder` |
+| Harness text | `nova-fast`, `qwen-coder`, `Circuit-Overtime/OreoLook` |
+| Web search | `perplexity` |
 | Image | `flux`, `klein` |
 | Video | `wan-fast` |
 | Audio | `elevenflash` |
@@ -14,6 +15,9 @@ in `crumb.elixpo/lib/model-policy.ts`.
 | Transcription | `whisper` |
 | Embeddings | `openai-3-small` |
 
-The harness will combine the two text models behind one replaceable text-model
-policy. Every other modality begins with one default except image, where both
-Flux and Klein are intentional user-facing choices.
+The harness keeps these text models behind one replaceable policy. OreoLook is
+an optional Elixpo-owned reasoning and vision route with a low per-user request
+ceiling, so it is not the default. `perplexity` is the dedicated web-grounded
+route and must only run through an explicitly approved network tool. Every
+other modality begins with one default except image, where both Flux and Klein
+are intentional user-facing choices.

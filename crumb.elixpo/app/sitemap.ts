@@ -3,6 +3,9 @@ import type { MetadataRoute } from 'next'
 export default function sitemap(): MetadataRoute.Sitemap {
   const routes = [
     { path: '', frequency: 'weekly' as const, priority: 1 },
+    { path: '/features', frequency: 'weekly' as const, priority: 0.9 },
+    { path: '/skills', frequency: 'weekly' as const, priority: 0.9 },
+    { path: '/plugins', frequency: 'weekly' as const, priority: 0.9 },
     { path: '/about', frequency: 'monthly' as const, priority: 0.7 },
     { path: '/docs', frequency: 'weekly' as const, priority: 0.9 },
     { path: '/docs/getting-started', frequency: 'weekly' as const, priority: 0.8 },

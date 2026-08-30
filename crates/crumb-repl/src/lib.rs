@@ -14,29 +14,332 @@ pub enum ReplOutcome {
     LaunchNativeShell,
 }
 
+/// One command exposed through Crumb's `/` namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SlashCommand {
+    pub usage: &'static str,
+    pub description: &'static str,
+}
+
+/// Commands shown by `/help` and interactive completion.
+pub const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        usage: "/help",
+        description: "show Crumb commands",
+    },
+    SlashCommand {
+        usage: "/auth login",
+        description: "connect your crumb.elixpo account",
+    },
+    SlashCommand {
+        usage: "/auth status",
+        description: "show Crumb account access",
+    },
+    SlashCommand {
+        usage: "/auth logout",
+        description: "remove local Crumb account access",
+    },
+    SlashCommand {
+        usage: "/connectors",
+        description: "show connected services",
+    },
+    SlashCommand {
+        usage: "/skills",
+        description: "select or unload agent skills",
+    },
+    SlashCommand {
+        usage: "/skills load ",
+        description: "load a skill into agent context",
+    },
+    SlashCommand {
+        usage: "/skills unload ",
+        description: "unload a skill from agent context",
+    },
+    SlashCommand {
+        usage: "/context",
+        description: "show inline reference syntax",
+    },
+    SlashCommand {
+        usage: "/history",
+        description: "show recent native history",
+    },
+    SlashCommand {
+        usage: "/history search ",
+        description: "search native history",
+    },
+    SlashCommand {
+        usage: "/mode",
+        description: "select auto, negotiate, or plan mode",
+    },
+    SlashCommand {
+        usage: "/mode use ",
+        description: "set auto, negotiate, or plan mode",
+    },
+    SlashCommand {
+        usage: "/model",
+        description: "inspect or select a model",
+    },
+    SlashCommand {
+        usage: "/model use ",
+        description: "select an exact provider/model",
+    },
+    SlashCommand {
+        usage: "/effort",
+        description: "inspect or set reasoning effort",
+    },
+    SlashCommand {
+        usage: "/effort use ",
+        description: "set light, medium, high, extra high, ultra, or default",
+    },
+    SlashCommand {
+        usage: "/session",
+        description: "manage agent sessions",
+    },
+    SlashCommand {
+        usage: "/session list",
+        description: "list agent sessions",
+    },
+    SlashCommand {
+        usage: "/session search ",
+        description: "search session metadata",
+    },
+    SlashCommand {
+        usage: "/session resume ",
+        description: "resume an agent session",
+    },
+    SlashCommand {
+        usage: "/session inspect ",
+        description: "inspect redacted session metadata",
+    },
+    SlashCommand {
+        usage: "/session rename ",
+        description: "label an agent session",
+    },
+    SlashCommand {
+        usage: "/session archive ",
+        description: "archive an agent session",
+    },
+    SlashCommand {
+        usage: "/session restore ",
+        description: "restore an archived session",
+    },
+    SlashCommand {
+        usage: "/session export ",
+        description: "print a redacted session export",
+    },
+    SlashCommand {
+        usage: "/session delete ",
+        description: "move a session to recoverable trash",
+    },
+    SlashCommand {
+        usage: "/review",
+        description: "review Crumb-owned edits",
+    },
+    SlashCommand {
+        usage: "/review list",
+        description: "list edit checkpoints",
+    },
+    SlashCommand {
+        usage: "/review diff ",
+        description: "show a bounded checkpoint diff",
+    },
+    SlashCommand {
+        usage: "/review approve ",
+        description: "approve a checkpoint",
+    },
+    SlashCommand {
+        usage: "/review reject ",
+        description: "safely rewind a checkpoint",
+    },
+    SlashCommand {
+        usage: "/review comment ",
+        description: "attach feedback to the next agent turn",
+    },
+    SlashCommand {
+        usage: "/review export ",
+        description: "print checkpoint metadata as JSON",
+    },
+    SlashCommand {
+        usage: "/jobs",
+        description: "list local agent jobs",
+    },
+    SlashCommand {
+        usage: "/jobs inspect ",
+        description: "inspect redacted job metadata",
+    },
+    SlashCommand {
+        usage: "/jobs create ",
+        description: "start an approved background request",
+    },
+    SlashCommand {
+        usage: "/jobs schedule once ",
+        description: "opt in to one scheduled run",
+    },
+    SlashCommand {
+        usage: "/jobs schedule recurring ",
+        description: "opt in to a recurring local run",
+    },
+    SlashCommand {
+        usage: "/jobs cancel ",
+        description: "cancel a queued or running job",
+    },
+    SlashCommand {
+        usage: "/jobs reattach ",
+        description: "resume a completed job session",
+    },
+    SlashCommand {
+        usage: "/jobs tick",
+        description: "launch due opted-in schedules",
+    },
+    SlashCommand {
+        usage: "/background",
+        description: "continue the active agent turn as a local job",
+    },
+    SlashCommand {
+        usage: "/attach ",
+        description: "attach a typed @ reference",
+    },
+    SlashCommand {
+        usage: "/detach ",
+        description: "remove attached context",
+    },
+    SlashCommand {
+        usage: "/plugins",
+        description: "inspect installed plugins",
+    },
+    SlashCommand {
+        usage: "/marketplace",
+        description: "browse installable skills and MCPs",
+    },
+    SlashCommand {
+        usage: "/marketplace inspect ",
+        description: "inspect a marketplace package",
+    },
+    SlashCommand {
+        usage: "/marketplace install ",
+        description: "verify and install a package",
+    },
+    SlashCommand {
+        usage: "/marketplace validate ",
+        description: "validate a local marketplace catalog",
+    },
+    SlashCommand {
+        usage: "/tools",
+        description: "inspect available tools",
+    },
+    SlashCommand {
+        usage: "/permissions",
+        description: "inspect agent permissions",
+    },
+    SlashCommand {
+        usage: "/memory",
+        description: "manage approved memory",
+    },
+    SlashCommand {
+        usage: "/memory show ",
+        description: "show approved project or user memory",
+    },
+    SlashCommand {
+        usage: "/memory remember ",
+        description: "explicitly persist a memory",
+    },
+    SlashCommand {
+        usage: "/memory forget ",
+        description: "remove a memory by display index",
+    },
+    SlashCommand {
+        usage: "/memory compact ",
+        description: "deduplicate approved memory",
+    },
+    SlashCommand {
+        usage: "/config",
+        description: "inspect live configuration",
+    },
+    SlashCommand {
+        usage: "/config provider ",
+        description: "configure Harness providers and models",
+    },
+    SlashCommand {
+        usage: "/cancel",
+        description: "cancel the active agent turn",
+    },
+    SlashCommand {
+        usage: "/doctor",
+        description: "diagnose optional AI services",
+    },
+    SlashCommand {
+        usage: "/cost",
+        description: "show session usage",
+    },
+    SlashCommand {
+        usage: "/platform",
+        description: "show the native platform",
+    },
+    SlashCommand {
+        usage: "/version",
+        description: "show the Crumb version",
+    },
+    SlashCommand {
+        usage: "/shell",
+        description: "enter the raw native shell",
+    },
+    SlashCommand {
+        usage: "/exit",
+        description: "exit Crumb",
+    },
+];
+
 /// Classifies one line without executing native shell input.
 #[must_use]
 pub fn classify_input(input: &str) -> InputEvent {
     let command = input.trim_end_matches(['\r', '\n']);
+    let command = if command.starts_with('/') || command.starts_with('?') {
+        command.trim_end()
+    } else {
+        command
+    };
     match command {
-        ":auth login" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Login)),
-        ":auth status" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Status)),
-        ":auth logout" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Logout)),
-        ":exit" => InputEvent::BuiltIn(BuiltInCommand::Exit),
-        ":history" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Recent)),
-        ":history search" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
+        "/auth login" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Login)),
+        "/auth status" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Status)),
+        "/auth logout" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Logout)),
+        "/connectors" => InputEvent::BuiltIn(BuiltInCommand::Connectors),
+        "/context" => InputEvent::BuiltIn(BuiltInCommand::Context),
+        "/exit" | "exit" => InputEvent::BuiltIn(BuiltInCommand::Exit),
+        "/help" | "?" => InputEvent::BuiltIn(BuiltInCommand::Help),
+        _ if command.trim_end() == "? config" => {
+            InputEvent::BuiltIn(BuiltInCommand::Reserved("? config".to_owned()))
+        }
+        "/history" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Recent)),
+        "/history search" => InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
             String::new(),
         ))),
-        ":platform" => InputEvent::BuiltIn(BuiltInCommand::Platform),
-        ":shell" => InputEvent::BuiltIn(BuiltInCommand::Shell),
-        ":version" => InputEvent::BuiltIn(BuiltInCommand::Version),
-        _ if command.starts_with(":history search ") => {
+        "/platform" => InputEvent::BuiltIn(BuiltInCommand::Platform),
+        "/shell" => InputEvent::BuiltIn(BuiltInCommand::Shell),
+        "/skills" => InputEvent::BuiltIn(BuiltInCommand::Skills),
+        "/version" => InputEvent::BuiltIn(BuiltInCommand::Version),
+        _ if command.starts_with("/history search ") => {
             InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
-                command[":history search ".len()..].to_owned(),
+                command["/history search ".len()..].to_owned(),
             )))
+        }
+        _ if reserved_slash_command(command) => {
+            InputEvent::BuiltIn(BuiltInCommand::Reserved(command.to_owned()))
         }
         _ => InputEvent::NativeInput(command.to_owned()),
     }
+}
+
+fn reserved_slash_command(command: &str) -> bool {
+    let Some(name) = command.split_whitespace().next() else {
+        return false;
+    };
+    SLASH_COMMANDS.iter().any(|candidate| {
+        candidate
+            .usage
+            .split_whitespace()
+            .next()
+            .is_some_and(|root| root == name)
+    })
 }
 
 /// Renders the phase-one prompt for a working directory.
@@ -78,7 +381,7 @@ pub fn read_classified_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Inp
     Ok(Some(classify_input(&line)))
 }
 
-/// Runs the WP-001 REPL until `:exit` or end-of-input.
+/// Runs the WP-001 REPL until `/exit` or end-of-input.
 ///
 /// Native input is classified and reported, but deliberately not executed.
 ///
@@ -105,11 +408,26 @@ pub fn run<R: BufRead, W: Write>(
                     "authentication is available in the crumb executable"
                 )?;
             }
+            InputEvent::BuiltIn(BuiltInCommand::Connectors) => {
+                writeln!(writer, "connectors are available in the crumb executable")?;
+            }
+            InputEvent::BuiltIn(BuiltInCommand::Context) => {
+                writeln!(
+                    writer,
+                    "context references are available in the crumb executable"
+                )?;
+            }
             InputEvent::BuiltIn(BuiltInCommand::Exit) => return Ok(ReplOutcome::Exit),
+            InputEvent::BuiltIn(BuiltInCommand::Help) => {
+                writeln!(writer, "help is available in the crumb executable")?;
+            }
             InputEvent::BuiltIn(BuiltInCommand::History(_)) => {
                 writeln!(writer, "history is available in the crumb executable")?;
             }
             InputEvent::BuiltIn(BuiltInCommand::Platform) => writeln!(writer, "{platform}")?,
+            InputEvent::BuiltIn(BuiltInCommand::Reserved(command)) => {
+                writeln!(writer, "reserved Crumb command: {command}")?;
+            }
             InputEvent::BuiltIn(BuiltInCommand::Shell) => {
                 let shell_name = match platform {
                     Platform::Linux => "Bash",
@@ -122,6 +440,9 @@ pub fn run<R: BufRead, W: Write>(
                 )?;
                 writer.flush()?;
                 return Ok(ReplOutcome::LaunchNativeShell);
+            }
+            InputEvent::BuiltIn(BuiltInCommand::Skills) => {
+                writeln!(writer, "skills are available in the crumb executable")?;
             }
             InputEvent::BuiltIn(BuiltInCommand::Version) => writeln!(writer, "crumb {version}")?,
             InputEvent::NativeInput(command) if command.trim().is_empty() => {}
@@ -148,30 +469,54 @@ mod tests {
     #[test]
     fn classifies_supported_built_ins() {
         assert_eq!(
-            classify_input(":exit\n"),
+            classify_input("/exit\n"),
             InputEvent::BuiltIn(BuiltInCommand::Exit)
         );
         assert_eq!(
-            classify_input(":version"),
+            classify_input("exit"),
+            InputEvent::BuiltIn(BuiltInCommand::Exit)
+        );
+        assert_eq!(
+            classify_input("/version"),
             InputEvent::BuiltIn(BuiltInCommand::Version)
         );
         assert_eq!(
-            classify_input(":platform"),
+            classify_input("/platform"),
             InputEvent::BuiltIn(BuiltInCommand::Platform)
         );
         assert_eq!(
-            classify_input(":shell"),
+            classify_input("/shell"),
             InputEvent::BuiltIn(BuiltInCommand::Shell)
         );
         assert_eq!(
-            classify_input(":auth login"),
+            classify_input("/auth login"),
             InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Login))
         );
         assert_eq!(
-            classify_input(":history search cargo test"),
+            classify_input("/history search cargo test"),
             InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
                 "cargo test".to_owned()
             )))
+        );
+        assert_eq!(
+            classify_input("/history   "),
+            InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Recent))
+        );
+        assert_eq!(
+            classify_input("/skills"),
+            InputEvent::BuiltIn(BuiltInCommand::Skills)
+        );
+        assert_eq!(
+            classify_input("?"),
+            InputEvent::BuiltIn(BuiltInCommand::Help)
+        );
+        assert_eq!(
+            classify_input("? config  "),
+            InputEvent::BuiltIn(BuiltInCommand::Reserved("? config".to_owned()))
+        );
+        assert_eq!(
+            classify_input("/mode auto"),
+            InputEvent::BuiltIn(BuiltInCommand::Reserved("/mode auto".to_owned()))
         );
     }
 
@@ -180,6 +525,10 @@ mod tests {
         assert_eq!(
             classify_input("  git status  "),
             InputEvent::NativeInput("  git status  ".to_owned())
+        );
+        assert_eq!(
+            classify_input("/usr/bin/env"),
+            InputEvent::NativeInput("/usr/bin/env".to_owned())
         );
     }
 
@@ -211,7 +560,7 @@ mod tests {
 
     #[test]
     fn repl_handles_built_ins_and_stops() {
-        let input = Cursor::new(":platform\n:version\n:exit\n");
+        let input = Cursor::new("/platform\n/version\n/exit\n");
         let mut output = Vec::new();
 
         let outcome = run(input, &mut output, Platform::Linux, "0.1.0").expect("REPL should run");
@@ -224,7 +573,7 @@ mod tests {
 
     #[test]
     fn shell_command_returns_control_to_the_cli() {
-        let input = Cursor::new(":shell\n");
+        let input = Cursor::new("/shell\n");
         let mut output = Vec::new();
 
         let outcome = run(input, &mut output, Platform::Linux, "0.1.0").expect("REPL should run");

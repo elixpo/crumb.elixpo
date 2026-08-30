@@ -43,7 +43,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Add `crumb-cli`, `crumb-core`, `crumb-repl`, and `crumb-platform`.
 - [x] Detect Linux, macOS, and Windows with a typed `Platform` enum.
 - [x] Render a minimal prompt containing the working directory.
-- [x] Implement `:exit`, `:version`, and `:platform`.
+- [x] Implement `/exit`, `/version`, and `/platform`.
 - [x] Classify all other input as `NativeInput` without executing it.
 - [x] Add unit tests and cross-platform GitHub Actions.
 - [x] Pass formatting, clippy, and workspace tests.
@@ -51,11 +51,104 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 </details>
 
+## Active CLI package: `/` commands and `@` references
+
+- [x] Keep plain English as the only natural-language prompt form.
+- [x] Reserve known `/` commands without intercepting native absolute paths.
+- [x] Implement `/help`, `/skills`, `/connectors`, and `/context`.
+- [x] Keep authentication, history, platform, version, shell, and exit commands functional.
+- [x] Add Tab suggestions for slash commands and typed inline references.
+- [x] Load enabled skill and configured MCP/plugin identifiers into suggestions.
+- [x] Bound file and folder suggestions to the active workspace.
+- [ ] Resolve selected `@` references into bounded, redacted agent context.
+- [ ] Implement `/attach`, `/detach`, and persistent session context.
+- [ ] Implement live `/mode`, `/model`, `/effort`, and `/config` changes.
+- [ ] Add the installable terminal UI and binary packaging pass.
+
+## Active terminal UX pass
+
+- [x] Make the interactive startup identity use the Crumb ASCII mark and product punchline.
+- [x] Keep non-interactive output free of startup branding and animations.
+- [x] Render Harness turns with model, mode, effort, cancellation guidance, and session metadata.
+- [x] Add a self-clearing inline activity indicator for synchronous Harness turns.
+- [x] Replace flat help output with a grouped `/` command palette.
+- [x] Add read-only `/mode`, `/model`, `/effort`, `/config`, and `/plugins` surfaces.
+- [x] Stream real Harness notifications into the renderer instead of projecting them after completion.
+- [x] Expose bounded Pollinations web search through MCP with an explicit network-tool grant.
+- [x] Add bounded Enter-to-steer and Ctrl+Enter FIFO follow-ups with queue replacement.
+- [x] Add queued steering and richer tool-specific event projection to the Harness stream.
+- [ ] Add interactive approval, tool-call, patch, error, and completion components.
+- [ ] Add live model, effort, and mode selection backed by atomic configuration writes.
+- [ ] Add terminal-width snapshots, reduced-motion behavior, and accessibility checks.
+- [ ] Package signed standalone binaries for Linux, macOS, and Windows.
+
+### Competitive terminal roadmap
+
+- [x] [Stream Harness activity and support queued steering](https://github.com/elixpo/crumb.elixpo/issues/36)
+- [x] [Add reviewable diffs, checkpoints, and safe rewind](https://github.com/elixpo/crumb.elixpo/issues/37)
+- [x] [Ship modern input editing, shell completions, and accessibility modes](https://github.com/elixpo/crumb.elixpo/issues/38)
+- [x] [Add resumable and searchable agent sessions](https://github.com/elixpo/crumb.elixpo/issues/35)
+- [x] [Add opt-in background jobs and scheduled agent work](https://github.com/elixpo/crumb.elixpo/issues/34)
+- [x] [Add pluggable Codex and Claude coding-agent backends](https://github.com/elixpo/crumb.elixpo/issues/39)
+- [ ] [Add terminal-configurable Harness providers and explicit model selection](https://github.com/elixpo/crumb.elixpo/issues/40)
+  - [x] Add the provider-neutral, non-secret endpoint and capability schema.
+  - [x] Add validated atomic terminal mutations for providers, models, mode, and effort.
+  - [x] Add OpenRouter/Pollinations presets and typed credential/header references.
+  - [x] Add advanced provider, compatibility, pricing, retry, and model mutations.
+  - [x] Project selected providers into the replaceable Harness adapter.
+  - [ ] Add lazy model discovery and local compatibility diagnostics.
+
+## Proposed roadmap: context, ecosystem, and release readiness
+
+These tracking issues define the next major phases. Implementation should be split into small,
+independently reviewable work packages under each tracker. Marketplace packages and optional
+engines remain replaceable; none may bypass Crumb's permission, credential, or shell boundaries.
+
+### Phase 1 — grounded context
+
+- [ ] [Add provenance-aware memory retrieval and conflict handling](https://github.com/elixpo/crumb.elixpo/issues/43).
+- [ ] [Add named personas and portable agent profiles](https://github.com/elixpo/crumb.elixpo/issues/44).
+- [ ] [Add graph-grounded project context with an optional Graphify adapter](https://github.com/elixpo/crumb.elixpo/issues/45).
+  - Keep Graphify opt-in, local-first, pinned, and replaceable.
+  - Require source/edge provenance, freshness detection, bounded retrieval, and native-search fallback.
+  - Route its MCP surface through Crumb's approval and supervision boundary.
+
+### Phase 2 — extensible ecosystem
+
+- [ ] [Expand the public skill and connector ecosystem](https://github.com/elixpo/crumb.elixpo/issues/46).
+- [ ] [Supervise and authorize third-party MCP servers](https://github.com/elixpo/crumb.elixpo/issues/47).
+- [ ] [Build marketplace trust, publishing, updates, rollback, and revocation](https://github.com/elixpo/crumb.elixpo/issues/48).
+  - Keep external packages disabled after installation until the user reviews and enables them.
+  - Prefer standard remote MCP OAuth and OS-keyring credential references.
+  - Prohibit arbitrary install hooks and implicit capability grants.
+
+### Phase 3 — public distribution, deliberately deferred
+
+- [ ] [Package and sign Crumb for Linux, macOS, and Windows](https://github.com/elixpo/crumb.elixpo/issues/49).
+  - Do not publish terminal binaries, installers, or updater metadata before the release-readiness gate is explicitly approved.
+  - Require signatures, checksums, SBOMs, provenance attestations, upgrade/rollback tests, and uninstall coverage for every platform.
+
 ## Planned work packages
 
-- [ ] [DeepSeek Harness + RTK/token optimizers](https://github.com/elixpo/crumb.elixpo/issues/22): harness first, optimizers second.
-- [ ] [Skills and natural-language routing](https://github.com/elixpo/crumb.elixpo/issues/25).
-- [ ] Refine the CLI UI after the harness and optimizers.
+- [x] [WP-012 — deterministic agent/session foundation](https://github.com/elixpo/crumb.elixpo/issues/33) ([design](agent-foundation.md)).
+- [x] [DeepSeek Harness + RTK/token optimizers](https://github.com/elixpo/crumb.elixpo/issues/22): [Harness adapter](deepseek-harness.md) and measured [optimizer pipeline](token-optimization.md).
+- [ ] [Skills and natural-language routing](https://github.com/elixpo/crumb.elixpo/issues/25): valid commands stay native; unresolved phrases follow configured deterministic policy.
+- [ ] Implement the [`/` command and `@` reference catalog](../product/input-namespaces-and-connectors.md) incrementally; neither symbol activates an AI prompt.
+- [ ] Add connectors in the catalog's priority order, starting with GitHub, Google Drive, Cloudinary, email, and calendar.
+- [ ] [Crumb MCP policy boundary](mcp-boundary.md): Rust-owned risk, approvals, cancellation, and workspace confinement.
+- [ ] Refine the standalone CLI UI after the harness and optimizers.
+  - [x] Add compact panda branding, startup readiness, and model/mode status.
+  - [x] Add inline history autosuggestions alongside `/` and `@` completion.
+  - [x] Add a muted empty-composer placeholder that cannot be accepted as input.
+  - [x] Add a one-line activity surface with live tool-state labels.
+  - [x] Add alternate-screen terminal takeover with an inline-mode escape hatch.
+  - [x] Gate interactive startup on explicit current-folder trust.
+  - [x] Surface effort, session budget, estimated context use, and Harness auto-compaction.
+  - [x] Keep the startup header fixed above a bounded scrolling transcript.
+  - [x] Keep the composer and responsive hotkey guide pinned below the transcript.
+  - [ ] Add the final panda application icon and platform launcher metadata.
+  - [x] Add responsive composer borders and a context/model status meter.
+  - [ ] Add installer, signed release binaries, and desktop launch entries.
 - [ ] Resume the `crumb.elixpo` web UI after the CLI UI.
 - [ ] WP-011 — streamed AI question mode.
 

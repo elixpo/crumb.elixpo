@@ -23,6 +23,12 @@ pub trait NativeShell {
     #[must_use]
     fn command_spec(&self) -> CommandSpec;
 
+    /// Built-ins that cannot be discovered by scanning `PATH`.
+    #[must_use]
+    fn builtin_commands(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Starts the native shell with the selected PTY backend.
     ///
     /// # Errors
@@ -46,6 +52,10 @@ impl NativeShell for LinuxBash {
     fn command_spec(&self) -> CommandSpec {
         CommandSpec::new("bash").arg("-i")
     }
+
+    fn builtin_commands(&self) -> &'static [&'static str] {
+        POSIX_BUILTINS
+    }
 }
 
 /// macOS Zsh implementation for WP-003.
@@ -59,6 +69,10 @@ impl NativeShell for MacOsZsh {
 
     fn command_spec(&self) -> CommandSpec {
         CommandSpec::new("zsh").arg("-i")
+    }
+
+    fn builtin_commands(&self) -> &'static [&'static str] {
+        POSIX_BUILTINS
     }
 }
 
@@ -83,6 +97,10 @@ impl NativeShell for WindowsPowerShell {
         CommandSpec::new("pwsh").arg("-NoLogo").arg("-NoExit")
     }
 
+    fn builtin_commands(&self) -> &'static [&'static str] {
+        POWERSHELL_BUILTINS
+    }
+
     fn spawn(&self, backend: &dyn PtyBackend, size: TerminalSize) -> Result<PtyProcess> {
         match backend.spawn(&self.command_spec(), size) {
             Ok(process) => Ok(process),
@@ -94,6 +112,20 @@ impl NativeShell for WindowsPowerShell {
         }
     }
 }
+
+const POSIX_BUILTINS: &[&str] = &[
+    ".", "alias", "bg", "break", "builtin", "cd", "command", "continue", "declare", "dirs",
+    "disown", "echo", "eval", "exec", "exit", "export", "false", "fc", "fg", "getopts", "hash",
+    "help", "history", "jobs", "kill", "let", "local", "logout", "popd", "printf", "pushd", "pwd",
+    "read", "readonly", "return", "set", "shift", "source", "test", "times", "trap", "true",
+    "type", "typeset", "ulimit", "umask", "unalias", "unset", "wait",
+];
+
+const POWERSHELL_BUILTINS: &[&str] = &[
+    "cd", "chdir", "cls", "copy", "del", "dir", "echo", "erase", "foreach", "ft", "fl", "gc",
+    "gci", "gi", "gm", "gps", "help", "history", "kill", "ls", "measure", "move", "pwd", "ren",
+    "rm", "rmdir", "select", "set", "sort", "where", "write", "%", "?",
+];
 
 /// Selects the native shell implemented for a platform.
 #[must_use]

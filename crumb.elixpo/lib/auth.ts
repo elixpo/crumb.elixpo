@@ -17,7 +17,7 @@ interface AccountsUser {
 export async function currentUser(): Promise<User | null> {
   const session = (await cookies()).get('crumb_session')?.value
   if (!session) return null
-  const row = await bindings().DB.prepare(`
+  const row = await (await bindings()).DB.prepare(`
     SELECT users.id, users.email, users.display_name
     FROM sessions JOIN users ON users.id = sessions.user_id
     WHERE sessions.id = ? AND sessions.expires_at > unixepoch()
@@ -29,7 +29,7 @@ export async function destroySession(): Promise<void> {
   const cookieStore = await cookies()
   const session = cookieStore.get('crumb_session')?.value
   if (session) {
-    await bindings().DB.prepare('DELETE FROM sessions WHERE id = ?').bind(session).run()
+    await (await bindings()).DB.prepare('DELETE FROM sessions WHERE id = ?').bind(session).run()
   }
   cookieStore.delete('crumb_session')
 }
@@ -69,7 +69,7 @@ export async function finishAccountsLogin(code: string, requestUrl: string): Pro
   const account = await userResponse.json() as AccountsUser
   if (!userResponse.ok || !account.id || !account.email) throw new Error('Accounts profile lookup failed')
   const user = { id: account.id, email: account.email, displayName: account.displayName || account.email }
-  const db = bindings().DB
+  const db = (await bindings()).DB
   await db.prepare(`
     INSERT INTO users (id, email, display_name, updated_at)
     VALUES (?, ?, ?, unixepoch())

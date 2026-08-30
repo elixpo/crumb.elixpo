@@ -1,5 +1,6 @@
 export const MODEL_POLICY = {
-  text: ['nova-fast', 'qwen-coder'],
+  text: ['nova-fast', 'qwen-coder', 'Circuit-Overtime/OreoLook'],
+  webSearch: ['perplexity'],
   image: ['flux', 'klein'],
   video: ['wan-fast'],
   audio: ['elevenflash'],

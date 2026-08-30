@@ -4,10 +4,15 @@
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BuiltInCommand {
     Auth(AuthAction),
+    Connectors,
+    Context,
     Exit,
+    Help,
     History(HistoryAction),
     Platform,
+    Reserved(String),
     Shell,
+    Skills,
     Version,
 }
 

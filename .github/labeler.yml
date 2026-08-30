@@ -10,6 +10,14 @@ platform:
   - changed-files:
       - any-glob-to-any-file: ['crates/crumb-platform/**']
 
+website:
+  - changed-files:
+      - any-glob-to-any-file: ['crumb.elixpo/**']
+
+marketplace:
+  - changed-files:
+      - any-glob-to-any-file: ['marketplace/**']
+
 documentation:
   - changed-files:
       - any-glob-to-any-file: ['**/*.md', 'docs/**']
