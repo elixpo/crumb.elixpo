@@ -35,7 +35,9 @@ use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credentia
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
 use crumb_harness_dsh::HarnessActivity;
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
-use crumb_marketplace::{InstallScope, Installer, Package, bundled_catalog};
+use crumb_marketplace::{
+    Catalog, InstallScope, Installer, Package, bundled_catalog, verify_package_files,
+};
 use crumb_mcp::{McpDispatcher, serve_stdio};
 use crumb_memory::{MemoryScope, MemorySet, MemoryStore};
 use crumb_native::session::{CommandOutcome, ShellSession};
@@ -3923,6 +3925,9 @@ const fn memory_scope_name(scope: MemoryScope) -> &'static str {
 }
 
 fn show_marketplace(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    if let Some(path) = command.strip_prefix("/marketplace validate ") {
+        return validate_marketplace_path(path.trim(), cwd, writer);
+    }
     let catalog = bundled_catalog()?;
     if command == "/marketplace" {
         let config = read_agent_config(cwd)?;
@@ -3967,8 +3972,51 @@ fn show_marketplace(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result
         return install_marketplace_package(&catalog, arguments, cwd, writer);
     }
     Err(anyhow!(
-        "usage: /marketplace [inspect <publisher/name> | install <publisher/name> [--scope project|user]]"
+        "usage: /marketplace [inspect <publisher/name> | install <publisher/name> [--scope project|user] | validate <catalog.json>]"
     ))
+}
+
+fn validate_marketplace_path(path: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    if path.is_empty() {
+        bail!("usage: /marketplace validate <catalog.json>");
+    }
+    let workspace = std::fs::canonicalize(cwd)
+        .with_context(|| format!("failed to resolve workspace `{}`", cwd.display()))?;
+    let requested = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        workspace.join(path)
+    };
+    let catalog_path = std::fs::canonicalize(&requested)
+        .with_context(|| format!("marketplace catalog `{path}` is unavailable"))?;
+    if !catalog_path.starts_with(&workspace) || !catalog_path.is_file() {
+        bail!("marketplace validation is limited to regular files in the workspace");
+    }
+    let catalog = Catalog::parse(&std::fs::read(&catalog_path)?)?;
+    let catalog_root = catalog_path
+        .parent()
+        .context("marketplace catalog has no parent")?;
+    for package in &catalog.packages {
+        let source = package.source.strip_prefix("./").with_context(|| {
+            format!(
+                "package `{}` must use a local `./` source for offline validation",
+                package.id
+            )
+        })?;
+        let source = std::fs::canonicalize(catalog_root.join(source))
+            .with_context(|| format!("package `{}` source is unavailable", package.id))?;
+        if !source.starts_with(catalog_root) || !source.is_dir() {
+            bail!("package `{}` source escapes the catalog", package.id);
+        }
+        verify_package_files(package, &source)?;
+    }
+    writeln!(
+        writer,
+        "◆ Marketplace valid · {} · {} packages · all artifacts verified",
+        catalog.name,
+        catalog.packages.len()
+    )?;
+    Ok(())
 }
 
 fn show_marketplace_package(package: &Package, writer: &mut dyn Write) -> Result<()> {

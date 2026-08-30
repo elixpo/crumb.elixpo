@@ -220,6 +220,10 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "verify and install a package",
     },
     SlashCommand {
+        usage: "/marketplace validate ",
+        description: "validate a local marketplace catalog",
+    },
+    SlashCommand {
         usage: "/tools",
         description: "inspect available tools",
     },

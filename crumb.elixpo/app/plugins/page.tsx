@@ -2,6 +2,7 @@ import Link from 'next/link'
 import { SiteFooter } from '@/app/components/SiteFooter'
 import { SiteHeader } from '@/app/components/SiteHeader'
 import { pageMetadata } from '@/lib/seo'
+import { marketplacePackages } from '@/lib/marketplace'
 
 const REPO = 'https://github.com/elixpo/crumb.elixpo'
 
@@ -19,9 +20,13 @@ const plugins = [
   { mark: 'MCP', name: 'MCP servers', copy: 'Bring compatible tools into Crumb through one typed, permission-aware interface.', status: 'Foundation' },
 ]
 
+const publicMcps = marketplacePackages.filter(entry => entry.mcp_servers?.length)
+
 export default function PluginsPage() {
   return <><SiteHeader /><main className="product-page plugins-page">
     <header className="product-hero"><p className="kicker">Plugins</p><h1>Add tools without<br />giving up control.</h1><p>Plugins let Crumb do more than talk. They can read a file, check a pull request, or query a service—but only through clear inputs, limited output, and permissions you control.</p><div><a className="button" href={`${REPO}/issues/new?template=plugin.yml`}>Request a plugin <span>↗</span></a><Link className="button button-secondary" href="/skills">Explore skills</Link></div></header>
+
+    <section className="plugin-grid">{publicMcps.map(plugin => <article key={plugin.id}><div><i>MCP</i><span>v{plugin.version}</span></div><h2>{plugin.display_name}</h2><p>{plugin.description}</p><code>/marketplace install {plugin.id}</code></article>)}</section>
 
     <section className="plugin-grid">{plugins.map(plugin => <article key={plugin.name}><div><i>{plugin.mark}</i><span>{plugin.status}</span></div><h2>{plugin.name}</h2><p>{plugin.copy}</p></article>)}</section>
 

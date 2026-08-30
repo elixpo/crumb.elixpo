@@ -12,6 +12,9 @@ use tempfile::Builder;
 const MAX_ARTIFACT_BYTES: usize = 256 * 1024;
 const MAX_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
 const BUNDLED_CATALOG: &[u8] = include_bytes!("../../../marketplace/catalog.json");
+#[cfg(test)]
+const PUBLIC_CATALOG: &[u8] =
+    include_bytes!("../../../crumb.elixpo/public/marketplace/catalog.json");
 
 /// Install location selected by the user.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -265,7 +268,7 @@ impl Installer {
             .join(package.id.replace('/', "--"))
             .join(&package.version);
         if package_root.exists() {
-            verify_installed(package, &package_root)?;
+            verify_package_files(package, &package_root)?;
             return Ok(InstalledPackage {
                 root: package_root,
                 package: package.clone(),
@@ -310,7 +313,12 @@ impl Installer {
     }
 }
 
-fn verify_installed(package: &Package, root: &Path) -> Result<()> {
+/// Verifies declared files in a package source or installed cache.
+///
+/// # Errors
+///
+/// Returns an error for missing, linked, oversized, or digest-mismatched artifacts.
+pub fn verify_package_files(package: &Package, root: &Path) -> Result<()> {
     let mut total_bytes = 0_usize;
     for artifact in &package.artifacts {
         let path = root.join(&artifact.path);
@@ -406,7 +414,7 @@ fn valid_env_name(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Catalog, Installer, bundled_catalog};
+    use super::{Catalog, Installer, PUBLIC_CATALOG, bundled_catalog};
     use sha2::{Digest, Sha256};
     use std::fs;
     use tempfile::tempdir;
@@ -458,6 +466,10 @@ mod tests {
     #[test]
     fn bundled_catalog_and_artifacts_are_in_sync() {
         let catalog = bundled_catalog().expect("bundled catalog should be valid");
+        assert_eq!(
+            catalog,
+            Catalog::parse(PUBLIC_CATALOG).expect("public catalog should be valid")
+        );
         let cache = tempdir().expect("cache tempdir");
         let installer = Installer::new(cache.path());
         for package in catalog.packages {

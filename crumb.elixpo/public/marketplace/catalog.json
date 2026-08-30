@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "name": "crumb-public",
+  "packages": [
+    {
+      "id": "crumb/code-review",
+      "version": "1.0.0",
+      "kind": "skill",
+      "display_name": "Code review",
+      "description": "Focused correctness, security, compatibility, and test review.",
+      "license": "MIT",
+      "source": "./packages/code-review",
+      "capabilities": ["workspace_read"],
+      "artifacts": [
+        {
+          "path": "skills/code-review/SKILL.md",
+          "sha256": "1728255549947cec3b09df2d6e10f76fea3ef388ff2db4308eaf02dbfaaa2852"
+        }
+      ],
+      "skills": [
+        {
+          "id": "code-review",
+          "path": "skills/code-review/SKILL.md"
+        }
+      ]
+    },
+    {
+      "id": "crumb/rust-quality",
+      "version": "1.0.0",
+      "kind": "skill",
+      "display_name": "Rust quality",
+      "description": "Repository-aware Rust formatting, Clippy, tests, and review.",
+      "license": "MIT",
+      "source": "./packages/rust-quality",
+      "capabilities": ["workspace_read"],
+      "artifacts": [
+        {
+          "path": "skills/rust-quality/SKILL.md",
+          "sha256": "c3ebb5f20cc7d3c68460fe90fd28c198dcb4c6475d79f96549d9c439ffdaf7c2"
+        }
+      ],
+      "skills": [
+        {
+          "id": "rust-quality",
+          "path": "skills/rust-quality/SKILL.md"
+        }
+      ]
+    },
+    {
+      "id": "crumb/workspace-mcp",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "Workspace MCP",
+      "description": "Crumb's built-in policy-controlled workspace MCP server.",
+      "license": "MIT",
+      "source": "./packages/workspace-mcp",
+      "capabilities": ["workspace_read", "process_execution"],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "8c6513c224cf24ffd839a70df680551fc3f76a5ba7df6f7aa35d942bec11f6af"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-workspace",
+          "command": "crumb",
+          "arguments": ["mcp", "serve"],
+          "environment": []
+        }
+      ]
+    }
+  ]
+}

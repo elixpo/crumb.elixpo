@@ -19,3 +19,7 @@ are variable names only; secret values do not belong in manifests, logs, or memo
 The first schema deliberately excludes arbitrary lifecycle scripts, implicit dependencies,
 and secret values. Future remote sources will be fetched only by an explicit command,
 verified into an immutable cache, and enabled separately by the user.
+
+Validate catalog structure against `schema/catalog.schema.json`. Crumb's Rust validator remains
+authoritative and additionally enforces cross-field rules such as unique package identifiers and
+skill paths referencing declared artifacts.
