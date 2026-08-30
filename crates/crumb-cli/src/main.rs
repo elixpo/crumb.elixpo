@@ -36,17 +36,20 @@ use crumb_tools::{
 };
 use crumb_ui::{GitSegment, PromptContext, Renderer, UiSettings};
 use reedline::{
-    ColumnarMenu, Emacs, FileBackedHistory, History, HistoryItem, KeyCode, KeyModifiers,
-    MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
-    ReedlineEvent, ReedlineMenu, Signal, default_emacs_keybindings,
+    ColumnarMenu, EditCommand, Emacs, FileBackedHistory, History, HistoryItem, KeyCode,
+    KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
+    PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal,
+    default_emacs_keybindings,
 };
 
 mod agent_runtime;
 mod completion;
 mod device_auth;
+mod shell_completion;
 
 use agent_runtime::AgentRuntime;
 use completion::{CompletionWorkspace, CrumbCompleter};
+use shell_completion::{CompletionShell, write_completion};
 
 const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
 
@@ -67,6 +70,13 @@ fn run_command_line_action() -> Result<bool> {
         serve_mcp()?;
         return Ok(true);
     }
+    if let [group, shell] = arguments.as_slice()
+        && group == "completions"
+    {
+        let shell = shell.to_str().context("shell identifier must be UTF-8")?;
+        write_completion(CompletionShell::parse(shell)?, &mut io::stdout().lock())?;
+        return Ok(true);
+    }
     if let [group, action, id] = arguments.as_slice()
         && group == "review"
         && action == "export"
@@ -82,7 +92,7 @@ fn run_command_line_action() -> Result<bool> {
         [group, action] if group == "auth" && action == "logout" => AuthAction::Logout,
         _ => {
             return Err(anyhow!(
-                "usage: crumb [auth <login|status|logout> | mcp serve | review export <id|all>]"
+                "usage: crumb [auth <login|status|logout> | mcp serve | review export <id|all> | completions <bash|zsh|fish|powershell>]"
             ));
         }
     };
@@ -543,7 +553,7 @@ fn observe_agent_turn(
         match task.recv_timeout(Duration::from_millis(15)) {
             Ok(event) => {
                 input.clear_line(writer)?;
-                render_harness_activity(&event, &mut activity, writer)?;
+                render_harness_activity(&event, &mut activity, renderer, writer)?;
                 input.redraw(writer)?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -562,7 +572,7 @@ fn observe_agent_turn(
     }
     while let Ok(event) = task.recv_timeout(Duration::ZERO) {
         input.clear_line(writer)?;
-        render_harness_activity(&event, &mut activity, writer)?;
+        render_harness_activity(&event, &mut activity, renderer, writer)?;
         input.redraw(writer)?;
     }
     input.clear_line(writer)?;
@@ -719,12 +729,17 @@ fn harness_activity_label(activity: &HarnessActivity) -> String {
 fn render_harness_activity(
     activity: &HarnessActivity,
     indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    renderer: Renderer,
     writer: &mut dyn Write,
 ) -> Result<()> {
     if let Some(indicator) = indicator.take() {
         indicator.finish();
     }
-    writeln!(writer, "  ↳ {}", harness_activity_label(activity))?;
+    writeln!(
+        writer,
+        "{}",
+        renderer.agent_activity(&harness_activity_label(activity))
+    )?;
     writer.flush()?;
     Ok(())
 }
@@ -855,6 +870,10 @@ fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
     writeln!(
         writer,
         "  Type `/` then Tab to search · `@` then Tab for context"
+    )?;
+    writeln!(
+        writer,
+        "  Enter submit · Alt/Shift+Enter newline · Ctrl+O editor · Ctrl+R history"
     )?;
     for (title, roots) in [
         (
@@ -1539,15 +1558,33 @@ fn create_line_editor(
             ReedlineEvent::MenuNext,
         ]),
     );
+    for modifiers in [KeyModifiers::ALT, KeyModifiers::SHIFT] {
+        keybindings.add_binding(
+            modifiers,
+            KeyCode::Enter,
+            ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
+        );
+    }
+    keybindings.add_binding(
+        KeyModifiers::CONTROL,
+        KeyCode::Char('o'),
+        ReedlineEvent::OpenEditor,
+    );
+    let terminal_width = suggestion_width(size()?.0);
     let menu = ColumnarMenu::default()
         .with_name("completion_menu")
-        .with_columns(1);
+        .with_columns(1)
+        .with_column_width(Some(terminal_width));
     let editor = Reedline::create()
         .with_history(Box::new(interactive_history))
         .with_completer(Box::new(CrumbCompleter::new(workspace.clone())))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
         .with_edit_mode(Box::new(Emacs::new(keybindings)));
     Ok(InteractiveLineEditor { editor, workspace })
+}
+
+fn suggestion_width(terminal_columns: u16) -> usize {
+    usize::from(terminal_columns.saturating_sub(4).max(1))
 }
 
 struct CrumbPrompt {
@@ -1747,7 +1784,7 @@ mod tests {
 
     use crumb_agent::{AgentConfig, RiskClass};
 
-    use super::{agent_config_location, workspace_read_host};
+    use super::{agent_config_location, suggestion_width, workspace_read_host};
 
     #[test]
     fn stdio_mcp_host_exposes_rust_owned_tool_risk() {
@@ -1794,5 +1831,14 @@ mod tests {
         assert_eq!(root, workspace);
         assert_eq!(path, root.join(".crumb/agent.json"));
         std::fs::remove_dir_all(root).expect("temporary workspace can be removed");
+    }
+
+    #[test]
+    fn suggestion_width_never_exceeds_the_terminal() {
+        for columns in [0, 1, 4, 5, 40, 240] {
+            let width = suggestion_width(columns);
+            assert!(width >= 1);
+            assert!(width <= usize::from(columns.max(1)));
+        }
     }
 }

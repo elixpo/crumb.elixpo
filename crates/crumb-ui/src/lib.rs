@@ -59,11 +59,27 @@ pub enum BrandingMode {
     Disabled,
 }
 
+/// Output density and assistive-technology behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputMode {
+    Rich,
+    Plain,
+    ScreenReader,
+}
+
+/// Whether transient UI may animate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MotionMode {
+    Full,
+    Reduced,
+}
+
 /// Presentation settings resolved once during startup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UiSettings {
     pub color: bool,
-    pub plain: bool,
+    pub output: OutputMode,
+    pub motion: MotionMode,
     pub branding: BrandingMode,
 }
 
@@ -71,16 +87,31 @@ impl UiSettings {
     /// Resolves UI settings from terminal capability and environment flags.
     #[must_use]
     pub fn from_environment(is_terminal: bool) -> Self {
-        let plain = !is_terminal || env_flag("CRUMB_PLAIN");
+        let screen_reader = env_flag("CRUMB_SCREEN_READER");
+        let plain = !is_terminal || screen_reader || env_flag("CRUMB_PLAIN");
         let color = is_terminal && !plain && env::var_os("NO_COLOR").is_none();
-        let branding = match (is_terminal, env::var("CRUMB_BRANDING").as_deref()) {
+        let branding = match (
+            is_terminal && !screen_reader,
+            env::var("CRUMB_BRANDING").as_deref(),
+        ) {
             (false, _) | (_, Ok("off" | "none" | "disabled")) => BrandingMode::Disabled,
             (_, Ok("compact")) => BrandingMode::Compact,
             _ => BrandingMode::Full,
         };
         Self {
             color,
-            plain,
+            output: if screen_reader {
+                OutputMode::ScreenReader
+            } else if plain {
+                OutputMode::Plain
+            } else {
+                OutputMode::Rich
+            },
+            motion: if screen_reader || env_flag("CRUMB_REDUCED_MOTION") {
+                MotionMode::Reduced
+            } else {
+                MotionMode::Full
+            },
             branding,
         }
     }
@@ -163,17 +194,27 @@ impl Renderer {
         if let Some(skill) = skill {
             details.push(format!("skill {skill}"));
         }
-        format!(
-            "{} {}\n  {}",
-            self.paint("◆", "35;1"),
-            self.paint("Crumb agent", "1"),
-            self.paint(&details.join(" · "), "2")
-        )
+        if self.settings.output == OutputMode::ScreenReader {
+            format!("Crumb agent\n{}", details.join(", "))
+        } else {
+            format!(
+                "{} {}\n  {}",
+                self.paint("◆", "35;1"),
+                self.paint("Crumb agent", "1"),
+                self.paint(&details.join(" · "), "2")
+            )
+        }
     }
 
     /// Renders one committed Harness response and its bounded session metadata.
     #[must_use]
     pub fn agent_response(&self, response: &str, session_id: &str, event_count: usize) -> String {
+        if self.settings.output == OutputMode::ScreenReader {
+            return format!(
+                "{}\nsession {session_id}, {event_count} committed events",
+                response.trim()
+            );
+        }
         format!(
             "{}\n{} {}",
             response.trim(),
@@ -193,6 +234,9 @@ impl Renderer {
         } else {
             ("!", "Agent unavailable")
         };
+        if self.settings.output == OutputMode::ScreenReader {
+            return format!("{title}: {message}");
+        }
         format!(
             "{} {}\n  {}",
             self.paint(marker, if cancelled { "33;1" } else { "31;1" }),
@@ -201,16 +245,30 @@ impl Renderer {
         )
     }
 
+    /// Renders one transient Harness activity update.
+    #[must_use]
+    pub fn agent_activity(&self, label: &str) -> String {
+        if self.settings.output == OutputMode::ScreenReader {
+            format!("Activity: {label}")
+        } else {
+            format!("  ↳ {label}")
+        }
+    }
+
     /// Starts a single-line terminal activity animation.
     #[must_use]
     pub fn activity(&self, label: &str) -> ActivityIndicator {
-        ActivityIndicator::start(label, !self.settings.plain, self.settings.color)
+        ActivityIndicator::start(
+            label,
+            self.settings.output == OutputMode::Rich && self.settings.motion == MotionMode::Full,
+            self.settings.color,
+        )
     }
 
     #[must_use]
     pub fn prompt(&self, context: &PromptContext<'_>) -> String {
         let cwd = display_path(context.cwd);
-        if self.settings.plain {
+        if self.settings.output != OutputMode::Rich {
             let mut segments = vec![format!("crumb {cwd}"), context.platform.to_string()];
             append_optional_segments(&mut segments, context);
             return format!("{}\n> ", segments.join(" | "));
@@ -360,13 +418,17 @@ mod tests {
 
     use crumb_platform::Platform;
 
-    use super::{BrandingMode, GitSegment, PUNCHLINES, PromptContext, Renderer, UiSettings};
+    use super::{
+        BrandingMode, GitSegment, MotionMode, OutputMode, PUNCHLINES, PromptContext, Renderer,
+        UiSettings,
+    };
 
     #[test]
     fn plain_prompt_is_deterministic() {
         let renderer = Renderer::new(UiSettings {
             color: false,
-            plain: true,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
             branding: BrandingMode::Disabled,
         });
         let git = GitSegment {
@@ -391,7 +453,8 @@ mod tests {
     fn rich_prompt_uses_two_lines_without_color_when_disabled() {
         let renderer = Renderer::new(UiSettings {
             color: false,
-            plain: false,
+            output: OutputMode::Rich,
+            motion: MotionMode::Full,
             branding: BrandingMode::Compact,
         });
 
@@ -410,7 +473,8 @@ mod tests {
     fn full_branding_contains_the_product_name_shape() {
         let renderer = Renderer::new(UiSettings {
             color: false,
-            plain: false,
+            output: OutputMode::Rich,
+            motion: MotionMode::Full,
             branding: BrandingMode::Full,
         });
 
@@ -429,7 +493,8 @@ mod tests {
     fn agent_output_keeps_response_and_metadata_distinct() {
         let renderer = Renderer::new(UiSettings {
             color: false,
-            plain: true,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
             branding: BrandingMode::Disabled,
         });
 
@@ -441,5 +506,25 @@ mod tests {
             renderer.agent_response("done\n", "session-1", 4),
             "done\n─ session session-1 · 4 committed events"
         );
+    }
+
+    #[test]
+    fn screen_reader_output_avoids_decorative_symbols() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::ScreenReader,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+
+        assert_eq!(
+            renderer.agent_header("qwen-coder", None, "plan", None),
+            "Crumb agent\nmodel qwen-coder, mode plan"
+        );
+        assert_eq!(
+            renderer.agent_error("stopped", true),
+            "Agent cancelled: stopped"
+        );
+        assert!(renderer.branding().is_empty());
     }
 }

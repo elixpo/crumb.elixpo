@@ -86,7 +86,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 - [x] [Stream Harness activity and support queued steering](https://github.com/elixpo/crumb.elixpo/issues/36)
 - [x] [Add reviewable diffs, checkpoints, and safe rewind](https://github.com/elixpo/crumb.elixpo/issues/37)
-- [ ] [Ship modern input editing, shell completions, and accessibility modes](https://github.com/elixpo/crumb.elixpo/issues/38)
+- [x] [Ship modern input editing, shell completions, and accessibility modes](https://github.com/elixpo/crumb.elixpo/issues/38)
 - [x] [Add resumable and searchable agent sessions](https://github.com/elixpo/crumb.elixpo/issues/35)
 - [ ] [Add opt-in background jobs and scheduled agent work](https://github.com/elixpo/crumb.elixpo/issues/34)
 - [ ] [Add pluggable Codex and Claude coding-agent backends](https://github.com/elixpo/crumb.elixpo/issues/39)
@@ -95,7 +95,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 ## Planned work packages
 
 - [x] [WP-012 — deterministic agent/session foundation](https://github.com/elixpo/crumb.elixpo/issues/33) ([design](agent-foundation.md)).
-- [ ] [DeepSeek Harness + RTK/token optimizers](https://github.com/elixpo/crumb.elixpo/issues/22): [Harness adapter](deepseek-harness.md) first, optimizers second.
+- [x] [DeepSeek Harness + RTK/token optimizers](https://github.com/elixpo/crumb.elixpo/issues/22): [Harness adapter](deepseek-harness.md) and measured [optimizer pipeline](token-optimization.md).
 - [ ] [Skills and natural-language routing](https://github.com/elixpo/crumb.elixpo/issues/25): valid commands stay native; unresolved phrases follow configured deterministic policy.
 - [ ] Implement the [`/` command and `@` reference catalog](../product/input-namespaces-and-connectors.md) incrementally; neither symbol activates an AI prompt.
 - [ ] Add connectors in the catalog's priority order, starting with GitHub, Google Drive, Cloudinary, email, and calendar.
