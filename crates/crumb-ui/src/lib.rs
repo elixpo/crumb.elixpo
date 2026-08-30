@@ -11,11 +11,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crumb_platform::Platform;
 
-const WORDMARK: &str = r"   _____ ____  _   _ __  __ ____
-  / ____|  _ \| | | |  \/  |  _ \
- | |    | |_) | | | | |\/| | |_) |
- | |____|  _ <| |_| | |  | |  _ <
-  \_____|_| \_\ \___/|_|  |_|_| \_\";
+const WORDMARK: &str = r"░█████╗░██████╗░██╗░░░██╗███╗░░░███╗██████╗░
+██╔══██╗██╔══██╗██║░░░██║████╗░████║██╔══██╗
+██║░░╚═╝██████╔╝██║░░░██║██╔████╔██║██████╦╝
+██║░░██╗██╔══██╗██║░░░██║██║╚██╔╝██║██╔══██╗
+╚█████╔╝██║░░██║╚██████╔╝██║░╚═╝░██║██████╦╝
+░╚════╝░╚═╝░░╚═╝░╚═════╝░╚═╝░░░░░╚═╝╚═════╝░";
 const PANDA_AWAKE: &str = include_str!("../assets/panda-awake.txt");
 const PANDA_COOL: &str = include_str!("../assets/panda-cool.txt");
 const COOKIE_SPINNER: [&str; 4] = ["(.:)", "(:.)", "(o.)", "(.o)"];
@@ -218,25 +219,23 @@ impl Renderer {
             "Native shell ready · run /auth login for AI".to_owned()
         };
         let copy = format!(
-            "Crumb CLI v{} uses AI.\nNative commands stay native. Review AI actions.\n\n{}\nEffort · {}\nSession budget · {} tokens\nContext · {} / {}{}\n\nTip: type naturally · : forces AI · / opens actions",
+            "{WORDMARK}\nCrumb CLI v{} · Native commands stay native.\n{} · effort {}\nContext {} / {} · session budget {}{}\nTip: type naturally · : forces AI · / opens actions",
             context.version,
             state,
             context.effort.unwrap_or("default"),
-            compact_tokens(context.session_budget_tokens),
             compact_tokens(context.context_tokens),
             compact_tokens(context.session_budget_tokens),
+            compact_tokens(context.session_budget_tokens),
             if context.auto_compaction {
-                " · auto compact at 80%"
+                " · compact at 80%"
             } else {
                 ""
             }
         );
-        if terminal_width < 64 {
-            return format!(
-                "{}\n\n{}",
-                self.paint_panda(trim_art(panda)),
-                self.paint(&copy, "2")
-            );
+        if terminal_width < 76 {
+            let panda = format!("  {}", trim_art(panda).replace('\n', "\n  "));
+            let copy = paint_welcome_copy(*self, &copy, "  ");
+            return format!("{}\n\n{}", self.paint_panda(&panda), copy);
         }
         compose_welcome(*self, trim_art(panda), &copy)
     }
@@ -293,7 +292,20 @@ impl Renderer {
         } else {
             "←/→ move · ↑ history · Tab complete · @ add context · / commands · Ctrl+C cancel"
         };
-        self.paint(guide, "2")
+        self.paint(&format!("  {guide}"), "2")
+    }
+
+    /// Renders the bottom edge of the full-width composer.
+    #[must_use]
+    pub fn composer_bottom_border(&self, terminal_width: u16) -> String {
+        let inner = usize::from(terminal_width.saturating_sub(6));
+        self.paint(&format!("  ╰{}╯", "─".repeat(inner)), "2")
+    }
+
+    /// Renders one vertical composer edge.
+    #[must_use]
+    pub fn composer_side_border(&self) -> String {
+        self.paint("│", "2")
     }
 
     /// Renders a compact, non-blocking startup readiness summary.
@@ -412,7 +424,7 @@ impl Renderer {
             return format!("{}\n> ", segments.join(" | "));
         }
 
-        let mut context_line = self.paint(&cwd, "34;1");
+        let mut context_line = self.paint(&format!("  {cwd}"), "34;1");
         if let Some(git) = context.git {
             let dirty = if git.dirty { " *" } else { "" };
             context_line.push_str(&self.paint(&format!("  git:{}{dirty}", git.branch), "2"));
@@ -422,10 +434,10 @@ impl Renderer {
         {
             context_line.push_str(&self.paint(&format!("  exit:{exit_code}"), "31"));
         }
-        let rule_width = usize::from(context.terminal_width.saturating_sub(2).clamp(20, 160));
+        let rule_width = usize::from(context.terminal_width.saturating_sub(6));
         format!(
-            "{context_line}\n{}\n{} ",
-            self.paint(&format!("┌{}", "─".repeat(rule_width)), "2"),
+            "{context_line}\n  {}\n  {} ",
+            self.paint(&format!("╭{}╮", "─".repeat(rule_width)), "2"),
             self.paint("│", "36;1")
         )
     }
@@ -440,14 +452,14 @@ impl Renderer {
 
     fn brand_art(self, terminal_width: u16) -> String {
         let panda = panda_art(panda_mood(None));
-        if terminal_width < 72 {
+        if terminal_width < 76 {
             return format!(
                 "{}\n{}",
-                self.paint("CRUMB", "36;1"),
-                self.paint_panda(trim_art(panda))
+                self.paint_panda(trim_art(panda)),
+                self.paint(WORDMARK, "38;2;255;255;204;1")
             );
         }
-        compose_styled_art(self, WORDMARK, trim_art(panda), 4)
+        compose_styled_art(self, trim_art(panda), WORDMARK, 4)
     }
 
     fn paint_panda(self, panda: &str) -> String {
@@ -547,9 +559,9 @@ fn compose_styled_art(renderer: Renderer, left: &str, right: &str, gap: usize) -
                 .unwrap_or("");
             format!(
                 "{}{}{}",
-                renderer.paint(&format!("{left_line:<left_width$}"), "36"),
+                renderer.paint_panda(&format!("{left_line:<left_width$}")),
                 " ".repeat(gap),
-                renderer.paint_panda(right_line)
+                renderer.paint(right_line, "38;2;255;255;204;1")
             )
         })
         .collect::<Vec<_>>()
@@ -570,13 +582,31 @@ fn compose_welcome(renderer: Renderer, panda: &str, copy: &str) -> String {
             let panda_line = panda.get(row).copied().unwrap_or("");
             let copy_line = copy.get(row).copied().unwrap_or("");
             format!(
-                "{}   {}",
+                "  {}    {}",
                 renderer.paint_panda(&format!("{panda_line:<panda_width$}")),
-                renderer.paint(copy_line, if row == 0 { "1" } else { "2" })
+                renderer.paint(copy_line, welcome_copy_style(row))
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn paint_welcome_copy(renderer: Renderer, copy: &str, gutter: &str) -> String {
+    copy.lines()
+        .enumerate()
+        .map(|(row, line)| format!("{gutter}{}", renderer.paint(line, welcome_copy_style(row))))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const fn welcome_copy_style(row: usize) -> &'static str {
+    match row {
+        0..=5 => "38;2;255;255;204;1",
+        6 => "97;1",
+        7 => "36;1",
+        9 => "35",
+        _ => "2",
+    }
 }
 
 fn startup_punchline() -> &'static str {
@@ -800,9 +830,15 @@ mod tests {
             terminal_width: 80,
         });
 
-        assert!(prompt.starts_with("/workspace\n┌"));
-        assert!(prompt.ends_with("\n│ "));
+        assert!(prompt.starts_with("  /workspace\n  ╭"));
+        assert!(prompt.ends_with("\n  │ "));
         assert!(!prompt.contains("exit:"));
+        let top_border = prompt.lines().nth(1).expect("composer top border");
+        let bottom_border = renderer.composer_bottom_border(80);
+        assert_eq!(top_border.chars().count(), 78);
+        assert_eq!(bottom_border.chars().count(), 78);
+        assert!(top_border.ends_with('╮'));
+        assert!(bottom_border.ends_with('╯'));
     }
 
     #[test]
@@ -818,13 +854,13 @@ mod tests {
         let narrow = renderer.branding_for_width(60);
         let wide = renderer.branding_for_width(180);
 
-        assert!(branding.contains("_____ ____"));
+        assert!(branding.contains("░█████╗░██████╗░"));
         assert!(
             PUNCHLINES
                 .iter()
                 .any(|punchline| branding.contains(punchline))
         );
-        assert!(narrow.contains("CRUMB"));
+        assert!(narrow.contains("░█████╗░██████╗░"));
         assert!(narrow.contains("╭▄█▄╮"));
         assert!(wide.contains("╭▄█▄╮"));
     }
@@ -883,7 +919,7 @@ mod tests {
             },
             120,
         );
-        assert!(welcome.contains("Crumb CLI v0.1.0 uses AI."));
+        assert!(welcome.contains("Crumb CLI v0.1.0 · Native commands stay native."));
         assert!(welcome.contains("Ready · pollinations/nova-fast · auto"));
         assert!(welcome.contains("╭▄█▄╮"));
     }

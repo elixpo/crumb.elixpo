@@ -364,11 +364,8 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             .as_ref()
             .map_or_else(current_process_dir, |shell| Ok(shell.cwd().to_path_buf()))?;
         let terminal_width = size().map_or(80, |(columns, _)| columns);
-        let status = prompt_model_status(&cwd, agent_runtime.as_ref());
-        let prompt = with_composer_status(
-            render_prompt(renderer, &cwd, platform, last_exit_code, terminal_width),
-            &status,
-        );
+        let status = prompt_model_status(&cwd, agent_runtime.as_ref(), terminal_width);
+        let prompt = render_prompt(renderer, &cwd, platform, last_exit_code, terminal_width);
         let event = if let Some(editor) = line_editor.as_mut() {
             editor.workspace.set(&cwd);
             if fullscreen {
@@ -376,7 +373,7 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             }
             match editor
                 .editor
-                .read_line(&CrumbPrompt::new(prompt, String::new()))?
+                .read_line(&CrumbPrompt::new(prompt, format!("{status}  ")))?
             {
                 Signal::Success(command) => Some(crumb_repl::classify_input(&command)),
                 Signal::CtrlD => None,
@@ -485,15 +482,14 @@ fn render_startup(
         let welcome = renderer.welcome(&startup, terminal_width);
         writeln!(writer, "{welcome}")?;
         return Ok(u16::try_from(welcome.lines().count()).unwrap_or(u16::MAX));
-    } else {
-        let branding = renderer.branding_for_width(terminal_width);
-        if !branding.is_empty() {
-            writeln!(
-                writer,
-                "{branding}\n\n{}\n",
-                renderer.startup_status(&startup)
-            )?;
-        }
+    }
+    let branding = renderer.branding_for_width(terminal_width);
+    if !branding.is_empty() {
+        writeln!(
+            writer,
+            "{branding}\n\n{}\n",
+            renderer.startup_status(&startup)
+        )?;
     }
     Ok(0)
 }
@@ -3310,6 +3306,7 @@ impl Hinter for CrumbHinter {
             return if use_ansi_coloring {
                 Style::new()
                     .fg(Color::DarkGray)
+                    .bold()
                     .paint(placeholder)
                     .to_string()
             } else {
@@ -3372,12 +3369,12 @@ impl Prompt for CrumbPrompt {
     }
 }
 
-fn prompt_model_status(cwd: &Path, runtime: Option<&AgentRuntime>) -> String {
+fn prompt_model_status(cwd: &Path, runtime: Option<&AgentRuntime>, terminal_width: u16) -> String {
     let Ok(config) = read_agent_config(cwd) else {
         return "native".to_owned();
     };
     let (context_tokens, session_tokens, compactions) =
-        runtime.map(AgentRuntime::token_usage).unwrap_or((0, 0, 0));
+        runtime.map_or((0, 0, 0), AgentRuntime::token_usage);
     config
         .models
         .get(&Modality::Text)
@@ -3386,6 +3383,21 @@ fn prompt_model_status(cwd: &Path, runtime: Option<&AgentRuntime>) -> String {
             || "native".to_owned(),
             |route| {
                 let effort = config.reasoning_effort_for(route).unwrap_or("default");
+                if terminal_width < 96 {
+                    return format!("{} · {}", route.model, agent_mode_name(config.mode));
+                }
+                let context = format!(
+                    "ctx ~{}/{}",
+                    compact_token_count(context_tokens),
+                    compact_token_count(context_token_budget(&config, Some(route)))
+                );
+                if terminal_width < 152 {
+                    return format!(
+                        "{} · {} · {effort} · {context}",
+                        route.model,
+                        agent_mode_name(config.mode)
+                    );
+                }
                 let compaction =
                     if matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })) {
                         "compact auto"
@@ -3393,11 +3405,9 @@ fn prompt_model_status(cwd: &Path, runtime: Option<&AgentRuntime>) -> String {
                         "compact provider"
                     };
                 format!(
-                    "{} · {} · effort {effort} · ctx ~{}/{} · session ~{} · {compaction}{}",
+                    "{} · {} · effort {effort} · {context} · session ~{} · {compaction}{}",
                     route.model,
                     agent_mode_name(config.mode),
-                    compact_token_count(context_tokens),
-                    compact_token_count(context_token_budget(&config, Some(route))),
                     compact_token_count(session_tokens),
                     if compactions == 0 {
                         String::new()
@@ -3407,14 +3417,6 @@ fn prompt_model_status(cwd: &Path, runtime: Option<&AgentRuntime>) -> String {
                 )
             },
         )
-}
-
-fn with_composer_status(prompt: String, status: &str) -> String {
-    if let Some((head, tail)) = prompt.split_once('\n') {
-        format!("{head}  {status}\n{tail}")
-    } else {
-        prompt
-    }
 }
 
 fn compact_token_count(tokens: u64) -> String {
@@ -3475,17 +3477,25 @@ fn set_transcript_scroll_region(
 
 fn position_composer(renderer: Renderer, header_rows: u16) -> io::Result<()> {
     let (columns, _) = size()?;
-    let (transcript_top, transcript_bottom, composer_row, footer_row) =
-        fullscreen_rows(header_rows)?;
+    let (_, _, composer_row, footer_row) = fullscreen_rows(header_rows)?;
     let mut writer = io::stdout();
-    set_transcript_scroll_region(&mut writer, transcript_top, transcript_bottom)?;
+    // Reedline owns cursor movement while editing. Reset margins before handing
+    // it the composer so its redraw bookkeeping cannot erase transcript rows.
+    write!(writer, "\x1b[r")?;
     crossterm::execute!(
         writer,
         MoveTo(0, composer_row),
         Clear(ClearType::FromCursorDown),
-        MoveTo(0, footer_row),
+        MoveTo(columns.saturating_sub(3), composer_row.saturating_add(2))
+    )?;
+    write!(writer, "{}", renderer.composer_side_border())?;
+    crossterm::execute!(
+        writer,
+        MoveTo(0, composer_row.saturating_add(3)),
         Clear(ClearType::CurrentLine)
     )?;
+    write!(writer, "{}", renderer.composer_bottom_border(columns))?;
+    crossterm::execute!(writer, MoveTo(0, footer_row), Clear(ClearType::CurrentLine))?;
     write!(writer, "{}", renderer.composer_hotkeys(columns))?;
     writer.flush()?;
     crossterm::execute!(writer, MoveTo(0, composer_row))
