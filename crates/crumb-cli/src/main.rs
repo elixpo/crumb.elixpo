@@ -254,7 +254,7 @@ fn launch_due_jobs(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
 fn serve_mcp() -> Result<()> {
     let workspace = current_process_dir()?;
     let config = read_agent_config(&workspace)?;
-    let search_api_key = std::env::var("POLLINATIONS_API_KEY").ok();
+    let search_api_key = pollinations_environment_key();
     let host = workspace_read_host(&workspace, &config, search_api_key)?;
     let dispatcher = McpDispatcher::new(
         host,
@@ -1867,11 +1867,7 @@ fn handle_auth(action: AuthAction, writer: &mut dyn Write) -> Result<()> {
             )?;
         }
         AuthAction::Status => {
-            let environment = std::env::var("POLLINATIONS_API_KEY").ok();
-            if environment
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-            {
+            if pollinations_environment_key().is_some() {
                 writeln!(writer, "Pollinations BYOK configured (environment)")?;
                 return Ok(());
             }
@@ -1897,15 +1893,30 @@ fn handle_auth(action: AuthAction, writer: &mut dyn Write) -> Result<()> {
             } else {
                 writeln!(writer, "Pollinations BYOK was not stored")?;
             }
-            if std::env::var_os("POLLINATIONS_API_KEY").is_some() {
+            let active = ["POLLINATIONS_API_KEY", "POLLINATIONS_KEY"]
+                .into_iter()
+                .filter(|name| std::env::var_os(name).is_some())
+                .collect::<Vec<_>>();
+            if !active.is_empty() {
                 writeln!(
                     writer,
-                    "POLLINATIONS_API_KEY remains active for this process"
+                    "{} remains active for this process",
+                    active.join(" and ")
                 )?;
             }
         }
     }
     Ok(())
+}
+
+fn pollinations_environment_key() -> Option<String> {
+    ["POLLINATIONS_API_KEY", "POLLINATIONS_KEY"]
+        .into_iter()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
 }
 
 fn execute_foreground(

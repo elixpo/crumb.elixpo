@@ -31,6 +31,9 @@ The executable composition is
 `DSH_CORDIS_CONFIG`, `DSH_CWD`, `DSH_SESSION_ROOT`, and `CRUMB_MCP_COMMAND`.
 It supplies `POLLINATIONS_API_KEY` transiently from Crumb's credential boundary;
 the key is never written into Cordis or agent configuration. The composition
+accepts the local-development `POLLINATIONS_KEY` alias at the CLI boundary and
+normalizes it to `POLLINATIONS_API_KEY` only in the isolated child environment.
+The composition
 uses the generic `llm-pi-ai` OpenAI-compatible route for `nova-fast` and
 `qwen-coder`, with optional `Circuit-Overtime/OreoLook` reasoning and
 `perplexity` search routes. It contains no Harness-native shell or filesystem

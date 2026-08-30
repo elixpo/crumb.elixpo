@@ -52,3 +52,20 @@ effort support varies by model:
 
 - [OpenAI models](https://developers.openai.com/api/docs/models)
 - [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage)
+
+## Isolated smoke test
+
+The checked-in [Codex](../examples/agent-config-codex.json) and
+[Claude](../examples/agent-config-claude.json) examples use plan mode and do
+not replace the repository configuration. Copy one into a temporary workspace:
+
+```bash
+mkdir -p /tmp/crumb-coding-smoke/.crumb
+cp docs/examples/agent-config-codex.json /tmp/crumb-coding-smoke/.crumb/agent.json
+cd /tmp/crumb-coding-smoke
+/path/to/crumb
+```
+
+Run `/doctor`, then submit a plain-language request. Change the example model
+and its declared effort metadata together when the provider account supports a
+different exact model.

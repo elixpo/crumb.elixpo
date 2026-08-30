@@ -610,9 +610,7 @@ fn resolve_composition(workspace: &Path, configured: Option<&Path>) -> Result<Pa
 }
 
 fn pollinations_credential() -> Result<SecretString> {
-    if let Ok(value) = std::env::var("POLLINATIONS_API_KEY")
-        && !value.trim().is_empty()
-    {
+    if let Some(value) = crate::pollinations_environment_key() {
         return Ok(SecretString::new(value));
     }
     OsCredentialStore::new()?

@@ -38,6 +38,17 @@ writes the key to a plaintext file.
 For headless or ephemeral sessions, `POLLINATIONS_API_KEY` remains an explicit
 process-only override. Crumb does not persist that value.
 
+Local development also accepts `POLLINATIONS_KEY` as an alias so the existing
+root `.env.local` can be sourced without renaming its variable. Crumb does not
+scan or parse dotenv files itself:
+
+```bash
+set -a
+source ./.env.local
+set +a
+cargo run -p crumb-cli
+```
+
 ## Web configuration
 
 See [account connector development](../development/account-connector.md) for
