@@ -373,7 +373,7 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             }
             match editor
                 .editor
-                .read_line(&CrumbPrompt::new(prompt, format!("{status}  ")))?
+                .read_line(&CrumbPrompt::new(prompt.clone(), format!("{status}  ")))?
             {
                 Signal::Success(command) => Some(crumb_repl::classify_input(&command)),
                 Signal::CtrlD => None,
@@ -390,7 +390,7 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             return Ok(ReplOutcome::Exit);
         };
         if fullscreen {
-            position_transcript(header_rows)?;
+            prepare_fullscreen_submission(renderer, header_rows, &prompt, &status, &event)?;
         }
         let mut writer = stdout.lock();
 
@@ -709,20 +709,6 @@ fn handle_agent_boundary(
     if matches!(decision.route, InputRoute::Native) {
         unreachable!("native input is handled by the shell path");
     }
-    if runtime.is_none() {
-        match AgentRuntime::new() {
-            Ok(created) => *runtime = Some(created),
-            Err(error) => {
-                writeln!(
-                    writer,
-                    "{}",
-                    renderer.agent_error(&error.to_string(), false)
-                )?;
-                return Ok(());
-            }
-        }
-    }
-
     let route = config
         .models
         .get(&Modality::Text)
@@ -737,6 +723,20 @@ fn handle_agent_boundary(
         renderer.agent_header(&model, effort, agent_mode_name(config.mode), None)
     )?;
     writer.flush()?;
+    if runtime.is_none() {
+        match AgentRuntime::new() {
+            Ok(created) => *runtime = Some(created),
+            Err(error) => {
+                writeln!(
+                    writer,
+                    "{}",
+                    renderer.agent_error(&error.to_string(), false)
+                )?;
+                return Ok(());
+            }
+        }
+    }
+
     execute_agent_sequence(
         decision.payload.clone(),
         config,
@@ -761,18 +761,21 @@ fn render_agent_result(
         Ok(result)
             if result.finish_reason.as_deref().is_some_and(|reason| {
                 matches!(reason, "error" | "failed" | "cancelled" | "canceled")
-            }) => {}
+            }) =>
+        {
+            writeln!(writer, "{}", renderer.agent_response(""))?
+        }
         Ok(_) if visible.as_deref().is_none_or(str::is_empty) => {
             writeln!(
                 writer,
                 "{}",
-                Renderer::agent_response("Turn completed without a text response.")
+                renderer.agent_response("Turn completed without a text response.")
             )?;
         }
         Ok(_) => writeln!(
             writer,
             "{}",
-            Renderer::agent_response(visible.as_deref().unwrap_or_default())
+            renderer.agent_response(visible.as_deref().unwrap_or_default())
         )?,
         Err(error) => {
             let message = error.to_string();
@@ -810,7 +813,7 @@ fn execute_agent_sequence(
             workspace.to_path_buf(),
             activity_capacity,
         )?;
-        let (returned_runtime, result) = loop {
+        let (returned_runtime, result, steered) = loop {
             match observe_agent_turn(
                 task,
                 &mut steering,
@@ -819,7 +822,9 @@ fn execute_agent_sequence(
                 writer,
                 interactive,
             )? {
-                TurnObservation::Finished(runtime, result) => break (*runtime, result),
+                TurnObservation::Finished(runtime, result, steered) => {
+                    break (*runtime, result, steered);
+                }
                 TurnObservation::Backgrounded(returned_task) => {
                     match promote_agent_turn(
                         returned_task,
@@ -845,8 +850,12 @@ fn execute_agent_sequence(
             }
         };
         active_runtime = returned_runtime;
-        let completed = result.is_ok();
-        render_agent_result(&result, renderer, writer)?;
+        let completed = result.is_ok() || steered;
+        if steered {
+            writeln!(writer, "{}", renderer.agent_response("Steering to your latest instruction."))?;
+        } else {
+            render_agent_result(&result, renderer, writer)?;
+        }
         if !completed {
             steering.clear();
             break;
@@ -866,7 +875,11 @@ fn execute_agent_sequence(
 }
 
 enum TurnObservation {
-    Finished(Box<AgentRuntime>, Result<crumb_harness_dsh::RunResult>),
+    Finished(
+        Box<AgentRuntime>,
+        Result<crumb_harness_dsh::RunResult>,
+        bool,
+    ),
     Backgrounded(agent_runtime::AgentTurnTask),
 }
 
@@ -949,7 +962,14 @@ fn observe_agent_turn(
             if let Some(indicator) = activity.take() {
                 indicator.finish();
             }
-            if input.handle_key(key.code, key.modifiers, &task, steering, writer)?
+            if input.handle_key(
+                key.code,
+                key.modifiers,
+                &task,
+                steering,
+                renderer,
+                writer,
+            )?
                 == SteeringInputAction::Background
             {
                 input.clear_line(writer)?;
@@ -967,13 +987,18 @@ fn observe_agent_turn(
         render_harness_activity(&event, &mut activity, renderer, writer)?;
         input.redraw(writer)?;
     }
+    let steered = input.steer_requested;
     input.clear_line(writer)?;
     drop(raw_mode);
     if let Some(indicator) = activity.take() {
         indicator.complete();
     }
     let (runtime, result) = task.finish()?;
-    Ok(TurnObservation::Finished(Box::new(runtime), result))
+    Ok(TurnObservation::Finished(
+        Box::new(runtime),
+        result,
+        steered,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -986,6 +1011,7 @@ struct SteeringInput {
     buffer: String,
     max_bytes: usize,
     visible: bool,
+    steer_requested: bool,
 }
 
 impl SteeringInput {
@@ -994,6 +1020,7 @@ impl SteeringInput {
             buffer: String::new(),
             max_bytes,
             visible: false,
+            steer_requested: false,
         }
     }
 
@@ -1003,6 +1030,7 @@ impl SteeringInput {
         modifiers: TerminalModifiers,
         task: &agent_runtime::AgentTurnTask,
         steering: &mut SteeringQueue,
+        renderer: Renderer,
         writer: &mut dyn Write,
     ) -> Result<SteeringInputAction> {
         if code == TerminalKeyCode::Char('c') && modifiers.contains(TerminalModifiers::CONTROL) {
@@ -1014,7 +1042,12 @@ impl SteeringInput {
             return Ok(SteeringInputAction::Continue);
         }
         match code {
-            TerminalKeyCode::Enter => return self.submit(steering, task, writer),
+            TerminalKeyCode::Enter if modifiers.contains(TerminalModifiers::CONTROL) => {
+                return self.submit(SteeringAction::Queue, steering, task, renderer, writer);
+            }
+            TerminalKeyCode::Enter => {
+                return self.submit(SteeringAction::Steer, steering, task, renderer, writer);
+            }
             TerminalKeyCode::Backspace => {
                 self.buffer.pop();
                 self.redraw(writer)?;
@@ -1042,8 +1075,10 @@ impl SteeringInput {
 
     fn submit(
         &mut self,
+        requested_action: SteeringAction,
         steering: &mut SteeringQueue,
         task: &agent_runtime::AgentTurnTask,
+        renderer: Renderer,
         writer: &mut dyn Write,
     ) -> Result<SteeringInputAction> {
         let input = self.buffer.trim().to_owned();
@@ -1067,21 +1102,31 @@ impl SteeringInput {
         }
         let (action, message) = input
             .strip_prefix("/replace ")
-            .map_or((SteeringAction::Queue, input.as_str()), |message| {
+            .map_or((requested_action, input.as_str()), |message| {
                 (SteeringAction::Replace, message)
             });
         self.clear_line(writer)?;
         match steering.submit(action, message) {
-            Ok(()) => writeln!(
-                writer,
-                "◇ {} follow-up · {} queued",
-                if action == SteeringAction::Replace {
-                    "Replaced"
-                } else {
-                    "Queued"
-                },
-                steering.len()
-            )?,
+            Ok(()) => {
+                writeln!(
+                    writer,
+                    "{}",
+                    renderer.transcript_input(&terminal_username(), message)
+                )?;
+                match action {
+                    SteeringAction::Steer => {
+                        self.steer_requested = true;
+                        task.cancel();
+                        writeln!(writer, "◇ Steering active turn")?;
+                    }
+                    SteeringAction::Queue => {
+                        writeln!(writer, "◇ Follow-up queued · {} waiting", steering.len())?;
+                    }
+                    SteeringAction::Replace => {
+                        writeln!(writer, "◇ Replaced follow-ups · {} waiting", steering.len())?;
+                    }
+                }
+            }
             Err(error) => writeln!(writer, "◇ Follow-up rejected · {error}")?,
         }
         self.buffer.clear();
@@ -1103,7 +1148,11 @@ impl SteeringInput {
         if self.buffer.is_empty() {
             return self.clear_line(writer);
         }
-        write!(writer, "\r\x1b[2K↪ steer> {}", self.buffer)?;
+        write!(
+            writer,
+            "\r\x1b[2K↪ follow-up [Enter steer · Ctrl+Enter queue]  {}",
+            self.buffer
+        )?;
         writer.flush()?;
         self.visible = true;
         Ok(())
@@ -3501,16 +3550,68 @@ fn position_composer(renderer: Renderer, header_rows: u16) -> io::Result<()> {
     crossterm::execute!(writer, MoveTo(0, composer_row))
 }
 
+fn render_idle_composer(
+    renderer: Renderer,
+    header_rows: u16,
+    prompt: &str,
+    status: &str,
+) -> io::Result<()> {
+    position_composer(renderer, header_rows)?;
+    let (columns, _) = size()?;
+    let (_, _, composer_row, _) = fullscreen_rows(header_rows)?;
+    let mut writer = io::stdout();
+    crossterm::execute!(writer, MoveTo(0, composer_row))?;
+    write!(writer, "{prompt}{}", renderer.composer_placeholder())?;
+    let status_width = u16::try_from(status.chars().count()).unwrap_or(u16::MAX);
+    let status_column = columns.saturating_sub(status_width.saturating_add(2));
+    crossterm::execute!(writer, MoveTo(status_column, composer_row))?;
+    write!(writer, "{}", renderer.composer_status(status))?;
+    writer.flush()
+}
+
+fn prepare_fullscreen_submission(
+    renderer: Renderer,
+    header_rows: u16,
+    prompt: &str,
+    status: &str,
+    event: &InputEvent,
+) -> io::Result<()> {
+    render_idle_composer(renderer, header_rows, prompt, status)?;
+    position_transcript(header_rows)?;
+    if let InputEvent::NativeInput(input) = event
+        && !input.trim().is_empty()
+    {
+        writeln!(
+            io::stdout(),
+            "{}",
+            renderer.transcript_input(&terminal_username(), input)
+        )?;
+    }
+    Ok(())
+}
+
+fn terminal_username() -> String {
+    let username = ["USER", "USERNAME"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok())
+        .unwrap_or_else(|| "you".to_owned());
+    let username = username
+        .chars()
+        .filter(|character| character.is_alphanumeric() || matches!(character, '_' | '-' | '.'))
+        .take(32)
+        .collect::<String>();
+    if username.is_empty() {
+        "you".to_owned()
+    } else {
+        username
+    }
+}
+
 fn position_transcript(header_rows: u16) -> io::Result<()> {
-    let (transcript_top, transcript_bottom, composer_row, _) = fullscreen_rows(header_rows)?;
+    let (transcript_top, transcript_bottom, _, _) = fullscreen_rows(header_rows)?;
     let mut writer = io::stdout();
     set_transcript_scroll_region(&mut writer, transcript_top, transcript_bottom)?;
-    crossterm::execute!(
-        writer,
-        MoveTo(0, composer_row),
-        Clear(ClearType::FromCursorDown),
-        MoveTo(0, transcript_bottom)
-    )?;
+    crossterm::execute!(writer, MoveTo(0, transcript_bottom))?;
     write!(writer, "\r\n")?;
     crossterm::execute!(writer, Clear(ClearType::CurrentLine))?;
     Ok(())

@@ -145,6 +145,19 @@ impl CommandCatalog {
         let Some(command) = command_word(trimmed) else {
             return decision(InputRoute::Native, RouteReason::ShellSyntax, input, None);
         };
+        if looks_like_sentence(trimmed) {
+            let route = route_for_unknown(policy.unknown_input);
+            return decision(
+                route,
+                if matches!(route, InputRoute::Agent) {
+                    RouteReason::NaturalLanguageCandidate
+                } else {
+                    RouteReason::PolicyFallback
+                },
+                input,
+                None,
+            );
+        }
         if looks_like_path(command)
             || (self.powershell_commands && looks_like_powershell_command(command))
             || self.contains(command)
@@ -168,11 +181,7 @@ impl CommandCatalog {
                 Some(suggestion.clone()),
             );
         }
-        let route = match policy.unknown_input {
-            UnknownInputPolicy::Agent => InputRoute::Agent,
-            UnknownInputPolicy::Negotiate => InputRoute::Negotiate,
-            UnknownInputPolicy::Native => InputRoute::Native,
-        };
+        let route = route_for_unknown(policy.unknown_input);
         decision(
             route,
             if single_token {
@@ -202,6 +211,35 @@ impl CommandCatalog {
             .min_by(std::cmp::Ord::cmp)
             .map(|(_, candidate)| candidate.clone())
     }
+}
+
+const fn route_for_unknown(policy: UnknownInputPolicy) -> InputRoute {
+    match policy {
+        UnknownInputPolicy::Agent => InputRoute::Agent,
+        UnknownInputPolicy::Negotiate => InputRoute::Negotiate,
+        UnknownInputPolicy::Native => InputRoute::Native,
+    }
+}
+
+fn looks_like_sentence(input: &str) -> bool {
+    let words = input.split_whitespace().collect::<Vec<_>>();
+    if words.len() < 5
+        || words.iter().any(|word| {
+            word.starts_with('-')
+                || word.contains('=')
+                || !word
+                    .trim_matches(['.', ',', '!', '?', ':'])
+                    .chars()
+                    .all(char::is_alphabetic)
+        })
+    {
+        return false;
+    }
+    let lengths = words
+        .iter()
+        .map(|word| word.trim_matches(['.', ',', '!', '?', ':']).chars().count());
+    lengths.clone().filter(|length| *length <= 3).count() >= 2
+        && lengths.filter(|length| *length >= 5).count() >= 2
 }
 
 fn decision(
@@ -345,6 +383,15 @@ mod tests {
         let decision = catalog().route("git status", &RoutePolicy::default());
         assert_eq!(decision.route, InputRoute::Native);
         assert_eq!(decision.reason, RouteReason::ResolvedCommand);
+    }
+
+    #[test]
+    fn sentence_shape_wins_over_an_accidental_executable_name_collision() {
+        let catalog = CommandCatalog::with_commands(["what".to_owned()]);
+        let decision = catalog.route("what is the folder about", &RoutePolicy::default());
+
+        assert_eq!(decision.route, InputRoute::Agent);
+        assert_eq!(decision.reason, RouteReason::NaturalLanguageCandidate);
     }
 
     #[test]

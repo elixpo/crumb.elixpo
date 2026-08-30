@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 /// User-selected update behavior for an active turn's follow-up queue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SteeringAction {
+    Steer,
     Queue,
     Replace,
 }
@@ -53,7 +54,7 @@ impl SteeringQueue {
             bail!("steering message exceeds the queue byte limit");
         }
         let (next_messages, next_bytes) = match action {
-            SteeringAction::Queue => (
+            SteeringAction::Steer | SteeringAction::Queue => (
                 self.messages.len().saturating_add(1),
                 self.bytes.saturating_add(message.len()),
             ),
@@ -66,7 +67,11 @@ impl SteeringQueue {
             self.messages.clear();
             self.bytes = 0;
         }
-        self.messages.push_back(message.to_owned());
+        if action == SteeringAction::Steer {
+            self.messages.push_front(message.to_owned());
+        } else {
+            self.messages.push_back(message.to_owned());
+        }
         self.bytes += message.len();
         Ok(())
     }
@@ -122,6 +127,20 @@ mod tests {
             .expect("message replaces queue");
         assert_eq!(queue.len(), 1);
         assert_eq!(queue.pop().as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn steer_runs_before_queued_follow_ups() {
+        let mut queue = SteeringQueue::new(3, 32).expect("valid limits");
+        queue
+            .submit(SteeringAction::Queue, "later")
+            .expect("follow-up queues");
+        queue
+            .submit(SteeringAction::Steer, "now")
+            .expect("steering message queues first");
+
+        assert_eq!(queue.pop().as_deref(), Some("now"));
+        assert_eq!(queue.pop().as_deref(), Some("later"));
     }
 
     #[test]

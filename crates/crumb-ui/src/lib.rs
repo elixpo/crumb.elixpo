@@ -288,9 +288,9 @@ impl Renderer {
     #[must_use]
     pub fn composer_hotkeys(&self, terminal_width: u16) -> String {
         let guide = if terminal_width < 80 {
-            "Tab complete · @ context · / commands · Ctrl+C cancel"
+            "Enter send · Tab complete · / commands · Ctrl+C cancel"
         } else {
-            "←/→ move · ↑ history · Tab complete · @ add context · / commands · Ctrl+C cancel"
+            "Enter send/steer · Ctrl+Enter queue · Tab complete · @ context · / commands · Ctrl+C cancel"
         };
         self.paint(&format!("  {guide}"), "2")
     }
@@ -306,6 +306,41 @@ impl Renderer {
     #[must_use]
     pub fn composer_side_border(&self) -> String {
         self.paint("│", "2")
+    }
+
+    /// Renders the inactive prompt hint while a submitted turn is running.
+    #[must_use]
+    pub fn composer_placeholder(&self) -> String {
+        self.paint(
+            "Ask Crumb anything or type a command · @ context · / commands · Tab complete",
+            "2;1",
+        )
+    }
+
+    /// Renders right-aligned, non-secret composer status.
+    #[must_use]
+    pub fn composer_status(&self, status: &str) -> String {
+        self.paint(status, "35")
+    }
+
+    /// Renders a submitted line as part of the scrolling transcript.
+    #[must_use]
+    pub fn transcript_input(&self, username: &str, input: &str) -> String {
+        if self.settings.output == OutputMode::ScreenReader {
+            return format!("{username}: {input}");
+        }
+        let mut lines = input.lines();
+        let first = lines.next().unwrap_or_default();
+        let mut body = format!("{} {}", self.paint("╰──▶", "36;1"), self.paint(first, "1"));
+        let continuation = lines
+            .map(|line| format!("\n{} {line}", self.paint("    │", "36")))
+            .collect::<String>();
+        body.push_str(&continuation);
+        format!(
+            "{} {}\n{body}",
+            self.paint("╭─❯", "36;1"),
+            self.paint(username, "1")
+        )
     }
 
     /// Renders a compact, non-blocking startup readiness summary.
@@ -363,8 +398,8 @@ impl Renderer {
         } else {
             format!(
                 "{} {}  {}",
-                self.paint("◆", "35;1"),
-                self.paint("Crumb agent", "1"),
+                self.paint("╭─◆", "35;1"),
+                self.paint("CRUMB", "38;2;255;255;204;1"),
                 self.paint(&details.join(" · "), "2")
             )
         }
@@ -372,8 +407,21 @@ impl Renderer {
 
     /// Renders one committed Harness response without protocol metadata.
     #[must_use]
-    pub fn agent_response(response: &str) -> String {
-        visible_agent_text(response)
+    pub fn agent_response(&self, response: &str) -> String {
+        let response = visible_agent_text(response);
+        if self.settings.output == OutputMode::ScreenReader {
+            return response;
+        }
+        let body = response
+            .lines()
+            .map(|line| format!("{} {line}", self.paint("│", "35")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if body.is_empty() {
+            self.paint("╰─", "35")
+        } else {
+            format!("{body}\n{}", self.paint("╰─", "35"))
+        }
     }
 
     /// Renders a Harness failure without conflating it with native shell output.
@@ -388,10 +436,13 @@ impl Renderer {
             return format!("{title}: {message}");
         }
         format!(
-            "{} {}\n  {}",
+            "{} {} {}\n{} {}\n{}",
+            self.paint("│", "35"),
             self.paint(marker, if cancelled { "33;1" } else { "31;1" }),
             self.paint(title, "1"),
-            self.paint(message, "2")
+            self.paint("│", "35"),
+            self.paint(message, "2"),
+            self.paint("╰─", "35")
         )
     }
 
@@ -401,7 +452,7 @@ impl Renderer {
         if self.settings.output == OutputMode::ScreenReader {
             format!("Activity: {label}")
         } else {
-            format!("  ↳ {label}")
+            format!("{}  ↳ {label}", self.paint("│", "35"))
         }
     }
 
@@ -876,9 +927,13 @@ mod tests {
 
         assert_eq!(
             renderer.agent_header("qwen-coder", Some("high"), "auto", None),
-            "◆ Crumb agent  model qwen-coder · mode auto · effort high"
+            "╭─◆ CRUMB  model qwen-coder · mode auto · effort high"
         );
-        assert_eq!(Renderer::agent_response("done\n"), "done");
+        assert_eq!(renderer.agent_response("done\n"), "│ done\n╰─");
+        assert_eq!(
+            renderer.transcript_input("elixpo", "fix this"),
+            "╭─❯ elixpo\n╰──▶ fix this"
+        );
     }
 
     #[test]
