@@ -50,7 +50,8 @@
   "skills": [],
   "mcp_servers": [],
   "permissions": {
-    "allow_network_tools": ["web_search"]
+    "allow_network_tools": ["web_search"],
+    "allow_workspace_tools": ["write_file"]
   },
   "optimizers": [
     { "id": "rtk", "command": "rtk", "arguments": [], "enabled": true }

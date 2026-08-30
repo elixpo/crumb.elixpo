@@ -151,6 +151,8 @@ pub struct OptimizerConfig {
 pub struct ToolPermissions {
     /// Network tools allowed without an interactive approval bridge.
     pub allow_network_tools: BTreeSet<String>,
+    /// Workspace-write tools explicitly enabled by the user.
+    pub allow_workspace_tools: BTreeSet<String>,
 }
 
 /// Complete live configuration. Secrets are deliberately not representable.
@@ -224,9 +226,10 @@ impl AgentConfig {
             .permissions
             .allow_network_tools
             .iter()
+            .chain(&self.permissions.allow_workspace_tools)
             .any(|tool| !valid_identifier(tool))
         {
-            bail!("network permission entries must be valid tool identifiers");
+            bail!("tool permission entries must be valid identifiers");
         }
         Ok(())
     }

@@ -95,13 +95,7 @@ impl CheckpointStore {
         before: Option<&[u8]>,
         after: &[u8],
     ) -> Result<WorkspaceCheckpoint> {
-        let path = validate_relative_path(path)?;
-        ensure_checkpoint_safe(&path, before, after)?;
-        if before.is_some_and(|content| content.len() > self.max_file_bytes)
-            || after.len() > self.max_file_bytes
-        {
-            bail!("checkpoint content exceeds the configured file limit");
-        }
+        let path = self.validate_edit(path, before, after)?;
         let current = fs::read(self.resolve_target(&path)?)
             .with_context(|| format!("failed to verify Crumb edit `{}`", path.display()))?;
         if current != after {
@@ -135,6 +129,28 @@ impl CheckpointStore {
         };
         write_manifest(&directory, &checkpoint)?;
         Ok(checkpoint)
+    }
+
+    /// Validates checkpoint safety before a write tool mutates the workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsafe paths, credential-like content, or files
+    /// exceeding the configured limit.
+    pub fn validate_edit(
+        &self,
+        path: &Path,
+        before: Option<&[u8]>,
+        after: &[u8],
+    ) -> Result<PathBuf> {
+        let path = validate_relative_path(path)?;
+        ensure_checkpoint_safe(&path, before, after)?;
+        if before.is_some_and(|content| content.len() > self.max_file_bytes)
+            || after.len() > self.max_file_bytes
+        {
+            bail!("checkpoint content exceeds the configured file limit");
+        }
+        Ok(path)
     }
 
     /// Lists valid checkpoint manifests newest-first.
@@ -231,6 +247,27 @@ impl CheckpointStore {
         }
         write_manifest(&self.checkpoint_directory(id)?, &checkpoint)?;
         Ok(checkpoint)
+    }
+
+    /// Applies one decision to every pending checkpoint, newest-first.
+    ///
+    /// Rejection stops at the first stale file so a later user edit is never
+    /// overwritten. Checkpoints successfully handled before that refusal keep
+    /// their explicit decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when checkpoints cannot be listed or a decision cannot
+    /// be applied safely.
+    pub fn decide_pending(
+        &self,
+        decision: CheckpointDecision,
+    ) -> Result<Vec<WorkspaceCheckpoint>> {
+        self.list()?
+            .into_iter()
+            .filter(|checkpoint| checkpoint.file.status == CheckpointStatus::Pending)
+            .map(|checkpoint| self.decide(&checkpoint.id, decision))
+            .collect()
     }
 
     fn restore(&self, checkpoint: &WorkspaceCheckpoint) -> Result<()> {

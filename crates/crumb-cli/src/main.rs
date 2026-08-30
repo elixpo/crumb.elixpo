@@ -29,7 +29,10 @@ use crumb_platform::Platform;
 use crumb_pollinations::{PollinationsSearchConfig, register_web_search_tool};
 use crumb_pty::{PtyInput, PtyResizer, SystemPty, TerminalSize};
 use crumb_repl::{ReplOutcome, read_classified_line};
-use crumb_tools::{WorkspaceToolLimits, register_workspace_read_tools};
+use crumb_tools::{
+    CheckpointDecision, CheckpointStatus, CheckpointStore, WorkspaceToolLimits,
+    WorkspaceWriteLimits, register_workspace_read_tools, register_workspace_write_tool,
+};
 use crumb_ui::{GitSegment, PromptContext, Renderer, UiSettings};
 use reedline::{
     ColumnarMenu, Emacs, FileBackedHistory, History, HistoryItem, KeyCode, KeyModifiers,
@@ -85,9 +88,10 @@ fn serve_mcp() -> Result<()> {
     let host = workspace_read_host(&workspace, &config, search_api_key)?;
     let dispatcher = McpDispatcher::new(
         host,
-        Arc::new(ConfiguredApprovals::new(
-            config.permissions.allow_network_tools,
-        )),
+        Arc::new(
+            ConfiguredApprovals::new(config.permissions.allow_network_tools.clone())
+                .with_workspace_tools(config.permissions.allow_workspace_tools.clone()),
+        ),
         config.mode,
         env!("CARGO_PKG_VERSION"),
     );
@@ -109,6 +113,8 @@ fn workspace_read_host(
         .map_err(|_| anyhow!("max_output_bytes exceeds this platform's address space"))?;
     let max_directory_entries = usize::try_from(config.limits.max_directory_entries)
         .map_err(|_| anyhow!("max_directory_entries exceeds this platform's address space"))?;
+    let max_file_write_bytes = usize::try_from(config.limits.max_file_write_bytes)
+        .map_err(|_| anyhow!("max_file_write_bytes exceeds this platform's address space"))?;
     let mut host = ToolHost::default();
     register_workspace_read_tools(
         &mut host,
@@ -116,6 +122,13 @@ fn workspace_read_host(
         WorkspaceToolLimits {
             max_output_bytes,
             max_directory_entries,
+        },
+    )?;
+    register_workspace_write_tool(
+        &mut host,
+        workspace,
+        WorkspaceWriteLimits {
+            max_file_bytes: max_file_write_bytes,
         },
     )?;
     if let Some(route) = config
@@ -834,7 +847,9 @@ fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
         ),
         (
             "AGENT",
-            &["/mode", "/model", "/effort", "/session", "/cancel", "/cost"][..],
+            &[
+                "/mode", "/model", "/effort", "/session", "/review", "/cancel", "/cost",
+            ][..],
         ),
         (
             "CONTEXT & CAPABILITIES",
@@ -947,6 +962,9 @@ fn show_reserved(
         }
         "/config" => show_config_summary(cwd, writer)?,
         "/plugins" => show_plugins(cwd, writer)?,
+        command if command == "/review" || command.starts_with("/review ") => {
+            show_reviews(command, cwd, writer)?;
+        }
         command if command == "/session" || command.starts_with("/session ") => {
             show_sessions(command, cwd, runtime, writer)?;
         }
@@ -956,6 +974,82 @@ fn show_reserved(
         }
     }
     Ok(())
+}
+
+fn show_reviews(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    let max_file_bytes = usize::try_from(config.limits.max_file_write_bytes)
+        .context("max_file_write_bytes exceeds this platform's address space")?;
+    let max_output_bytes = usize::try_from(config.limits.max_output_bytes)
+        .context("max_output_bytes exceeds this platform's address space")?;
+    let store = CheckpointStore::new(cwd, max_file_bytes)?;
+    let arguments = command.split_whitespace().skip(1).collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [] | ["list"] => show_review_list(&store, writer)?,
+        ["diff", id] => {
+            let checkpoint = store.load(id)?;
+            show_review_summary(&checkpoint, writer)?;
+            writeln!(writer, "{}", store.render_diff(id, max_output_bytes)?)?;
+        }
+        ["approve", id] => {
+            let checkpoint = store.decide(id, CheckpointDecision::Approve)?;
+            writeln!(writer, "◆ Approved checkpoint {}", checkpoint.id)?;
+        }
+        ["reject" | "rewind", id] => {
+            let checkpoint = store.decide(id, CheckpointDecision::Reject)?;
+            writeln!(
+                writer,
+                "◆ Rewound {} from checkpoint {}",
+                checkpoint.file.path.display(),
+                checkpoint.id
+            )?;
+        }
+        ["export", id] => {
+            serde_json::to_writer_pretty(&mut *writer, &store.load(id)?)?;
+            writeln!(writer)?;
+        }
+        _ => writeln!(
+            writer,
+            "usage: /review [list | diff <id> | approve <id> | reject <id> | rewind <id> | export <id>]"
+        )?,
+    }
+    Ok(())
+}
+
+fn show_review_list(store: &CheckpointStore, writer: &mut dyn Write) -> Result<()> {
+    let checkpoints = store.list()?;
+    writeln!(writer, "◆ Crumb edit checkpoints")?;
+    if checkpoints.is_empty() {
+        writeln!(writer, "  No Crumb-owned edits to review")?;
+    }
+    for checkpoint in checkpoints.into_iter().take(20) {
+        show_review_summary(&checkpoint, writer)?;
+    }
+    Ok(())
+}
+
+fn show_review_summary(
+    checkpoint: &crumb_tools::WorkspaceCheckpoint,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writeln!(
+        writer,
+        "  {}  {:<8}  {}  {} → {} bytes",
+        checkpoint.id,
+        checkpoint_status_name(checkpoint.file.status),
+        checkpoint.file.path.display(),
+        checkpoint.file.before_bytes,
+        checkpoint.file.after_bytes
+    )?;
+    Ok(())
+}
+
+const fn checkpoint_status_name(status: CheckpointStatus) -> &'static str {
+    match status {
+        CheckpointStatus::Pending => "pending",
+        CheckpointStatus::Approved => "approved",
+        CheckpointStatus::Rejected => "rejected",
+    }
 }
 
 fn show_sessions(
@@ -1543,15 +1637,18 @@ mod tests {
     use super::{agent_config_location, workspace_read_host};
 
     #[test]
-    fn stdio_mcp_host_exposes_only_read_tools() {
+    fn stdio_mcp_host_exposes_rust_owned_tool_risk() {
         let workspace = std::env::current_dir().expect("current directory is available");
         let host = workspace_read_host(&workspace, &AgentConfig::default(), None)
             .expect("workspace tools are registered");
         let tools = host.tools().collect::<Vec<_>>();
-        assert_eq!(tools.len(), 2);
-        assert!(tools.iter().all(|tool| tool.risk == RiskClass::ReadOnly));
+        assert_eq!(tools.len(), 3);
         assert_eq!(tools[0].name, "list_directory");
+        assert_eq!(tools[0].risk, RiskClass::ReadOnly);
         assert_eq!(tools[1].name, "read_file");
+        assert_eq!(tools[1].risk, RiskClass::ReadOnly);
+        assert_eq!(tools[2].name, "write_file");
+        assert_eq!(tools[2].risk, RiskClass::WriteWorkspace);
     }
 
     #[test]

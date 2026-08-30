@@ -112,6 +112,30 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "move a session to recoverable trash",
     },
     SlashCommand {
+        usage: "/review",
+        description: "review Crumb-owned edits",
+    },
+    SlashCommand {
+        usage: "/review list",
+        description: "list edit checkpoints",
+    },
+    SlashCommand {
+        usage: "/review diff ",
+        description: "show a bounded checkpoint diff",
+    },
+    SlashCommand {
+        usage: "/review approve ",
+        description: "approve a checkpoint",
+    },
+    SlashCommand {
+        usage: "/review reject ",
+        description: "safely rewind a checkpoint",
+    },
+    SlashCommand {
+        usage: "/review export ",
+        description: "print checkpoint metadata as JSON",
+    },
+    SlashCommand {
         usage: "/attach ",
         description: "attach a typed @ reference",
     },

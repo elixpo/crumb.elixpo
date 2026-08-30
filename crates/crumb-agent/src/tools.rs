@@ -133,12 +133,22 @@ impl ApprovalBroker for DenyAllApprovals {
 #[derive(Clone, Debug, Default)]
 pub struct ConfiguredApprovals {
     network_tools: BTreeSet<String>,
+    workspace_tools: BTreeSet<String>,
 }
 
 impl ConfiguredApprovals {
     #[must_use]
     pub fn new(network_tools: BTreeSet<String>) -> Self {
-        Self { network_tools }
+        Self {
+            network_tools,
+            workspace_tools: BTreeSet::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_workspace_tools(mut self, workspace_tools: BTreeSet<String>) -> Self {
+        self.workspace_tools = workspace_tools;
+        self
     }
 }
 
@@ -149,7 +159,10 @@ impl ApprovalBroker for ConfiguredApprovals {
         _arguments: &serde_json::Value,
         _cancellation: &CancellationToken,
     ) -> ApprovalDecision {
-        if request.risk == RiskClass::NetworkAccess && self.network_tools.contains(&request.tool) {
+        if (request.risk == RiskClass::NetworkAccess && self.network_tools.contains(&request.tool))
+            || (request.risk == RiskClass::WriteWorkspace
+                && self.workspace_tools.contains(&request.tool))
+        {
             ApprovalDecision::AllowOnce
         } else {
             ApprovalDecision::Deny
@@ -501,6 +514,35 @@ mod tests {
                 &write_request,
                 &serde_json::json!({}),
                 &CancellationToken::default()
+            ),
+            ApprovalDecision::Deny
+        );
+    }
+
+    #[test]
+    fn configured_workspace_grant_is_exact_and_risk_scoped() {
+        let approvals = ConfiguredApprovals::new(BTreeSet::new())
+            .with_workspace_tools(BTreeSet::from(["write_file".to_owned()]));
+        let cancellation = CancellationToken::default();
+        assert_eq!(
+            approvals.decide(
+                &ApprovalRequest {
+                    tool: "write_file".to_owned(),
+                    risk: RiskClass::WriteWorkspace,
+                },
+                &json!({}),
+                &cancellation,
+            ),
+            ApprovalDecision::AllowOnce
+        );
+        assert_eq!(
+            approvals.decide(
+                &ApprovalRequest {
+                    tool: "write_file".to_owned(),
+                    risk: RiskClass::NetworkAccess,
+                },
+                &json!({}),
+                &cancellation,
             ),
             ApprovalDecision::Deny
         );

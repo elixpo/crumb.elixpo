@@ -1,7 +1,8 @@
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use crumb_agent::{
@@ -9,16 +10,24 @@ use crumb_agent::{
 };
 use serde_json::{Value, json};
 
-use crate::bounded_text;
+use crate::{CheckpointStore, bounded_text};
 
 const READ_FILE: &str = "read_file";
 const LIST_DIRECTORY: &str = "list_directory";
+const WRITE_FILE: &str = "write_file";
+static NEXT_WRITE: AtomicU64 = AtomicU64::new(0);
 
 /// Runtime ceilings for workspace read tools.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkspaceToolLimits {
     pub max_output_bytes: usize,
     pub max_directory_entries: usize,
+}
+
+/// Runtime ceiling for a checkpointed workspace write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkspaceWriteLimits {
+    pub max_file_bytes: usize,
 }
 
 /// Registers bounded read-only tools rooted at one canonical workspace.
@@ -47,6 +56,33 @@ pub fn register_workspace_read_tools(
     host.register(read_descriptor(), Arc::new(ReadFile(boundary.clone())))?;
     host.register(list_descriptor(), Arc::new(ListDirectory(boundary)))?;
     Ok(())
+}
+
+/// Registers a permission-gated UTF-8 write tool with mandatory checkpoints.
+///
+/// # Errors
+///
+/// Returns an error when the workspace or limit is invalid, or the tool name
+/// is already registered.
+pub fn register_workspace_write_tool(
+    host: &mut ToolHost,
+    workspace: &Path,
+    limits: WorkspaceWriteLimits,
+) -> Result<()> {
+    if limits.max_file_bytes == 0 {
+        bail!("workspace write limit must be positive");
+    }
+    let root = fs::canonicalize(workspace)
+        .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
+    let checkpoints = CheckpointStore::new(&root, limits.max_file_bytes)?;
+    host.register(
+        write_descriptor(),
+        Arc::new(WriteFile {
+            root,
+            limits,
+            checkpoints,
+        }),
+    )
 }
 
 #[derive(Clone)]
@@ -149,6 +185,177 @@ impl ToolHandler for ListDirectory {
             Err(error) => ToolOutput::error(error.to_string()),
         })
     }
+}
+
+struct WriteFile {
+    root: PathBuf,
+    limits: WorkspaceWriteLimits,
+    checkpoints: CheckpointStore,
+}
+
+impl ToolHandler for WriteFile {
+    fn call(&self, arguments: &Value, cancellation: &CancellationToken) -> Result<ToolOutput> {
+        match write_file(self, arguments, cancellation) {
+            Ok(output) => Ok(output),
+            Err(error) if cancellation.is_cancelled() => Err(error),
+            Err(error) => Ok(ToolOutput::error(error.to_string())),
+        }
+    }
+}
+
+fn write_file(
+    tool: &WriteFile,
+    arguments: &Value,
+    cancellation: &CancellationToken,
+) -> Result<ToolOutput> {
+    ensure_active(cancellation)?;
+    let requested = string_argument(arguments, "path")?;
+    let content = string_argument(arguments, "content")?;
+    if content.len() > tool.limits.max_file_bytes {
+        bail!("file content exceeds the configured write limit");
+    }
+    let (relative, target) = resolve_write_target(&tool.root, requested)?;
+    let before = read_optional_bounded(&target, tool.limits.max_file_bytes)?;
+    tool.checkpoints
+        .validate_edit(&relative, before.as_deref(), content.as_bytes())?;
+    ensure_active(cancellation)?;
+    let checkpoint = install_checkpointed_write(
+        &target,
+        &relative,
+        before.as_deref(),
+        content.as_bytes(),
+        &tool.checkpoints,
+        cancellation,
+    )?;
+    Ok(ToolOutput {
+        text: format!(
+            "wrote {} bytes to {}\ncheckpoint: {}",
+            content.len(),
+            relative.display(),
+            checkpoint.id
+        ),
+        structured: Some(json!({
+            "path": relative,
+            "bytes": content.len(),
+            "checkpoint": checkpoint.id
+        })),
+        is_error: false,
+    })
+}
+
+fn resolve_write_target(root: &Path, requested: &str) -> Result<(PathBuf, PathBuf)> {
+    let relative = Path::new(requested);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            !matches!(component, std::path::Component::Normal(_))
+                || matches!(
+                    component.as_os_str().to_str(),
+                    Some(".git" | ".crumb" | ".ssh")
+                )
+        })
+    {
+        bail!("write path must be a safe workspace-relative file");
+    }
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let resolved_parent = fs::canonicalize(root.join(parent))
+        .with_context(|| format!("parent directory for `{requested}` does not exist"))?;
+    if !resolved_parent.starts_with(root) || !resolved_parent.is_dir() {
+        bail!("write path escapes the workspace");
+    }
+    let filename = relative
+        .file_name()
+        .context("write path requires a filename")?;
+    let target = resolved_parent.join(filename);
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => bail!("write target is a symlink"),
+        Ok(metadata) if !metadata.is_file() => bail!("write target is not a regular file"),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to inspect write target"),
+    }
+    Ok((relative.to_path_buf(), target))
+}
+
+fn read_optional_bounded(path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("failed to read write preimage"),
+    };
+    let mut content = Vec::with_capacity(limit.min(64 * 1024));
+    file.take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut content)
+        .context("failed to read write preimage")?;
+    if content.len() > limit {
+        bail!("existing file exceeds the configured write limit");
+    }
+    Ok(Some(content))
+}
+
+fn install_checkpointed_write(
+    target: &Path,
+    relative: &Path,
+    before: Option<&[u8]>,
+    after: &[u8],
+    checkpoints: &CheckpointStore,
+    cancellation: &CancellationToken,
+) -> Result<crate::WorkspaceCheckpoint> {
+    let parent = target.parent().context("write target has no parent")?;
+    let sequence = NEXT_WRITE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".crumb-write-{}-{sequence}.tmp",
+        std::process::id()
+    ));
+    let backup = parent.join(format!(
+        ".crumb-write-{}-{sequence}.bak",
+        std::process::id()
+    ));
+    write_temporary(&temporary, after, target.exists().then_some(target))?;
+    if cancellation.is_cancelled() {
+        let _ = fs::remove_file(&temporary);
+        bail!("tool call cancelled");
+    }
+    if before.is_some() {
+        fs::rename(target, &backup).context("failed to stage write preimage")?;
+    }
+    if let Err(error) = fs::rename(&temporary, target) {
+        if before.is_some() {
+            let _ = fs::rename(&backup, target);
+        }
+        return Err(error).context("failed to install workspace write");
+    }
+    match checkpoints.record_edit(relative, before, after) {
+        Ok(checkpoint) => {
+            if before.is_some() {
+                fs::remove_file(&backup).context("failed to remove write backup")?;
+            }
+            Ok(checkpoint)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(target);
+            if before.is_some() {
+                let _ = fs::rename(&backup, target);
+            }
+            Err(error).context("workspace write was rolled back because checkpointing failed")
+        }
+    }
+}
+
+fn write_temporary(path: &Path, content: &[u8], permissions_from: Option<&Path>) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .context("failed to create temporary workspace write")?;
+    if let Some(source) = permissions_from {
+        fs::set_permissions(path, fs::metadata(source)?.permissions())
+            .context("failed to preserve file permissions")?;
+    }
+    file.write_all(content)
+        .context("failed to write temporary workspace file")?;
+    file.flush()
+        .context("failed to flush temporary workspace file")
 }
 
 fn list_directory(
@@ -273,6 +480,26 @@ fn list_descriptor() -> ToolDescriptor {
     }
 }
 
+fn write_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: WRITE_FILE.to_owned(),
+        description:
+            "Replace or create one UTF-8 workspace file with a mandatory review checkpoint."
+                .to_owned(),
+        input_schema: json!({
+            "type":"object",
+            "properties":{
+                "path":{"type":"string","minLength":1},
+                "content":{"type":"string"}
+            },
+            "required":["path","content"],
+            "additionalProperties":false
+        }),
+        risk: RiskClass::WriteWorkspace,
+        transport: ToolTransport::Native,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -280,11 +507,17 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crumb_agent::{
-        AgentMode, CancellationToken, DenyAllApprovals, ToolCallErrorKind, ToolHost,
+        AgentMode, ApprovalBroker, ApprovalDecision, ApprovalRequest, CancellationToken,
+        DenyAllApprovals, ToolCallErrorKind, ToolHost,
     };
     use serde_json::json;
 
-    use super::{WorkspaceToolLimits, register_workspace_read_tools};
+    use crate::{CheckpointDecision, CheckpointStore};
+
+    use super::{
+        WorkspaceToolLimits, WorkspaceWriteLimits, register_workspace_read_tools,
+        register_workspace_write_tool,
+    };
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -321,6 +554,32 @@ mod tests {
             },
         )
         .expect("workspace tools are registered");
+        host
+    }
+
+    struct AllowOnce;
+
+    impl ApprovalBroker for AllowOnce {
+        fn decide(
+            &self,
+            _request: &ApprovalRequest,
+            _arguments: &serde_json::Value,
+            _cancellation: &CancellationToken,
+        ) -> ApprovalDecision {
+            ApprovalDecision::AllowOnce
+        }
+    }
+
+    fn write_host(workspace: &Path) -> ToolHost {
+        let mut host = ToolHost::default();
+        register_workspace_write_tool(
+            &mut host,
+            workspace,
+            WorkspaceWriteLimits {
+                max_file_bytes: 128,
+            },
+        )
+        .expect("write tool is registered");
         host
     }
 
@@ -430,5 +689,47 @@ mod tests {
             )
             .expect_err("cancelled calls do not reach the handler");
         assert_eq!(error.kind, ToolCallErrorKind::Cancelled);
+    }
+
+    #[test]
+    fn approved_write_creates_a_rewindable_checkpoint() {
+        let workspace = TempWorkspace::new();
+        let output = write_host(workspace.path())
+            .call(
+                "write_file",
+                &json!({"path":"notes.txt","content":"after"}),
+                AgentMode::Auto,
+                &AllowOnce,
+                &CancellationToken::default(),
+            )
+            .expect("approved write succeeds");
+        assert!(!output.is_error);
+        let checkpoint = output
+            .structured
+            .as_ref()
+            .and_then(|value| value.get("checkpoint"))
+            .and_then(serde_json::Value::as_str)
+            .expect("checkpoint id is returned");
+        let store = CheckpointStore::new(workspace.path(), 128).expect("store opens");
+        store
+            .decide(checkpoint, CheckpointDecision::Reject)
+            .expect("checkpoint rewinds");
+        assert!(!workspace.path().join("notes.txt").exists());
+    }
+
+    #[test]
+    fn sensitive_write_is_rejected_before_mutation() {
+        let workspace = TempWorkspace::new();
+        let output = write_host(workspace.path())
+            .call(
+                "write_file",
+                &json!({"path":".env.local","content":"TOKEN=secret"}),
+                AgentMode::Auto,
+                &AllowOnce,
+                &CancellationToken::default(),
+            )
+            .expect("expected write refusal is tool output");
+        assert!(output.is_error);
+        assert!(!workspace.path().join(".env.local").exists());
     }
 }

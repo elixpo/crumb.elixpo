@@ -8,7 +8,10 @@ pub use checkpoint::{
     CheckpointDecision, CheckpointFile, CheckpointStatus, CheckpointStore, WorkspaceCheckpoint,
 };
 pub use shell::{AgentShellConfig, register_shell_tool};
-pub use workspace::{WorkspaceToolLimits, register_workspace_read_tools};
+pub use workspace::{
+    WorkspaceToolLimits, WorkspaceWriteLimits, register_workspace_read_tools,
+    register_workspace_write_tool,
+};
 
 fn bounded_text(mut text: String, limit: usize) -> String {
     if text.len() <= limit {

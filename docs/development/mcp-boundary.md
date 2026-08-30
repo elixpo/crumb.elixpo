@@ -29,6 +29,16 @@ the output-byte and directory-entry ceilings; tool arguments may only lower
 those limits. Results are sorted where applicable, UTF-8 only, bounded, and
 share the session cancellation token.
 
+## Checkpointed workspace writes
+
+`write_file` is registered as `write_workspace` and remains denied unless its
+exact tool name appears in the user-owned workspace permission allowlist. Every
+successful write records a bounded preimage and post-edit digest under
+`.crumb/checkpoints`. Credential-sensitive paths, private keys, symlinks, and
+workspace escapes are refused before mutation. Rewind restores only when the
+current file still matches Crumb's post-edit digest; it never invokes Git reset
+or overwrites a later user change.
+
 ## Isolated shell
 
 `run_shell` starts a fresh non-interactive process for each approved call. It
@@ -57,10 +67,8 @@ agent indefinitely.
 3. [x] Interactive allow-once approval bridge for negotiate mode.
 4. [x] `crumb mcp serve` entry point and Harness Cordis composition.
 
-The stdio entry point intentionally registers only `read_file` and
-`list_directory`. Its stdout is MCP-only, it loads limits and mode from the
-workspace's live `.crumb/agent.json`, and it performs no network access. The
-checked-in Cordis composition exposes those tools as `mcp__crumb__...` and
-omits Harness-native shell and filesystem plugins. Approval-gated mutation will
-be added only through a parent-CLI-owned interactive transport; the unattended
-stdio child cannot approve mutations.
+The stdio entry point registers `read_file`, `list_directory`, and checkpointed
+`write_file`. Its stdout is MCP-only and it loads limits, mode, and exact
+user-owned permission allowlists from the workspace's live
+`.crumb/agent.json`. The checked-in Cordis composition exposes these tools as
+`mcp__crumb__...` and omits Harness-native shell and filesystem plugins.
