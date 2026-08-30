@@ -5,6 +5,7 @@
 //! requests and is not part of native-shell startup.
 
 pub mod approvals;
+pub mod backend;
 pub mod config;
 pub mod harness;
 pub mod jobs;
@@ -14,6 +15,7 @@ pub mod steering;
 pub mod tools;
 
 pub use approvals::{ApprovalInbox, InteractiveApprovalBroker, PendingApproval, approval_channel};
+pub use backend::{BackendDiscovery, CodingBackend};
 pub use config::{
     AgentConfig, AgentLimits, AgentMode, HarnessConfig, LiveConfig, MistakePolicy, Modality,
     ModelRoute, OptimizerConfig, StructuredEncoding, ToolPermissions,

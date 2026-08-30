@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::{CodingBackend, ModelCapabilities};
+
 /// Controls how much autonomy an agent receives for a turn.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,6 +57,11 @@ pub enum HarnessConfig {
         arguments: Vec<String>,
         #[serde(default)]
         cordis: Option<PathBuf>,
+    },
+    CodingCli {
+        backend: CodingBackend,
+        command: PathBuf,
+        capabilities: Vec<ModelCapabilities>,
     },
 }
 
@@ -205,10 +212,16 @@ impl AgentConfig {
         if self.skills.iter().any(|skill| skill.id.trim().is_empty()) {
             bail!("skill identifiers cannot be empty");
         }
-        if let Some(HarnessConfig::Process { command, .. }) = &self.harness
-            && command.as_os_str().is_empty()
-        {
-            bail!("process harness requires a command");
+        match &self.harness {
+            Some(HarnessConfig::Process { command, .. }) if command.as_os_str().is_empty() => {
+                bail!("process harness requires a command");
+            }
+            Some(HarnessConfig::CodingCli {
+                command,
+                capabilities,
+                ..
+            }) => self.validate_coding_cli(command, capabilities)?,
+            _ => {}
         }
         if self
             .mcp_servers
@@ -241,6 +254,49 @@ impl AgentConfig {
             .reasoning_effort
             .as_deref()
             .or(self.reasoning_effort.as_deref())
+    }
+
+    fn validate_coding_cli(
+        &self,
+        command: &Path,
+        capabilities: &[ModelCapabilities],
+    ) -> Result<()> {
+        if command.as_os_str().is_empty() {
+            bail!("coding CLI harness requires an explicit command");
+        }
+        let routes = self
+            .models
+            .get(&Modality::Text)
+            .filter(|routes| routes.len() == 1)
+            .context("coding CLI harness requires exactly one explicit text model route")?;
+        let route = &routes[0];
+        let mut identities = BTreeSet::new();
+        for capability in capabilities {
+            if capability.provider.trim().is_empty() || capability.model.trim().is_empty() {
+                bail!("coding CLI capabilities require provider and model identifiers");
+            }
+            if !identities.insert((&capability.provider, &capability.model)) {
+                bail!("coding CLI capabilities cannot contain duplicate models");
+            }
+            for effort in &capability.reasoning_efforts {
+                validate_effort(Some(effort))?;
+            }
+        }
+        let capability = capabilities
+            .iter()
+            .find(|capability| {
+                capability.provider == route.provider && capability.model == route.model
+            })
+            .context("selected coding CLI model is not present in its capability metadata")?;
+        if let Some(effort) = self.reasoning_effort_for(route)
+            && !capability
+                .reasoning_efforts
+                .iter()
+                .any(|supported| supported == effort)
+        {
+            bail!("selected coding CLI model does not support effort `{effort}`");
+        }
+        Ok(())
     }
 }
 
@@ -314,7 +370,8 @@ impl LiveConfig {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{AgentConfig, AgentMode, MistakePolicy, Modality, ModelRoute};
+    use super::{AgentConfig, AgentMode, HarnessConfig, MistakePolicy, Modality, ModelRoute};
+    use crate::{CodingBackend, ModelCapabilities};
 
     #[test]
     fn model_routes_are_data_driven() {
@@ -346,5 +403,37 @@ mod tests {
     fn secrets_are_not_part_of_the_config_schema() {
         let result = serde_json::from_str::<AgentConfig>(r#"{"api_key":"secret"}"#);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn coding_cli_requires_one_explicit_supported_model_and_effort() {
+        let mut models = BTreeMap::new();
+        models.insert(
+            Modality::Text,
+            vec![ModelRoute {
+                provider: "openai".to_owned(),
+                model: "fixture-codex".to_owned(),
+                reasoning_effort: Some("high".to_owned()),
+            }],
+        );
+        let config = AgentConfig {
+            harness: Some(HarnessConfig::CodingCli {
+                backend: CodingBackend::Codex,
+                command: "codex".into(),
+                capabilities: vec![ModelCapabilities {
+                    provider: "openai".to_owned(),
+                    model: "fixture-codex".to_owned(),
+                    reasoning_efforts: vec!["low".to_owned(), "high".to_owned()],
+                }],
+            }),
+            models,
+            ..AgentConfig::default()
+        };
+        assert!(config.validate().is_ok());
+
+        let mut unsupported = config;
+        unsupported.models.get_mut(&Modality::Text).expect("route")[0].reasoning_effort =
+            Some("max".to_owned());
+        assert!(unsupported.validate().is_err());
     }
 }
