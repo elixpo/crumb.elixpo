@@ -3462,6 +3462,9 @@ fn set_transcript_scroll_region(
     transcript_top: u16,
     transcript_bottom: u16,
 ) -> io::Result<()> {
+    if transcript_top >= transcript_bottom {
+        return write!(writer, "\x1b[r");
+    }
     write!(
         writer,
         "\x1b[{};{}r",
@@ -3664,8 +3667,9 @@ impl AlternateScreenGuard {
 impl Drop for AlternateScreenGuard {
     fn drop(&mut self) {
         if self.active {
-            let _ = write!(io::stdout(), "\x1b[r");
-            let _ = crossterm::execute!(io::stdout(), Show, LeaveAlternateScreen);
+            let mut writer = io::stdout();
+            let _ = write!(writer, "\x1b[r");
+            let _ = crossterm::execute!(writer, Show, LeaveAlternateScreen);
         }
     }
 }

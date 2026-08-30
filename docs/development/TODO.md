@@ -114,6 +114,8 @@ This is the local source of truth for implementation order. GitHub issues provid
   - [x] Add alternate-screen terminal takeover with an inline-mode escape hatch.
   - [x] Gate interactive startup on explicit current-folder trust.
   - [x] Surface effort, session budget, estimated context use, and Harness auto-compaction.
+  - [x] Keep the startup header fixed above a bounded scrolling transcript.
+  - [x] Keep the composer and responsive hotkey guide pinned below the transcript.
   - [ ] Add the final panda application icon and platform launcher metadata.
   - [x] Add responsive composer borders and a context/model status meter.
   - [ ] Add installer, signed release binaries, and desktop launch entries.
