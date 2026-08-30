@@ -404,6 +404,7 @@ impl Renderer {
                 *last = fit_terminal_text(&format!("{last} …"), content_width);
             }
         }
+        body.push(String::new());
         body.into_iter()
             .map(|line| self.transcript_card_line(&line, card_width, "1"))
             .collect::<Vec<_>>()
@@ -1098,7 +1099,7 @@ mod tests {
         );
         assert_eq!(
             renderer.transcript_input("elixpo", "fix this"),
-            "  ◆ > fix this"
+            "  ◆ > fix this\n  "
         );
         assert_eq!(renderer.native_output_prefix(), "  ╰──▶ ");
         let handoff =

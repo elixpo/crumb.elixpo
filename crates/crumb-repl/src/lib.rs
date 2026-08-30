@@ -293,6 +293,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
 #[must_use]
 pub fn classify_input(input: &str) -> InputEvent {
     let command = input.trim_end_matches(['\r', '\n']);
+    let command = if command.starts_with('/') || command.starts_with('?') {
+        command.trim_end()
+    } else {
+        command
+    };
     match command {
         "/auth login" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Login)),
         "/auth status" => InputEvent::BuiltIn(BuiltInCommand::Auth(AuthAction::Status)),
@@ -492,6 +497,10 @@ mod tests {
             InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Search(
                 "cargo test".to_owned()
             )))
+        );
+        assert_eq!(
+            classify_input("/history   "),
+            InputEvent::BuiltIn(BuiltInCommand::History(HistoryAction::Recent))
         );
         assert_eq!(
             classify_input("/skills"),

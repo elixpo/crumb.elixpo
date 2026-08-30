@@ -479,15 +479,41 @@ fn handle_repl_event(
     context: &mut InputContext<'_>,
 ) -> Result<Option<ReplOutcome>> {
     match event {
-        InputEvent::BuiltIn(command) => handle_builtin(
-            command,
-            context.session,
-            context.agent_runtime,
-            context.history,
-            context.cwd,
-            context.platform,
-            context.writer,
-        ),
+        InputEvent::BuiltIn(command)
+            if matches!(&command, BuiltInCommand::Auth(AuthAction::Login)) =>
+        {
+            writeln!(context.writer, "{}", context.renderer.agent_response(""))?;
+            handle_builtin(
+                command,
+                context.session,
+                context.agent_runtime,
+                context.history,
+                context.cwd,
+                context.platform,
+                context.writer,
+            )
+        }
+        InputEvent::BuiltIn(command) => {
+            let mut output = Vec::new();
+            let outcome = handle_builtin(
+                command,
+                context.session,
+                context.agent_runtime,
+                context.history,
+                context.cwd,
+                context.platform,
+                &mut output,
+            )?;
+            if !output.is_empty() {
+                let output = String::from_utf8_lossy(&output);
+                writeln!(
+                    context.writer,
+                    "{}",
+                    context.renderer.agent_response(output.trim_end())
+                )?;
+            }
+            Ok(outcome)
+        }
         InputEvent::NativeInput(command) if command.trim().is_empty() => Ok(None),
         InputEvent::NativeInput(command) => handle_input(&command, context),
     }
@@ -565,6 +591,7 @@ impl FullscreenTranscript {
                 status,
                 input,
                 self.cursor,
+                self.started,
             )?;
             self.started = true;
         }
@@ -4867,10 +4894,14 @@ fn prepare_fullscreen_submission(
     status: &str,
     input: &str,
     transcript_cursor: Option<(u16, u16)>,
+    separate_from_previous: bool,
 ) -> io::Result<()> {
     render_idle_composer(renderer, header_rows, prompt, status)?;
     position_transcript(header_rows, transcript_cursor)?;
     if !input.trim().is_empty() {
+        if separate_from_previous {
+            writeln!(io::stdout())?;
+        }
         let timestamp = Local::now().format("%H:%M").to_string();
         let terminal_width = size().map_or(80, |(columns, _)| columns);
         writeln!(
