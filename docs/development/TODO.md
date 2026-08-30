@@ -98,6 +98,36 @@ This is the local source of truth for implementation order. GitHub issues provid
   - [x] Project selected providers into the replaceable Harness adapter.
   - [ ] Add lazy model discovery and local compatibility diagnostics.
 
+## Proposed roadmap: context, ecosystem, and release readiness
+
+These tracking issues define the next major phases. Implementation should be split into small,
+independently reviewable work packages under each tracker. Marketplace packages and optional
+engines remain replaceable; none may bypass Crumb's permission, credential, or shell boundaries.
+
+### Phase 1 — grounded context
+
+- [ ] [Add provenance-aware memory retrieval and conflict handling](https://github.com/elixpo/crumb.elixpo/issues/43).
+- [ ] [Add named personas and portable agent profiles](https://github.com/elixpo/crumb.elixpo/issues/44).
+- [ ] [Add graph-grounded project context with an optional Graphify adapter](https://github.com/elixpo/crumb.elixpo/issues/45).
+  - Keep Graphify opt-in, local-first, pinned, and replaceable.
+  - Require source/edge provenance, freshness detection, bounded retrieval, and native-search fallback.
+  - Route its MCP surface through Crumb's approval and supervision boundary.
+
+### Phase 2 — extensible ecosystem
+
+- [ ] [Expand the public skill and connector ecosystem](https://github.com/elixpo/crumb.elixpo/issues/46).
+- [ ] [Supervise and authorize third-party MCP servers](https://github.com/elixpo/crumb.elixpo/issues/47).
+- [ ] [Build marketplace trust, publishing, updates, rollback, and revocation](https://github.com/elixpo/crumb.elixpo/issues/48).
+  - Keep external packages disabled after installation until the user reviews and enables them.
+  - Prefer standard remote MCP OAuth and OS-keyring credential references.
+  - Prohibit arbitrary install hooks and implicit capability grants.
+
+### Phase 3 — public distribution, deliberately deferred
+
+- [ ] [Package and sign Crumb for Linux, macOS, and Windows](https://github.com/elixpo/crumb.elixpo/issues/49).
+  - Do not publish terminal binaries, installers, or updater metadata before the release-readiness gate is explicitly approved.
+  - Require signatures, checksums, SBOMs, provenance attestations, upgrade/rollback tests, and uninstall coverage for every platform.
+
 ## Planned work packages
 
 - [x] [WP-012 — deterministic agent/session foundation](https://github.com/elixpo/crumb.elixpo/issues/33) ([design](agent-foundation.md)).
