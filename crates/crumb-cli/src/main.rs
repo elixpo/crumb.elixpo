@@ -18,8 +18,8 @@ use crumb_agent::{
     CompatibilityFlag, ConfiguredApprovals, CredentialReference, HarnessConfig, InputRoute, JobId,
     JobSchedule, JobState, JobStore, LiveConfig, MistakePolicy, Modality, ModelRoute, NewJob,
     ProviderCompatibility, ProviderConfig, ProviderHeader, ProviderModel, ProviderProtocol,
-    ProviderTransport, RouteDecision, SteeringAction, SteeringQueue, TokenOptimizer, ToolHost,
-    TurnStatus, UnknownInputPolicy, export_session, list_sessions, search_sessions,
+    ProviderTransport, RouteDecision, RouteReason, SteeringAction, SteeringQueue, TokenOptimizer,
+    ToolHost, TurnStatus, UnknownInputPolicy, export_session, list_sessions, search_sessions,
     session_summary, set_session_archived, set_session_label, trash_session,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
@@ -474,9 +474,15 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
     match outcome {
         CommandOutcome::Completed(completion) => {
             *context.last_exit_code = Some(completion.exit_code);
-            if completion.exit_code != 0 {
-                render_error_assistance(command, &decision, agent_config.mistakes, context.writer)?;
-            }
+            let retry_with_ai = completion.exit_code != 0
+                && offer_ai_recovery(
+                    command,
+                    &decision,
+                    completion.exit_code,
+                    agent_config.mistakes,
+                    context.interactive,
+                    context.writer,
+                )?;
             record_history(
                 context.history,
                 command,
@@ -486,6 +492,18 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
                 Some(completion.exit_code),
                 context.writer,
             )?;
+            if retry_with_ai {
+                let recovery = failed_command_recovery(command, completion.exit_code);
+                handle_agent_boundary(
+                    &recovery,
+                    &agent_config,
+                    context.cwd,
+                    context.agent_runtime,
+                    context.renderer,
+                    context.writer,
+                    context.interactive,
+                )?;
+            }
             Ok(None)
         }
         CommandOutcome::ShellExited => {
@@ -1026,14 +1044,16 @@ const fn agent_mode_name(mode: AgentMode) -> &'static str {
     }
 }
 
-fn render_error_assistance(
+fn offer_ai_recovery(
     command: &str,
     decision: &RouteDecision,
+    exit_code: i32,
     policy: MistakePolicy,
+    interactive: bool,
     writer: &mut dyn Write,
-) -> Result<()> {
+) -> Result<bool> {
     if matches!(policy, MistakePolicy::Disabled) {
-        return Ok(());
+        return Ok(false);
     }
     if let Some(suggestion) = &decision.suggestion {
         writeln!(
@@ -1043,17 +1063,61 @@ fn render_error_assistance(
         )?;
     }
     match policy {
-        MistakePolicy::Prompt => writeln!(
-            writer,
-            "help: describe the error in plain English for AI assistance"
-        )?,
-        MistakePolicy::Automatic => writeln!(
-            writer,
-            "help: automatic AI diagnosis will start when the agent runtime is enabled"
-        )?,
-        MistakePolicy::Disabled => {}
+        MistakePolicy::Prompt if interactive => prompt_for_ai_recovery(exit_code, writer),
+        MistakePolicy::Prompt => {
+            writeln!(writer, "help: rerun interactively to ask Crumb AI")?;
+            Ok(false)
+        }
+        MistakePolicy::Automatic => {
+            writeln!(writer, "help: asking Crumb AI about exit {exit_code}")?;
+            Ok(true)
+        }
+        MistakePolicy::Disabled => Ok(false),
     }
-    Ok(())
+}
+
+fn prompt_for_ai_recovery(exit_code: i32, writer: &mut dyn Write) -> Result<bool> {
+    write!(
+        writer,
+        "help: command exited {exit_code} · [A] Ask AI  [Enter] Continue"
+    )?;
+    writer.flush()?;
+    let _raw_mode = RawModeGuard::enable()?;
+    loop {
+        if let TerminalEvent::Key(key) = read_terminal_event()?
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        {
+            let retry = match key.code {
+                TerminalKeyCode::Char('a' | 'A') => true,
+                TerminalKeyCode::Enter
+                | TerminalKeyCode::Esc
+                | TerminalKeyCode::Char('n' | 'N') => false,
+                TerminalKeyCode::Char('c')
+                    if key.modifiers.contains(TerminalModifiers::CONTROL) =>
+                {
+                    false
+                }
+                _ => continue,
+            };
+            writeln!(writer)?;
+            writer.flush()?;
+            return Ok(retry);
+        }
+    }
+}
+
+fn failed_command_recovery(command: &str, exit_code: i32) -> RouteDecision {
+    RouteDecision {
+        route: InputRoute::Agent,
+        reason: RouteReason::PolicyFallback,
+        payload: format!(
+            "A native shell command failed.\nCommand: {command}\nExit code: {exit_code}\n\
+             Diagnose the likely cause. If the executable is unavailable, explain the safest \
+             platform-appropriate installation choices. Propose a corrected command or retry \
+             when useful, but request approval before installing software or making changes."
+        ),
+        suggestion: None,
+    }
 }
 
 fn open_history(writer: &mut dyn Write) -> Result<Option<HistoryStore>> {
@@ -3260,9 +3324,19 @@ mod tests {
     };
 
     use super::{
-        agent_config_location, openrouter_preset, parse_credential_reference,
-        parse_provider_header, suggestion_width, workspace_read_host,
+        agent_config_location, failed_command_recovery, openrouter_preset,
+        parse_credential_reference, parse_provider_header, suggestion_width, workspace_read_host,
     };
+
+    #[test]
+    fn failed_command_recovery_preserves_context_without_authorizing_changes() {
+        let recovery = failed_command_recovery("magick image.png output.webp", 127);
+
+        assert_eq!(recovery.route, crumb_agent::InputRoute::Agent);
+        assert!(recovery.payload.contains("magick image.png output.webp"));
+        assert!(recovery.payload.contains("Exit code: 127"));
+        assert!(recovery.payload.contains("request approval"));
+    }
 
     #[test]
     fn openrouter_preset_contains_only_public_metadata_and_secret_references() {
