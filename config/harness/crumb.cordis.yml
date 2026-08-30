@@ -9,38 +9,9 @@
 - id: llm-pi-ai
   name: '@deepseek-ai/dsh-llm-pi-ai'
   config:
-    providers:
-      pollinations:
-        displayName: Pollinations
-        apiKeyEnv: POLLINATIONS_API_KEY
-        api: openai-completions
-        baseURL: https://gen.pollinations.ai/v1
-        models:
-          - id: nova-fast
-            name: Nova Fast
-            contextWindow: 128000
-            maxTokens: 8192
-            reasoningEfforts: false
-          - id: qwen-coder
-            name: Qwen Coder
-            contextWindow: 262144
-            maxTokens: 8192
-            reasoningEfforts: false
-          - id: Circuit-Overtime/OreoLook
-            name: OreoLook
-            contextWindow: 256000
-            maxTokens: 8192
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-            compat:
-              supportsReasoningEffort: true
-          - id: perplexity
-            name: Perplexity Search
-            contextWindow: 200000
-            maxTokens: 8192
-            reasoningEfforts: false
+    # Crumb projects one validated provider dictionary into the isolated child.
+    # Secret headers remain env references until this final in-process step.
+    providers: !!js (() => { const providers = JSON.parse(process.env.CRUMB_HARNESS_PROVIDERS ?? '{}'); for (const profile of Object.values(providers)) for (const [name, value] of Object.entries(profile.headers ?? {})) if (value && typeof value === 'object' && '$env' in value) profile.headers[name] = process.env[value.$env] ?? ''; return providers })()
 
 - id: llm-retry
   name: '@deepseek-ai/dsh-llm-retry'
@@ -72,8 +43,7 @@
     command: !!js process.env.CRUMB_MCP_COMMAND
     args: ['mcp', 'serve']
     cwd: !!js process.env.DSH_CWD
-    env:
-      POLLINATIONS_API_KEY: !!js process.env.POLLINATIONS_API_KEY
+    env: !!js process.env.POLLINATIONS_API_KEY ? { POLLINATIONS_API_KEY: process.env.POLLINATIONS_API_KEY } : {}
     failOnStartupError: true
     reconnect:
       enabled: false

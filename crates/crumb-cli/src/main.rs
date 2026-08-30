@@ -49,6 +49,7 @@ use reedline::{
 mod agent_runtime;
 mod completion;
 mod device_auth;
+mod provider_projection;
 mod shell_completion;
 
 use agent_runtime::AgentRuntime;

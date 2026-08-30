@@ -26,18 +26,21 @@ must not expose a Harness composition containing direct mutating shell or file
 tools. Executable compositions must route tools through Crumb's policy-enforcing
 MCP boundary; plan-only compositions may omit tools entirely.
 
-The executable composition is
-`config/harness/crumb.cordis.yml`. The launcher supplies absolute values for
-`DSH_CORDIS_CONFIG`, `DSH_CWD`, `DSH_SESSION_ROOT`, and `CRUMB_MCP_COMMAND`.
-It supplies `POLLINATIONS_API_KEY` transiently from Crumb's credential boundary;
-the key is never written into Cordis or agent configuration. The composition
-accepts the local-development `POLLINATIONS_KEY` alias at the CLI boundary and
-normalizes it to `POLLINATIONS_API_KEY` only in the isolated child environment.
-The composition
-uses the generic `llm-pi-ai` OpenAI-compatible route for `nova-fast` and
-`qwen-coder`, with optional `Circuit-Overtime/OreoLook` reasoning and
-`perplexity` search routes. It contains no Harness-native shell or filesystem
-tool rows.
+The executable composition is `config/harness/crumb.cordis.yml`. The launcher
+supplies absolute values for `DSH_CORDIS_CONFIG`, `DSH_CWD`,
+`DSH_SESSION_ROOT`, and `CRUMB_MCP_COMMAND`. It projects the selected validated
+provider into the generic `llm-pi-ai` adapter through an isolated child
+environment. The projection carries endpoint, protocol, exact models,
+capabilities, effort maps, transport, compatibility and limits. Environment and
+keyring credentials are resolved only at launch. Secret headers remain typed
+environment references until Cordis resolves them inside the child; no secret
+is written into Cordis, agent configuration, sessions, diagnostics, or the
+non-secret process-identity fingerprint.
+
+Changing a provider profile changes that fingerprint and forces a clean
+Harness restart. The initialized request also receives the selected model's
+explicit output-token ceiling. The composition contains no Harness-native
+shell or filesystem tool rows.
 
 Reasoning-capable routes declare an explicit effort map because the Harness
 uses those values both as selectable capabilities and as the exact
@@ -79,4 +82,4 @@ path and does not depend on the agent runtime.
 2. Lazy subprocess lifecycle with bounded stderr and shutdown escalation. (implemented)
 3. Session notification projection and committed terminal output. (projection implemented)
 4. CLI fallback integration and cancellation. (implemented)
-5. Pollinations-compatible Harness composition and effort capabilities.
+5. Provider-neutral Harness composition and effort capabilities. (implemented)

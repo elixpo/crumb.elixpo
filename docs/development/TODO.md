@@ -95,7 +95,7 @@ This is the local source of truth for implementation order. GitHub issues provid
   - [x] Add validated atomic terminal mutations for providers, models, mode, and effort.
   - [x] Add OpenRouter/Pollinations presets and typed credential/header references.
   - [x] Add advanced provider, compatibility, pricing, retry, and model mutations.
-  - [ ] Project selected providers into the replaceable Harness adapter.
+  - [x] Project selected providers into the replaceable Harness adapter.
   - [ ] Add lazy model discovery and local compatibility diagnostics.
 
 ## Planned work packages

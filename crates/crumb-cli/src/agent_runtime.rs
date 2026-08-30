@@ -10,12 +10,13 @@ use crumb_agent::{
     AgentConfig, AgentMode, AgentSession, BackendDiscovery, CancellationToken, HarnessConfig,
     Modality, SessionId, SessionJournal, session_summary,
 };
-use crumb_auth::{CredentialStore, OsCredentialStore, SecretString};
 use crumb_harness_cli::{CodingCliLaunch, run_text as run_coding_cli_text};
 use crumb_harness_dsh::{
     HarnessActivity, HarnessEnvironment, HarnessIdentity, HarnessLaunch, HarnessSupervisor,
     Notification, RunResult, SupervisorLimits,
 };
+
+use crate::provider_projection::project_provider;
 
 type TurnThreadResult = (AgentRuntime, Result<RunResult>);
 static ACTIVE_CANCELLATION: OnceLock<Arc<Mutex<Option<CancellationToken>>>> = OnceLock::new();
@@ -571,13 +572,22 @@ fn harness_launch(
     let session_root =
         std::fs::canonicalize(session_root).context("failed to resolve Harness session root")?;
     let crumb_program = std::env::current_exe().context("failed to locate crumb executable")?;
-    let credential = pollinations_credential()?;
+    let projection = project_provider(config, route)?;
     let mut environment = HarnessEnvironment::runtime_basics();
     environment.insert("DSH_CORDIS_CONFIG", composition.as_os_str());
     environment.insert("DSH_CWD", workspace.as_os_str());
     environment.insert("DSH_SESSION_ROOT", session_root.as_os_str());
     environment.insert("CRUMB_MCP_COMMAND", crumb_program.as_os_str());
-    environment.insert("POLLINATIONS_API_KEY", credential.expose());
+    environment.insert(
+        "CRUMB_HARNESS_PROVIDERS",
+        projection.providers_json.as_str(),
+    );
+    for (name, secret) in &projection.environment {
+        environment.insert(name.as_str(), secret.expose());
+    }
+    if let Some(search_credential) = crate::pollinations_environment_key() {
+        environment.insert("POLLINATIONS_API_KEY", search_credential);
+    }
     Ok(HarnessLaunch {
         identity: HarnessIdentity {
             program: command.clone(),
@@ -588,8 +598,8 @@ fn harness_launch(
             provider: route.provider.clone(),
             model: route.model.clone(),
             reasoning_effort,
-            max_tokens: None,
-            environment_revision,
+            max_tokens: projection.max_tokens,
+            environment_revision: environment_revision ^ projection.revision,
         },
         environment,
     })
@@ -607,15 +617,6 @@ fn resolve_composition(workspace: &Path, configured: Option<&Path>) -> Result<Pa
     };
     std::fs::canonicalize(&candidate)
         .with_context(|| format!("failed to resolve Cordis config `{}`", candidate.display()))
-}
-
-fn pollinations_credential() -> Result<SecretString> {
-    if let Some(value) = crate::pollinations_environment_key() {
-        return Ok(SecretString::new(value));
-    }
-    OsCredentialStore::new()?
-        .get()?
-        .context("Pollinations is not connected; run `crumb auth login`")
 }
 
 fn new_session_id() -> Result<SessionId> {

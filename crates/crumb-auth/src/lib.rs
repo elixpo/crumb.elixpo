@@ -106,8 +106,19 @@ impl OsCredentialStore {
     ///
     /// Returns a redacted error if the platform has no usable secure store.
     pub fn new() -> AuthResult<Self> {
-        let entry =
-            Entry::new(SERVICE, POLLINATIONS_ACCOUNT).map_err(|error| map_keyring_error(&error))?;
+        Self::named(SERVICE, POLLINATIONS_ACCOUNT)
+    }
+
+    /// Connects to an explicitly named native credential-store entry.
+    ///
+    /// Names are non-secret configuration; credential values remain behind
+    /// the same redacted, zeroizing [`CredentialStore`] boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted error if the platform has no usable secure store.
+    pub fn named(service: &str, account: &str) -> AuthResult<Self> {
+        let entry = Entry::new(service, account).map_err(|error| map_keyring_error(&error))?;
         Ok(Self { entry })
     }
 }

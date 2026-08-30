@@ -28,6 +28,27 @@
     "arguments": [],
     "cordis": "config/harness/crumb.cordis.yml"
   },
+  "providers": {
+    "pollinations": {
+      "display_name": "Pollinations",
+      "protocol": "open_ai_completions",
+      "base_url": "https://gen.pollinations.ai/v1",
+      "credential": { "source": "keyring", "service": "crumb.elixpo", "account": "pollinations-api-key" },
+      "models": [
+        { "id": "nova-fast", "input": ["text"], "tool_calling": true, "context_window": 128000, "max_output_tokens": 8192 },
+        { "id": "qwen-coder", "input": ["text"], "tool_calling": true, "context_window": 262144, "max_output_tokens": 8192 },
+        { "id": "Circuit-Overtime/OreoLook", "input": ["text", "image"], "tool_calling": true, "context_window": 256000, "max_output_tokens": 8192, "reasoning_efforts": { "low": "low", "medium": "medium", "high": "high" }, "compatibility": { "flags": { "reasoning_effort": true } } },
+        { "id": "perplexity", "input": ["text"], "context_window": 200000, "max_output_tokens": 8192 },
+        { "id": "flux", "input": ["image"] },
+        { "id": "klein", "input": ["image"] },
+        { "id": "wan-fast", "input": ["video"] },
+        { "id": "elevenflash", "input": ["audio"] },
+        { "id": "trellis-2", "input": ["three_d"] },
+        { "id": "whisper", "input": ["transcription"] },
+        { "id": "openai-3-small", "input": ["embeddings"] }
+      ]
+    }
+  },
   "models": {
     "text": [
       { "provider": "pollinations", "model": "nova-fast", "effort": null },

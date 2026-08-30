@@ -60,6 +60,12 @@ Provider IDs and exact models are selected explicitly. When a selected route
 names a configured provider, Crumb validates the model and effort locally
 before any Harness process or network request starts.
 
+For process Harnesses, Crumb projects only the selected provider dictionary.
+Credential and secret-header values are resolved at the child boundary, while
+the restart fingerprint contains only non-secret configuration. The generic
+DeepSeek Harness adapter receives OpenAI Completions, OpenAI Responses, and
+Anthropic Messages protocol names directly.
+
 ## Terminal mutation surface
 
 The live terminal mutation surface includes:
