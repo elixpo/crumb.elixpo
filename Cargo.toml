@@ -8,6 +8,7 @@ members = [
     "crates/crumb-harness-dsh",
     "crates/crumb-harness-cli",
     "crates/crumb-llm",
+    "crates/crumb-marketplace",
     "crates/crumb-mcp",
     "crates/crumb-native",
     "crates/crumb-optimize",

@@ -575,6 +575,17 @@ name = "crumb-llm"
 version = "0.1.0"
 
 [[package]]
+name = "crumb-marketplace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "crumb-mcp"
 version = "0.1.0"
 dependencies = [
