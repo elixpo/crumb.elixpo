@@ -88,7 +88,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] [Add reviewable diffs, checkpoints, and safe rewind](https://github.com/elixpo/crumb.elixpo/issues/37)
 - [x] [Ship modern input editing, shell completions, and accessibility modes](https://github.com/elixpo/crumb.elixpo/issues/38)
 - [x] [Add resumable and searchable agent sessions](https://github.com/elixpo/crumb.elixpo/issues/35)
-- [ ] [Add opt-in background jobs and scheduled agent work](https://github.com/elixpo/crumb.elixpo/issues/34)
+- [x] [Add opt-in background jobs and scheduled agent work](https://github.com/elixpo/crumb.elixpo/issues/34)
 - [ ] [Add pluggable Codex and Claude coding-agent backends](https://github.com/elixpo/crumb.elixpo/issues/39)
 - [ ] [Add OpenRouter-compatible BYOK providers and explicit model selection](https://github.com/elixpo/crumb.elixpo/issues/40)
 
