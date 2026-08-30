@@ -416,7 +416,10 @@ impl Renderer {
         }
         let line = fit_terminal_text(line, width);
         let padded = format!("{line:<width$}");
-        format!("  {}", self.paint(&padded, &format!("{style};48;5;236")))
+        format!(
+            "  {}",
+            self.paint(&padded, &format!("{style};48;2;85;85;85"))
+        )
     }
 
     /// Starts raw native output with a shell-specific transcript branch.
@@ -1103,6 +1106,22 @@ mod tests {
         assert!(handoff.contains("Runtime  10.0s"));
         assert!(handoff.contains("Session  crumb-session-1 · ~1.2k tokens"));
         assert!(handoff.contains("Resume   crumb --resume=crumb-session-1"));
+    }
+
+    #[test]
+    fn transcript_card_uses_the_requested_neutral_grey_fill() {
+        let renderer = Renderer::new(UiSettings {
+            color: true,
+            output: OutputMode::Rich,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+
+        assert!(
+            renderer
+                .transcript_input_at("you", "pwd", None, 80)
+                .contains("\x1b[1;48;2;85;85;85m")
+        );
     }
 
     #[test]
