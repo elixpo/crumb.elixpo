@@ -926,6 +926,11 @@ fn read_agent_config(cwd: &Path) -> Result<AgentConfig> {
             *cordis = config_root.join(cordis.as_path());
         }
     }
+    for skill in &mut config.skills {
+        if skill.path.is_relative() {
+            skill.path = config_root.join(skill.path.as_path());
+        }
+    }
     Ok(config)
 }
 
@@ -959,10 +964,22 @@ fn handle_agent_boundary(
         format!("{}/{}", route.provider, route.model)
     });
     let effort = route.and_then(|route| config.reasoning_effort_for(route));
+    let loaded_skills = config
+        .skills
+        .iter()
+        .filter(|skill| skill.enabled)
+        .map(|skill| skill.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     writeln!(
         writer,
         "{}",
-        renderer.agent_header(&model, effort, agent_mode_name(config.mode), None)
+        renderer.agent_header(
+            &model,
+            effort,
+            agent_mode_name(config.mode),
+            (!loaded_skills.is_empty()).then_some(loaded_skills.as_str()),
+        )
     )?;
     writer.flush()?;
     if runtime.is_none() {
@@ -1049,7 +1066,7 @@ fn execute_agent_sequence(
     loop {
         let session_id = active_runtime.prepare_local_job(config.mode, workspace)?;
         let persisted_request = request.clone();
-        let initial_activity = initial_agent_activity(&persisted_request);
+        let initial_activity = initial_agent_activity(&persisted_request, config);
         let mut task = active_runtime.spawn_turn(
             request,
             config.clone(),
@@ -1262,8 +1279,10 @@ fn observe_agent_turn(
     ))
 }
 
-fn initial_agent_activity(request: &str) -> &'static str {
-    if request
+fn initial_agent_activity(request: &str, config: &AgentConfig) -> &'static str {
+    if config.skills.iter().any(|skill| skill.enabled) {
+        "Loading skills"
+    } else if request
         .split_whitespace()
         .any(|token| token.starts_with('@') && token.len() > 1)
     {
@@ -1808,22 +1827,24 @@ fn show_skills(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         writeln!(writer, "◇ No skills configured")?;
         writeln!(
             writer,
-            "  Add skills to .crumb/agent.json, then type @skill: and press Tab."
+            "  Add skills to .crumb/agent.json; configured skills then appear in the `/` palette."
         )?;
         return Ok(());
     }
+    writeln!(writer, "◆ Agent skills")?;
     for skill in config.skills {
         writeln!(
             writer,
-            "{}  {}",
+            "  {}  {}",
             if skill.enabled {
-                "enabled "
+                "● loaded  "
             } else {
-                "disabled"
+                "○ unloaded"
             },
             skill.id
         )?;
     }
+    writeln!(writer, "  `/skills load <id>` · `/skills unload <id>`")?;
     Ok(())
 }
 
@@ -1867,6 +1888,12 @@ fn show_reserved(
         command if command.starts_with("/effort use ") => {
             set_reasoning_effort(command, cwd, writer)?;
         }
+        command if command == "/skills load" || command.starts_with("/skills load ") => {
+            set_skill_enabled(command, cwd, true, writer)?;
+        }
+        command if command == "/skills unload" || command.starts_with("/skills unload ") => {
+            set_skill_enabled(command, cwd, false, writer)?;
+        }
         command if command == "/config provider" || command.starts_with("/config provider ") => {
             configure_provider(command, cwd, writer)?;
         }
@@ -1886,6 +1913,36 @@ fn show_reserved(
             writeln!(writer, "  Reserved by Crumb; not available in this build.")?;
         }
     }
+    Ok(())
+}
+
+fn set_skill_enabled(
+    command: &str,
+    cwd: &Path,
+    enabled: bool,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let action = if enabled { "load" } else { "unload" };
+    let prefix = format!("/skills {action}");
+    let id = command
+        .strip_prefix(&prefix)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .with_context(|| format!("usage: /skills {action} <id>"))?;
+    update_agent_config(cwd, |config| {
+        let skill = config
+            .skills
+            .iter_mut()
+            .find(|skill| skill.id == id)
+            .with_context(|| format!("skill `{id}` is not configured"))?;
+        skill.enabled = enabled;
+        Ok(())
+    })?;
+    writeln!(
+        writer,
+        "◆ Skill {} · {id}",
+        if enabled { "loaded" } else { "unloaded" }
+    )?;
     Ok(())
 }
 
@@ -3770,6 +3827,22 @@ fn create_line_editor(
     let menu_width = u16::try_from(terminal_width).unwrap_or(COMPLETION_PALETTE_MAX_WIDTH);
     let menu = IdeMenu::default()
         .with_name("completion_menu")
+        .with_text_style(Style::new().fg(Color::Fixed(245)))
+        .with_selected_text_style(
+            Style::new()
+                .fg(Color::Fixed(252))
+                .on(Color::Fixed(238))
+                .bold(),
+        )
+        .with_description_text_style(Style::new().fg(Color::Fixed(243)))
+        .with_match_text_style(Style::new().fg(Color::Fixed(250)).underline())
+        .with_selected_match_text_style(
+            Style::new()
+                .fg(Color::Fixed(255))
+                .on(Color::Fixed(238))
+                .bold()
+                .underline(),
+        )
         .with_min_completion_width(menu_width.min(32))
         .with_max_completion_width(menu_width)
         .with_max_completion_height(COMPLETION_PALETTE_MAX_ROWS)
@@ -3780,6 +3853,7 @@ fn create_line_editor(
         .with_max_description_width(48)
         .with_max_description_height(4)
         .with_description_offset(1)
+        .with_cursor_offset(i16::try_from(FULLSCREEN_SIDE_GUTTER).unwrap_or(2))
         .with_correct_cursor_pos(true);
     let editor = Reedline::create()
         .with_history(Box::new(interactive_history))
@@ -4325,10 +4399,13 @@ mod tests {
     #[test]
     fn inline_references_start_with_context_activity() {
         assert_eq!(
-            initial_agent_activity("review @src/main.rs"),
+            initial_agent_activity("review @src/main.rs", &AgentConfig::default()),
             "Attaching context"
         );
-        assert_eq!(initial_agent_activity("review the project"), "Thinking");
+        assert_eq!(
+            initial_agent_activity("review the project", &AgentConfig::default()),
+            "Thinking"
+        );
     }
 
     #[test]

@@ -45,7 +45,15 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         usage: "/skills",
-        description: "show configured skills",
+        description: "select or unload agent skills",
+    },
+    SlashCommand {
+        usage: "/skills load ",
+        description: "load a skill into agent context",
+    },
+    SlashCommand {
+        usage: "/skills unload ",
+        description: "unload a skill from agent context",
     },
     SlashCommand {
         usage: "/context",

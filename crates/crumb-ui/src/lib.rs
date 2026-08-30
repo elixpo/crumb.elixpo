@@ -361,14 +361,18 @@ impl Renderer {
         }
         let mut lines = input.lines();
         let first = lines.next().unwrap_or_default();
-        let mut body = format!("{} {}", self.paint("╰──▶", "36;1"), self.paint(first, "1"));
+        let mut body = format!(
+            "  {} {}",
+            self.paint("╰──▶", "36;1"),
+            self.paint(first, "1")
+        );
         for line in lines {
             body.push('\n');
-            body.push_str(&self.paint("    │", "36"));
+            body.push_str(&self.paint("      │", "36"));
             body.push(' ');
             body.push_str(line);
         }
-        let header = format!("╭─[◆ {username}]");
+        let header = format!("  ╭─[◆ {username}]");
         let timestamp = timestamp.unwrap_or_default();
         let padding = usize::from(terminal_width)
             .saturating_sub(header.chars().count())
@@ -388,7 +392,7 @@ impl Renderer {
         if self.settings.output == OutputMode::ScreenReader {
             return "Shell output: ".to_owned();
         }
-        format!("{} ", self.paint("╰──▶", "35;1"))
+        format!("  {} ", self.paint("╰──▶", "35;1"))
     }
 
     /// Renders a compact, non-blocking startup readiness summary.
@@ -445,7 +449,7 @@ impl Renderer {
             format!("Crumb agent\n{}", details.join(", "))
         } else {
             format!(
-                "{} {}  {}",
+                "  {} {}  {}",
                 self.paint("╭─◆", "35;1"),
                 self.paint("CRUMB", "38;2;255;255;204;1"),
                 self.paint(&details.join(" · "), "2")
@@ -462,13 +466,13 @@ impl Renderer {
         }
         let body = response
             .lines()
-            .map(|line| format!("{} {line}", self.paint("│", "35")))
+            .map(|line| format!("  {} {line}", self.paint("│", "35")))
             .collect::<Vec<_>>()
             .join("\n");
         if body.is_empty() {
-            self.paint("╰─", "35")
+            format!("  {}", self.paint("╰─", "35"))
         } else {
-            format!("{body}\n{}", self.paint("╰─", "35"))
+            format!("{body}\n  {}", self.paint("╰─", "35"))
         }
     }
 
@@ -484,7 +488,7 @@ impl Renderer {
             return format!("{title}: {message}");
         }
         format!(
-            "{} {} {}\n{} {}\n{}",
+            "  {} {} {}\n  {} {}\n  {}",
             self.paint("│", "35"),
             self.paint(marker, if cancelled { "33;1" } else { "31;1" }),
             self.paint(title, "1"),
@@ -500,7 +504,7 @@ impl Renderer {
         if self.settings.output == OutputMode::ScreenReader {
             format!("Activity: {label}")
         } else {
-            format!("{}  ↳ {label}", self.paint("│", "35"))
+            format!("  {}  ↳ {label}", self.paint("│", "35"))
         }
     }
 
@@ -998,14 +1002,14 @@ mod tests {
 
         assert_eq!(
             renderer.agent_header("qwen-coder", Some("high"), "auto", None),
-            "╭─◆ CRUMB  model qwen-coder · mode auto · effort high"
+            "  ╭─◆ CRUMB  model qwen-coder · mode auto · effort high"
         );
-        assert_eq!(renderer.agent_response("done\n"), "│ done\n╰─");
+        assert_eq!(renderer.agent_response("done\n"), "  │ done\n  ╰─");
         assert_eq!(
             renderer.transcript_input("elixpo", "fix this"),
-            "╭─[◆ elixpo]\n╰──▶ fix this"
+            "  ╭─[◆ elixpo]\n  ╰──▶ fix this"
         );
-        assert_eq!(renderer.native_output_prefix(), "╰──▶ ");
+        assert_eq!(renderer.native_output_prefix(), "  ╰──▶ ");
     }
 
     #[test]

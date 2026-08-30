@@ -31,6 +31,7 @@ Targets:
   --worker               Build or deploy the OpenNext Cloudflare Worker
   --pages                Build or deploy a Cloudflare Pages application
   --github               Mirror public npm packages to GitHub Packages
+  --terminal             Build the standalone Crumb terminal binary
 
 Actions:
   build                  Install dependencies and build the selected target
@@ -54,6 +55,7 @@ Examples:
   ./deploy.sh --worker build deploy
   ./deploy.sh --pages build deploy
   ./deploy.sh --github build deploy
+  ./deploy.sh --terminal build
 USAGE
 }
 
@@ -381,6 +383,15 @@ deploy_pages() {
     --project-name "$PAGES_PROJECT"
 }
 
+build_terminal() {
+  if ! $DRY_RUN; then
+    command -v cargo >/dev/null 2>&1 || fail "Rust and Cargo are required."
+  fi
+  log "Building the standalone Crumb terminal binary..."
+  run_in "$ROOT_DIR" cargo build --locked --release -p crumb-cli
+  log "Terminal binary ready at $ROOT_DIR/target/release/crumb"
+}
+
 set_target() {
   local selected="$1"
   [ -z "$TARGET" ] || [ "$TARGET" = "$selected" ] \
@@ -394,6 +405,7 @@ while [ $# -gt 0 ]; do
     --worker) set_target worker ;;
     --pages) set_target pages ;;
     --github) set_target github ;;
+    --terminal) set_target terminal ;;
     --name)
       shift
       [ -n "${1:-}" ] || fail "--name requires a package name."
@@ -420,7 +432,7 @@ fi
 for action in "${ACTIONS[@]}"; do
   case "$TARGET:$action" in
     worker:build|worker:deploy|worker:provision|worker:migrate|worker:secrets) ;;
-    package:build|package:deploy|github:build|github:deploy|pages:build|pages:deploy) ;;
+    package:build|package:deploy|github:build|github:deploy|pages:build|pages:deploy|terminal:build) ;;
     *) fail "Action '$action' is not valid for --$TARGET." ;;
   esac
 done
@@ -444,6 +456,7 @@ for action in "${ACTIONS[@]}"; do
     github:deploy) deploy_npm_packages "https://npm.pkg.github.com" ;;
     pages:build) build_pages ;;
     pages:deploy) deploy_pages ;;
+    terminal:build) build_terminal ;;
     *) fail "Action '$action' is not valid for --$TARGET." ;;
   esac
 done

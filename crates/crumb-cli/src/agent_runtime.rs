@@ -5,6 +5,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use crumb_agent::config::SkillConfig;
 use crumb_agent::session::TurnStatus;
 use crumb_agent::{
     AgentConfig, AgentMode, AgentSession, BackendDiscovery, CancellationToken, HarnessConfig,
@@ -327,6 +328,7 @@ impl AgentRuntime {
             .context("agent config has no text model route")?;
         let effort = config.reasoning_effort_for(route).map(str::to_owned);
         let session_id = self.start_turn(config.mode, route, effort.clone(), request)?;
+        let prepared_request = attach_enabled_skills(request, &config.skills, &workspace)?;
         let cancellation_slot = Arc::clone(&self.active_cancellation);
         let _active = ActiveCancellation::new(&cancellation_slot, cancellation.clone())?;
         let mut on_notification = on_notification;
@@ -341,7 +343,7 @@ impl AgentRuntime {
                 route,
                 effort,
                 &session_id,
-                request,
+                &prepared_request,
                 cancellation,
                 &mut on_notification,
             ),
@@ -355,7 +357,7 @@ impl AgentRuntime {
                 command,
                 effort.as_deref(),
                 &session_id,
-                request,
+                &prepared_request,
                 cancellation,
                 &mut on_notification,
             ),
@@ -369,7 +371,7 @@ impl AgentRuntime {
             Err(_) => TurnStatus::Failed,
         };
         self.record_token_estimate(
-            request,
+            &prepared_request,
             result.as_ref().ok(),
             context_token_budget(config, route),
             matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
@@ -536,6 +538,71 @@ impl AgentRuntime {
     }
 }
 
+const MAX_SKILL_BYTES: usize = 64 * 1024;
+const MAX_SKILL_CONTEXT_BYTES: usize = 128 * 1024;
+
+fn attach_enabled_skills(
+    request: &str,
+    skills: &[SkillConfig],
+    workspace: &Path,
+) -> Result<String> {
+    let enabled = skills
+        .iter()
+        .filter(|skill| skill.enabled)
+        .collect::<Vec<_>>();
+    if enabled.is_empty() {
+        return Ok(request.to_owned());
+    }
+    let mut context = String::from(
+        "User-selected skills are active for this turn. Follow their instructions when relevant.\n",
+    );
+    for skill in enabled {
+        let configured_path = if skill.path.is_absolute() {
+            skill.path.clone()
+        } else {
+            workspace.join(&skill.path)
+        };
+        let path = if configured_path.is_dir() {
+            configured_path.join("SKILL.md")
+        } else {
+            configured_path
+        };
+        let metadata = std::fs::metadata(&path)
+            .with_context(|| format!("loaded skill `{}` is unavailable", skill.id))?;
+        let bytes = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+        if bytes > MAX_SKILL_BYTES {
+            bail!(
+                "loaded skill `{}` exceeds the {} byte limit",
+                skill.id,
+                MAX_SKILL_BYTES
+            );
+        }
+        let instructions = std::fs::read_to_string(&path)
+            .with_context(|| format!("loaded skill `{}` must be UTF-8", skill.id))?;
+        let projected = context
+            .len()
+            .saturating_add(instructions.len())
+            .saturating_add(skill.id.len())
+            .saturating_add(32);
+        if projected > MAX_SKILL_CONTEXT_BYTES {
+            bail!("loaded skills exceed the {MAX_SKILL_CONTEXT_BYTES} byte context limit");
+        }
+        let label = skill
+            .id
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect::<String>();
+        context.push_str("\n## Skill: ");
+        context.push_str(&label);
+        context.push('\n');
+        context.push_str(&instructions);
+        context.push('\n');
+    }
+    context.push_str("\n## User request\n");
+    context.push_str(request);
+    Ok(context)
+}
+
 fn estimate_tokens(text: &str) -> u64 {
     u64::try_from(text.len()).unwrap_or(u64::MAX).div_ceil(4)
 }
@@ -683,4 +750,42 @@ fn new_session_id() -> Result<SessionId> {
         .context("system clock is before the Unix epoch")?
         .as_millis();
     SessionId::new(format!("crumb-{}-{timestamp}", std::process::id()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crumb_agent::config::SkillConfig;
+
+    use super::attach_enabled_skills;
+
+    #[test]
+    fn enabled_skills_are_loaded_before_the_user_request() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-skill-context-{suffix}"));
+        let skill_directory = workspace.join("skills/review");
+        std::fs::create_dir_all(&skill_directory).expect("skill directory can be created");
+        std::fs::write(
+            skill_directory.join("SKILL.md"),
+            "Review changes carefully.",
+        )
+        .expect("skill can be written");
+        let skills = [SkillConfig {
+            id: "review".to_owned(),
+            path: PathBuf::from("skills/review"),
+            enabled: true,
+        }];
+
+        let prompt = attach_enabled_skills("inspect this", &skills, &workspace)
+            .expect("skill context can be loaded");
+
+        assert!(prompt.contains("## Skill: review\nReview changes carefully."));
+        assert!(prompt.ends_with("## User request\ninspect this"));
+        std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
+    }
 }

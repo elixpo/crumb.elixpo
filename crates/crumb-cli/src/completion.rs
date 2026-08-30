@@ -59,7 +59,7 @@ impl Completer for CrumbCompleter {
         };
         let (_, token) = current_token(prefix);
         let suggestions = if prefix.starts_with('/') && !prefix.contains('\n') {
-            slash_suggestions(prefix, pos)
+            slash_suggestions(prefix, pos, &self.workspace.get())
         } else if token.starts_with('@') {
             reference_suggestions(prefix, pos, &self.workspace.get())
         } else if token.starts_with('?') {
@@ -106,11 +106,42 @@ fn current_token(line: &str) -> (usize, &str) {
     (start, &line[start..])
 }
 
-fn slash_suggestions(prefix: &str, pos: usize) -> Vec<Suggestion> {
-    crumb_repl::SLASH_COMMANDS
+fn slash_suggestions(prefix: &str, pos: usize, workspace: &Path) -> Vec<Suggestion> {
+    let mut commands = crumb_repl::SLASH_COMMANDS
         .iter()
-        .filter(|command| command.usage.starts_with(prefix))
-        .map(|command| suggestion(command.usage, command.description, Span::new(0, pos)))
+        .map(|command| (command.usage.to_owned(), command.description.to_owned()))
+        .collect::<Vec<_>>();
+    commands.extend(configured_skill_actions(workspace));
+    commands
+        .into_iter()
+        .filter(|(usage, _)| usage.starts_with(prefix))
+        .map(|(usage, description)| suggestion(&usage, &description, Span::new(0, pos)))
+        .collect()
+}
+
+fn configured_skill_actions(workspace: &Path) -> Vec<(String, String)> {
+    let Some(path) = config_path(workspace) else {
+        return Vec::new();
+    };
+    let Ok(config) = LiveConfig::new(path).load() else {
+        return Vec::new();
+    };
+    config
+        .skills
+        .into_iter()
+        .map(|skill| {
+            if skill.enabled {
+                (
+                    format!("/skills unload {}", skill.id),
+                    "unload from agent context".to_owned(),
+                )
+            } else {
+                (
+                    format!("/skills load {}", skill.id),
+                    "load into agent context".to_owned(),
+                )
+            }
+        })
         .collect()
 }
 
@@ -179,7 +210,10 @@ fn native_path_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Sugg
                 value.push('/');
             }
             Some(Suggestion {
-                display_override: Some(value.clone()),
+                display_override: Some(format!(
+                    "{}  {value}",
+                    if is_directory { "▱" } else { "·" }
+                )),
                 description: Some(if is_directory { "folder" } else { "file" }.to_owned()),
                 span: Span::new(start, pos),
                 append_whitespace: !is_directory,
@@ -196,21 +230,19 @@ fn native_path_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Sugg
 fn no_records_suggestion(line: &str, pos: usize) -> Suggestion {
     let (start, token) = current_token(line);
     let label = " NO RECORD FOUND ";
-    let width = crossterm::terminal::size().map_or(80, |(columns, _)| usize::from(columns));
-    let padding = width.saturating_sub(label.len()).saturating_div(2);
     let chip = if std::env::var_os("NO_COLOR").is_some() {
         label.to_owned()
     } else {
         Style::new()
-            .fg(Color::Black)
-            .on(Color::Rgb(255, 255, 204))
+            .fg(Color::Fixed(250))
+            .on(Color::Fixed(238))
             .bold()
             .paint(label)
             .to_string()
     };
     Suggestion {
         value: token.to_owned(),
-        display_override: Some(format!("{}{chip}", " ".repeat(padding))),
+        display_override: Some(format!("  {chip}")),
         span: Span::new(start, pos),
         append_whitespace: false,
         ..Suggestion::default()
@@ -316,7 +348,7 @@ fn path_suggestions(
 fn suggestion(value: &str, description: &str, span: Span) -> Suggestion {
     Suggestion {
         value: value.to_owned(),
-        display_override: Some(format!("{value}  {description}")),
+        display_override: Some(format!("{}  {value}", palette_icon(value))),
         description: Some(description.to_owned()),
         span,
         append_whitespace: !value.ends_with([':', ' ']),
@@ -324,9 +356,34 @@ fn suggestion(value: &str, description: &str, span: Span) -> Suggestion {
     }
 }
 
+fn palette_icon(value: &str) -> &'static str {
+    if value.starts_with("/skills") || value.starts_with("@skill:") {
+        "✦"
+    } else if value.starts_with("/model") {
+        "◇"
+    } else if value.starts_with("/mode") || value.starts_with("/effort") {
+        "◐"
+    } else if value.starts_with("/auth") || value.starts_with("/connectors") {
+        "◎"
+    } else if value.starts_with("/session") || value.starts_with("@session:") {
+        "▣"
+    } else if value.starts_with("/plugins") || value.starts_with("@plugin:") {
+        "⬡"
+    } else if value.starts_with("@file:") || value.starts_with("@folder:") {
+        "▱"
+    } else if value.starts_with('@') {
+        "⌁"
+    } else if value.starts_with('?') || value == "/help" {
+        "?"
+    } else {
+        "›"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use reedline::Completer;
 
@@ -342,6 +399,37 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.value == "/help")
         );
+    }
+
+    #[test]
+    fn slash_palette_exposes_the_available_skill_action() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-skill-menu-{suffix}"));
+        std::fs::create_dir_all(workspace.join(".crumb")).expect("config directory can be created");
+        std::fs::write(
+            workspace.join(".crumb/agent.json"),
+            br#"{"skills":[{"id":"review","path":"skills/review","enabled":false}]}"#,
+        )
+        .expect("skill config can be written");
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(workspace.clone()));
+
+        let result = completer.complete("/skills ", 8);
+
+        let skill = result
+            .suggestions()
+            .iter()
+            .find(|candidate| candidate.value == "/skills load review")
+            .expect("disabled skill exposes a load action");
+        assert!(
+            skill
+                .display_override
+                .as_deref()
+                .is_some_and(|display| display.starts_with("✦  "))
+        );
+        std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
     }
 
     #[test]
