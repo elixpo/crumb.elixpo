@@ -232,6 +232,22 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "manage approved memory",
     },
     SlashCommand {
+        usage: "/memory show ",
+        description: "show approved project or user memory",
+    },
+    SlashCommand {
+        usage: "/memory remember ",
+        description: "explicitly persist a memory",
+    },
+    SlashCommand {
+        usage: "/memory forget ",
+        description: "remove a memory by display index",
+    },
+    SlashCommand {
+        usage: "/memory compact ",
+        description: "deduplicate approved memory",
+    },
+    SlashCommand {
         usage: "/config",
         description: "inspect live configuration",
     },

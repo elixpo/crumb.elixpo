@@ -77,7 +77,10 @@ impl OptimizationPipeline {
             let Ok(output) = candidate.optimize(kind, &selected, budget) else {
                 continue;
             };
-            if !output.is_empty() && output.len() < selected.len() {
+            if !output.is_empty()
+                && output.len() < selected.len()
+                && preserves_diagnostics(&selected, &output)
+            {
                 selected = output;
                 optimizer = Some(candidate.name().to_owned());
                 break;
@@ -86,6 +89,16 @@ impl OptimizationPipeline {
         let bytes = clip_bytes(&selected, budget, kind);
         report(bytes, input_bytes, redacted_lines, optimizer)
     }
+}
+
+fn preserves_diagnostics(input: &[u8], output: &[u8]) -> bool {
+    let (Ok(input), Ok(output)) = (std::str::from_utf8(input), std::str::from_utf8(output)) else {
+        return false;
+    };
+    input
+        .lines()
+        .filter(|line| is_diagnostic(line))
+        .all(|line| output.contains(line))
 }
 
 /// Optional `rtk pipe` adapter. Availability checks do not spawn a process.
@@ -429,6 +442,19 @@ mod tests {
             .expect("optimizer input is UTF-8");
         assert!(!observed.contains("Bearer secret"));
         assert!(observed.contains("[sensitive output redacted]"));
+    }
+
+    #[test]
+    fn external_optimizer_cannot_drop_critical_diagnostics() {
+        let optimizer = FixtureOptimizer {
+            observed: Arc::new(Mutex::new(Vec::new())),
+        };
+        let pipeline = OptimizationPipeline::new(vec![Box::new(optimizer)]);
+        let input = b"progress progress progress\nerror: compilation failed\n";
+        let result = pipeline.optimize(OutputKind::Cargo, input, 1024);
+
+        assert!(String::from_utf8_lossy(&result.bytes).contains("error: compilation failed"));
+        assert_eq!(result.optimizer, None);
     }
 
     #[test]

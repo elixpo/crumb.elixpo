@@ -517,6 +517,7 @@ dependencies = [
  "crumb-history",
  "crumb-marketplace",
  "crumb-mcp",
+ "crumb-memory",
  "crumb-native",
  "crumb-optimize",
  "crumb-platform",
@@ -594,6 +595,15 @@ dependencies = [
  "anyhow",
  "crumb-agent",
  "serde_json",
+]
+
+[[package]]
+name = "crumb-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "directories",
+ "tempfile",
 ]
 
 [[package]]

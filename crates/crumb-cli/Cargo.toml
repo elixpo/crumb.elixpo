@@ -16,6 +16,7 @@ crumb-auth = { path = "../crumb-auth" }
 crumb-core = { path = "../crumb-core" }
 crumb-history = { path = "../crumb-history" }
 crumb-marketplace = { path = "../crumb-marketplace" }
+crumb-memory = { path = "../crumb-memory" }
 crumb-harness-cli = { path = "../crumb-harness-cli" }
 crumb-harness-dsh = { path = "../crumb-harness-dsh" }
 crumb-mcp = { path = "../crumb-mcp" }
