@@ -45,8 +45,8 @@ use crumb_tools::{
 use crumb_ui::{GitSegment, PromptContext, Renderer, StartupContext, UiSettings};
 use nu_ansi_term::{Color, Style};
 use reedline::{
-    ColumnarMenu, DefaultHinter, EditCommand, Emacs, FileBackedHistory, History, HistoryItem,
-    KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
+    ColumnarMenu, DefaultHinter, EditCommand, Emacs, FileBackedHistory, Hinter, History,
+    HistoryItem, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
     PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal,
     default_emacs_keybindings,
 };
@@ -3157,9 +3157,7 @@ fn create_line_editor(
         .with_column_width(Some(terminal_width));
     let editor = Reedline::create()
         .with_history(Box::new(interactive_history))
-        .with_hinter(Box::new(
-            DefaultHinter::default().with_style(Style::new().fg(Color::DarkGray)),
-        ))
+        .with_hinter(Box::new(CrumbHinter::default()))
         .with_completer(Box::new(CrumbCompleter::new(workspace.clone())))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
         .with_edit_mode(Box::new(Emacs::new(keybindings)));
@@ -3173,6 +3171,62 @@ fn suggestion_width(terminal_columns: u16) -> usize {
 struct CrumbPrompt {
     rendered: String,
     right: String,
+}
+
+struct CrumbHinter {
+    history: DefaultHinter,
+    placeholder_visible: bool,
+}
+
+impl Default for CrumbHinter {
+    fn default() -> Self {
+        Self {
+            history: DefaultHinter::default().with_style(Style::new().fg(Color::DarkGray)),
+            placeholder_visible: false,
+        }
+    }
+}
+
+impl Hinter for CrumbHinter {
+    fn handle(
+        &mut self,
+        line: &str,
+        pos: usize,
+        history: &dyn History,
+        use_ansi_coloring: bool,
+        cwd: &str,
+    ) -> String {
+        self.placeholder_visible = line.is_empty();
+        if self.placeholder_visible {
+            let placeholder = "Describe a task or type a command · @ context · / actions";
+            return if use_ansi_coloring {
+                Style::new()
+                    .fg(Color::DarkGray)
+                    .paint(placeholder)
+                    .to_string()
+            } else {
+                placeholder.to_owned()
+            };
+        }
+        self.history
+            .handle(line, pos, history, use_ansi_coloring, cwd)
+    }
+
+    fn complete_hint(&self) -> String {
+        if self.placeholder_visible {
+            String::new()
+        } else {
+            self.history.complete_hint()
+        }
+    }
+
+    fn next_hint_token(&self) -> String {
+        if self.placeholder_visible {
+            String::new()
+        } else {
+            self.history.next_hint_token()
+        }
+    }
 }
 
 impl CrumbPrompt {

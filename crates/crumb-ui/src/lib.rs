@@ -182,7 +182,7 @@ impl Renderer {
         match self.settings.branding {
             BrandingMode::Full => format!(
                 "{}\n  {}\n  {}",
-                self.paint(&responsive_brand(terminal_width), "36"),
+                self.brand_art(terminal_width),
                 self.paint(punchline, "1"),
                 self.paint("Type naturally · : forces AI · /help opens commands", "2")
             ),
@@ -214,8 +214,11 @@ impl Renderer {
         }
         format!(
             "{}  {}\n{}  {}",
-            self.paint(&format!("crumb {}", context.version), "1"),
-            self.paint(&context.platform.to_string(), "2"),
+            self.paint(" SESSION ", "30;46;1"),
+            self.paint(
+                &format!("crumb {} · {}", context.version, context.platform),
+                "2"
+            ),
             self.paint(
                 if context.agent_configured {
                     "●"
@@ -326,27 +329,49 @@ impl Renderer {
             text.to_owned()
         }
     }
-}
 
-fn responsive_brand(terminal_width: u16) -> String {
-    let panda = if terminal_width >= 120 {
-        PANDA_LARGE
-    } else if terminal_width >= 88 {
-        PANDA_MEDIUM
-    } else {
-        PANDA_SMALL
-    };
-    if terminal_width < 72 {
-        return format!("CRUMB\n{}", trim_art(panda));
+    fn brand_art(self, terminal_width: u16) -> String {
+        let panda = if terminal_width >= 240 {
+            PANDA_LARGE
+        } else if terminal_width >= 88 {
+            PANDA_MEDIUM
+        } else {
+            PANDA_SMALL
+        };
+        if terminal_width < 72 {
+            return format!(
+                "{}\n{}",
+                self.paint("CRUMB", "36;1"),
+                self.paint_panda(trim_art(panda))
+            );
+        }
+        compose_styled_art(self, WORDMARK, trim_art(panda), 4)
     }
-    compose_art(WORDMARK, trim_art(panda), 4)
+
+    fn paint_panda(self, panda: &str) -> String {
+        panda
+            .lines()
+            .map(|line| {
+                let parts = line.split('*').collect::<Vec<_>>();
+                let mut painted = String::new();
+                for (index, part) in parts.iter().enumerate() {
+                    painted.push_str(&self.paint(part, "37;1"));
+                    if index + 1 < parts.len() {
+                        painted.push_str(&self.paint("*", "38;5;203;1"));
+                    }
+                }
+                painted
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 fn trim_art(art: &str) -> &str {
     art.trim()
 }
 
-fn compose_art(left: &str, right: &str, gap: usize) -> String {
+fn compose_styled_art(renderer: Renderer, left: &str, right: &str, gap: usize) -> String {
     let left = left.lines().collect::<Vec<_>>();
     let right = right.lines().collect::<Vec<_>>();
     let height = left.len().max(right.len());
@@ -369,7 +394,12 @@ fn compose_art(left: &str, right: &str, gap: usize) -> String {
                 .and_then(|index| right.get(index))
                 .copied()
                 .unwrap_or("");
-            format!("{left_line:<left_width$}{}{right_line}", " ".repeat(gap))
+            format!(
+                "{}{}{}",
+                renderer.paint(&format!("{left_line:<left_width$}"), "36"),
+                " ".repeat(gap),
+                renderer.paint_panda(right_line)
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -655,7 +685,7 @@ mod tests {
 
         assert_eq!(
             status,
-            "crumb 0.1.0  linux\n●  agent ready · pollinations/nova-fast · auto"
+            " SESSION   crumb 0.1.0 · linux\n●  agent ready · pollinations/nova-fast · auto"
         );
     }
 
