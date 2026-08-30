@@ -13,15 +13,16 @@ Routing performs no model call and follows this precedence:
 1. Crumb built-ins remain typed and local.
 2. Shell syntax, paths, environment assignments, and commands resolved from
    `PATH` remain native.
-3. A likely typo of a discovered executable remains native and carries a
+3. A likely typo with command arguments remains native and carries a
    deterministic suggestion for the error UI.
-4. A single unknown token remains native so the shell owns `command not found`.
-5. An unresolved multi-word phrase follows the configured fallback: agent,
-   negotiate, or native.
+4. A single unknown token is ambiguous, even when it resembles a command, and
+   follows the configured fallback: agent, negotiate, or native.
+5. Any other unresolved phrase follows that same configured fallback.
 
 No prefix is needed for natural language. Inputs beginning with `/` are
 reserved for Crumb commands, connector/plugin references, and future file or
-folder attachments; they never select the agent path.
+folder attachments; they never select the agent path. A leading `:` is an
+explicit override that removes the prefix and sends the remainder to the agent.
 
 ## Operating modes
 

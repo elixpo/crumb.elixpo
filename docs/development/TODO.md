@@ -106,7 +106,13 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [ ] Implement the [`/` command and `@` reference catalog](../product/input-namespaces-and-connectors.md) incrementally; neither symbol activates an AI prompt.
 - [ ] Add connectors in the catalog's priority order, starting with GitHub, Google Drive, Cloudinary, email, and calendar.
 - [ ] [Crumb MCP policy boundary](mcp-boundary.md): Rust-owned risk, approvals, cancellation, and workspace confinement.
-- [ ] Refine the CLI UI after the harness and optimizers.
+- [ ] Refine the standalone CLI UI after the harness and optimizers.
+  - [x] Add compact panda branding, startup readiness, and model/mode status.
+  - [x] Add inline history autosuggestions alongside `/` and `@` completion.
+  - [x] Add a one-line activity surface with live tool-state labels.
+  - [ ] Add the final panda application icon and platform launcher metadata.
+  - [ ] Add responsive composer borders and a right-aligned context/model meter.
+  - [ ] Add installer, signed release binaries, and desktop launch entries.
 - [ ] Resume the `crumb.elixpo` web UI after the CLI UI.
 - [ ] WP-011 — streamed AI question mode.
 

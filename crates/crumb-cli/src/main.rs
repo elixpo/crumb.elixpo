@@ -38,10 +38,11 @@ use crumb_tools::{
     CheckpointDecision, CheckpointStatus, CheckpointStore, WorkspaceToolLimits,
     WorkspaceWriteLimits, register_workspace_read_tools, register_workspace_write_tool,
 };
-use crumb_ui::{GitSegment, PromptContext, Renderer, UiSettings};
+use crumb_ui::{GitSegment, PromptContext, Renderer, StartupContext, UiSettings};
+use nu_ansi_term::{Color, Style};
 use reedline::{
-    ColumnarMenu, EditCommand, Emacs, FileBackedHistory, History, HistoryItem, KeyCode,
-    KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
+    ColumnarMenu, DefaultHinter, EditCommand, Emacs, FileBackedHistory, History, HistoryItem,
+    KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
     PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal,
     default_emacs_keybindings,
 };
@@ -349,9 +350,27 @@ fn run_managed_repl() -> Result<ReplOutcome> {
         .then(|| create_line_editor(history.as_ref(), completion_workspace.clone()))
         .transpose()?;
 
+    let startup_cwd = current_process_dir()?;
+    let startup_config = read_agent_config(&startup_cwd).unwrap_or_default();
+    let startup_model = startup_config
+        .models
+        .get(&Modality::Text)
+        .and_then(|routes| routes.first())
+        .map(|route| format!("{}/{}", route.provider, route.model));
+    let startup = StartupContext {
+        version: env!("CARGO_PKG_VERSION"),
+        platform,
+        model: startup_model.as_deref(),
+        mode: agent_mode_name(startup_config.mode),
+        agent_configured: startup_config.harness.is_some() && startup_model.is_some(),
+    };
     let branding = renderer.branding();
     if !branding.is_empty() {
-        writeln!(stdout.lock(), "{branding}")?;
+        writeln!(
+            stdout.lock(),
+            "{branding}\n{}",
+            renderer.startup_status(&startup)
+        )?;
     }
 
     loop {
@@ -796,7 +815,7 @@ fn observe_agent_turn(
     writer: &mut dyn Write,
     interactive: bool,
 ) -> Result<TurnObservation> {
-    let mut activity = Some(renderer.activity("Working"));
+    let mut activity = Some(renderer.activity("Thinking"));
     let mut input = SteeringInput::new(steering_bytes);
     let raw_mode = interactive.then(RawModeGuard::enable).transpose()?;
     while !task.is_finished() {
@@ -1005,35 +1024,46 @@ fn render_harness_activity(
     renderer: Renderer,
     writer: &mut dyn Write,
 ) -> Result<()> {
-    if matches!(
-        activity,
+    match activity {
+        HarnessActivity::ToolStarted { name } => {
+            replace_activity(indicator, renderer, &format!("Using {name}"));
+        }
+        HarnessActivity::ToolFinished { success: true, .. } => {
+            replace_activity(indicator, renderer, "Thinking");
+        }
+        HarnessActivity::ApprovalRequired { .. }
+        | HarnessActivity::ToolFinished { success: false, .. }
+        | HarnessActivity::Failed { .. }
+        | HarnessActivity::Cancelled => {
+            if let Some(active) = indicator.take() {
+                active.finish();
+            }
+            write!(writer, "\r\x1b[2K")?;
+            writeln!(
+                writer,
+                "{}",
+                renderer.agent_activity(&harness_activity_label(activity))
+            )?;
+            writer.flush()?;
+        }
         HarnessActivity::RequestAccepted
-            | HarnessActivity::Status { .. }
-            | HarnessActivity::Completed { .. }
-            | HarnessActivity::Progress { .. }
-    ) {
-        return Ok(());
-    }
-    if let Some(indicator) = indicator.take() {
-        indicator.finish();
-    }
-    write!(writer, "\r\x1b[2K")?;
-    writeln!(
-        writer,
-        "{}",
-        renderer.agent_activity(&harness_activity_label(activity))
-    )?;
-    writer.flush()?;
-    if matches!(
-        activity,
-        HarnessActivity::ToolStarted { .. }
-            | HarnessActivity::ToolOutput { .. }
-            | HarnessActivity::ToolFinished { .. }
-            | HarnessActivity::ApprovalRequired { .. }
-    ) {
-        *indicator = Some(renderer.activity("Working"));
+        | HarnessActivity::Status { .. }
+        | HarnessActivity::ToolOutput { .. }
+        | HarnessActivity::Completed { .. }
+        | HarnessActivity::Progress { .. } => {}
     }
     Ok(())
+}
+
+fn replace_activity(
+    indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    renderer: Renderer,
+    label: &str,
+) {
+    if let Some(active) = indicator.take() {
+        active.finish();
+    }
+    *indicator = Some(renderer.activity(label));
 }
 
 const fn agent_mode_name(mode: AgentMode) -> &'static str {
@@ -1207,8 +1237,9 @@ fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
     writeln!(writer, "Crumb command palette")?;
     writeln!(
         writer,
-        "  Type `/` then Tab to search · `@` then Tab for context"
+        "  Type naturally for AI · prefix `:` to force AI · `/` then Tab for commands"
     )?;
+    writeln!(writer, "  Type `@` then Tab to attach context")?;
     writeln!(
         writer,
         "  Enter submit · Alt/Shift+Enter newline · Ctrl+O editor · Ctrl+R history"
@@ -3114,6 +3145,9 @@ fn create_line_editor(
         .with_column_width(Some(terminal_width));
     let editor = Reedline::create()
         .with_history(Box::new(interactive_history))
+        .with_hinter(Box::new(
+            DefaultHinter::default().with_style(Style::new().fg(Color::DarkGray)),
+        ))
         .with_completer(Box::new(CrumbCompleter::new(workspace.clone())))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
         .with_edit_mode(Box::new(Emacs::new(keybindings)));

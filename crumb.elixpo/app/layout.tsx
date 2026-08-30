@@ -20,9 +20,20 @@ export const metadata: Metadata = {
   alternates: { canonical: '/' },
   manifest: '/manifest.webmanifest',
   robots: { index: true, follow: true },
-  openGraph: { type: 'website', url: siteUrl, siteName: 'Crumb NLT', title, description },
-  twitter: { card: 'summary', title, description },
-  icons: { icon: '/favicon.ico', shortcut: '/favicon.ico' },
+  openGraph: {
+    type: 'website',
+    url: siteUrl,
+    siteName: 'Crumb NLT',
+    title,
+    description,
+    images: [{ url: '/og-image.png', width: 1280, height: 720, alt: 'Crumb — the terminal that speaks your native language' }],
+  },
+  twitter: { card: 'summary_large_image', title, description, images: ['/og-image.png'] },
+  icons: {
+    icon: [{ url: '/favicon.ico' }, { url: '/favicon.png', type: 'image/png', sizes: '1024x1024' }],
+    shortcut: '/favicon.ico',
+    apple: '/apple-touch-icon.png',
+  },
   formatDetection: { telephone: false },
 }
 

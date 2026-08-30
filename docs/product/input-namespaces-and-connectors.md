@@ -4,6 +4,12 @@ Crumb keeps prompting natural: a user writes a normal sentence without `?`,
 `@`, or another activation prefix. The deterministic router keeps known shell
 commands native and sends eligible natural-language requests to the agent.
 
+## `:` — explicit agent override
+
+`:` sends the remaining text directly to the agent when a command-shaped or
+deliberately terse prompt would otherwise be ambiguous. For example,
+`:summarize status` reaches the agent without changing the normal routing rules.
+
 ## `/` — Crumb actions
 
 `/` opens Crumb's command palette. Slash commands are handled locally and are

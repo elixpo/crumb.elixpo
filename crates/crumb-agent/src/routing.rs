@@ -19,6 +19,7 @@ pub enum InputRoute {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteReason {
     Empty,
+    ExplicitAgentPrefix,
     ShellSyntax,
     ResolvedCommand,
     PossibleCommandTypo,
@@ -27,7 +28,7 @@ pub enum RouteReason {
     PolicyFallback,
 }
 
-/// Policy for multi-word input whose first word is not a known command.
+/// Policy for input whose first word is not a known command.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnknownInputPolicy {
@@ -128,6 +129,16 @@ impl CommandCatalog {
         if trimmed.is_empty() {
             return decision(InputRoute::Native, RouteReason::Empty, input, None);
         }
+        if let Some(payload) = trimmed.strip_prefix(':')
+            && !payload.trim().is_empty()
+        {
+            return decision(
+                InputRoute::Agent,
+                RouteReason::ExplicitAgentPrefix,
+                payload.trim_start(),
+                None,
+            );
+        }
         if has_shell_syntax(trimmed) {
             return decision(InputRoute::Native, RouteReason::ShellSyntax, input, None);
         }
@@ -145,15 +156,18 @@ impl CommandCatalog {
                 None,
             );
         }
-        if let Some(suggestion) = self.suggest(command, policy.typo_distance) {
+        let single_token = trimmed.split_whitespace().count() == 1;
+        let suggestion = self.suggest(command, policy.typo_distance);
+        if let Some(suggestion) = &suggestion
+            && !single_token
+        {
             return decision(
                 InputRoute::Native,
                 RouteReason::PossibleCommandTypo,
                 input,
-                Some(suggestion),
+                Some(suggestion.clone()),
             );
         }
-        let single_token = trimmed.split_whitespace().count() == 1;
         let route = match policy.unknown_input {
             UnknownInputPolicy::Agent => InputRoute::Agent,
             UnknownInputPolicy::Negotiate => InputRoute::Negotiate,
@@ -169,7 +183,7 @@ impl CommandCatalog {
                 RouteReason::PolicyFallback
             },
             input,
-            None,
+            suggestion,
         )
     }
 
@@ -342,6 +356,15 @@ mod tests {
     }
 
     #[test]
+    fn colon_forces_agent_routing_and_is_removed_from_payload() {
+        let decision = catalog().route(": run git status", &RoutePolicy::default());
+
+        assert_eq!(decision.route, InputRoute::Agent);
+        assert_eq!(decision.reason, RouteReason::ExplicitAgentPrefix);
+        assert_eq!(decision.payload, "run git status");
+    }
+
+    #[test]
     fn conversational_single_word_uses_the_unknown_input_policy() {
         let catalog = CommandCatalog::with_commands(["help".to_owned()]);
         let decision = catalog.route("hello", &RoutePolicy::default());
@@ -349,6 +372,16 @@ mod tests {
         assert_eq!(decision.route, InputRoute::Agent);
         assert_eq!(decision.reason, RouteReason::SingleUnknownToken);
         assert!(decision.suggestion.is_none());
+    }
+
+    #[test]
+    fn ambiguous_single_word_typo_uses_the_unknown_input_policy() {
+        let catalog = CommandCatalog::with_commands(["help".to_owned()]);
+        let decision = catalog.route("helo", &RoutePolicy::default());
+
+        assert_eq!(decision.route, InputRoute::Agent);
+        assert_eq!(decision.reason, RouteReason::SingleUnknownToken);
+        assert_eq!(decision.suggestion.as_deref(), Some("help"));
     }
 
     #[test]

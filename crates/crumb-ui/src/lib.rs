@@ -11,13 +11,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crumb_platform::Platform;
 
-const FULL_LOGO: &str = r"   ██████╗██████╗ ██╗   ██╗███╗   ███╗██████╗
-  ██╔════╝██╔══██╗██║   ██║████╗ ████║██╔══██╗
-  ██║     ██████╔╝██║   ██║██╔████╔██║██████╔╝
-  ██║     ██╔══██╗██║   ██║██║╚██╔╝██║██╔══██╗
-  ╚██████╗██║  ██║╚██████╔╝██║ ╚═╝ ██║██████╔╝
-   ╚═════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝╚═════╝";
-const COOKIE_ART: &str = include_str!("../assets/cookie.txt");
+const FULL_LOGO: &str = r#"   _____ ____  _   _ __  __ ____        .-""-.
+  / ____|  _ \| | | |  \/  |  _ \     _/(o)(o)\_
+ | |    | |_) | | | | |\/| | |_) |   /    ^    \
+ | |____|  _ <| |_| | |  | |  _ <   |   \___/   |
+  \_____|_| \_\ \___/|_|  |_|_| \_\   \_________/"#;
+const COOKIE_SPINNER: [&str; 4] = ["(.:)", "(:.)", "(o.)", "(.o)"];
 
 const PUNCHLINES: &[&str] = &[
     "Broken biscuit. Working terminal.",
@@ -146,6 +145,16 @@ pub struct PromptContext<'a> {
     pub last_exit_code: Option<i32>,
 }
 
+/// Non-secret state rendered once when the standalone terminal starts.
+#[derive(Clone, Debug)]
+pub struct StartupContext<'a> {
+    pub version: &'a str,
+    pub platform: Platform,
+    pub model: Option<&'a str>,
+    pub mode: &'a str,
+    pub agent_configured: bool,
+}
+
 /// Stateless terminal renderer.
 #[derive(Clone, Copy, Debug)]
 pub struct Renderer {
@@ -166,7 +175,7 @@ impl Renderer {
                 "{}\n  {}  {}",
                 self.paint(FULL_LOGO, "36"),
                 self.paint(punchline, "1"),
-                self.paint("Type /help or press Tab after / and @", "2")
+                self.paint("Type naturally · : forces AI · /help opens commands", "2")
             ),
             BrandingMode::Compact => {
                 format!(
@@ -177,6 +186,37 @@ impl Renderer {
             }
             BrandingMode::Disabled => String::new(),
         }
+    }
+
+    /// Renders a compact, non-blocking startup readiness summary.
+    #[must_use]
+    pub fn startup_status(&self, context: &StartupContext<'_>) -> String {
+        let model = context.model.unwrap_or("not configured");
+        let state = if context.agent_configured {
+            "agent ready"
+        } else {
+            "native shell ready · agent setup needed"
+        };
+        if self.settings.output == OutputMode::ScreenReader {
+            return format!(
+                "crumb {} on {}\n{state}; model {model}; mode {}",
+                context.version, context.platform, context.mode
+            );
+        }
+        format!(
+            "{}  {}\n{}  {}",
+            self.paint(&format!("crumb {}", context.version), "1"),
+            self.paint(&context.platform.to_string(), "2"),
+            self.paint(
+                if context.agent_configured {
+                    "●"
+                } else {
+                    "○"
+                },
+                "36;1"
+            ),
+            self.paint(&format!("{state} · {model} · {}", context.mode), "2")
+        )
     }
 
     /// Renders the stable context shown before a Harness turn begins.
@@ -199,7 +239,7 @@ impl Renderer {
             format!("Crumb agent\n{}", details.join(", "))
         } else {
             format!(
-                "{} {}\n  {}",
+                "{} {}  {}",
                 self.paint("◆", "35;1"),
                 self.paint("Crumb agent", "1"),
                 self.paint(&details.join(" · "), "2")
@@ -296,7 +336,6 @@ pub struct ActivityIndicator {
     started: Instant,
     visible: bool,
     color: bool,
-    line_count: usize,
 }
 
 impl ActivityIndicator {
@@ -313,7 +352,6 @@ impl ActivityIndicator {
             started: Instant::now(),
             visible: animated,
             color,
-            line_count: COOKIE_ART.lines().count() + 1,
         }
     }
 
@@ -327,12 +365,12 @@ impl ActivityIndicator {
         self.stop();
         if self.visible {
             let elapsed = self.started.elapsed().as_secs_f32();
-            let crumb = if self.color {
-                "\x1b[35;1m.\x1b[0m"
+            let summary = if self.color {
+                format!("\x1b[90m. Worked for {elapsed:.1}s\x1b[0m")
             } else {
-                "."
+                format!(". Worked for {elapsed:.1}s")
             };
-            let _ = writeln!(io::stderr(), "{crumb} Worked for {elapsed:.1}s");
+            let _ = writeln!(io::stderr(), "{summary}");
             let _ = io::stderr().flush();
         }
     }
@@ -341,7 +379,7 @@ impl ActivityIndicator {
         self.running.store(false, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
-            clear_activity_lines(self.line_count);
+            clear_activity_line();
         }
     }
 }
@@ -353,73 +391,28 @@ impl Drop for ActivityIndicator {
 }
 
 fn animate_activity(label: &str, color: bool, running: &AtomicBool) {
-    let mirrored = mirror_cookie(COOKIE_ART);
-    let frames = [
-        (COOKIE_ART, 0_usize),
-        (COOKIE_ART, 1),
-        (mirrored.as_str(), 2),
-        (mirrored.as_str(), 1),
-    ];
     let mut frame = 0_usize;
-    let mut drawn = false;
     while running.load(Ordering::Acquire) {
-        if drawn {
-            clear_activity_lines(COOKIE_ART.lines().count() + 1);
-        }
-        draw_activity_frame(frames[frame].0, frames[frame].1, label, color);
-        let _ = io::stderr().flush();
-        drawn = true;
-        frame = (frame + 1) % frames.len();
-        thread::sleep(Duration::from_millis(220));
-    }
-}
-
-fn draw_activity_frame(art: &str, offset: usize, label: &str, color: bool) {
-    let indent = " ".repeat(offset);
-    for line in art.lines() {
+        let cookie = COOKIE_SPINNER[frame];
         if color {
-            let _ = write!(io::stderr(), "\r\x1b[2K{indent}\x1b[35m{line}\x1b[0m\r\n");
+            let _ = write!(
+                io::stderr(),
+                "\r\x1b[2K\x1b[35;1m{cookie}\x1b[0m \x1b[90m{label} · type to steer · Ctrl+C to cancel\x1b[0m"
+            );
         } else {
-            let _ = write!(io::stderr(), "\r\x1b[2K{indent}{line}\r\n");
+            let _ = write!(
+                io::stderr(),
+                "\r\x1b[2K{cookie} {label} · type to steer · Ctrl+C to cancel"
+            );
         }
+        let _ = io::stderr().flush();
+        frame = (frame + 1) % COOKIE_SPINNER.len();
+        thread::sleep(Duration::from_millis(140));
     }
-    let _ = write!(
-        io::stderr(),
-        "\r\x1b[2K{indent}{label}  type to steer · Ctrl+C to cancel"
-    );
 }
 
-fn mirror_cookie(art: &str) -> String {
-    art.lines()
-        .map(|line| line.chars().rev().map(mirror_braille).collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn mirror_braille(character: char) -> char {
-    let code = u32::from(character);
-    if !(0x2800..=0x28ff).contains(&code) {
-        return character;
-    }
-    let dots = code - 0x2800;
-    let mirrored = ((dots & 0b0000_0001) << 3)
-        | ((dots & 0b0000_0010) << 3)
-        | ((dots & 0b0000_0100) << 3)
-        | ((dots & 0b0000_1000) >> 3)
-        | ((dots & 0b0001_0000) >> 3)
-        | ((dots & 0b0010_0000) >> 3)
-        | ((dots & 0b0100_0000) << 1)
-        | ((dots & 0b1000_0000) >> 1);
-    char::from_u32(0x2800 + mirrored).unwrap_or(character)
-}
-
-fn clear_activity_lines(line_count: usize) {
-    for line in 0..line_count {
-        let _ = write!(io::stderr(), "\r\x1b[2K");
-        if line + 1 < line_count {
-            let _ = write!(io::stderr(), "\x1b[1A");
-        }
-    }
+fn clear_activity_line() {
+    let _ = write!(io::stderr(), "\r\x1b[2K");
     let _ = io::stderr().flush();
 }
 
@@ -499,8 +492,8 @@ mod tests {
     use crumb_platform::Platform;
 
     use super::{
-        BrandingMode, COOKIE_ART, GitSegment, MotionMode, OutputMode, PUNCHLINES, PromptContext,
-        Renderer, UiSettings, mirror_cookie,
+        BrandingMode, COOKIE_SPINNER, GitSegment, MotionMode, OutputMode, PUNCHLINES,
+        PromptContext, Renderer, StartupContext, UiSettings,
     };
 
     #[test]
@@ -560,13 +553,13 @@ mod tests {
 
         let branding = renderer.branding();
 
-        assert!(branding.contains("██████╗"));
+        assert!(branding.contains("_____ ____"));
         assert!(
             PUNCHLINES
                 .iter()
                 .any(|punchline| branding.contains(punchline))
         );
-        assert_eq!(branding.lines().count(), 7);
+        assert_eq!(branding.lines().count(), 6);
     }
 
     #[test]
@@ -580,9 +573,31 @@ mod tests {
 
         assert_eq!(
             renderer.agent_header("qwen-coder", Some("high"), "auto", None),
-            "◆ Crumb agent\n  model qwen-coder · mode auto · effort high"
+            "◆ Crumb agent  model qwen-coder · mode auto · effort high"
         );
         assert_eq!(Renderer::agent_response("done\n"), "done");
+    }
+
+    #[test]
+    fn startup_status_contains_only_non_secret_readiness_metadata() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Compact,
+        });
+        let status = renderer.startup_status(&StartupContext {
+            version: "0.1.0",
+            platform: Platform::Linux,
+            model: Some("pollinations/nova-fast"),
+            mode: "auto",
+            agent_configured: true,
+        });
+
+        assert_eq!(
+            status,
+            "crumb 0.1.0  linux\n●  agent ready · pollinations/nova-fast · auto"
+        );
     }
 
     #[test]
@@ -602,12 +617,11 @@ mod tests {
     }
 
     #[test]
-    fn cookie_activity_uses_the_asset_and_mirrors_cleanly() {
-        let mirrored = mirror_cookie(COOKIE_ART);
-
-        assert_eq!(COOKIE_ART.lines().count(), 15);
-        assert_ne!(mirrored, COOKIE_ART.trim_end());
-        assert_eq!(mirror_cookie(&mirrored), COOKIE_ART.trim_end());
+    fn cookie_spinner_is_compact_ascii_art() {
+        assert!(COOKIE_SPINNER.iter().all(|frame| frame.is_ascii()));
+        assert!(COOKIE_SPINNER.iter().all(|frame| frame.len() == 4));
+        assert!(COOKIE_SPINNER.iter().all(|frame| frame.starts_with('(')));
+        assert!(COOKIE_SPINNER.iter().all(|frame| frame.ends_with(')')));
     }
 
     #[test]

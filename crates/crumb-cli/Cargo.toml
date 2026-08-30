@@ -27,6 +27,7 @@ crumb-tools = { path = "../crumb-tools" }
 crumb-ui = { path = "../crumb-ui" }
 crossterm.workspace = true
 ctrlc.workspace = true
+nu-ansi-term.workspace = true
 reedline.workspace = true
 reqwest.workspace = true
 serde.workspace = true
