@@ -6,6 +6,7 @@ members = [
     "crates/crumb-core",
     "crates/crumb-history",
     "crates/crumb-harness-dsh",
+    "crates/crumb-harness-cli",
     "crates/crumb-llm",
     "crates/crumb-mcp",
     "crates/crumb-native",
