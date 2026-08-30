@@ -7,7 +7,9 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 crumb-agent = { path = "../crumb-agent" }
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true

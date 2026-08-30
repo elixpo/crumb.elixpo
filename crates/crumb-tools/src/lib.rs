@@ -1,8 +1,12 @@
 //! Native tools whose permissions remain owned by Crumb.
 
+mod checkpoint;
 mod shell;
 mod workspace;
 
+pub use checkpoint::{
+    CheckpointDecision, CheckpointFile, CheckpointStatus, CheckpointStore, WorkspaceCheckpoint,
+};
 pub use shell::{AgentShellConfig, register_shell_tool};
 pub use workspace::{WorkspaceToolLimits, register_workspace_read_tools};
 
