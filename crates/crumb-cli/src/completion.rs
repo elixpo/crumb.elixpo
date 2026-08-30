@@ -170,7 +170,7 @@ fn native_path_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Sugg
 
 fn no_records_suggestion(line: &str, pos: usize) -> Suggestion {
     let (start, token) = current_token(line);
-    let label = " NO RECORDS FOUND ";
+    let label = " NO RECORD FOUND ";
     let width = crossterm::terminal::size().map_or(80, |(columns, _)| usize::from(columns));
     let padding = width.saturating_sub(label.len()).saturating_div(2);
     let chip = if std::env::var_os("NO_COLOR").is_some() {
@@ -344,7 +344,8 @@ mod tests {
     #[test]
     fn empty_completion_uses_a_non_inserting_footer_chip() {
         let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
-        let result = completer.complete("cd this-path-does-not-exist", 27);
+        let line = "cd this-path-does-not-exist";
+        let result = completer.complete(line, line.len());
         let suggestion = &result.suggestions()[0];
 
         assert_eq!(suggestion.value, "this-path-does-not-exist");
@@ -352,7 +353,7 @@ mod tests {
             suggestion
                 .display_override
                 .as_deref()
-                .is_some_and(|display| display.contains("NO RECORDS FOUND"))
+                .is_some_and(|display| display.contains("NO RECORD FOUND"))
         );
         assert!(!suggestion.append_whitespace);
     }
