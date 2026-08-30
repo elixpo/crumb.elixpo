@@ -7,16 +7,21 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] [WP-001 — workspace bootstrap](https://github.com/elixpo/crumb.elixpo/issues/1)
 - [x] [WP-002 — persistent Linux Bash PTY](https://github.com/elixpo/crumb.elixpo/issues/4)
 
-## Current milestone: [WP-003 — macOS Zsh parity](https://github.com/elixpo/crumb.elixpo/issues/6)
+## Active stack
 
-- [x] Add a typed macOS Zsh implementation.
-- [x] Select interactive Zsh for `Platform::MacOs`.
+- [ ] [WP-003 — macOS Zsh parity](https://github.com/elixpo/crumb.elixpo/issues/6) ([PR #7](https://github.com/elixpo/crumb.elixpo/pull/7))
+
+## Current milestone: [WP-004 — Windows PowerShell parity](https://github.com/elixpo/crumb.elixpo/issues/8)
+
+- [x] Add a typed Windows PowerShell implementation.
+- [x] Prefer `pwsh` and fall back to Windows PowerShell.
+- [x] Select PowerShell for `Platform::Windows`.
 - [x] Reuse the portable PTY lifecycle and terminal relay.
-- [x] Preserve cwd and environment state in one Zsh process.
-- [x] Add deterministic macOS integration coverage.
-- [ ] Keep Linux and Windows workspace builds green.
+- [x] Preserve cwd and environment state in one PowerShell process.
+- [x] Add deterministic Windows integration coverage.
+- [ ] Keep Linux and macOS workspace builds green.
 - [ ] Pass formatting, clippy, and workspace tests.
-- [ ] Merge WP-003.
+- [ ] Merge WP-004.
 
 <details>
 <summary>WP-001 completion details</summary>
@@ -35,7 +40,6 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 ## Planned work packages
 
-- [ ] WP-004 — Windows PowerShell parity.
 - [ ] WP-005 — shell lifecycle and completion protocol.
 - [ ] WP-006 — terminal UI layer.
 - [ ] WP-007 — persistent history.
