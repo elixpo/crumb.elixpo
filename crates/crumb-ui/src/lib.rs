@@ -352,25 +352,47 @@ impl Renderer {
     #[must_use]
     pub fn transcript_input_at(
         &self,
-        username: &str,
+        _username: &str,
         input: &str,
         timestamp: Option<&str>,
         terminal_width: u16,
     ) -> String {
         if self.settings.output == OutputMode::ScreenReader {
-            return format!("{username}: {input}");
+            return format!("User: {input}");
         }
         let card_width = usize::from(terminal_width.saturating_sub(4));
         let content_width = card_width.saturating_sub(2);
+        let timestamp = timestamp.unwrap_or_default();
         let mut body = Vec::new();
         for line in input.lines().take(TRANSCRIPT_INPUT_MAX_ROWS) {
-            let marker = if body.is_empty() { "▶" } else { "│" };
+            let first = body.is_empty();
+            let marker = if first { "◆ >" } else { "  │" };
+            let timestamp_width = if first && !timestamp.is_empty() {
+                timestamp.chars().count().saturating_add(1)
+            } else {
+                0
+            };
             let line = if content_width == 0 {
                 line.to_owned()
             } else {
-                fit_terminal_text(line, content_width.saturating_sub(2))
+                fit_terminal_text(
+                    line,
+                    content_width
+                        .saturating_sub(marker.chars().count())
+                        .saturating_sub(timestamp_width)
+                        .saturating_sub(1),
+                )
             };
-            body.push(format!("{marker} {line}"));
+            let mut row = format!("{marker} {line}");
+            if first && !timestamp.is_empty() {
+                let padding = content_width
+                    .saturating_sub(row.chars().count())
+                    .saturating_sub(timestamp.chars().count())
+                    .max(1);
+                row.push_str(&" ".repeat(padding));
+                row.push_str(timestamp);
+            }
+            body.push(row);
         }
         if input.lines().count() > TRANSCRIPT_INPUT_MAX_ROWS
             && let Some(last) = body.last_mut()
@@ -381,24 +403,10 @@ impl Renderer {
                 *last = fit_terminal_text(&format!("{last} …"), content_width);
             }
         }
-        let header = format!("◆ {username}");
-        let timestamp = timestamp.unwrap_or_default();
-        let header = if timestamp.is_empty() {
-            header
-        } else {
-            let padding = content_width
-                .saturating_sub(header.chars().count())
-                .saturating_sub(timestamp.chars().count())
-                .max(1);
-            format!("{header}{}{timestamp}", " ".repeat(padding))
-        };
-        let mut card = Vec::with_capacity(body.len().saturating_add(1));
-        card.push(self.transcript_card_line(&header, card_width, "36;1"));
-        card.extend(
-            body.into_iter()
-                .map(|line| self.transcript_card_line(&line, card_width, "1")),
-        );
-        card.join("\n")
+        body.into_iter()
+            .map(|line| self.transcript_card_line(&line, card_width, "1"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn transcript_card_line(self, line: &str, width: usize, style: &str) -> String {
@@ -473,9 +481,8 @@ impl Renderer {
             format!("Crumb agent\n{}", details.join(", "))
         } else {
             format!(
-                "  {} {}  {}",
-                self.paint("╭─◆", "35;1"),
-                self.paint("CRUMB", "38;2;255;255;204;1"),
+                "  {}  {}",
+                self.paint("[ CRUMB ]", "38;2;255;255;204;48;5;53;1"),
                 self.paint(&details.join(" · "), "2")
             )
         }
@@ -1026,12 +1033,12 @@ mod tests {
 
         assert_eq!(
             renderer.agent_header("qwen-coder", Some("high"), "auto", None),
-            "  ╭─◆ CRUMB  model qwen-coder · mode auto · effort high"
+            "  [ CRUMB ]  model qwen-coder · mode auto · effort high"
         );
         assert_eq!(renderer.agent_response("done\n"), "\n  ╰──▶ done");
         assert_eq!(
             renderer.transcript_input("elixpo", "fix this"),
-            "  ◆ elixpo\n  ▶ fix this"
+            "  ◆ > fix this"
         );
         assert_eq!(renderer.native_output_prefix(), "  ╰──▶ ");
     }
