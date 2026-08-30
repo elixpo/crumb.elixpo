@@ -1,4 +1,5 @@
-'''
+'''Candidate Crumb wordmarks retained with the UI tooling.
+
 
 ▒█▀▀█ ▒█▀▀█ ▒█░▒█ ▒█▀▄▀█ ▒█▀▀█ 
 ▒█░░░ ▒█▄▄▀ ▒█░▒█ ▒█▒█▒█ ▒█▀▀▄ 

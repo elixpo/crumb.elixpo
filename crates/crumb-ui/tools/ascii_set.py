@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render Oreo as a compact ANSI outline mascot for Crumb."""
+"""Render Oreo source art for the crumb-ui terminal assets."""
 
 from __future__ import annotations
 
@@ -33,9 +33,20 @@ AWAKE_ART = (
     " ╰───────────╯",
 )
 
+CLOSING_ART = (
+    " ╭───╮   ╭───╮",
+    "╭╯   ╰───╯  ╰╮",
+    "╭╯ ▛▀▀▜═▛▀▀▜ ╰╮",
+    "│  ████ ████  │",
+    "│ ░▒▓     ▓▒░ │",
+    "╰╮   ▆▃▂▃▆   ╭╯",
+    " ╰───────────╯",
+)
+
 STATES = {
     "cool": SUNGLASSES_ART,
     "awake": AWAKE_ART,
+    "closing": CLOSING_ART,
 }
 
 

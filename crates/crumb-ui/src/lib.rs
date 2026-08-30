@@ -19,7 +19,7 @@ const WORDMARK: &str = r"░█████╗░██████╗░██�
 ░╚════╝░╚═╝░░╚═╝░╚═════╝░╚═╝░░░░░╚═╝╚═════╝░";
 const PANDA_AWAKE: &str = include_str!("../assets/panda-awake.txt");
 const PANDA_COOL: &str = include_str!("../assets/panda-cool.txt");
-const PANDA_SMALL: &str = include_str!("../assets/panda-small.txt");
+const PANDA_CLOSING: &str = include_str!("../assets/panda-closing.txt");
 const COOKIE_SPINNER: [&str; 4] = ["(.:)", "(:.)", "(o.)", "(.o)"];
 const TRANSCRIPT_INPUT_MAX_ROWS: usize = 4;
 
@@ -547,7 +547,7 @@ impl Renderer {
             return format!("{runtime}\n{session}\n{resume}");
         }
         let details = [runtime, session, resume];
-        let art = trim_art(PANDA_SMALL);
+        let art = trim_art(PANDA_CLOSING);
         let art_width = art.lines().map(str::len).max().unwrap_or_default();
         art.lines()
             .enumerate()
@@ -555,7 +555,7 @@ impl Renderer {
                 let detail = details.get(index).map_or("", String::as_str);
                 format!(
                     "{}  {}",
-                    self.paint(&format!("{line:<art_width$}"), "90"),
+                    self.paint(&format!("{line:<art_width$}"), "38;2;128;128;128"),
                     self.paint(detail, "2")
                 )
             })
@@ -1105,6 +1105,7 @@ mod tests {
         let handoff =
             renderer.session_handoff(Duration::from_secs(10), Some("crumb-session-1"), 1_200);
         assert!(handoff.contains("Runtime  10.0s"));
+        assert!(handoff.contains("╭───╮   ╭───╮"));
         assert!(handoff.contains("Session  crumb-session-1 · ~1.2k tokens"));
         assert!(handoff.contains("Resume   crumb --resume=crumb-session-1"));
     }
@@ -1123,6 +1124,20 @@ mod tests {
                 .transcript_input_at("you", "pwd", None, 80)
                 .contains("\x1b[1;48;2;85;85;85m")
         );
+    }
+
+    #[test]
+    fn closing_avatar_uses_one_muted_grey_color() {
+        let renderer = Renderer::new(UiSettings {
+            color: true,
+            output: OutputMode::Rich,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+
+        let handoff = renderer.session_handoff(Duration::from_secs(1), None, 0);
+        assert!(handoff.contains("╭───╮   ╭───╮"));
+        assert!(handoff.contains("\x1b[38;2;128;128;128m"));
     }
 
     #[test]
