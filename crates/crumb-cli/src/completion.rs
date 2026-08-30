@@ -210,11 +210,10 @@ fn native_path_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Sugg
                 value.push('/');
             }
             Some(Suggestion {
-                display_override: Some(format!(
-                    "{}  {value}",
-                    if is_directory { "▱" } else { "·" }
+                display_override: Some(palette_row(
+                    &value,
+                    if is_directory { "folder" } else { "file" },
                 )),
-                description: Some(if is_directory { "folder" } else { "file" }.to_owned()),
                 span: Span::new(start, pos),
                 append_whitespace: !is_directory,
                 value,
@@ -348,36 +347,26 @@ fn path_suggestions(
 fn suggestion(value: &str, description: &str, span: Span) -> Suggestion {
     Suggestion {
         value: value.to_owned(),
-        display_override: Some(format!("{}  {value}", palette_icon(value))),
-        description: Some(description.to_owned()),
+        display_override: Some(palette_row(value, description)),
         span,
         append_whitespace: !value.ends_with([':', ' ']),
         ..Suggestion::default()
     }
 }
 
-fn palette_icon(value: &str) -> &'static str {
-    if value.starts_with("/skills") || value.starts_with("@skill:") {
-        "✦"
-    } else if value.starts_with("/model") {
-        "◇"
-    } else if value.starts_with("/mode") || value.starts_with("/effort") {
-        "◐"
-    } else if value.starts_with("/auth") || value.starts_with("/connectors") {
-        "◎"
-    } else if value.starts_with("/session") || value.starts_with("@session:") {
-        "▣"
-    } else if value.starts_with("/plugins") || value.starts_with("@plugin:") {
-        "⬡"
-    } else if value.starts_with("@file:") || value.starts_with("@folder:") {
-        "▱"
-    } else if value.starts_with('@') {
-        "⌁"
-    } else if value.starts_with('?') || value == "/help" {
-        "?"
-    } else {
-        "›"
-    }
+fn palette_row(value: &str, description: &str) -> String {
+    let width = crossterm::terminal::size()
+        .map_or(80, |(columns, _)| usize::from(columns))
+        .saturating_sub(8)
+        .max(24);
+    let label_width = width.saturating_mul(2).saturating_div(5).clamp(18, 44);
+    let value = value
+        .chars()
+        .take(label_width.saturating_sub(2))
+        .collect::<String>();
+    let mut row = format!("{value:<label_width$}{description}");
+    row.truncate(row.floor_char_boundary(width.min(row.len())));
+    row
 }
 
 #[cfg(test)]
@@ -427,7 +416,7 @@ mod tests {
             skill
                 .display_override
                 .as_deref()
-                .is_some_and(|display| display.starts_with("✦  "))
+                .is_some_and(|display| display.starts_with("/skills load review"))
         );
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
     }
@@ -448,9 +437,9 @@ mod tests {
         assert_eq!(result.suggestions()[0].value, "?");
         assert!(
             result.suggestions()[0]
-                .description
+                .display_override
                 .as_deref()
-                .is_some_and(|description| description.contains("keyboard shortcuts"))
+                .is_some_and(|display| display.contains("keyboard shortcuts"))
         );
         assert!(
             result

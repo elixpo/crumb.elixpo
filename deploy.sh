@@ -11,6 +11,7 @@ DRY_RUN=false
 TARGET=""
 PACKAGE_NAME=""
 VSCODE_PACKAGE=false
+QUICK_BUILD=false
 PAGES_DIR="${CRUMB_PAGES_DIR:-$SITE_DIR}"
 PAGES_PROJECT="${CRUMB_PAGES_PROJECT:-crumb-elixpo}"
 PAGES_OUTPUT_DIR="${CRUMB_PAGES_OUTPUT_DIR:-dist}"
@@ -45,6 +46,7 @@ Worker-only actions:
 Options:
   --name NAME            Select one npm package
   --vs                   Select the VS Code package
+  --quick                Use the fast debug profile for terminal builds
   --dry-run              Print commands without executing them
   -h, --help             Show this help
 
@@ -56,6 +58,7 @@ Examples:
   ./deploy.sh --pages build deploy
   ./deploy.sh --github build deploy
   ./deploy.sh --terminal build
+  ./deploy.sh --terminal --quick build
 USAGE
 }
 
@@ -360,6 +363,22 @@ deploy_vscode_package() {
   run_in "${PACKAGE_DIRS[0]}" npx vsce publish
 }
 
+build_package_target() {
+  if $VSCODE_PACKAGE; then
+    build_vscode_package
+  else
+    build_npm_packages
+  fi
+}
+
+deploy_package_target() {
+  if $VSCODE_PACKAGE; then
+    deploy_vscode_package
+  else
+    deploy_npm_packages "https://registry.npmjs.org"
+  fi
+}
+
 require_pages() {
   [ -f "$PAGES_DIR/package.json" ] || fail "Missing Cloudflare Pages package at $PAGES_DIR/package.json."
   grep -q '"pages:build"' "$PAGES_DIR/package.json" || fail \
@@ -387,9 +406,15 @@ build_terminal() {
   if ! $DRY_RUN; then
     command -v cargo >/dev/null 2>&1 || fail "Rust and Cargo are required."
   fi
-  log "Building the standalone Crumb terminal binary..."
-  run_in "$ROOT_DIR" cargo build --locked --release -p crumb-cli
-  log "Terminal binary ready at $ROOT_DIR/target/release/crumb"
+  if $QUICK_BUILD; then
+    log "Quick-building the Crumb terminal binary..."
+    run_in "$ROOT_DIR" cargo build --locked -p crumb-cli
+    log "Terminal binary ready at $ROOT_DIR/target/debug/crumb"
+  else
+    log "Building the standalone Crumb terminal binary..."
+    run_in "$ROOT_DIR" cargo build --locked --release -p crumb-cli
+    log "Terminal binary ready at $ROOT_DIR/target/release/crumb"
+  fi
 }
 
 set_target() {
@@ -412,6 +437,7 @@ while [ $# -gt 0 ]; do
       PACKAGE_NAME="$1"
       ;;
     --vs) VSCODE_PACKAGE=true ;;
+    --quick) QUICK_BUILD=true ;;
     --dry-run) DRY_RUN=true ;;
     build|deploy|provision|migrate|secrets) ACTIONS+=("$1") ;;
     -h|--help|help) usage; exit 0 ;;
@@ -427,6 +453,9 @@ done
 if $VSCODE_PACKAGE; then
   [ "$TARGET" = package ] || fail "--vs is only valid with --package."
   [ -z "$PACKAGE_NAME" ] || fail "--vs and --name cannot be combined."
+fi
+if $QUICK_BUILD; then
+  [ "$TARGET" = terminal ] || fail "--quick is only valid with --terminal."
 fi
 
 for action in "${ACTIONS[@]}"; do
@@ -450,8 +479,8 @@ for action in "${ACTIONS[@]}"; do
     worker:provision) provision ;;
     worker:migrate) migrate ;;
     worker:secrets) upload_secrets ;;
-    package:build) if $VSCODE_PACKAGE; then build_vscode_package; else build_npm_packages; fi ;;
-    package:deploy) if $VSCODE_PACKAGE; then deploy_vscode_package; else deploy_npm_packages "https://registry.npmjs.org"; fi ;;
+    package:build) build_package_target ;;
+    package:deploy) deploy_package_target ;;
     github:build) build_npm_packages ;;
     github:deploy) deploy_npm_packages "https://npm.pkg.github.com" ;;
     pages:build) build_pages ;;

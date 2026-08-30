@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -48,10 +49,10 @@ use crumb_tools::{
 use crumb_ui::{GitSegment, PromptContext, Renderer, StartupContext, UiSettings};
 use nu_ansi_term::{Color, Style};
 use reedline::{
-    DefaultHinter, DescriptionMode, EditCommand, Emacs, FileBackedHistory, Hinter, History,
-    HistoryItem, IdeMenu, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode,
-    PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal,
-    default_emacs_keybindings,
+    Completer, DefaultHinter, EditCommand, Editor, Emacs, FileBackedHistory, Hinter, History,
+    HistoryItem, IdeMenu, KeyCode, KeyModifiers, Menu, MenuBuilder, MenuEvent, Painter, Prompt,
+    PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent,
+    ReedlineMenu, Signal, Suggestion, default_emacs_keybindings,
 };
 
 mod agent_runtime;
@@ -352,15 +353,19 @@ fn run_managed_repl() -> Result<ReplOutcome> {
     let (mut last_exit_code, mut command_context) = (None, SessionCommandContext::default());
     let history = open_history(&mut stdout.lock())?;
     let completion_workspace = CompletionWorkspace::new(initial_cwd);
-    let mut line_editor =
-        optional_line_editor(interactive, history.as_ref(), completion_workspace)?;
-
     let header_rows = render_startup(
         renderer,
         platform,
         interactive,
         fullscreen,
         &mut stdout.lock(),
+    )?;
+    let mut line_editor = optional_line_editor(
+        interactive,
+        history.as_ref(),
+        completion_workspace,
+        renderer,
+        header_rows,
     )?;
 
     loop {
@@ -3760,19 +3765,177 @@ struct InteractiveLineEditor {
     workspace: CompletionWorkspace,
 }
 
+struct CompletionOverlay {
+    menu: IdeMenu,
+    renderer: Renderer,
+    header_rows: u16,
+}
+
+impl CompletionOverlay {
+    const fn new(menu: IdeMenu, renderer: Renderer, header_rows: u16) -> Self {
+        Self {
+            menu,
+            renderer,
+            header_rows,
+        }
+    }
+
+    fn overlay_rows(&self) -> (u16, u16, u16) {
+        let (columns, rows) = size().unwrap_or((80, 24));
+        let composer_row = rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
+        let top = composer_row
+            .saturating_sub(COMPLETION_PALETTE_MAX_ROWS)
+            .max(self.header_rows.min(composer_row));
+        (columns, top, composer_row)
+    }
+
+    fn paint_overlay(&self, body: &str) -> String {
+        let (columns, top, composer_row) = self.overlay_rows();
+        let mut frame = String::new();
+        let mut lines = body.lines();
+        for row in top..composer_row {
+            let _ = write!(frame, "\x1b[{};1H\x1b[2K", row.saturating_add(1));
+            if let Some(line) = lines.next() {
+                frame.push_str(line);
+            }
+        }
+        let _ = write!(
+            frame,
+            "\x1b[{};1H\x1b[2K{}",
+            composer_row.saturating_add(4),
+            self.renderer.composer_idle_status()
+        );
+        let _ = write!(
+            frame,
+            "\x1b[{};1H\x1b[2K{}",
+            size().map_or(24, |(_, rows)| rows),
+            self.renderer.composer_hotkeys(columns)
+        );
+        frame
+    }
+
+    fn clear_overlay(&self) {
+        let mut output = io::stdout();
+        let frame = self.paint_overlay("");
+        let _ = write!(output, "\x1b7{frame}\x1b8");
+        let _ = output.flush();
+    }
+}
+
+impl Menu for CompletionOverlay {
+    fn name(&self) -> &'static str {
+        "completion_menu"
+    }
+
+    fn indicator(&self) -> &'static str {
+        ""
+    }
+
+    fn is_active(&self) -> bool {
+        self.menu.is_active()
+    }
+
+    fn set_active(&mut self, active: bool) {
+        self.menu.set_active(active);
+    }
+
+    fn clear_input(&mut self) {
+        self.menu.clear_input();
+    }
+
+    fn menu_event(&mut self, event: MenuEvent) {
+        let closing = matches!(event, MenuEvent::Deactivate);
+        self.menu.menu_event(event);
+        if closing {
+            self.clear_overlay();
+        }
+    }
+
+    fn can_quick_complete(&self) -> bool {
+        self.menu.can_quick_complete()
+    }
+
+    fn can_partially_complete(
+        &mut self,
+        values_updated: bool,
+        editor: &mut Editor,
+        completer: &mut dyn Completer,
+    ) -> bool {
+        self.menu
+            .can_partially_complete(values_updated, editor, completer)
+    }
+
+    fn update_values(&mut self, editor: &mut Editor, completer: &mut dyn Completer) {
+        self.menu.update_values(editor, completer);
+    }
+
+    fn reset_position(&mut self) {
+        self.menu.reset_position();
+    }
+
+    fn update_working_details(
+        &mut self,
+        editor: &mut Editor,
+        completer: &mut dyn Completer,
+        painter: &Painter,
+    ) {
+        self.menu.update_working_details(editor, completer, painter);
+    }
+
+    fn replace_in_buffer(&self, editor: &mut Editor) {
+        self.menu.replace_in_buffer(editor);
+    }
+
+    fn menu_required_lines(&self, _terminal_columns: u16) -> u16 {
+        0
+    }
+
+    fn menu_string(&self, _available_lines: u16, use_ansi_coloring: bool) -> String {
+        self.paint_overlay(
+            &self
+                .menu
+                .menu_string(COMPLETION_PALETTE_MAX_ROWS, use_ansi_coloring),
+        )
+    }
+
+    fn min_rows(&self) -> u16 {
+        0
+    }
+
+    fn get_values(&self) -> &[Suggestion] {
+        self.menu.get_values()
+    }
+
+    fn results_are_provisional(&self) -> bool {
+        self.menu.results_are_provisional()
+    }
+
+    fn is_awaiting_first_answer(&self) -> bool {
+        self.menu.is_awaiting_first_answer()
+    }
+
+    fn set_cursor_pos(&mut self, pos: (u16, u16)) {
+        self.menu.set_cursor_pos(pos);
+    }
+}
+
 fn optional_line_editor(
     interactive: bool,
     history: Option<&HistoryStore>,
     workspace: CompletionWorkspace,
+    renderer: Renderer,
+    header_rows: u16,
 ) -> Result<Option<InteractiveLineEditor>> {
     interactive
-        .then(|| create_line_editor(history, workspace))
+        .then(|| create_line_editor(history, workspace, renderer, header_rows))
         .transpose()
 }
 
 fn create_line_editor(
     history: Option<&HistoryStore>,
     workspace: CompletionWorkspace,
+    renderer: Renderer,
+    header_rows: u16,
 ) -> Result<InteractiveLineEditor> {
     let mut interactive_history = FileBackedHistory::new(INTERACTIVE_HISTORY_CAPACITY)?;
     if let Some(history) = history {
@@ -3824,7 +3987,7 @@ fn create_line_editor(
         ReedlineEvent::OpenEditor,
     );
     let terminal_width = suggestion_width(size()?.0);
-    let menu_width = u16::try_from(terminal_width).unwrap_or(COMPLETION_PALETTE_MAX_WIDTH);
+    let menu_width = u16::try_from(terminal_width).unwrap_or(1);
     let menu = IdeMenu::default()
         .with_name("completion_menu")
         .with_text_style(Style::new().fg(Color::Fixed(245)))
@@ -3843,18 +4006,13 @@ fn create_line_editor(
                 .bold()
                 .underline(),
         )
-        .with_min_completion_width(menu_width.min(32))
+        .with_min_completion_width(menu_width)
         .with_max_completion_width(menu_width)
         .with_max_completion_height(COMPLETION_PALETTE_MAX_ROWS)
-        .with_padding(1)
-        .with_default_border()
-        .with_description_mode(DescriptionMode::PreferRight)
-        .with_min_description_width(20)
-        .with_max_description_width(48)
-        .with_max_description_height(4)
-        .with_description_offset(1)
+        .with_padding(0)
         .with_cursor_offset(i16::try_from(FULLSCREEN_SIDE_GUTTER).unwrap_or(2))
         .with_correct_cursor_pos(true);
+    let menu = CompletionOverlay::new(menu, renderer, header_rows);
     let editor = Reedline::create()
         .with_history(Box::new(interactive_history))
         .with_hinter(Box::new(CrumbHinter::default()))
@@ -3865,14 +4023,9 @@ fn create_line_editor(
 }
 
 const COMPLETION_PALETTE_MAX_ROWS: u16 = 12;
-const COMPLETION_PALETTE_MAX_WIDTH: u16 = 72;
 
 fn suggestion_width(terminal_columns: u16) -> usize {
-    usize::from(
-        terminal_columns
-            .saturating_sub(8)
-            .clamp(1, COMPLETION_PALETTE_MAX_WIDTH),
-    )
+    usize::from(terminal_columns.saturating_sub(4).max(1))
 }
 
 struct CrumbPrompt {
@@ -4026,7 +4179,10 @@ const FULLSCREEN_COMPOSER_ROWS: u16 = 5;
 fn fullscreen_rows(header_rows: u16) -> io::Result<(u16, u16, u16, u16)> {
     let (_, rows) = size()?;
     let composer_row = rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
-    let transcript_bottom = composer_row.saturating_sub(1);
+    let palette_top = composer_row
+        .saturating_sub(COMPLETION_PALETTE_MAX_ROWS)
+        .max(header_rows.min(composer_row));
+    let transcript_bottom = palette_top.saturating_sub(1);
     let transcript_top = header_rows.min(transcript_bottom);
     Ok((
         transcript_top,
