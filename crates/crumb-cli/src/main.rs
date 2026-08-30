@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Local;
-use crossterm::cursor::{MoveTo, Show};
+use crossterm::cursor::{MoveTo, Show, position as cursor_position};
 use crossterm::event::{
     Event as TerminalEvent, KeyCode as TerminalKeyCode, KeyEventKind,
     KeyModifiers as TerminalModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
@@ -367,38 +367,36 @@ fn run_managed_repl() -> Result<ReplOutcome> {
         renderer,
         header_rows,
     )?;
+    let mut transcript = FullscreenTranscript::new(fullscreen, renderer, header_rows);
 
     loop {
+        transcript.capture_cursor();
         let cwd = active_cwd(session.as_ref())?;
         let terminal_width = size().map_or(80, |(columns, _)| columns);
         let status = prompt_model_status(&cwd);
         let prompt = render_prompt(renderer, &cwd, platform, last_exit_code, terminal_width);
-        let event = if let Some(editor) = line_editor.as_mut() {
-            editor.workspace.set(&cwd);
-            if fullscreen {
-                position_composer(renderer, header_rows)?;
+        transcript.position_composer()?;
+        let submission = read_repl_submission(
+            line_editor.as_mut(),
+            &stdin,
+            &stdout,
+            &cwd,
+            &prompt,
+            &status,
+        )?;
+        let (event, submitted_input) = match submission {
+            ReplSubmission::Input(event, input) => (event, input),
+            ReplSubmission::Retry => continue,
+            ReplSubmission::Exit => {
+                shutdown_session(session)?;
+                return Ok(ReplOutcome::Exit);
             }
-            match editor
-                .editor
-                .read_line(&CrumbPrompt::new(prompt.clone(), format!("{status}  ")))?
-            {
-                Signal::Success(command) => Some(crumb_repl::classify_input(&command)),
-                Signal::CtrlD => None,
-                _ => continue,
-            }
-        } else {
-            let mut writer = stdout.lock();
-            writer.write_all(prompt.as_bytes())?;
-            writer.flush()?;
-            read_classified_line(&mut stdin.lock())?
         };
-        let Some(event) = event else {
-            shutdown_session(session)?;
-            return Ok(ReplOutcome::Exit);
-        };
-        if fullscreen {
-            prepare_fullscreen_submission(renderer, header_rows, &prompt, &status, &event)?;
-        }
+        transcript.submit(
+            &prompt,
+            &status,
+            submitted_input.as_deref().unwrap_or_default(),
+        )?;
         let mut writer = stdout.lock();
 
         match event {
@@ -437,6 +435,90 @@ fn run_managed_repl() -> Result<ReplOutcome> {
             }
         }
     }
+}
+
+enum ReplSubmission {
+    Input(InputEvent, Option<String>),
+    Retry,
+    Exit,
+}
+
+struct FullscreenTranscript {
+    enabled: bool,
+    renderer: Renderer,
+    header_rows: u16,
+    started: bool,
+    cursor: Option<(u16, u16)>,
+}
+
+impl FullscreenTranscript {
+    const fn new(enabled: bool, renderer: Renderer, header_rows: u16) -> Self {
+        Self {
+            enabled,
+            renderer,
+            header_rows,
+            started: false,
+            cursor: None,
+        }
+    }
+
+    fn capture_cursor(&mut self) {
+        if self.enabled && self.started {
+            self.cursor = cursor_position().ok().or(self.cursor);
+        }
+    }
+
+    fn position_composer(&self) -> io::Result<()> {
+        if self.enabled {
+            position_composer(self.renderer, self.header_rows)?;
+        }
+        Ok(())
+    }
+
+    fn submit(&mut self, prompt: &str, status: &str, input: &str) -> io::Result<()> {
+        if self.enabled {
+            prepare_fullscreen_submission(
+                self.renderer,
+                self.header_rows,
+                prompt,
+                status,
+                input,
+                self.cursor,
+            )?;
+            self.started = true;
+        }
+        Ok(())
+    }
+}
+
+fn read_repl_submission(
+    editor: Option<&mut InteractiveLineEditor>,
+    stdin: &io::Stdin,
+    stdout: &io::Stdout,
+    cwd: &Path,
+    prompt: &str,
+    status: &str,
+) -> Result<ReplSubmission> {
+    let Some(editor) = editor else {
+        let mut writer = stdout.lock();
+        writer.write_all(prompt.as_bytes())?;
+        writer.flush()?;
+        return Ok(read_classified_line(&mut stdin.lock())?
+            .map_or(ReplSubmission::Exit, |event| {
+                ReplSubmission::Input(event, None)
+            }));
+    };
+    editor.workspace.set(cwd);
+    let signal = editor
+        .editor
+        .read_line(&CrumbPrompt::new(prompt.to_owned(), format!("{status}  ")))?;
+    Ok(match signal {
+        Signal::Success(command) => {
+            ReplSubmission::Input(crumb_repl::classify_input(&command), Some(command))
+        }
+        Signal::CtrlD => ReplSubmission::Exit,
+        _ => ReplSubmission::Retry,
+    })
 }
 
 fn active_cwd(session: Option<&ShellSession>) -> Result<PathBuf> {
@@ -4265,13 +4347,12 @@ fn prepare_fullscreen_submission(
     header_rows: u16,
     prompt: &str,
     status: &str,
-    event: &InputEvent,
+    input: &str,
+    transcript_cursor: Option<(u16, u16)>,
 ) -> io::Result<()> {
     render_idle_composer(renderer, header_rows, prompt, status)?;
-    position_transcript(header_rows)?;
-    if let InputEvent::NativeInput(input) = event
-        && !input.trim().is_empty()
-    {
+    position_transcript(header_rows, transcript_cursor)?;
+    if !input.trim().is_empty() {
         let timestamp = Local::now().format("%H:%M").to_string();
         let terminal_width = size().map_or(80, |(columns, _)| columns);
         writeln!(
@@ -4305,12 +4386,18 @@ fn terminal_username() -> String {
     }
 }
 
-fn position_transcript(header_rows: u16) -> io::Result<()> {
+fn position_transcript(header_rows: u16, cursor: Option<(u16, u16)>) -> io::Result<()> {
     let (transcript_top, transcript_bottom, _, _) = fullscreen_rows(header_rows)?;
     let mut writer = io::stdout();
     set_transcript_scroll_region(&mut writer, transcript_top, transcript_bottom)?;
-    crossterm::execute!(writer, MoveTo(0, transcript_bottom))?;
-    write!(writer, "\r\n")?;
+    let row = cursor.map_or_else(
+        || transcript_top.saturating_add(1),
+        |(column, row)| {
+            row.saturating_add(u16::from(column > 0))
+                .clamp(transcript_top, transcript_bottom)
+        },
+    );
+    crossterm::execute!(writer, MoveTo(0, row))?;
     crossterm::execute!(writer, Clear(ClearType::CurrentLine))?;
     Ok(())
 }
