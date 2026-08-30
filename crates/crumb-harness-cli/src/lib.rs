@@ -321,11 +321,15 @@ fn terminate(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    use crumb_agent::{AgentMode, CodingBackend};
+    use crumb_agent::{AgentMode, CancellationToken, CodingBackend};
 
-    use super::{CodingCliLaunch, parse_claude_response, parse_codex_response};
+    use super::{
+        CodingCliLaunch, configure_process_group, parse_claude_response, parse_codex_response,
+        wait_for_child,
+    };
 
     fn launch(backend: CodingBackend) -> CodingCliLaunch<'static> {
         CodingCliLaunch {
@@ -389,5 +393,22 @@ mod tests {
                 .expect("Claude fixture"),
             "ready"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_terminates_the_backend_process_group() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_process_group(&mut command);
+        let mut child = command.spawn().expect("fixture process starts");
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        assert!(wait_for_child(&mut child, Duration::from_secs(1), &cancellation).is_err());
+        let _ = child.wait();
     }
 }

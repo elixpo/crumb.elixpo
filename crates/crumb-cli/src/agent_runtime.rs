@@ -7,10 +7,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use crumb_agent::session::TurnStatus;
 use crumb_agent::{
-    AgentConfig, AgentMode, AgentSession, CancellationToken, HarnessConfig, Modality, SessionId,
-    SessionJournal, session_summary,
+    AgentConfig, AgentMode, AgentSession, BackendDiscovery, CancellationToken, HarnessConfig,
+    Modality, SessionId, SessionJournal, session_summary,
 };
 use crumb_auth::{CredentialStore, OsCredentialStore, SecretString};
+use crumb_harness_cli::{CodingCliLaunch, run_text as run_coding_cli_text};
 use crumb_harness_dsh::{
     HarnessActivity, HarnessEnvironment, HarnessIdentity, HarnessLaunch, HarnessSupervisor,
     Notification, RunResult, SupervisorLimits,
@@ -300,6 +301,7 @@ impl AgentRuntime {
     ) -> Result<RunResult> {
         let workspace = std::fs::canonicalize(workspace)
             .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
+        config.validate()?;
         self.ensure_session(&workspace, config.mode)?;
         let route = config
             .models
@@ -307,40 +309,141 @@ impl AgentRuntime {
             .and_then(|routes| routes.first())
             .context("agent config has no text model route")?;
         let effort = config.reasoning_effort_for(route).map(str::to_owned);
-        let limits = supervisor_limits(config)?;
-        self.ensure_supervisor(limits)?;
-        let launch = harness_launch(
-            config,
-            &workspace,
-            route,
-            effort.clone(),
-            self.environment_revision,
-        )?;
-
-        let session = self.session.as_mut().context("agent session unavailable")?;
-        if session.mode() != config.mode {
-            session.set_mode(config.mode)?;
-        }
-        session.record_model_selection(
-            route.provider.clone(),
-            route.model.clone(),
-            effort.clone(),
-        )?;
-        session.record_turn_start(request)?;
-        let _active = ActiveCancellation::new(&self.active_cancellation, cancellation.clone())?;
-        let session_id = session.id().as_str().to_owned();
-        let result = self
-            .supervisor
-            .as_mut()
-            .context("Harness supervisor unavailable")?
-            .run_text_with_events(launch, &session_id, request, cancellation, on_notification);
+        let session_id = self.start_turn(config.mode, route, effort.clone(), request)?;
+        let cancellation_slot = Arc::clone(&self.active_cancellation);
+        let _active = ActiveCancellation::new(&cancellation_slot, cancellation.clone())?;
+        let mut on_notification = on_notification;
+        let result = match config
+            .harness
+            .as_ref()
+            .context("agent Harness is not configured")?
+        {
+            HarnessConfig::Process { .. } => self.run_process_harness(
+                config,
+                &workspace,
+                route,
+                effort,
+                &session_id,
+                request,
+                cancellation,
+                &mut on_notification,
+            ),
+            HarnessConfig::CodingCli {
+                backend, command, ..
+            } => self.run_coding_cli(
+                config,
+                &workspace,
+                route,
+                *backend,
+                command,
+                effort.as_deref(),
+                &session_id,
+                request,
+                cancellation,
+                &mut on_notification,
+            ),
+            HarnessConfig::Native => {
+                Err(anyhow::anyhow!("native agent Harness is not implemented"))
+            }
+        };
         let status = match &result {
             Ok(_) => TurnStatus::Complete,
             Err(_) if cancellation.is_cancelled() => TurnStatus::Cancelled,
             Err(_) => TurnStatus::Failed,
         };
-        session.record_turn_end(status, 0, 0)?;
+        self.session
+            .as_mut()
+            .context("agent session unavailable")?
+            .record_turn_end(status, 0, 0)?;
         result
+    }
+
+    fn start_turn(
+        &mut self,
+        mode: AgentMode,
+        route: &crumb_agent::ModelRoute,
+        effort: Option<String>,
+        request: &str,
+    ) -> Result<String> {
+        let session = self.session.as_mut().context("agent session unavailable")?;
+        if session.mode() != mode {
+            session.set_mode(mode)?;
+        }
+        session.record_model_selection(route.provider.clone(), route.model.clone(), effort)?;
+        session.record_turn_start(request)?;
+        Ok(session.id().as_str().to_owned())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_process_harness(
+        &mut self,
+        config: &AgentConfig,
+        workspace: &Path,
+        route: &crumb_agent::ModelRoute,
+        effort: Option<String>,
+        session_id: &str,
+        request: &str,
+        cancellation: &CancellationToken,
+        on_notification: &mut impl FnMut(&Notification) -> Result<()>,
+    ) -> Result<RunResult> {
+        let limits = supervisor_limits(config)?;
+        self.ensure_supervisor(limits)?;
+        let launch = harness_launch(config, workspace, route, effort, self.environment_revision)?;
+        self.supervisor
+            .as_mut()
+            .context("Harness supervisor unavailable")?
+            .run_text_with_events(launch, session_id, request, cancellation, on_notification)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_coding_cli(
+        &mut self,
+        config: &AgentConfig,
+        workspace: &Path,
+        route: &crumb_agent::ModelRoute,
+        backend: crumb_agent::CodingBackend,
+        command: &Path,
+        effort: Option<&str>,
+        session_id: &str,
+        request: &str,
+        cancellation: &CancellationToken,
+        on_notification: &mut impl FnMut(&Notification) -> Result<()>,
+    ) -> Result<RunResult> {
+        self.clear_supervisor()?;
+        let discovery = BackendDiscovery::discover(backend, command);
+        let executable = discovery.executable.with_context(|| {
+            format!(
+                "selected {backend:?} CLI `{}` is unavailable",
+                command.display()
+            )
+        })?;
+        let running = Notification {
+            method: "session.status".to_owned(),
+            params: serde_json::json!({ "sessionId": session_id, "status": "running" }),
+        };
+        on_notification(&running)?;
+        let launch = CodingCliLaunch {
+            backend,
+            executable: &executable,
+            workspace,
+            session_id,
+            model: &route.model,
+            reasoning_effort: effort,
+            mode: config.mode,
+            workspace_write: config
+                .permissions
+                .allow_workspace_tools
+                .contains("write_file"),
+            max_turns: config.limits.max_steps,
+            timeout: Duration::from_secs(config.limits.max_wall_time_seconds),
+            output_limit: usize::try_from(config.limits.max_output_bytes)
+                .context("max_output_bytes exceeds this platform's address space")?,
+        };
+        let result = run_coding_cli_text(&launch, request, cancellation)?;
+        for notification in &result.notifications {
+            on_notification(notification)?;
+        }
+        Ok(result)
     }
 
     fn ensure_session(&mut self, workspace: &Path, mode: AgentMode) -> Result<()> {
@@ -378,6 +481,14 @@ impl AgentRuntime {
             self.supervisor = Some(HarnessSupervisor::new(limits));
             self.supervisor_limits = Some(limits);
         }
+        Ok(())
+    }
+
+    fn clear_supervisor(&mut self) -> Result<()> {
+        if let Some(mut supervisor) = self.supervisor.take() {
+            supervisor.shutdown()?;
+        }
+        self.supervisor_limits = None;
         Ok(())
     }
 }

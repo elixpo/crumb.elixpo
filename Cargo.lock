@@ -507,6 +507,7 @@ dependencies = [
  "crumb-agent",
  "crumb-auth",
  "crumb-core",
+ "crumb-harness-cli",
  "crumb-harness-dsh",
  "crumb-history",
  "crumb-mcp",
@@ -530,6 +531,17 @@ dependencies = [
 [[package]]
 name = "crumb-core"
 version = "0.1.0"
+
+[[package]]
+name = "crumb-harness-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crumb-agent",
+ "crumb-harness-dsh",
+ "rustix",
+ "serde_json",
+]
 
 [[package]]
 name = "crumb-harness-dsh"

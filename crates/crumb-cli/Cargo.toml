@@ -14,6 +14,7 @@ crumb-agent = { path = "../crumb-agent" }
 crumb-auth = { path = "../crumb-auth" }
 crumb-core = { path = "../crumb-core" }
 crumb-history = { path = "../crumb-history" }
+crumb-harness-cli = { path = "../crumb-harness-cli" }
 crumb-harness-dsh = { path = "../crumb-harness-dsh" }
 crumb-mcp = { path = "../crumb-mcp" }
 crumb-native = { path = "../crumb-native" }
