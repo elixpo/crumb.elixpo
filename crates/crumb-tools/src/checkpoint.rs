@@ -259,10 +259,7 @@ impl CheckpointStore {
     ///
     /// Returns an error when checkpoints cannot be listed or a decision cannot
     /// be applied safely.
-    pub fn decide_pending(
-        &self,
-        decision: CheckpointDecision,
-    ) -> Result<Vec<WorkspaceCheckpoint>> {
+    pub fn decide_pending(&self, decision: CheckpointDecision) -> Result<Vec<WorkspaceCheckpoint>> {
         self.list()?
             .into_iter()
             .filter(|checkpoint| checkpoint.file.status == CheckpointStatus::Pending)
@@ -597,5 +594,29 @@ mod tests {
             .expect("checkpoint is recorded");
         let diff = store.render_diff(&checkpoint.id, 32).expect("diff renders");
         assert!(diff.len() <= 32);
+    }
+
+    #[test]
+    fn whole_change_decision_approves_every_pending_file() {
+        let workspace = Workspace::new();
+        let store = CheckpointStore::new(workspace.path(), 128).expect("store opens");
+        for (name, content) in [
+            ("one.txt", b"one".as_slice()),
+            ("two.txt", b"two".as_slice()),
+        ] {
+            fs::write(workspace.path().join(name), content).expect("fixture is written");
+            store
+                .record_edit(Path::new(name), None, content)
+                .expect("checkpoint is recorded");
+        }
+        let decided = store
+            .decide_pending(CheckpointDecision::Approve)
+            .expect("whole change is approved");
+        assert_eq!(decided.len(), 2);
+        assert!(
+            decided
+                .iter()
+                .all(|checkpoint| checkpoint.file.status == CheckpointStatus::Approved)
+        );
     }
 }

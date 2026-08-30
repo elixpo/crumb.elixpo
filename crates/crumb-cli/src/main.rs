@@ -66,6 +66,14 @@ fn run_command_line_action() -> Result<bool> {
         serve_mcp()?;
         return Ok(true);
     }
+    if let [group, action, id] = arguments.as_slice()
+        && group == "review"
+        && action == "export"
+    {
+        let id = id.to_str().context("checkpoint identifier must be UTF-8")?;
+        export_reviews(&current_process_dir()?, id, &mut io::stdout().lock())?;
+        return Ok(true);
+    }
     let action = match arguments.as_slice() {
         [] => return Ok(false),
         [group, action] if group == "auth" && action == "login" => AuthAction::Login,
@@ -73,12 +81,26 @@ fn run_command_line_action() -> Result<bool> {
         [group, action] if group == "auth" && action == "logout" => AuthAction::Logout,
         _ => {
             return Err(anyhow!(
-                "usage: crumb [auth <login|status|logout> | mcp serve]"
+                "usage: crumb [auth <login|status|logout> | mcp serve | review export <id|all>]"
             ));
         }
     };
     handle_auth(action, &mut io::stdout().lock())?;
     Ok(true)
+}
+
+fn export_reviews(cwd: &Path, id: &str, writer: &mut dyn Write) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    let max_file_bytes = usize::try_from(config.limits.max_file_write_bytes)
+        .context("max_file_write_bytes exceeds this platform's address space")?;
+    let store = CheckpointStore::new(cwd, max_file_bytes)?;
+    if id == "all" {
+        serde_json::to_writer(&mut *writer, &store.list()?)?;
+    } else {
+        serde_json::to_writer(&mut *writer, &store.load(id)?)?;
+    }
+    writeln!(writer)?;
+    Ok(())
 }
 
 fn serve_mcp() -> Result<()> {

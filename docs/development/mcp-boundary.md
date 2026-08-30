@@ -9,8 +9,8 @@ Harness client, and the stateless `2026-07-28` discovery shape.
 
 - `plan` denies every tool call.
 - `auto` permits only tools registered as read-only without interaction.
-- `negotiate` and all mutating risk classes require a user-owned allow-once
-  decision.
+- `negotiate` and all mutating risk classes require either a user-owned
+  allow-once decision or an exact persistent grant in live configuration.
 - No approval channel means deny, never allow.
 - Approval metadata contains a digest of arguments, not raw arguments.
 - Cancellation is shared with the agent session and tool handler.
@@ -37,7 +37,10 @@ successful write records a bounded preimage and post-edit digest under
 `.crumb/checkpoints`. Credential-sensitive paths, private keys, symlinks, and
 workspace escapes are refused before mutation. Rewind restores only when the
 current file still matches Crumb's post-edit digest; it never invokes Git reset
-or overwrites a later user change.
+or overwrites a later user change. `/review` shows bounded file summaries before
+diffs, accepts per-file or all-pending decisions, and exports stable JSON.
+Review comments stay only in process memory and are consumed by the next agent
+turn. `crumb review export <id|all>` provides prompt-free JSON for automation.
 
 ## Isolated shell
 

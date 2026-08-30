@@ -529,8 +529,9 @@ mod tests {
                 &ApprovalRequest {
                     tool: "write_file".to_owned(),
                     risk: RiskClass::WriteWorkspace,
+                    arguments_digest: "digest".to_owned(),
                 },
-                &json!({}),
+                &serde_json::json!({}),
                 &cancellation,
             ),
             ApprovalDecision::AllowOnce
@@ -540,8 +541,9 @@ mod tests {
                 &ApprovalRequest {
                     tool: "write_file".to_owned(),
                     risk: RiskClass::NetworkAccess,
+                    arguments_digest: "digest".to_owned(),
                 },
-                &json!({}),
+                &serde_json::json!({}),
                 &cancellation,
             ),
             ApprovalDecision::Deny
