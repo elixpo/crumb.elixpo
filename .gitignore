@@ -4,6 +4,13 @@
 .idea/
 .vscode/
 *.log
-.env
-.env.*
+.env.local
 !.env.example
+!**/.env.local.example
+
+node_modules/
+.next/
+.wrangler/
+.vercel/
+.open-next/
+*.tsbuildinfo

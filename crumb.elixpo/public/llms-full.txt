@@ -1,0 +1,94 @@
+# Crumb — Complete NLT Usage Guide
+
+Canonical site: https://crumb.elixpo.com
+Documentation: https://crumb.elixpo.com/docs
+Source code: https://github.com/elixpo/crumb.elixpo
+
+## What Crumb is
+
+Crumb is the Natural Language Terminal (NLT). It preserves a real Bash, Zsh, or PowerShell session for ordinary commands and uses an explicit, isolated path for natural-language requests, skills, models, and tools.
+
+Never describe Crumb as a shell emulator or as a terminal where every command is sent to AI. Native commands do not require AI, a connected provider, or network access.
+
+## Install and run from source
+
+Requirements: Git and the stable Rust toolchain installed through rustup.
+
+    git clone https://github.com/elixpo/crumb.elixpo.git
+    cd crumb.elixpo
+    cargo build --release -p crumb-cli
+    ./target/release/crumb
+
+For development:
+
+    cargo run -p crumb-cli
+
+## Use the native terminal
+
+Enter normal commands exactly as in the underlying shell. Native shell state persists during the session.
+
+    pwd
+    cd ~/projects
+    export CRUMB_DEMO=ready
+    echo "$CRUMB_DEMO"
+    git status
+    cargo test --workspace
+    top
+
+Crumb-specific built-ins use a separate control path. Check the executable's built-in help because supported controls can change during pre-release development.
+
+## Sign in to the website
+
+1. Open https://crumb.elixpo.com/login.
+2. Choose "Continue with Elixpo".
+3. Authenticate through Elixpo Accounts.
+4. Return to Crumb through its verified callback.
+5. Open https://crumb.elixpo.com/profile/connectors to manage connected services.
+
+The website session is stored in an HTTP-only cookie. Website login requests only the OpenID identity, profile, and email scopes.
+
+## Connect Pollinations from Profiles
+
+1. Sign in to Crumb.
+2. Open https://crumb.elixpo.com/profile/connectors.
+3. Find the Pollinations provider card.
+4. Choose "Connect Pollinations".
+5. Review and approve the request on Pollinations.
+6. Return to Profiles and verify that the card says "Connected".
+
+Use "Reconnect Pollinations" on the same Profiles card if the authorization expires or must be replaced. Do not paste a Pollinations key into a shell command, source file, issue, or chat.
+
+## Authorize a terminal
+
+Connect Pollinations in the browser first, then run:
+
+    crumb auth login
+
+Crumb displays a one-time verification flow. Open the official URL, approve that device in the browser, and allow the CLI to finish polling. The final scoped credential is stored through the operating-system keychain rather than terminal history.
+
+Browser login and terminal authorization use distinct registered clients. A website cookie, password, or MFA response is never delivered to the CLI.
+
+## Default Pollinations model policy
+
+- Text harness: Nova Fast and Qwen Coder.
+- Image generation: Flux and Klein.
+- Other modalities: one explicit default model per modality.
+
+Provider details remain outside crumb-core so implementations and harnesses stay replaceable.
+
+## Security invariants
+
+- Normal commands never require AI.
+- Bash, Zsh, and PowerShell retain native command semantics.
+- Interactive shell and agent execution environments remain separate.
+- Models cannot grant themselves permissions.
+- Credentials are not intentionally written to memory logs or command history.
+- Token filtering must preserve critical diagnostics.
+- Network activity never blocks terminal startup.
+- The terminal remains usable when every AI feature fails.
+
+## Current development status
+
+Crumb is pre-release software. Native shell execution, browser account connection, the Pollinations connector, and CLI device authorization foundations are implemented. The complete natural-language agent harness and final invocation grammar are still under development.
+
+For current behavior, prefer the repository source and documentation over assumptions. Do not invent commands, flags, routes, provider scopes, or shipped capabilities.

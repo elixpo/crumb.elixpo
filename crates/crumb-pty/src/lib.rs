@@ -2,7 +2,7 @@
 
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -120,7 +120,7 @@ impl PtyBackend for SystemPty {
         let pair = native_pty_system().openpty(size.into())?;
         let child = pair.slave.spawn_command(command.to_command_builder()?)?;
         drop(pair.slave);
-        let writer = pair.master.take_writer()?;
+        let writer = PtyInput::new(pair.master.take_writer()?);
 
         Ok(PtyProcess {
             master: Arc::new(Mutex::new(pair.master)),
@@ -133,7 +133,7 @@ impl PtyBackend for SystemPty {
 /// A live child process and its controlling pseudoterminal.
 pub struct PtyProcess {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    writer: Option<Box<dyn Write + Send>>,
+    writer: Option<PtyInput>,
     child: Box<dyn Child + Send + Sync>,
 }
 
@@ -165,6 +165,18 @@ impl PtyProcess {
         Ok(())
     }
 
+    /// Clones a synchronized handle to the PTY input stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if ownership of the input stream was already
+    /// transferred with [`Self::take_writer`].
+    pub fn try_clone_input(&self) -> Result<PtyInput> {
+        self.writer
+            .clone()
+            .ok_or_else(|| anyhow!("PTY input writer has already been taken"))
+    }
+
     /// Transfers ownership of the PTY input stream to a relay thread.
     ///
     /// # Errors
@@ -173,6 +185,7 @@ impl PtyProcess {
     pub fn take_writer(&mut self) -> Result<Box<dyn Write + Send>> {
         self.writer
             .take()
+            .map(|writer| Box::new(writer) as Box<dyn Write + Send>)
             .ok_or_else(|| anyhow!("PTY input writer has already been taken"))
     }
 
@@ -217,6 +230,36 @@ impl PtyProcess {
     }
 }
 
+/// Cloneable, synchronized writer for a live PTY input stream.
+#[derive(Clone)]
+pub struct PtyInput {
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+}
+
+impl PtyInput {
+    fn new(writer: Box<dyn Write + Send>) -> Self {
+        Self {
+            writer: Arc::new(Mutex::new(writer)),
+        }
+    }
+}
+
+impl Write for PtyInput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.writer
+            .lock()
+            .map_err(|_| io::Error::other("PTY input lock is poisoned"))?
+            .write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer
+            .lock()
+            .map_err(|_| io::Error::other("PTY input lock is poisoned"))?
+            .flush()
+    }
+}
+
 /// Cloneable handle used to resize a live PTY from a watcher thread.
 #[derive(Clone)]
 pub struct PtyResizer {
@@ -239,9 +282,27 @@ impl PtyResizer {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
-    use super::{CommandSpec, TerminalSize};
+    use super::{CommandSpec, PtyInput, TerminalSize};
+
+    struct SharedSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedSink {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("test sink lock should be valid")
+                .extend(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn terminal_size_defaults_to_no_pixel_dimensions() {
@@ -262,5 +323,22 @@ mod tests {
         assert_eq!(command.program(), "bash");
         assert_eq!(command.args(), ["-i"]);
         assert_eq!(command.working_directory(), Some(Path::new("/tmp/project")));
+    }
+
+    #[test]
+    fn cloned_pty_inputs_share_one_writer() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut first = PtyInput::new(Box::new(SharedSink(Arc::clone(&bytes))));
+        let mut second = first.clone();
+
+        first.write_all(b"one").expect("first write should succeed");
+        second
+            .write_all(b"two")
+            .expect("second write should succeed");
+
+        assert_eq!(
+            *bytes.lock().expect("test sink lock should be valid"),
+            b"onetwo"
+        );
     }
 }

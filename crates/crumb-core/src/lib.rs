@@ -1,12 +1,29 @@
 //! Provider-neutral domain types shared by crumb components.
 
 /// A command handled directly by crumb rather than the native shell.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BuiltInCommand {
+    Auth(AuthAction),
     Exit,
+    History(HistoryAction),
     Platform,
     Shell,
     Version,
+}
+
+/// Secure authentication action handled by crumb.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthAction {
+    Login,
+    Status,
+    Logout,
+}
+
+/// Query performed by the local history built-in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HistoryAction {
+    Recent,
+    Search(String),
 }
 
 /// A classified line of terminal input.

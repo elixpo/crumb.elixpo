@@ -1,24 +1,488 @@
-use std::io::{self, Read, Write};
+use std::borrow::Cow;
+use std::io::{self, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
+use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
+use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
+use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
+use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::shell_for;
 use crumb_platform::Platform;
-use crumb_pty::{SystemPty, TerminalSize};
-use crumb_repl::ReplOutcome;
+use crumb_pty::{PtyInput, PtyResizer, SystemPty, TerminalSize};
+use crumb_repl::{ReplOutcome, read_classified_line};
+use crumb_ui::{GitSegment, PromptContext, Renderer, UiSettings};
+use reedline::{
+    FileBackedHistory, History, HistoryItem, Prompt, PromptEditMode, PromptHistorySearch,
+    PromptHistorySearchStatus, Reedline, Signal,
+};
+
+mod device_auth;
+
+const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
 
 fn main() -> Result<()> {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-
-    if crumb_cli::run(stdin.lock(), stdout.lock())? == ReplOutcome::LaunchNativeShell {
+    if run_command_line_action()? {
+        return Ok(());
+    }
+    if run_managed_repl()? == ReplOutcome::LaunchNativeShell {
         run_native_shell()?;
     }
 
+    Ok(())
+}
+
+fn run_command_line_action() -> Result<bool> {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let action = match arguments.as_slice() {
+        [] => return Ok(false),
+        [group, action] if group == "auth" && action == "login" => AuthAction::Login,
+        [group, action] if group == "auth" && action == "status" => AuthAction::Status,
+        [group, action] if group == "auth" && action == "logout" => AuthAction::Logout,
+        _ => return Err(anyhow!("usage: crumb auth <login|status|logout>")),
+    };
+    handle_auth(action, &mut io::stdout().lock())?;
+    Ok(true)
+}
+
+fn run_managed_repl() -> Result<ReplOutcome> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let interactive = stdin.is_terminal() && stdout.is_terminal();
+    let renderer = Renderer::new(UiSettings::from_environment(interactive));
+    let platform = Platform::current();
+    let mut session: Option<ShellSession> = None;
+    let mut last_exit_code = None;
+    let history = open_history(&mut stdout.lock())?;
+    let mut line_editor = interactive
+        .then(|| create_line_editor(history.as_ref()))
+        .transpose()?;
+
+    let branding = renderer.branding();
+    if !branding.is_empty() {
+        writeln!(stdout.lock(), "{branding}")?;
+    }
+
+    loop {
+        let cwd = session
+            .as_ref()
+            .map_or_else(current_process_dir, |shell| Ok(shell.cwd().to_path_buf()))?;
+        let prompt = render_prompt(renderer, &cwd, platform, last_exit_code);
+        let event = if let Some(editor) = line_editor.as_mut() {
+            match editor.read_line(&CrumbPrompt::new(prompt))? {
+                Signal::Success(command) => Some(crumb_repl::classify_input(&command)),
+                Signal::CtrlD => None,
+                _ => continue,
+            }
+        } else {
+            let mut writer = stdout.lock();
+            writer.write_all(prompt.as_bytes())?;
+            writer.flush()?;
+            read_classified_line(&mut stdin.lock())?
+        };
+        let Some(event) = event else {
+            shutdown_session(session)?;
+            return Ok(ReplOutcome::Exit);
+        };
+        let mut writer = stdout.lock();
+
+        match event {
+            InputEvent::BuiltIn(command) => {
+                if let Some(outcome) = handle_builtin(
+                    command,
+                    &mut session,
+                    history.as_ref(),
+                    &cwd,
+                    platform,
+                    &mut writer,
+                )? {
+                    return Ok(outcome);
+                }
+            }
+            InputEvent::NativeInput(command) if command.trim().is_empty() => {}
+            InputEvent::NativeInput(command) => {
+                if session.is_none() {
+                    let (cols, rows) = size()?;
+                    let shell = shell_for(platform);
+                    session = Some(ShellSession::start(
+                        shell.as_ref(),
+                        &SystemPty,
+                        TerminalSize::new(rows, cols),
+                    )?);
+                }
+                if let Some(shell) = session.as_mut() {
+                    let outcome = if interactive {
+                        execute_foreground(shell, &command, &mut writer)?
+                    } else {
+                        shell.execute(&command, &mut writer)?
+                    };
+                    match outcome {
+                        CommandOutcome::Completed(completion) => {
+                            last_exit_code = Some(completion.exit_code);
+                            record_history(
+                                history.as_ref(),
+                                &command,
+                                &cwd,
+                                platform,
+                                HistoryMode::Native,
+                                Some(completion.exit_code),
+                                &mut writer,
+                            )?;
+                        }
+                        CommandOutcome::ShellExited => {
+                            record_history(
+                                history.as_ref(),
+                                &command,
+                                &cwd,
+                                platform,
+                                HistoryMode::Native,
+                                None,
+                                &mut writer,
+                            )?;
+                            return Ok(ReplOutcome::Exit);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn open_history(writer: &mut dyn Write) -> Result<Option<HistoryStore>> {
+    match HistoryStore::open_default() {
+        Ok(store) => Ok(Some(store)),
+        Err(error) => {
+            writeln!(writer, "warning: command history is unavailable: {error}")?;
+            Ok(None)
+        }
+    }
+}
+
+fn render_prompt(
+    renderer: Renderer,
+    cwd: &Path,
+    platform: Platform,
+    last_exit_code: Option<i32>,
+) -> String {
+    let git = GitSegment::discover(cwd);
+    renderer.prompt(&PromptContext {
+        cwd,
+        platform,
+        git: git.as_ref(),
+        last_exit_code,
+    })
+}
+
+fn handle_builtin(
+    command: BuiltInCommand,
+    session: &mut Option<ShellSession>,
+    history: Option<&HistoryStore>,
+    cwd: &std::path::Path,
+    platform: Platform,
+    writer: &mut dyn Write,
+) -> Result<Option<ReplOutcome>> {
+    match command {
+        BuiltInCommand::Auth(action) => handle_auth(action, writer)?,
+        BuiltInCommand::Exit => {
+            shutdown_session(session.take())?;
+            return Ok(Some(ReplOutcome::Exit));
+        }
+        BuiltInCommand::History(action) => show_history(history, &action, writer)?,
+        BuiltInCommand::Platform => {
+            writeln!(writer, "{platform}")?;
+            record_history(
+                history,
+                ":platform",
+                cwd,
+                platform,
+                HistoryMode::BuiltIn,
+                Some(0),
+                writer,
+            )?;
+        }
+        BuiltInCommand::Version => {
+            writeln!(writer, "crumb {}", env!("CARGO_PKG_VERSION"))?;
+            record_history(
+                history,
+                ":version",
+                cwd,
+                platform,
+                HistoryMode::BuiltIn,
+                Some(0),
+                writer,
+            )?;
+        }
+        BuiltInCommand::Shell if session.is_none() => {
+            return Ok(Some(ReplOutcome::LaunchNativeShell));
+        }
+        BuiltInCommand::Shell => writeln!(
+            writer,
+            "`:shell` is available before the managed shell starts; restart crumb to enter raw mode"
+        )?,
+    }
+    Ok(None)
+}
+
+fn handle_auth(action: AuthAction, writer: &mut dyn Write) -> Result<()> {
+    match action {
+        AuthAction::Login => {
+            let store = OsCredentialStore::new()?;
+            let secret = device_auth::connect(writer)?;
+            login(&store, &secret)?;
+            writeln!(
+                writer,
+                "Pollinations account connected and saved in the OS credential store"
+            )?;
+        }
+        AuthAction::Status => {
+            let environment = std::env::var("POLLINATIONS_API_KEY").ok();
+            if environment
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                writeln!(writer, "Pollinations BYOK configured (environment)")?;
+                return Ok(());
+            }
+            let store = OsCredentialStore::new()?;
+            let status = credential_status(&store, None)?;
+            match status.source {
+                Some(CredentialSource::Keyring) => {
+                    writeln!(writer, "Pollinations BYOK configured (OS credential store)")?;
+                }
+                Some(CredentialSource::Environment) => {
+                    unreachable!("handled before keyring access")
+                }
+                None => writeln!(writer, "Pollinations BYOK is not configured")?,
+            }
+        }
+        AuthAction::Logout => {
+            let store = OsCredentialStore::new()?;
+            if store.delete()? {
+                writeln!(
+                    writer,
+                    "Pollinations BYOK removed from the OS credential store"
+                )?;
+            } else {
+                writeln!(writer, "Pollinations BYOK was not stored")?;
+            }
+            if std::env::var_os("POLLINATIONS_API_KEY").is_some() {
+                writeln!(
+                    writer,
+                    "POLLINATIONS_API_KEY remains active for this process"
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn execute_foreground(
+    shell: &mut ShellSession,
+    command: &str,
+    output: &mut dyn Write,
+) -> Result<CommandOutcome> {
+    let input = shell.try_clone_input()?;
+    let resizer = shell.resizer();
+    let running = Arc::new(AtomicBool::new(true));
+    let relay_running = Arc::clone(&running);
+    let _raw_mode = RawModeGuard::enable()?;
+    let submitted = shell.submit(command)?;
+
+    thread::scope(|scope| {
+        let relay = scope.spawn(move || relay_foreground_input(input, &resizer, &relay_running));
+        let outcome = submitted.wait(output);
+        running.store(false, Ordering::Relaxed);
+        let relay_result = relay
+            .join()
+            .map_err(|_| anyhow!("foreground input relay panicked"))?;
+        relay_result?;
+        outcome
+    })
+}
+
+fn relay_foreground_input(
+    mut destination: PtyInput,
+    resizer: &PtyResizer,
+    running: &AtomicBool,
+) -> io::Result<()> {
+    let mut stdin = io::stdin();
+    let mut previous_size = size()?;
+    let mut buffer = [0_u8; 8192];
+
+    while running.load(Ordering::Relaxed) {
+        if stdin_ready(&stdin)? {
+            let bytes_read = stdin.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            destination.write_all(&buffer[..bytes_read])?;
+            destination.flush()?;
+        }
+
+        if let Ok(current @ (cols, rows)) = size()
+            && current != previous_size
+        {
+            resizer
+                .resize(TerminalSize::new(rows, cols))
+                .map_err(io::Error::other)?;
+            previous_size = current;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn stdin_ready(stdin: &io::Stdin) -> io::Result<bool> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 25_000_000,
+    };
+    let mut descriptors = [PollFd::new(stdin, PollFlags::IN)];
+    poll(&mut descriptors, Some(&timeout)).map_err(io::Error::from)?;
+    Ok(descriptors[0].revents().contains(PollFlags::IN))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stdin_ready(_stdin: &io::Stdin) -> io::Result<bool> {
+    crossterm::event::poll(Duration::from_millis(25))
+}
+
+fn create_line_editor(history: Option<&HistoryStore>) -> Result<Reedline> {
+    let mut interactive_history = FileBackedHistory::new(INTERACTIVE_HISTORY_CAPACITY)?;
+    if let Some(history) = history {
+        let capacity = u32::try_from(INTERACTIVE_HISTORY_CAPACITY)
+            .map_err(|_| anyhow!("interactive history capacity exceeds u32"))?;
+        let mut entries = history.recent(capacity)?;
+        entries.reverse();
+        for entry in entries {
+            interactive_history.save(HistoryItem::from_command_line(entry.command))?;
+        }
+    }
+    Ok(Reedline::create().with_history(Box::new(interactive_history)))
+}
+
+struct CrumbPrompt {
+    rendered: String,
+}
+
+impl CrumbPrompt {
+    const fn new(rendered: String) -> Self {
+        Self { rendered }
+    }
+}
+
+impl Prompt for CrumbPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.rendered)
+    }
+
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Borrowed("::: ")
+    }
+
+    fn render_prompt_history_search_indicator(
+        &self,
+        history_search: PromptHistorySearch,
+    ) -> Cow<'_, str> {
+        let status = match history_search.status {
+            PromptHistorySearchStatus::Passing => "reverse-search",
+            PromptHistorySearchStatus::Failing => "failing reverse-search",
+        };
+        Cow::Owned(format!("({status}: {}) ", history_search.term))
+    }
+}
+
+fn show_history(
+    history: Option<&HistoryStore>,
+    action: &HistoryAction,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let Some(history) = history else {
+        writeln!(writer, "history is unavailable")?;
+        return Ok(());
+    };
+    let result = match action {
+        HistoryAction::Recent => history.recent(20),
+        HistoryAction::Search(query) if query.trim().is_empty() => {
+            writeln!(writer, "usage: :history search <text>")?;
+            return Ok(());
+        }
+        HistoryAction::Search(query) => history.search(query, 20),
+    };
+    match result {
+        Ok(entries) if entries.is_empty() => writeln!(writer, "no history entries")?,
+        Ok(entries) => {
+            for entry in entries {
+                writeln!(writer, "{}", format_history_entry(&entry))?;
+            }
+        }
+        Err(error) => writeln!(writer, "warning: history query failed: {error}")?,
+    }
+    Ok(())
+}
+
+fn format_history_entry(entry: &HistoryEntry) -> String {
+    let exit = entry
+        .exit_code
+        .map_or_else(|| "-".to_owned(), |code| code.to_string());
+    format!(
+        "{}\t{}\t{}\t{}",
+        entry.id,
+        exit,
+        entry.cwd.display(),
+        entry.command
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_history(
+    history: Option<&HistoryStore>,
+    command: &str,
+    cwd: &std::path::Path,
+    platform: Platform,
+    mode: HistoryMode,
+    exit_code: Option<i32>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    if let Some(history) = history
+        && let Err(error) = history.record(
+            command,
+            RecordContext {
+                cwd,
+                platform,
+                mode,
+                exit_code,
+            },
+        )
+    {
+        writeln!(writer, "warning: failed to record history: {error}")?;
+    }
+    Ok(())
+}
+
+fn current_process_dir() -> Result<PathBuf> {
+    Ok(std::env::current_dir()?)
+}
+
+fn shutdown_session(session: Option<ShellSession>) -> Result<()> {
+    if let Some(session) = session {
+        session.shutdown()?;
+    }
     Ok(())
 }
 

@@ -1,18 +1,23 @@
 [workspace]
 members = [
+    "crates/crumb-auth",
     "crates/crumb-cli",
     "crates/crumb-core",
+    "crates/crumb-history",
+    "crates/crumb-llm",
     "crates/crumb-native",
     "crates/crumb-platform",
+    "crates/crumb-pollinations",
     "crates/crumb-pty",
     "crates/crumb-repl",
+    "crates/crumb-ui",
 ]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -23,5 +28,21 @@ pedantic = "warn"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+base64 = "0.22.1"
+bytes = "1.11"
 crossterm = "0.29.0"
+directories = "6.0.0"
+futures-util = "0.3.34"
+getrandom = "0.4.3"
+keyring = "4.1.6"
 portable-pty = "0.9.0"
+reqwest = { version = "0.13.4", features = ["blocking", "form", "json", "stream"] }
+reedline = { version = "0.51.0", default-features = false }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustix = { version = "1.1.4", features = ["event"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10.9"
+tokio = { version = "1.53.1", features = ["time"] }
+zeroize = "1.9"
+url = "2.5.8"
