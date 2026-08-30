@@ -56,6 +56,12 @@ impl CancellationToken {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
+
+    /// Returns whether two handles signal the same cancellation boundary.
+    #[must_use]
+    pub fn shares_signal_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// Persisted event vocabulary. Raw prompts, tool arguments, credentials, and

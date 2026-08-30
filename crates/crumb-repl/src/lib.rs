@@ -172,6 +172,10 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "launch due opted-in schedules",
     },
     SlashCommand {
+        usage: "/background",
+        description: "continue the active agent turn as a local job",
+    },
+    SlashCommand {
         usage: "/attach ",
         description: "attach a typed @ reference",
     },

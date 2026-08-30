@@ -15,8 +15,8 @@ use crossterm::event::{
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crumb_agent::{
     AgentConfig, AgentMode, CancellationToken, CommandCatalog, ConfiguredApprovals, HarnessConfig,
-    InputRoute, JobSchedule, JobState, JobStore, LiveConfig, MistakePolicy, Modality, NewJob,
-    RouteDecision, SteeringAction, SteeringQueue, TokenOptimizer, ToolHost, TurnStatus,
+    InputRoute, JobId, JobSchedule, JobState, JobStore, LiveConfig, MistakePolicy, Modality,
+    NewJob, RouteDecision, SteeringAction, SteeringQueue, TokenOptimizer, ToolHost, TurnStatus,
     UnknownInputPolicy, export_session, list_sessions, search_sessions, session_summary,
     set_session_archived, set_session_label, trash_session,
 };
@@ -640,20 +640,48 @@ fn execute_agent_sequence(
     let mut request = initial_request;
     let mut active_runtime = runtime.take().context("agent runtime is unavailable")?;
     loop {
-        let task = active_runtime.spawn_turn(
+        let session_id = active_runtime.prepare_local_job(config.mode, workspace)?;
+        let persisted_request = request.clone();
+        let mut task = active_runtime.spawn_turn(
             request,
             config.clone(),
             workspace.to_path_buf(),
             activity_capacity,
         )?;
-        let (returned_runtime, result) = observe_agent_turn(
-            task,
-            &mut steering,
-            steering_bytes,
-            renderer,
-            writer,
-            interactive,
-        )?;
+        let (returned_runtime, result) = loop {
+            match observe_agent_turn(
+                task,
+                &mut steering,
+                steering_bytes,
+                renderer,
+                writer,
+                interactive,
+            )? {
+                TurnObservation::Finished(runtime, result) => break (*runtime, result),
+                TurnObservation::Backgrounded(returned_task) => {
+                    match promote_agent_turn(
+                        returned_task,
+                        &persisted_request,
+                        config,
+                        workspace,
+                        session_id.clone(),
+                    ) {
+                        Ok(id) => {
+                            writeln!(
+                                writer,
+                                "◆ Agent turn continues as background job {}",
+                                id.as_str()
+                            )?;
+                            return Ok(());
+                        }
+                        Err((error, returned_task)) => {
+                            writeln!(writer, "◇ Background promotion rejected · {error}")?;
+                            task = returned_task;
+                        }
+                    }
+                }
+            }
+        };
         active_runtime = returned_runtime;
         let completed = result.is_ok();
         render_agent_result(&result, renderer, writer)?;
@@ -675,6 +703,61 @@ fn execute_agent_sequence(
     Ok(())
 }
 
+enum TurnObservation {
+    Finished(Box<AgentRuntime>, Result<crumb_harness_dsh::RunResult>),
+    Backgrounded(agent_runtime::AgentTurnTask),
+}
+
+fn promote_agent_turn(
+    task: agent_runtime::AgentTurnTask,
+    request: &str,
+    config: &AgentConfig,
+    workspace: &Path,
+    session_id: crumb_agent::SessionId,
+) -> std::result::Result<JobId, (anyhow::Error, agent_runtime::AgentTurnTask)> {
+    let store = JobStore::new(workspace.to_path_buf());
+    let promotion = (|| -> Result<crumb_agent::JobSummary> {
+        let created = store.create(NewJob {
+            request: request.to_owned(),
+            config: config.clone(),
+            schedule: JobSchedule::Immediate,
+            scheduler_opt_in: false,
+        })?;
+        if let Err(error) = store.mark_running(created.id.as_str(), std::process::id()) {
+            let _ = store.request_cancel(created.id.as_str());
+            return Err(error);
+        }
+        if let Err(error) = store.attach_session(created.id.as_str(), session_id) {
+            let _ = store.finish(created.id.as_str(), Some(&error.to_string()));
+            return Err(error);
+        }
+        Ok(created)
+    })();
+    let created = match promotion {
+        Ok(created) => created,
+        Err(error) => return Err((error, task)),
+    };
+    let id = created.id.clone();
+    let worker_id = id.as_str().to_owned();
+    drop(thread::spawn(move || {
+        while !task.is_finished() {
+            if let Ok(job) = store.inspect(&worker_id)
+                && matches!(job.state, JobState::CancellationRequested { .. })
+            {
+                task.cancel();
+            }
+            let _ = task.recv_timeout(Duration::from_millis(50));
+        }
+        while task.recv_timeout(Duration::ZERO).is_ok() {}
+        let error = match task.finish() {
+            Ok((_, result)) => result.err().map(|error| error.to_string()),
+            Err(error) => Some(error.to_string()),
+        };
+        let _ = store.finish(&worker_id, error.as_deref());
+    }));
+    Ok(id)
+}
+
 fn observe_agent_turn(
     task: agent_runtime::AgentTurnTask,
     steering: &mut SteeringQueue,
@@ -682,7 +765,7 @@ fn observe_agent_turn(
     renderer: Renderer,
     writer: &mut dyn Write,
     interactive: bool,
-) -> Result<(AgentRuntime, Result<crumb_harness_dsh::RunResult>)> {
+) -> Result<TurnObservation> {
     let mut activity = Some(renderer.activity("Working through Harness"));
     let mut input = SteeringInput::new(steering_bytes);
     let raw_mode = interactive.then(RawModeGuard::enable).transpose()?;
@@ -704,7 +787,17 @@ fn observe_agent_turn(
             if let Some(indicator) = activity.take() {
                 indicator.finish();
             }
-            input.handle_key(key.code, key.modifiers, &task, steering, writer)?;
+            if input.handle_key(key.code, key.modifiers, &task, steering, writer)?
+                == SteeringInputAction::Background
+            {
+                input.clear_line(writer)?;
+                drop(raw_mode);
+                if let Some(indicator) = activity.take() {
+                    indicator.finish();
+                }
+                task.detach_interrupt();
+                return Ok(TurnObservation::Backgrounded(task));
+            }
         }
     }
     while let Ok(event) = task.recv_timeout(Duration::ZERO) {
@@ -717,7 +810,14 @@ fn observe_agent_turn(
     if let Some(indicator) = activity.take() {
         indicator.finish();
     }
-    task.finish()
+    let (runtime, result) = task.finish()?;
+    Ok(TurnObservation::Finished(Box::new(runtime), result))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SteeringInputAction {
+    Continue,
+    Background,
 }
 
 struct SteeringInput {
@@ -742,17 +842,17 @@ impl SteeringInput {
         task: &agent_runtime::AgentTurnTask,
         steering: &mut SteeringQueue,
         writer: &mut dyn Write,
-    ) -> Result<()> {
+    ) -> Result<SteeringInputAction> {
         if code == TerminalKeyCode::Char('c') && modifiers.contains(TerminalModifiers::CONTROL) {
             task.cancel();
             steering.clear();
             self.buffer.clear();
             self.clear_line(writer)?;
             writeln!(writer, "◇ Cancelling active agent turn")?;
-            return Ok(());
+            return Ok(SteeringInputAction::Continue);
         }
         match code {
-            TerminalKeyCode::Enter => self.submit(steering, task, writer)?,
+            TerminalKeyCode::Enter => return self.submit(steering, task, writer),
             TerminalKeyCode::Backspace => {
                 self.buffer.pop();
                 self.redraw(writer)?;
@@ -775,7 +875,7 @@ impl SteeringInput {
             }
             _ => {}
         }
-        Ok(())
+        Ok(SteeringInputAction::Continue)
     }
 
     fn submit(
@@ -783,11 +883,12 @@ impl SteeringInput {
         steering: &mut SteeringQueue,
         task: &agent_runtime::AgentTurnTask,
         writer: &mut dyn Write,
-    ) -> Result<()> {
+    ) -> Result<SteeringInputAction> {
         let input = self.buffer.trim().to_owned();
         if input.is_empty() {
             self.buffer.clear();
-            return self.clear_line(writer);
+            self.clear_line(writer)?;
+            return Ok(SteeringInputAction::Continue);
         }
         if input == "/cancel" {
             task.cancel();
@@ -795,7 +896,12 @@ impl SteeringInput {
             self.buffer.clear();
             self.clear_line(writer)?;
             writeln!(writer, "◇ Cancelling active agent turn")?;
-            return Ok(());
+            return Ok(SteeringInputAction::Continue);
+        }
+        if input == "/background" {
+            self.buffer.clear();
+            self.clear_line(writer)?;
+            return Ok(SteeringInputAction::Background);
         }
         let (action, message) = input
             .strip_prefix("/replace ")
@@ -819,7 +925,7 @@ impl SteeringInput {
         self.buffer.clear();
         self.visible = false;
         writer.flush()?;
-        Ok(())
+        Ok(SteeringInputAction::Continue)
     }
 
     fn clear_line(&mut self, writer: &mut dyn Write) -> Result<()> {
@@ -1027,7 +1133,15 @@ fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
         (
             "AGENT",
             &[
-                "/mode", "/model", "/effort", "/session", "/review", "/jobs", "/cancel", "/cost",
+                "/mode",
+                "/model",
+                "/effort",
+                "/session",
+                "/review",
+                "/jobs",
+                "/background",
+                "/cancel",
+                "/cost",
             ][..],
         ),
         (

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +17,7 @@ use crumb_harness_dsh::{
 };
 
 type TurnThreadResult = (AgentRuntime, Result<RunResult>);
+static ACTIVE_CANCELLATION: OnceLock<Arc<Mutex<Option<CancellationToken>>>> = OnceLock::new();
 
 /// Background Harness turn whose public event stream is already redacted.
 pub struct AgentTurnTask {
@@ -45,6 +46,17 @@ impl AgentTurnTask {
 
     pub fn cancel(&self) {
         self.cancellation.cancel();
+    }
+
+    pub fn detach_interrupt(&self) {
+        if let Some(slot) = ACTIVE_CANCELLATION.get()
+            && let Ok(mut active) = slot.lock()
+            && active
+                .as_ref()
+                .is_some_and(|token| token.shares_signal_with(&self.cancellation))
+        {
+            *active = None;
+        }
     }
 
     /// Rejoins the runtime after its turn completes.
@@ -82,16 +94,22 @@ impl AgentRuntime {
     /// Returns an error when the operating system signal handler cannot be
     /// installed.
     pub fn new() -> Result<Self> {
-        let active_cancellation: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
-        let signal_slot = Arc::clone(&active_cancellation);
-        ctrlc::set_handler(move || {
-            if let Ok(active) = signal_slot.lock()
-                && let Some(cancellation) = active.as_ref()
-            {
-                cancellation.cancel();
-            }
-        })
-        .context("failed to install agent cancellation handler")?;
+        let active_cancellation = if let Some(slot) = ACTIVE_CANCELLATION.get() {
+            Arc::clone(slot)
+        } else {
+            let slot: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+            let signal_slot = Arc::clone(&slot);
+            ctrlc::set_handler(move || {
+                if let Ok(active) = signal_slot.lock()
+                    && let Some(cancellation) = active.as_ref()
+                {
+                    cancellation.cancel();
+                }
+            })
+            .context("failed to install agent cancellation handler")?;
+            let _ = ACTIVE_CANCELLATION.set(Arc::clone(&slot));
+            slot
+        };
         Ok(Self {
             active_cancellation,
             session: None,
@@ -245,7 +263,9 @@ impl AgentRuntime {
     ///
     /// Returns an error when the workspace or session journal is unavailable.
     pub fn prepare_local_job(&mut self, mode: AgentMode, workspace: &Path) -> Result<SessionId> {
-        self.ensure_session(workspace, mode)?;
+        let workspace = std::fs::canonicalize(workspace)
+            .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
+        self.ensure_session(&workspace, mode)?;
         self.session
             .as_ref()
             .map(|session| session.id().clone())
@@ -376,6 +396,7 @@ impl Drop for AgentRuntime {
 
 struct ActiveCancellation<'a> {
     slot: &'a Mutex<Option<CancellationToken>>,
+    cancellation: CancellationToken,
 }
 
 impl<'a> ActiveCancellation<'a> {
@@ -386,14 +407,18 @@ impl<'a> ActiveCancellation<'a> {
         *slot
             .lock()
             .map_err(|_| anyhow::anyhow!("agent cancellation state is unavailable"))? =
-            Some(cancellation);
-        Ok(Self { slot })
+            Some(cancellation.clone());
+        Ok(Self { slot, cancellation })
     }
 }
 
 impl Drop for ActiveCancellation<'_> {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.slot.lock() {
+        if let Ok(mut active) = self.slot.lock()
+            && active
+                .as_ref()
+                .is_some_and(|token| token.shares_signal_with(&self.cancellation))
+        {
             *active = None;
         }
     }

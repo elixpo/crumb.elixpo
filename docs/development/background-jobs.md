@@ -9,6 +9,9 @@ native commands.
 
 - `/jobs create <request>` records an immediate job and starts an isolated local
   worker.
+- While an agent turn is active, type `/background` at the steering prompt to
+  transfer that exact running turn into the local job ledger. The prompt is not
+  submitted again, and Ctrl+C returns to foreground-only cancellation.
 - `/jobs list` and `/jobs inspect <id>` show redacted metadata only.
 - `/jobs cancel <id>` updates the ledger; the worker observes it and triggers
   the same cancellation token used by foreground Harness turns and tools.
