@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Manage stale issues and PRs
-        uses: actions/stale@v9
+        uses: actions/stale@v11
         with:
           # Issue settings
           days-before-issue-stale: 60
