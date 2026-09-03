@@ -79,6 +79,37 @@
           "environment": []
         }
       ]
+    },
+    {
+      "id": "crumb/weather",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "Weather lookup",
+      "description": "Look up current weather for a city using Open-Meteo.",
+      "license": "MIT",
+      "source": "./packages/weather",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-weather",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-weather-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
     }
   ]
 }

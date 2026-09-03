@@ -19,6 +19,7 @@ members = [
     "crates/crumb-repl",
     "crates/crumb-tools",
     "crates/crumb-ui",
+    "crates/crumb-weather-mcp",
 ]
 resolver = "2"
 
