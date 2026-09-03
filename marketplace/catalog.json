@@ -79,6 +79,564 @@
           "environment": []
         }
       ]
+    },
+    {
+      "id": "crumb/weather",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "Weather lookup",
+      "description": "Look up current weather for a city using Open-Meteo.",
+      "license": "MIT",
+      "source": "./packages/weather",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-weather",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-weather-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/currency",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "Currency convert",
+      "description": "Convert currency using Frankfurter.dev",
+      "license": "MIT",
+      "source": "./packages/currency",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-currency",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-currency-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/ip",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "IP Geolocation",
+      "description": "Look up IP geolocation using ip-api.com",
+      "license": "MIT",
+      "source": "./packages/ip",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-ip",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-ip-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/dictionary",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "Dictionary define",
+      "description": "Define a word using dictionaryapi.dev",
+      "license": "MIT",
+      "source": "./packages/dictionary",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-dictionary",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-dictionary-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/crypto",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "Crypto price",
+      "description": "Check cryptocurrency price using CoinGecko",
+      "license": "MIT",
+      "source": "./packages/crypto",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-crypto",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-crypto-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/holidays",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "Public holidays",
+      "description": "Look up public holidays for a country code (e.g. US)",
+      "license": "MIT",
+      "source": "./packages/holidays",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-holidays",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-holidays-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/qr",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "QR Code generate",
+      "description": "Generate QR code URL for text",
+      "license": "MIT",
+      "source": "./packages/qr",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-qr",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-qr-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/shorturl",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "Short URL",
+      "description": "Shorten a URL using is.gd",
+      "license": "MIT",
+      "source": "./packages/shorturl",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-shorturl",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-shorturl-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/quote",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "Random quote",
+      "description": "Get a random quote",
+      "license": "MIT",
+      "source": "./packages/quote",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-quote",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-quote-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/github",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "GitHub repo lookup",
+      "description": "Look up a GitHub repository",
+      "license": "MIT",
+      "source": "./packages/github",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-github",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-github-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/github-auth",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "GitHub (authenticated)",
+      "description": "Authenticated GitHub access",
+      "license": "MIT",
+      "source": "./packages/github-auth",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-github-auth",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-github-auth-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/discord",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "Discord",
+      "description": "Discord integration",
+      "license": "MIT",
+      "source": "./packages/discord",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-discord",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-discord-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/trello",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "Trello",
+      "description": "Trello integration",
+      "license": "MIT",
+      "source": "./packages/trello",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-trello",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-trello-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/todoist",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "Todoist",
+      "description": "Todoist integration",
+      "license": "MIT",
+      "source": "./packages/todoist",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-todoist",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-todoist-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/notion",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "Notion",
+      "description": "Notion integration",
+      "license": "MIT",
+      "source": "./packages/notion",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-notion",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-notion-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/spotify",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "Spotify (read-only search)",
+      "description": "Spotify integration",
+      "license": "MIT",
+      "source": "./packages/spotify",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-spotify",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-spotify-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/gcal",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "Google Calendar (read-only)",
+      "description": "Google Calendar integration",
+      "license": "MIT",
+      "source": "./packages/gcal",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-gcal",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-gcal-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
+    },
+    {
+      "id": "crumb/gmail",
+      "version": "1.0.0",
+      "kind": "mcp",
+      "display_name": "Gmail (search/draft only)",
+      "description": "Gmail integration",
+      "license": "MIT",
+      "source": "./packages/gmail",
+      "capabilities": [
+        "network_access"
+      ],
+      "artifacts": [
+        {
+          "path": "README.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "crumb-gmail",
+          "command": "cargo",
+          "arguments": [
+            "run",
+            "--bin",
+            "crumb-gmail-mcp",
+            "-q"
+          ],
+          "environment": []
+        }
+      ]
     }
   ]
 }
