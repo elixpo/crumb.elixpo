@@ -6,6 +6,9 @@ pub use dry_run::{BlastRadiusAssessment, MatchedPattern, Severity, assess_shell_
 mod secrets;
 pub use secrets::{SecretKind, SecretMatch, SecretScanner};
 
+mod undo_ledger;
+pub use undo_ledger::{LedgerEntry, UndoLedger};
+
 /// A command handled directly by crumb rather than the native shell.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BuiltInCommand {
