@@ -3,6 +3,9 @@
 mod dry_run;
 pub use dry_run::{BlastRadiusAssessment, MatchedPattern, Severity, assess_shell_command};
 
+mod secrets;
+pub use secrets::{SecretKind, SecretMatch, SecretScanner};
+
 /// A command handled directly by crumb rather than the native shell.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BuiltInCommand {
