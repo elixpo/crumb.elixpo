@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,7 @@ use crumb_agent::{
     CancellationToken, OutputKind, RiskClass, ToolDescriptor, ToolHandler, ToolHost, ToolOutput,
     ToolTransport,
 };
+use crumb_core::UndoLedger;
 use crumb_optimize::{OptimizationPipeline, OptimizationResult};
 use serde_json::{Value, json};
 
@@ -83,32 +84,46 @@ fn register_shell_tool_inner(
     if !workspace.is_dir() {
         bail!("agent shell workspace must be a directory");
     }
+    let capacity = std::num::NonZeroUsize::new(UNDO_LEDGER_CAPACITY)
+        .expect("UNDO_LEDGER_CAPACITY is a nonzero constant");
     host.register(
         descriptor(),
         Arc::new(ShellTool {
             workspace,
             config,
             optimizer,
+            ledger: Mutex::new(UndoLedger::new(capacity)),
         }),
     )?;
     Ok(())
 }
 
+const UNDO_LEDGER_CAPACITY: usize = 50;
+
 struct ShellTool {
     workspace: PathBuf,
     config: AgentShellConfig,
     optimizer: Option<Arc<OptimizationPipeline>>,
+    ledger: Mutex<UndoLedger>,
 }
 
 impl ToolHandler for ShellTool {
     fn call(&self, arguments: &Value, cancellation: &CancellationToken) -> Result<ToolOutput> {
-        match run_shell(
+        let result = run_shell(
             &self.workspace,
             &self.config,
             self.optimizer.as_deref(),
             arguments,
             cancellation,
-        ) {
+        );
+        if let Ok(output) = &result
+            && !output.is_error
+            && let Some(command) = arguments.get("command").and_then(Value::as_str)
+            && let Ok(mut ledger) = self.ledger.lock()
+        {
+            ledger.record(command);
+        }
+        match result {
             Ok(output) => Ok(output),
             Err(error) if cancellation.is_cancelled() => Err(error),
             Err(error) => Ok(ToolOutput::error(error.to_string())),
