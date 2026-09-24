@@ -2,15 +2,16 @@ use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use crumb_agent::{
     CancellationToken, OutputKind, RiskClass, ToolDescriptor, ToolHandler, ToolHost, ToolOutput,
     ToolTransport,
 };
+use crumb_core::UndoLedger;
 use crumb_optimize::{OptimizationPipeline, OptimizationResult};
 use serde_json::{Value, json};
 
@@ -28,7 +29,17 @@ pub struct AgentShellConfig {
     pub max_output_bytes: usize,
     pub timeout: Duration,
 }
-
+/// Snapshot of the most recent failed `run_shell` invocation, for read-only
+/// diagnosis by `diagnose_last_failure`.
+#[derive(Clone, Debug)]
+struct LastFailure {
+    command: String,
+    exit_status: String,
+    stdout_tail: String,
+    stderr_tail: String,
+    modified_files: Vec<PathBuf>,
+    modified_files_truncated: bool,
+}
 /// Registers an approval-gated shell tool rooted at one canonical workspace.
 ///
 /// The program receives the model-proposed command as its final argument. Its
@@ -83,25 +94,40 @@ fn register_shell_tool_inner(
     if !workspace.is_dir() {
         bail!("agent shell workspace must be a directory");
     }
+    let capacity = std::num::NonZeroUsize::new(UNDO_LEDGER_CAPACITY)
+        .expect("UNDO_LEDGER_CAPACITY is a nonzero constant");
+    let shell_tool = Arc::new(ShellTool {
+        workspace,
+        config,
+        optimizer,
+        ledger: Mutex::new(UndoLedger::new(capacity)),
+        last_failure: Mutex::new(None),
+    });
+    host.register(descriptor(), shell_tool.clone())?;
     host.register(
-        descriptor(),
-        Arc::new(ShellTool {
-            workspace,
-            config,
-            optimizer,
+        diagnose_descriptor(),
+        Arc::new(DiagnoseLastFailureTool {
+            shell: shell_tool,
         }),
     )?;
     Ok(())
 }
+const UNDO_LEDGER_CAPACITY: usize = 50;
 
 struct ShellTool {
     workspace: PathBuf,
     config: AgentShellConfig,
     optimizer: Option<Arc<OptimizationPipeline>>,
+    ledger: Mutex<UndoLedger>,
+    last_failure: Mutex<Option<LastFailure>>,
 }
 
 impl ToolHandler for ShellTool {
     fn call(&self, arguments: &Value, cancellation: &CancellationToken) -> Result<ToolOutput> {
+        let command_text = arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         match run_shell(
             &self.workspace,
             &self.config,
@@ -109,11 +135,53 @@ impl ToolHandler for ShellTool {
             arguments,
             cancellation,
         ) {
-            Ok(output) => Ok(output),
+            Ok(result) => {
+                if let Some(command) = &command_text {
+                    if result.output.is_error {
+                        self.record_failure(command, &result);
+                    } else if let Ok(mut ledger) = self.ledger.lock() {
+                        ledger.record(command);
+                    }
+                }
+                Ok(result.output)
+            }
             Err(error) if cancellation.is_cancelled() => Err(error),
             Err(error) => Ok(ToolOutput::error(error.to_string())),
         }
     }
+}
+
+impl ShellTool {
+    fn record_failure(&self, command: &str, result: &ShellRunResult) {
+        const MAX_MODIFIED_FILES: usize = 50;
+        let (modified_files, modified_files_truncated) =
+            match modified_since(&self.workspace, result.started_at) {
+                Ok(mut paths) => {
+                    let truncated = paths.len() > MAX_MODIFIED_FILES;
+                    paths.truncate(MAX_MODIFIED_FILES);
+                    (paths, truncated)
+                }
+                Err(_) => (Vec::new(), false),
+            };
+        if let Ok(mut last_failure) = self.last_failure.lock() {
+            *last_failure = Some(LastFailure {
+                command: command.to_owned(),
+                exit_status: result.exit_status.clone(),
+                stdout_tail: result.stdout_text.clone(),
+                stderr_tail: result.stderr_text.clone(),
+                modified_files,
+                modified_files_truncated,
+            });
+        }
+    }
+}
+
+struct ShellRunResult {
+    output: ToolOutput,
+    exit_status: String,
+    stdout_text: String,
+    stderr_text: String,
+    started_at: SystemTime,
 }
 
 fn run_shell(
@@ -122,7 +190,7 @@ fn run_shell(
     optimizer: Option<&OptimizationPipeline>,
     arguments: &Value,
     cancellation: &CancellationToken,
-) -> Result<ToolOutput> {
+) -> Result<ShellRunResult> {
     ensure_active(cancellation)?;
     let command = arguments
         .get("command")
@@ -132,6 +200,7 @@ fn run_shell(
         bail!("command cannot be empty");
     }
     let timeout = requested_timeout(arguments, config.timeout)?;
+    let started_at = SystemTime::now();
     let mut process = Command::new(&config.program);
     process
         .args(&config.arguments)
@@ -186,30 +255,49 @@ fn run_shell(
 
     let stdout = join_capture(stdout_reader)?;
     let stderr = join_capture(stderr_reader)?;
-    match outcome {
+    let stdout_text = String::from_utf8_lossy(&stdout.bytes).into_owned();
+    let stderr_text = String::from_utf8_lossy(&stderr.bytes).into_owned();
+
+    let (exit_status, output) = match outcome {
         ProcessOutcome::Cancelled => bail!("tool call cancelled"),
-        ProcessOutcome::TimedOut => Ok(render_tool_output(
-            render_output("timed_out", &stdout, &stderr, true, config.max_output_bytes),
-            true,
-            optimizer,
-            classify_output(command),
-            config.max_output_bytes,
-        )),
+        ProcessOutcome::TimedOut => {
+            let exit_status = "timed_out".to_owned();
+            let text =
+                render_output(&exit_status, &stdout, &stderr, true, config.max_output_bytes);
+            let output = render_tool_output(
+                text,
+                true,
+                optimizer,
+                classify_output(command),
+                config.max_output_bytes,
+            );
+            (exit_status, output)
+        }
         ProcessOutcome::Exited(status) => {
             let failed = !status.success();
-            let status = status
+            let exit_status = status
                 .code()
                 .map_or_else(|| "signal".to_owned(), |code| code.to_string());
-            let text = render_output(&status, &stdout, &stderr, failed, config.max_output_bytes);
-            Ok(render_tool_output(
+            let text =
+                render_output(&exit_status, &stdout, &stderr, failed, config.max_output_bytes);
+            let output = render_tool_output(
                 text,
                 failed,
                 optimizer,
                 classify_output(command),
                 config.max_output_bytes,
-            ))
+            );
+            (exit_status, output)
         }
-    }
+    };
+
+    Ok(ShellRunResult {
+        output,
+        exit_status,
+        stdout_text,
+        stderr_text,
+        started_at,
+    })
 }
 
 fn render_tool_output(
@@ -371,6 +459,55 @@ fn ensure_active(cancellation: &CancellationToken) -> Result<()> {
     Ok(())
 }
 
+fn modified_since(workspace: &Path, since: std::time::SystemTime) -> Result<Vec<PathBuf>> {
+    let since = since.checked_sub(Duration::from_secs(1)).unwrap_or(since);
+
+    let mut modified = Vec::new();
+    let mut stack = vec![workspace.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .with_context(|| format!("failed to read directory `{}`", dir.display()))?;
+        for entry in entries {
+            let entry = entry.context("failed to read directory entry")?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("failed to inspect `{}`", path.display()))?;
+
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some(".git") | Some("target") | Some("node_modules")
+                ) {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let metadata = entry
+                .metadata()
+                .with_context(|| format!("failed to read metadata for `{}`", path.display()))?;
+            let mtime = metadata.modified().with_context(|| {
+                format!("filesystem lacks mtime support for `{}`", path.display())
+            })?;
+
+            if mtime >= since {
+                modified.push(path);
+            }
+        }
+    }
+
+    Ok(modified)
+}
+
 #[cfg(unix)]
 fn configure_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -414,6 +551,65 @@ fn descriptor() -> ToolDescriptor {
             "additionalProperties":false
         }),
         risk: RiskClass::ProcessExecution,
+        transport: ToolTransport::Native,
+    }
+}
+struct DiagnoseLastFailureTool {
+    shell: Arc<ShellTool>,
+}
+
+impl ToolHandler for DiagnoseLastFailureTool {
+    fn call(&self, _arguments: &Value, cancellation: &CancellationToken) -> Result<ToolOutput> {
+        ensure_active(cancellation)?;
+        let last_failure = self
+            .shell
+            .last_failure
+            .lock()
+            .map_err(|_| anyhow::anyhow!("last-failure state poisoned"))?;
+        match &*last_failure {
+            None => Ok(ToolOutput::text(
+                "No failed command has been recorded in this session.".to_owned(),
+            )),
+            Some(failure) => Ok(ToolOutput::text(render_last_failure(failure))),
+        }
+    }
+}
+
+fn render_last_failure(failure: &LastFailure) -> String {
+    let mut sections = vec![
+        format!("command: {}", failure.command),
+        format!("exit: {}", failure.exit_status),
+        format!("stderr:\n{}", failure.stderr_tail),
+        format!("stdout:\n{}", failure.stdout_tail),
+    ];
+    if failure.modified_files.is_empty() {
+        sections.push("modified files: none detected".to_owned());
+    } else {
+        let mut listing = String::from("modified files:\n");
+        for path in &failure.modified_files {
+            listing.push_str(&format!("  {}\n", path.display()));
+        }
+        if failure.modified_files_truncated {
+            listing.push_str("  ... (truncated)\n");
+        }
+        sections.push(listing);
+    }
+    sections.join("\n")
+}
+
+fn diagnose_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: "diagnose_last_failure".to_owned(),
+        description:
+            "Read-only diagnosis of the most recent failed run_shell command: exit status, \
+             stderr/stdout tails, and files modified since it started."
+                .to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        risk: RiskClass::ReadOnly,
         transport: ToolTransport::Native,
     }
 }
@@ -505,7 +701,10 @@ mod tests {
     #[test]
     fn shell_execution_requires_approval() {
         let host = host(Duration::from_secs(1));
-        let descriptor = host.tools().next().expect("shell descriptor exists");
+        let descriptor = host
+            .tools()
+            .find(|descriptor| descriptor.name == "run_shell")
+            .expect("shell descriptor exists");
         assert_eq!(descriptor.risk, RiskClass::ProcessExecution);
         let error = host
             .call(
@@ -619,5 +818,62 @@ mod tests {
             .expect("tool thread does not panic")
             .expect_err("cancelled command returns a typed error");
         assert_eq!(error.kind, ToolCallErrorKind::Cancelled);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn diagnose_last_failure_reports_nothing_before_any_failure() {
+        let host = host(Duration::from_secs(1));
+        let output = host
+            .call(
+                "diagnose_last_failure",
+                &json!({}),
+                AgentMode::Auto,
+                &AllowOnce,
+                &CancellationToken::default(),
+            )
+            .expect("diagnose call succeeds even with no prior failure");
+        assert!(!output.is_error);
+        assert!(output.text.contains("No failed command"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnose_last_failure_reports_the_most_recent_failure() {
+        let host = host(Duration::from_secs(1));
+        let run = host
+            .call(
+                "run_shell",
+                &json!({"command":"printf diagnostic >&2; exit 7"}),
+                AgentMode::Auto,
+                &AllowOnce,
+                &CancellationToken::default(),
+            )
+            .expect("failing command is returned as tool output, not a call error");
+        assert!(run.is_error);
+
+        let diagnosis = host
+            .call(
+                "diagnose_last_failure",
+                &json!({}),
+                AgentMode::Auto,
+                &AllowOnce,
+                &CancellationToken::default(),
+            )
+            .expect("diagnose call succeeds after a recorded failure");
+        assert!(!diagnosis.is_error);
+        assert!(diagnosis.text.contains("printf diagnostic >&2; exit 7"));
+        assert!(diagnosis.text.contains("exit: 7"));
+        assert!(diagnosis.text.contains("diagnostic"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnose_last_failure_is_read_only_and_needs_no_approval_beyond_run_shell() {
+        let host = host(Duration::from_secs(1));
+        let descriptor = host
+            .tools()
+            .find(|descriptor| descriptor.name == "diagnose_last_failure")
+            .expect("diagnose descriptor exists");
+        assert_eq!(descriptor.risk, RiskClass::ReadOnly);
     }
 }
