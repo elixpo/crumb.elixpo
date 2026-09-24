@@ -621,6 +621,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crumb-agent",
+ "crumb-core",
 ]
 
 [[package]]
