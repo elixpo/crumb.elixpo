@@ -5270,7 +5270,7 @@ mod tests {
             provider.headers.get("HTTP-Referer"),
             Some(ProviderHeader::Public { .. })
         ));
-        assert!(provider.models.is_empty());
+        assert!(matches!(provider.models.as_slice(), []));
     }
 
     #[test]

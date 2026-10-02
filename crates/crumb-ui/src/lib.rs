@@ -1257,6 +1257,6 @@ mod tests {
             renderer.agent_error("stopped", true),
             "Agent cancelled: stopped"
         );
-        assert!(renderer.branding().is_empty());
+        assert_eq!(renderer.branding(), "");
     }
 }

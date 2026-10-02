@@ -257,8 +257,8 @@ mod tests {
             .expect("second chunk should decode");
 
         assert_eq!(first.visible, b"hello\r\n");
-        assert!(first.completions.is_empty());
-        assert!(second.visible.is_empty());
+        assert!(matches!(first.completions.as_slice(), []));
+        assert!(matches!(second.visible.as_slice(), []));
         assert_eq!(
             second.completions,
             [CommandCompletion {
@@ -278,6 +278,6 @@ mod tests {
             .expect("ANSI output should decode");
 
         assert_eq!(decoded.visible, b"\x1b[31mred\x1b[0m");
-        assert!(decoded.completions.is_empty());
+        assert!(matches!(decoded.completions.as_slice(), []));
     }
 }

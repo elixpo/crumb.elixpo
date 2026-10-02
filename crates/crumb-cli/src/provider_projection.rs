@@ -357,7 +357,7 @@ mod tests {
         assert!(projection.providers_json.contains("vendor/coder"));
         assert!(projection.providers_json.contains("openai-responses"));
         assert!(!projection.providers_json.contains("api_key"));
-        assert!(projection.environment.is_empty());
+        assert!(matches!(projection.environment.as_slice(), []));
         assert_eq!(projection.max_tokens, Some(4_096));
     }
 }

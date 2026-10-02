@@ -309,7 +309,10 @@ mod tests {
                 .expect("sensitive is valid"),
             None
         );
-        assert!(store.recent(10).expect("history should load").is_empty());
+        assert!(matches!(
+            store.recent(10).expect("history should load").as_slice(),
+            []
+        ));
     }
 
     #[test]

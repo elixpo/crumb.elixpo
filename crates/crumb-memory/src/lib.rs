@@ -286,7 +286,10 @@ mod tests {
         assert_eq!(store.entries().expect("entries"), ["Use cargo fmt"]);
         assert_eq!(store.compact_approved().expect("compact"), 0);
         assert_eq!(store.forget_approved(1).expect("forget"), "Use cargo fmt");
-        assert!(store.entries().expect("empty entries").is_empty());
+        assert!(matches!(
+            store.entries().expect("empty entries").as_slice(),
+            []
+        ));
     }
 
     #[test]
