@@ -244,6 +244,11 @@ impl ToolHost {
         self.registry.iter()
     }
 
+    #[must_use]
+    pub fn descriptor(&self, name: &str) -> Option<&ToolDescriptor> {
+        self.registry.get(name)
+    }
+
     /// Authorizes and executes one tool call.
     ///
     /// # Errors

@@ -1,10 +1,14 @@
 //! Cancellable, append-only agent session primitives.
 
 use std::fs::{self, File, OpenOptions};
+use std::future::Future;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -44,23 +48,69 @@ impl SessionId {
 }
 
 /// Cloneable cancellation signal shared by Ctrl+C, the agent loop, and tools.
+#[derive(Debug, Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    waiters: Mutex<Vec<Waker>>,
+}
+
 #[derive(Clone, Debug, Default)]
-pub struct CancellationToken(Arc<AtomicBool>);
+pub struct CancellationToken(Arc<CancellationState>);
 
 impl CancellationToken {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        if !self.0.cancelled.swap(true, Ordering::AcqRel)
+            && let Ok(mut waiters) = self.0.waiters.lock()
+        {
+            for waiter in waiters.drain(..) {
+                waiter.wake();
+            }
+        }
     }
 
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.cancelled.load(Ordering::Acquire)
     }
 
     /// Returns whether two handles signal the same cancellation boundary.
     #[must_use]
     pub fn shares_signal_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Resolves as soon as this token is cancelled without polling a timer.
+    #[must_use]
+    pub fn cancelled(&self) -> CancellationFuture<'_> {
+        CancellationFuture { token: self }
+    }
+}
+
+/// Borrowed future returned by [`CancellationToken::cancelled`].
+pub struct CancellationFuture<'a> {
+    token: &'a CancellationToken,
+}
+
+impl Future for CancellationFuture<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        if self.token.is_cancelled() {
+            return Poll::Ready(());
+        }
+        let Ok(mut waiters) = self.token.0.waiters.lock() else {
+            return Poll::Ready(());
+        };
+        if self.token.is_cancelled() {
+            return Poll::Ready(());
+        }
+        if !waiters
+            .iter()
+            .any(|waiter| waiter.will_wake(context.waker()))
+        {
+            waiters.push(context.waker().clone());
+        }
+        Poll::Pending
     }
 }
 
@@ -582,6 +632,44 @@ impl AgentSession {
             at_ms: timestamp_ms(),
             request_bytes: request.len(),
             request_digest: digest(request.as_bytes()),
+        })
+    }
+
+    /// Records only the tool name, policy risk, and argument digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the event cannot be persisted.
+    pub fn record_tool_request(
+        &mut self,
+        name: String,
+        risk: crate::tools::RiskClass,
+        arguments: &[u8],
+    ) -> Result<()> {
+        self.journal.append(&SessionEvent::ToolRequested {
+            at_ms: timestamp_ms(),
+            name,
+            risk,
+            arguments_digest: digest(arguments),
+        })
+    }
+
+    /// Records bounded tool completion metadata without output content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the event cannot be persisted.
+    pub fn record_tool_finish(
+        &mut self,
+        name: String,
+        success: bool,
+        output_bytes: usize,
+    ) -> Result<()> {
+        self.journal.append(&SessionEvent::ToolFinished {
+            at_ms: timestamp_ms(),
+            name,
+            success,
+            output_bytes,
         })
     }
 

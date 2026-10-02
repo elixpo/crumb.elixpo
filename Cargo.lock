@@ -542,6 +542,18 @@ name = "crumb-core"
 version = "0.1.0"
 
 [[package]]
+name = "crumb-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crumb-agent",
+ "crumb-llm",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "crumb-harness-cli"
 version = "0.1.0"
 dependencies = [
