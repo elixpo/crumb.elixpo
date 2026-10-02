@@ -67,7 +67,7 @@ impl PollinationsConfig {
         Ok(Self {
             base_url: DEFAULT_BASE_URL.to_owned(),
             api_key,
-            request_timeout: Duration::from_secs(60),
+            request_timeout: Duration::from_mins(1),
             retry: RetryPolicy::default(),
         })
     }
