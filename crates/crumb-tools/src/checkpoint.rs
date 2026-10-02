@@ -581,7 +581,7 @@ mod tests {
                 .record_edit(Path::new(".env.local"), Some(b"old"), b"new")
                 .is_err()
         );
-        assert!(store.list().expect("list succeeds").is_empty());
+        assert_eq!(store.list().expect("list succeeds"), []);
     }
 
     #[test]
