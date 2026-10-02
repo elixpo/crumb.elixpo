@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crumb_llm::{
     ChatEvent, ChatMessage, ChatRequest, ChatRole, EmbeddingRequest, FinishReason, LlmProvider,
-    ModelCapability, ProviderErrorKind, TokenUsage,
+    ModelCapability, ProviderErrorKind, TokenUsage, ToolChoice,
 };
 
 use crate::{PollinationsConfig, PollinationsProvider, RetryPolicy};
@@ -166,10 +166,9 @@ fn provider_maps_models_chat_and_embeddings_over_http() {
         let mut stream = provider
             .chat_stream(ChatRequest {
                 model: "openai".to_owned(),
-                messages: vec![ChatMessage {
-                    role: ChatRole::User,
-                    content: "hello".to_owned(),
-                }],
+                messages: vec![ChatMessage::text(ChatRole::User, "hello")],
+                tools: Vec::new(),
+                tool_choice: ToolChoice::None,
                 max_output_tokens: Some(16),
             })
             .await

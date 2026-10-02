@@ -1,8 +1,10 @@
 use crumb_llm::{
     ChatEvent, ChatRequest, ChatRole, EmbeddingRequest, EmbeddingResponse, FinishReason,
     ModelCapability, ModelInfo, ProviderError, ProviderErrorKind, ProviderResult, TokenUsage,
+    ToolCall, ToolChoice, ToolDefinition,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ChatCompletionRequest<'a> {
@@ -11,6 +13,10 @@ pub(crate) struct ChatCompletionRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ChatTool<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
     stream_options: StreamOptions,
 }
 
@@ -21,13 +27,12 @@ impl<'a> From<&'a ChatRequest> for ChatCompletionRequest<'a> {
             messages: request
                 .messages
                 .iter()
-                .map(|message| ChatCompletionMessage {
-                    role: role_name(message.role),
-                    content: &message.content,
-                })
+                .map(ChatCompletionMessage::from)
                 .collect(),
             stream: true,
             max_tokens: request.max_output_tokens,
+            tools: request.tools.iter().map(ChatTool::from).collect(),
+            tool_choice: (!request.tools.is_empty()).then(|| tool_choice_name(request.tool_choice)),
             stream_options: StreamOptions {
                 include_usage: true,
             },
@@ -39,6 +44,79 @@ impl<'a> From<&'a ChatRequest> for ChatCompletionRequest<'a> {
 struct ChatCompletionMessage<'a> {
     role: &'static str,
     content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<AssistantToolCall<'a>>,
+}
+
+impl<'a> From<&'a crumb_llm::ChatMessage> for ChatCompletionMessage<'a> {
+    fn from(message: &'a crumb_llm::ChatMessage) -> Self {
+        Self {
+            role: role_name(message.role),
+            content: &message.content,
+            tool_call_id: message.tool_call_id.as_deref(),
+            tool_calls: message
+                .tool_calls
+                .iter()
+                .map(AssistantToolCall::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ChatTool<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: ChatFunction<'a>,
+}
+
+impl<'a> From<&'a ToolDefinition> for ChatTool<'a> {
+    fn from(tool: &'a ToolDefinition) -> Self {
+        Self {
+            kind: "function",
+            function: ChatFunction {
+                name: &tool.name,
+                description: &tool.description,
+                parameters: &tool.input_schema,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ChatFunction<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct AssistantToolCall<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: AssistantFunction<'a>,
+}
+
+impl<'a> From<&'a ToolCall> for AssistantToolCall<'a> {
+    fn from(call: &'a ToolCall) -> Self {
+        Self {
+            id: &call.id,
+            kind: "function",
+            function: AssistantFunction {
+                name: &call.name,
+                arguments: call.arguments.to_string(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AssistantFunction<'a> {
+    name: &'a str,
+    arguments: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,6 +130,14 @@ const fn role_name(role: ChatRole) -> &'static str {
         ChatRole::User => "user",
         ChatRole::Assistant => "assistant",
         ChatRole::Tool => "tool",
+    }
+}
+
+const fn tool_choice_name(choice: ToolChoice) -> &'static str {
+    match choice {
+        ToolChoice::Auto => "auto",
+        ToolChoice::None => "none",
+        ToolChoice::Required => "required",
     }
 }
 
@@ -72,6 +158,28 @@ struct ChatChoice {
 #[derive(Debug, Default, Deserialize)]
 struct ChatDelta {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ToolCallDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolCallDelta {
+    index: usize,
+    id: Option<String>,
+    function: Option<FunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PendingToolCall {
+    id: Option<String>,
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +308,7 @@ pub(crate) struct SseDecoder {
     pending: Vec<u8>,
     done: bool,
     finish_reason: Option<FinishReason>,
+    tool_calls: BTreeMap<usize, PendingToolCall>,
 }
 
 impl SseDecoder {
@@ -239,6 +348,7 @@ impl SseDecoder {
             return Ok(());
         }
         if data == "[DONE]" {
+            self.emit_tool_calls(output)?;
             output.push(ChatEvent::Finished(
                 self.finish_reason
                     .take()
@@ -256,6 +366,20 @@ impl SseDecoder {
             {
                 output.push(ChatEvent::TextDelta(content));
             }
+            for delta in choice.delta.tool_calls {
+                let pending = self.tool_calls.entry(delta.index).or_default();
+                if let Some(id) = delta.id {
+                    pending.id = Some(id);
+                }
+                if let Some(function) = delta.function {
+                    if let Some(name) = function.name {
+                        pending.name.push_str(&name);
+                    }
+                    if let Some(arguments) = function.arguments {
+                        pending.arguments.push_str(&arguments);
+                    }
+                }
+            }
             if let Some(reason) = choice.finish_reason {
                 self.finish_reason = Some(map_finish_reason(&reason));
             }
@@ -264,6 +388,30 @@ impl SseDecoder {
             output.push(ChatEvent::Usage(TokenUsage {
                 input_tokens: usage.prompt_tokens,
                 output_tokens: usage.completion_tokens,
+            }));
+        }
+        Ok(())
+    }
+
+    fn emit_tool_calls(&mut self, output: &mut Vec<ChatEvent>) -> ProviderResult<()> {
+        for (_, pending) in std::mem::take(&mut self.tool_calls) {
+            let id = pending
+                .id
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| protocol_error("streamed tool call is missing an id"))?;
+            if pending.name.is_empty() {
+                return Err(protocol_error("streamed tool call is missing a name"));
+            }
+            let arguments = if pending.arguments.trim().is_empty() {
+                serde_json::Value::Object(serde_json::Map::new())
+            } else {
+                serde_json::from_str(&pending.arguments)
+                    .map_err(|_| protocol_error("streamed tool arguments are not valid JSON"))?
+            };
+            output.push(ChatEvent::ToolCall(ToolCall {
+                id,
+                name: pending.name,
+                arguments,
             }));
         }
         Ok(())
@@ -298,6 +446,7 @@ fn protocol_error(message: &'static str) -> ProviderError {
 mod tests {
     use crumb_llm::{
         ChatEvent, ChatMessage, ChatRequest, ChatRole, FinishReason, ProviderErrorKind, TokenUsage,
+        ToolChoice, ToolDefinition,
     };
 
     use super::{ChatCompletionRequest, SseDecoder};
@@ -306,10 +455,9 @@ mod tests {
     fn chat_request_uses_openai_roles_and_streaming() {
         let request = ChatRequest {
             model: "openai".to_owned(),
-            messages: vec![ChatMessage {
-                role: ChatRole::User,
-                content: "hello".to_owned(),
-            }],
+            messages: vec![ChatMessage::text(ChatRole::User, "hello")],
+            tools: Vec::new(),
+            tool_choice: ToolChoice::None,
             max_output_tokens: Some(64),
         };
 
@@ -322,6 +470,84 @@ mod tests {
         assert_eq!(json["stream"], true);
         assert_eq!(json["stream_options"]["include_usage"], true);
         assert_eq!(json["max_tokens"], 64);
+        assert!(json.get("tools").is_none());
+        assert!(json.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn chat_request_serializes_tools_and_choice() {
+        let request = ChatRequest {
+            model: "openai".to_owned(),
+            messages: vec![ChatMessage::text(ChatRole::User, "weather")],
+            tools: vec![ToolDefinition {
+                name: "weather".to_owned(),
+                description: "Read the forecast".to_owned(),
+                input_schema: serde_json::json!({"type":"object"}),
+            }],
+            tool_choice: ToolChoice::Auto,
+            max_output_tokens: None,
+        };
+        let json = serde_json::to_value(ChatCompletionRequest::from(&request))
+            .expect("request should serialize");
+
+        assert_eq!(json["tool_choice"], "auto");
+        assert_eq!(json["tools"][0]["type"], "function");
+        assert_eq!(json["tools"][0]["function"]["name"], "weather");
+    }
+
+    #[test]
+    fn chat_request_serializes_correlated_tool_history() {
+        let call = crumb_llm::ToolCall {
+            id: "call_1".to_owned(),
+            name: "weather".to_owned(),
+            arguments: serde_json::json!({"city":"Pune"}),
+        };
+        let request = ChatRequest {
+            model: "openai".to_owned(),
+            messages: vec![
+                ChatMessage::assistant_tool_calls(vec![call]),
+                ChatMessage::tool_result("call_1", "sunny"),
+            ],
+            tools: Vec::new(),
+            tool_choice: ToolChoice::None,
+            max_output_tokens: None,
+        };
+        let json = serde_json::to_value(ChatCompletionRequest::from(&request))
+            .expect("request should serialize");
+
+        assert_eq!(
+            json["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            r#"{"city":"Pune"}"#
+        );
+        assert_eq!(json["messages"][1]["role"], "tool");
+        assert_eq!(json["messages"][1]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn decoder_assembles_streamed_tool_calls() {
+        let payload = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"wea","arguments":"{\"city\":"}}]},"finish_reason":null}]}
+
+"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"ther","arguments":"\"Pune\"}"}}]},"finish_reason":"tool_calls"}]}
+
+"#,
+            "data: [DONE]\n\n"
+        );
+        let mut decoder = SseDecoder::default();
+        let events = decoder.push(payload.as_bytes()).expect("valid tool stream");
+
+        assert_eq!(
+            events,
+            vec![
+                ChatEvent::ToolCall(crumb_llm::ToolCall {
+                    id: "call_1".to_owned(),
+                    name: "weather".to_owned(),
+                    arguments: serde_json::json!({"city":"Pune"}),
+                }),
+                ChatEvent::Finished(FinishReason::ToolCall),
+            ]
+        );
     }
 
     #[test]

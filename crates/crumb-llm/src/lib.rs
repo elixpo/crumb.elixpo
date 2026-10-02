@@ -45,6 +45,64 @@ pub enum ChatRole {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    pub tool_call_id: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+}
+
+impl ChatMessage {
+    #[must_use]
+    pub fn text(role: ChatRole, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn assistant_tool_calls(calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: ChatRole::Assistant,
+            content: String::new(),
+            tool_call_id: None,
+            tool_calls: calls,
+        }
+    }
+
+    #[must_use]
+    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Tool,
+            content: content.into(),
+            tool_call_id: Some(call_id.into()),
+            tool_calls: Vec::new(),
+        }
+    }
+}
+
+/// Model-visible declaration of one callable function.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+/// Complete, provider-neutral function call assembled from a stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+/// How the model may choose from the supplied tools.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolChoice {
+    Auto,
+    None,
+    Required,
 }
 
 /// Input for one streamed chat request.
@@ -52,6 +110,8 @@ pub struct ChatMessage {
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
+    pub tools: Vec<ToolDefinition>,
+    pub tool_choice: ToolChoice,
     pub max_output_tokens: Option<u32>,
 }
 
@@ -75,6 +135,7 @@ pub enum FinishReason {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChatEvent {
     TextDelta(String),
+    ToolCall(ToolCall),
     Usage(TokenUsage),
     Finished(FinishReason),
 }
@@ -231,7 +292,7 @@ mod tests {
     use super::{
         ChatEvent, ChatMessage, ChatRequest, ChatRole, EmbeddingRequest, EmbeddingResponse,
         FinishReason, LlmProvider, MockProvider, ModelCapability, ModelInfo, ProviderError,
-        ProviderErrorKind, TokenUsage,
+        ProviderErrorKind, TokenUsage, ToolChoice,
     };
 
     fn resolve<T>(future: impl Future<Output = T>) -> T {
@@ -284,10 +345,9 @@ mod tests {
         let provider = MockProvider::new(vec![model()], events.clone(), embeddings());
         let request = ChatRequest {
             model: "mock-chat".to_owned(),
-            messages: vec![ChatMessage {
-                role: ChatRole::User,
-                content: "hello".to_owned(),
-            }],
+            messages: vec![ChatMessage::text(ChatRole::User, "hello")],
+            tools: Vec::new(),
+            tool_choice: ToolChoice::None,
             max_output_tokens: Some(32),
         };
         let mut stream = resolve(provider.chat_stream(request)).expect("stream should start");
