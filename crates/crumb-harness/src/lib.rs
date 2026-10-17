@@ -147,6 +147,9 @@ impl Conversation {
 pub struct HarnessOutcome {
     pub text: String,
     pub usage: TokenUsage,
+    /// Tokens occupying the model context at the end of the turn. Unlike
+    /// `usage`, this is not summed across tool-call rounds.
+    pub context_tokens: u64,
     pub model_rounds: usize,
     pub tool_calls: usize,
 }
@@ -620,6 +623,10 @@ fn finish_turn(
     usage: TokenUsage,
     metrics: &TurnMetrics,
 ) -> HarnessOutcome {
+    let context_tokens = round
+        .usage
+        .input_tokens
+        .saturating_add(round.usage.output_tokens);
     let final_text = sanitize_agent_response(&round.text, &turn.user_message);
     let chunks = if final_text == round.text {
         round.text_chunks
@@ -633,6 +640,7 @@ fn finish_turn(
     HarnessOutcome {
         text: final_text,
         usage,
+        context_tokens,
         model_rounds: metrics.model_rounds,
         tool_calls: metrics.tool_calls,
     }
@@ -1405,6 +1413,10 @@ mod tests {
                 name: "weather".to_owned(),
                 arguments: json!({"city":"Pune"}),
             }),
+            ChatEvent::Usage(TokenUsage {
+                input_tokens: 100,
+                output_tokens: 2,
+            }),
             ChatEvent::Finished(FinishReason::ToolCall),
         ]
     }
@@ -1459,6 +1471,9 @@ mod tests {
         assert_eq!(outcome.text, "It is 24 C.");
         assert_eq!(outcome.model_rounds, 2);
         assert_eq!(outcome.tool_calls, 1);
+        assert_eq!(outcome.usage.input_tokens, 110);
+        assert_eq!(outcome.usage.output_tokens, 7);
+        assert_eq!(outcome.context_tokens, 15);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(conversation.len(), 1);
         assert!(

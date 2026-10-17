@@ -727,7 +727,7 @@ impl AgentRuntime {
                 .context("agent session is unavailable")?
                 .record_memory_retrieval(audit.record_ids, audit.conflict_topics, audit.omitted)?;
         }
-        let skill_context = load_enabled_skill_context(&config.skills, &workspace)?;
+        let skill_context = load_enabled_skill_context(&config.skills, &workspace, request)?;
         let prepared_request = attach_skill_context(&memory.request, &skill_context);
         let mut trusted_context = memory.context.into_iter().collect::<Vec<_>>();
         trusted_context.push(runtime_session_context(
@@ -845,10 +845,12 @@ impl AgentRuntime {
         });
         let turn_tokens = estimated.max(reported);
         self.session_tokens_estimate = self.session_tokens_estimate.saturating_add(turn_tokens);
-        self.context_tokens_estimate = self
-            .context_tokens_estimate
-            .saturating_add(estimated)
-            .max(reported);
+        let reported_context = result.map_or(0, |result| result.context_tokens);
+        self.context_tokens_estimate = if reported_context > 0 {
+            reported_context
+        } else {
+            self.context_tokens_estimate.saturating_add(estimated)
+        };
         let threshold = limit.saturating_mul(4) / 5;
         if auto_compaction && threshold > 0 && self.context_tokens_estimate >= threshold {
             self.context_tokens_estimate = limit.saturating_mul(16) / 100;
@@ -988,6 +990,7 @@ impl AgentRuntime {
             finish_reason: Some("stop".to_owned()),
             input_tokens: outcome.usage.input_tokens,
             output_tokens: outcome.usage.output_tokens,
+            context_tokens: outcome.context_tokens,
             events: Vec::new(),
             notifications: Vec::new(),
         })
@@ -1259,10 +1262,14 @@ fn attach_skill_context(request: &str, contexts: &[String]) -> String {
     )
 }
 
-fn load_enabled_skill_context(skills: &[SkillConfig], workspace: &Path) -> Result<Vec<String>> {
+fn load_enabled_skill_context(
+    skills: &[SkillConfig],
+    workspace: &Path,
+    request: &str,
+) -> Result<Vec<String>> {
     let enabled = skills
         .iter()
-        .filter(|skill| skill.enabled)
+        .filter(|skill| skill.enabled && skill_is_relevant(skill, request))
         .collect::<Vec<_>>();
     if enabled.is_empty() {
         return Ok(Vec::new());
@@ -1297,6 +1304,55 @@ fn load_enabled_skill_context(skills: &[SkillConfig], workspace: &Path) -> Resul
         context_bytes = projected;
     }
     Ok(contexts)
+}
+
+fn skill_is_relevant(skill: &SkillConfig, request: &str) -> bool {
+    if crate::bundled_skills::id_from_path(&skill.path).is_none() {
+        return true;
+    }
+    let request = request.to_ascii_lowercase();
+    let contains_any = |terms: &[&str]| terms.iter().any(|term| request.contains(term));
+    match skill.id.as_str() {
+        "codebase-map" => contains_any(&[
+            "repo",
+            "project",
+            "codebase",
+            "file",
+            "folder",
+            "directory",
+            "source",
+            "cargo",
+        ]),
+        "failure-autopsy" => contains_any(&[
+            "fail", "error", "broken", "crash", "bug", "wrong", "diagnose", "debug",
+        ]),
+        "test-repair" => contains_any(&["test", "spec", "ci", "assert"]),
+        "safe-refactor" => contains_any(&["refactor", "cleanup", "restructure", "rename"]),
+        "security-review" => contains_any(&[
+            "security",
+            "secure",
+            "vulnerability",
+            "permission",
+            "secret",
+            "auth",
+            "oauth",
+        ]),
+        "plan-execute" => contains_any(&[
+            "build",
+            "implement",
+            "create",
+            "change",
+            "add",
+            "fix",
+            "plan",
+            "multiple",
+        ]),
+        "web-research" => contains_any(&[
+            "search", "web", "online", "current", "latest", "today", "weather", "news", "price",
+            "festival", "who is", "what is",
+        ]),
+        _ => true,
+    }
 }
 
 fn estimate_tokens(text: &str) -> u64 {
@@ -1534,8 +1590,8 @@ mod tests {
             enabled: true,
         }];
 
-        let context =
-            load_enabled_skill_context(&skills, &workspace).expect("skill context can be loaded");
+        let context = load_enabled_skill_context(&skills, &workspace, "inspect this")
+            .expect("skill context can be loaded");
         let prompt = attach_skill_context("inspect this", &context);
 
         assert!(prompt.contains("## Active skill: review"));
@@ -1553,12 +1609,39 @@ mod tests {
             enabled: true,
         }];
 
-        let context = load_enabled_skill_context(&skills, Path::new("."))
+        let context = load_enabled_skill_context(&skills, Path::new("."), "diagnose this failure")
             .expect("bundled skill context loads");
         let prompt = attach_skill_context("diagnose this", &context);
 
         assert!(prompt.contains("## Active skill: failure-autopsy"));
         assert!(prompt.contains("first causal error"));
+    }
+
+    #[test]
+    fn unrelated_bundled_skills_are_not_sent_to_the_model() {
+        let skills = [
+            SkillConfig {
+                id: "codebase-map".to_owned(),
+                path: crate::bundled_skills::path("codebase-map"),
+                enabled: true,
+            },
+            SkillConfig {
+                id: "web-research".to_owned(),
+                path: crate::bundled_skills::path("web-research"),
+                enabled: true,
+            },
+        ];
+
+        let context = load_enabled_skill_context(
+            &skills,
+            Path::new("."),
+            "find the project folder on my computer",
+        )
+        .expect("relevant bundled skills load");
+
+        assert_eq!(context.len(), 1);
+        assert!(context[0].contains("codebase-map"));
+        assert!(!context[0].contains("web-research"));
     }
 
     #[test]

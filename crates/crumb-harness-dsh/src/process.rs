@@ -74,6 +74,8 @@ pub struct RunResult {
     pub finish_reason: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Tokens in the latest model context, distinct from cumulative turn usage.
+    pub context_tokens: u64,
     pub events: Vec<serde_json::Value>,
     pub notifications: Vec<Notification>,
 }
@@ -588,6 +590,7 @@ impl<'a> RunProjection<'a> {
             finish_reason: finish_reason(&self.events)?,
             input_tokens: 0,
             output_tokens: 0,
+            context_tokens: 0,
             events: self.events,
             notifications: self.notifications,
         })

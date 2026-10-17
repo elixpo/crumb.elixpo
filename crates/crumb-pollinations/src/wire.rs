@@ -24,6 +24,18 @@ impl<'a> From<&'a ChatRequest> for ChatCompletionRequest<'a> {
     fn from(request: &'a ChatRequest) -> Self {
         let prompt_cache_supported =
             supports_prompt_cache(&request.model, request.tools.is_empty());
+        let cacheable_user_messages = if prompt_cache_supported {
+            request
+                .messages
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(|(index, message)| (message.role == ChatRole::User).then_some(index))
+                .take(3)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         Self {
             model: &request.model,
             messages: request
@@ -33,7 +45,9 @@ impl<'a> From<&'a ChatRequest> for ChatCompletionRequest<'a> {
                 .map(|(index, message)| {
                     ChatCompletionMessage::new(
                         message,
-                        prompt_cache_supported && index == 0 && message.role == ChatRole::System,
+                        prompt_cache_supported
+                            && ((index == 0 && message.role == ChatRole::System)
+                                || cacheable_user_messages.contains(&index)),
                     )
                 })
                 .collect(),
@@ -523,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn nova_request_marks_only_the_stable_system_prefix_for_caching() {
+    fn nova_request_caches_the_system_prefix_and_latest_user_turn() {
         let request = ChatRequest {
             model: "nova-fast".to_owned(),
             messages: vec![
@@ -546,7 +560,11 @@ mod tests {
             "ephemeral"
         );
         assert_eq!(json["messages"][1]["content"], "dynamic");
-        assert_eq!(json["messages"][2]["content"], "hello");
+        assert_eq!(json["messages"][2]["content"][0]["text"], "hello");
+        assert_eq!(
+            json["messages"][2]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
     }
 
     #[test]
