@@ -324,6 +324,22 @@ fn sensitive_shell_command(command: &str) -> bool {
 
 /// Native implementation of one registered tool.
 pub trait ToolHandler: Send + Sync {
+    /// Normalizes arguments before approval, activity reporting, and execution.
+    /// The default preserves the provider request exactly. Implementations may
+    /// apply deterministic, non-mutating optimizations such as command proxy
+    /// rewriting, but must safely fall back to the original arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when arguments cannot be prepared safely.
+    fn prepare(
+        &self,
+        arguments: &serde_json::Value,
+        _cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value> {
+        Ok(arguments.clone())
+    }
+
     /// Executes with already-authorized arguments.
     ///
     /// # Errors
@@ -434,6 +450,33 @@ impl ToolHost {
     #[must_use]
     pub fn descriptor(&self, name: &str) -> Option<&ToolDescriptor> {
         self.registry.get(name)
+    }
+
+    /// Prepares one tool request using its registered implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the tool is unknown, cancelled, or argument
+    /// preparation fails internally.
+    pub fn prepare_arguments(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<serde_json::Value, ToolCallError> {
+        if cancellation.is_cancelled() {
+            return Err(ToolCallError::new(
+                ToolCallErrorKind::Cancelled,
+                "tool call cancelled",
+            ));
+        }
+        let handler = self
+            .handlers
+            .get(name)
+            .ok_or_else(|| ToolCallError::new(ToolCallErrorKind::UnknownTool, "unknown tool"))?;
+        handler
+            .prepare(arguments, cancellation)
+            .map_err(|_| ToolCallError::new(ToolCallErrorKind::Internal, "tool preparation failed"))
     }
 
     /// Authorizes and executes one tool call.

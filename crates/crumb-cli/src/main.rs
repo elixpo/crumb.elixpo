@@ -479,6 +479,7 @@ fn shell_tool_config(config: &AgentConfig, max_output_bytes: usize) -> AgentShel
         program: disposable.program,
         arguments: disposable.arguments,
         path: disposable.path,
+        command_rewriter: Some(PathBuf::from("rtk")),
         inherit_environment: config.permissions.mode == ApprovalMode::FullAccess,
         max_output_bytes: disposable.max_output_bytes,
         timeout: Duration::from_secs(config.limits.max_shell_command_seconds),

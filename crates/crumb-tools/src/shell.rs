@@ -25,6 +25,9 @@ pub struct AgentShellConfig {
     pub program: PathBuf,
     pub arguments: Vec<OsString>,
     pub path: Option<OsString>,
+    /// Optional local command proxy used to rewrite supported commands before
+    /// approval and execution (for example, `rtk rewrite`).
+    pub command_rewriter: Option<PathBuf>,
     /// Preserve the launching terminal's environment for explicitly selected
     /// full-access sessions. Safer permission modes keep the isolated
     /// PATH-only environment.
@@ -105,6 +108,15 @@ struct ShellTool {
 }
 
 impl ToolHandler for ShellTool {
+    fn prepare(&self, arguments: &Value, cancellation: &CancellationToken) -> Result<Value> {
+        Ok(rewrite_arguments(
+            &self.workspace,
+            &self.config,
+            arguments,
+            cancellation,
+        ))
+    }
+
     fn call(&self, arguments: &Value, cancellation: &CancellationToken) -> Result<ToolOutput> {
         match run_shell(
             &self.workspace,
@@ -118,6 +130,60 @@ impl ToolHandler for ShellTool {
             Err(error) => Ok(ToolOutput::error(error.to_string())),
         }
     }
+}
+
+fn rewrite_arguments(
+    workspace: &Path,
+    config: &AgentShellConfig,
+    arguments: &Value,
+    cancellation: &CancellationToken,
+) -> Value {
+    let Some(rewriter) = config.command_rewriter.as_ref() else {
+        return arguments.clone();
+    };
+    let Some(command) = arguments.get("command").and_then(Value::as_str) else {
+        return arguments.clone();
+    };
+    if cancellation.is_cancelled() {
+        return arguments.clone();
+    }
+    let mut process = Command::new(rewriter);
+    process
+        .args(["rewrite", command])
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if !config.inherit_environment {
+        process.env_clear();
+    }
+    if let Some(path) = &config.path {
+        process.env("PATH", path);
+    }
+    let Ok(output) = process.output() else {
+        return arguments.clone();
+    };
+    let Some(rewritten) = accepted_rewrite(command, &output.stdout) else {
+        return arguments.clone();
+    };
+    let mut prepared = arguments.clone();
+    prepared["command"] = Value::String(rewritten);
+    prepared
+}
+
+fn accepted_rewrite(original: &str, output: &[u8]) -> Option<String> {
+    const MAX_REWRITE_BYTES: usize = 4 * 1024;
+    if output.len() > MAX_REWRITE_BYTES {
+        return None;
+    }
+    let rewritten = std::str::from_utf8(output).ok()?.trim();
+    if rewritten.is_empty()
+        || rewritten == original.trim()
+        || rewritten.contains(['\n', '\r', '\0'])
+    {
+        return None;
+    }
+    Some(rewritten.to_owned())
 }
 
 fn run_shell(
@@ -255,6 +321,7 @@ fn optimization_metadata(result: &OptimizationResult) -> Value {
 
 fn classify_output(command: &str) -> OutputKind {
     let command = command.trim_start();
+    let command = command.strip_prefix("rtk ").unwrap_or(command);
     if command.starts_with("cargo ") {
         OutputKind::Cargo
     } else if command.starts_with("git diff") {
@@ -440,7 +507,9 @@ mod tests {
     use crumb_optimize::OptimizationPipeline;
     use serde_json::json;
 
-    use super::{AgentShellConfig, register_shell_tool, register_shell_tool_with_optimizer};
+    use super::{
+        AgentShellConfig, accepted_rewrite, register_shell_tool, register_shell_tool_with_optimizer,
+    };
 
     struct AllowOnce;
 
@@ -494,6 +563,7 @@ mod tests {
             program,
             arguments,
             path,
+            command_rewriter: None,
             inherit_environment: false,
             max_output_bytes: 256,
             timeout,
@@ -538,6 +608,20 @@ mod tests {
             )
             .expect_err("process execution is approval gated");
         assert_eq!(error.kind, ToolCallErrorKind::Denied);
+    }
+
+    #[test]
+    fn rtk_rewrites_are_bounded_and_never_nested() {
+        assert_eq!(
+            accepted_rewrite("find . -name Cargo.toml", b"rtk find . -name Cargo.toml\n"),
+            Some("rtk find . -name Cargo.toml".to_owned())
+        );
+        assert_eq!(accepted_rewrite("pwd", b""), None);
+        assert_eq!(accepted_rewrite("pwd", b"rtk read x\nsecond line"), None);
+        assert_eq!(
+            accepted_rewrite("rtk git status", b"rtk git status\n"),
+            None
+        );
     }
 
     #[cfg(unix)]

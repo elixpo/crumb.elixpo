@@ -463,11 +463,17 @@ impl NativeHarness {
         sink: &mut dyn EventSink,
     ) -> Result<ExecutedTool, HarnessError> {
         ensure_active(cancellation, deadline)?;
+        let arguments = self
+            .tools
+            .prepare_arguments(&call.name, &call.arguments, cancellation)
+            .map_err(|error| {
+                HarnessError::new(HarnessErrorKind::InvalidRequest, error.to_string())
+            })?;
         let risk = self
             .tools
             .descriptor(&call.name)
             .map_or(RiskClass::CredentialSensitive, |tool| tool.risk);
-        let encoded = serde_json::to_vec(&call.arguments).map_err(|_| {
+        let encoded = serde_json::to_vec(&arguments).map_err(|_| {
             HarnessError::new(
                 HarnessErrorKind::InvalidRequest,
                 "tool arguments could not be encoded",
@@ -479,7 +485,7 @@ impl NativeHarness {
         sink.emit(HarnessEvent::ToolRequested {
             id: call.id.clone(),
             name: call.name.clone(),
-            detail: tool_request_detail(&call.name, &call.arguments),
+            detail: tool_request_detail(&call.name, &arguments),
         });
         let mut report_progress = |label: &str| {
             sink.emit(HarnessEvent::ToolProgress {
@@ -490,7 +496,7 @@ impl NativeHarness {
         };
         let result = self.tools.call_with_progress(
             &call.name,
-            &call.arguments,
+            &arguments,
             session.mode(),
             self.approvals.as_ref(),
             cancellation,
