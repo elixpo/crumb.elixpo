@@ -351,13 +351,8 @@ impl NativeHarness {
                 ));
             }
             metrics.model_rounds += 1;
-            let request = build_chat_request(
-                &turn,
-                &messages,
-                &definitions,
-                require_tool,
-                suppress_tools_once,
-            );
+            let tool_choice = (require_tool, suppress_tools_once);
+            let request = build_request(&turn, &messages, &definitions, tool_choice);
             let mut round = self
                 .run_model_round(request, cancellation, deadline, sink, &mut output_bytes)
                 .await?;
@@ -370,6 +365,7 @@ impl NativeHarness {
                         if prepare_grounding_retry(
                             &mut messages,
                             &round.text,
+                            &turn.user_message,
                             successful_tool_evidence,
                             &mut grounding_retry_used,
                             &mut suppress_tools_once,
@@ -427,6 +423,7 @@ impl NativeHarness {
             }
             successful_tool_evidence |=
                 record_successful_tool_evidence(&mut messages, round_succeeded);
+            suppress_tools_once = round_succeeded;
             if retries.prepare_failed_execution(&mut messages, &turn.user_message, &failed_tools) {
                 require_tool = true;
             }
@@ -710,9 +707,9 @@ fn should_retry_with_execution(user_message: &str, response: &str) -> bool {
     .any(|phrase| response.contains(phrase))
 }
 
-fn response_contradicts_successful_tool(response: &str) -> bool {
+fn response_needs_grounding_correction(response: &str, user_message: &str) -> bool {
     let response = response.to_ascii_lowercase();
-    [
+    let contradicts_evidence = [
         "permission restriction",
         "permission restrictions",
         "due to permissions",
@@ -726,20 +723,28 @@ fn response_contradicts_successful_tool(response: &str) -> bool {
         "no specific details are available",
     ]
     .iter()
-    .any(|phrase| response.contains(phrase))
+    .any(|phrase| response.contains(phrase));
+    let persona_only = strip_persona_boilerplate(&response, asks_about_identity(user_message))
+        .trim()
+        .is_empty();
+    contradicts_evidence || persona_only
 }
 
-fn build_chat_request(
+fn build_request(
     turn: &HarnessTurn,
     messages: &[ChatMessage],
     definitions: &[crumb_llm::ToolDefinition],
-    require_tool: bool,
-    suppress_tools: bool,
+    tool_choice: (bool, bool),
 ) -> ChatRequest {
+    let (require_tool, suppress_tools) = tool_choice;
     ChatRequest {
         model: turn.model.clone(),
         messages: messages.to_vec(),
-        tools: definitions.to_vec(),
+        tools: if suppress_tools {
+            Vec::new()
+        } else {
+            definitions.to_vec()
+        },
         tool_choice: if definitions.is_empty() || suppress_tools {
             ToolChoice::None
         } else if require_tool {
@@ -775,13 +780,14 @@ fn initial_tool_requirement(definitions: &[crumb_llm::ToolDefinition], user_mess
 fn prepare_grounding_retry(
     messages: &mut Vec<ChatMessage>,
     response: &str,
+    user_message: &str,
     successful_tool_evidence: bool,
     grounding_retry_used: &mut bool,
     suppress_tools_once: &mut bool,
 ) -> bool {
     if !successful_tool_evidence
         || *grounding_retry_used
-        || !response_contradicts_successful_tool(response)
+        || !response_needs_grounding_correction(response, user_message)
     {
         return false;
     }
@@ -1613,6 +1619,8 @@ mod tests {
                 .iter()
                 .any(|message| message.role == crumb_llm::ChatRole::Tool)
         );
+        assert_eq!(requests[1].tool_choice, ToolChoice::None);
+        assert_eq!(requests[1].tools.len(), 0);
         drop(requests);
         let journal = export_session(root.path(), "harness-test").expect("session exports");
         assert!(journal.events.iter().any(|event| matches!(
@@ -1817,7 +1825,7 @@ mod tests {
             ["run_shell"]
         );
         assert_eq!(requests[1].tool_choice, ToolChoice::Required);
-        assert_eq!(requests[2].tool_choice, ToolChoice::Auto);
+        assert_eq!(requests[2].tool_choice, ToolChoice::None);
         assert!(requests[1].messages.iter().any(|message| {
             message.role == ChatRole::System
                 && message
@@ -1885,6 +1893,10 @@ mod tests {
 
     #[test]
     fn repetitive_persona_boilerplate_is_removed() {
+        assert!(super::response_needs_grounding_correction(
+            "I am Crumb, an AI agent built by Elixpo.",
+            "find the folder"
+        ));
         assert_eq!(
             super::sanitize_agent_response(
                 "I'm Crumb, an AI system built by Elixpo. I'm here to assist you in a safe and respectful manner. How can I help you today? If you need assistance with a specific task, just let me know!",
