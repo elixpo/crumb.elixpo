@@ -549,6 +549,16 @@ name = "crumb-core"
 version = "0.1.0"
 
 [[package]]
+name = "crumb-graph"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "crumb-harness"
 version = "0.1.0"
 dependencies = [
