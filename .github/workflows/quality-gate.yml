@@ -16,7 +16,7 @@ jobs:
     steps:
       # ── Checkout the calling repo ──────────────────────────────────
       - name: Checkout calling repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # ── Install yq for YAML parsing ───────────────────────────────
       - name: Install yq
