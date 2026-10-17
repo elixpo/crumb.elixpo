@@ -1050,7 +1050,7 @@ mod tests {
             )
             .expect("retrieval");
 
-        assert!(retrieved.selected.is_empty());
+        assert_eq!(retrieved.selected.len(), 0);
         assert_eq!(retrieved.conflicts.len(), 1);
         assert_eq!(retrieved.conflicts[0].topic, "indentation");
         assert_eq!(retrieved.conflicts[0].record_ids.len(), 2);
@@ -1077,7 +1077,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.selected.len(), 1);
         assert_eq!(first.omitted, 1);
-        assert!(
+        assert_eq!(
             set.retrieve(
                 "rule",
                 &[],
@@ -1089,7 +1089,8 @@ mod tests {
             )
             .expect("bounded retrieval")
             .selected
-            .is_empty()
+            .len(),
+            0
         );
     }
 
