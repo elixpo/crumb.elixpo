@@ -114,7 +114,7 @@ engines remain replaceable; none may bypass Crumb's permission, credential, or s
 
 - [x] [Add provenance-aware memory retrieval and conflict handling](https://github.com/elixpo/crumb.elixpo/issues/43).
 - [x] [Add named personas and portable agent profiles](https://github.com/elixpo/crumb.elixpo/issues/44).
-- [ ] [Add graph-grounded project context with an optional Graphify adapter](https://github.com/elixpo/crumb.elixpo/issues/45).
+- [x] [Add graph-grounded project context with an optional Graphify adapter](https://github.com/elixpo/crumb.elixpo/issues/45).
   - [x] [WP-024: provider-neutral graph core and pinned Graphify adapter](https://github.com/elixpo/crumb.elixpo/issues/100).
   - [x] [WP-032: qualify Graphify retrieval and native fallback](https://github.com/elixpo/crumb.elixpo/issues/122).
   - Keep Graphify opt-in, local-first, pinned, and replaceable.
