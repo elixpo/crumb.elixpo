@@ -865,7 +865,7 @@ struct TranscriptState {
 
 impl TranscriptState {
     const MAX_LINES: usize = 4_096;
-    const SCROLL_STEP: usize = 4;
+    const SCROLL_STEP: usize = 8;
 
     fn append(&mut self, output: &str) -> bool {
         let appended = sanitize_transcript_output(output)
@@ -1134,18 +1134,41 @@ fn initialize_transcript(
     context_tokens: u64,
     writer: &mut dyn Write,
 ) -> Result<(u16, Arc<Mutex<TranscriptState>>)> {
-    let header_rows = render_startup(
-        renderer,
-        platform,
-        interactive,
-        fullscreen,
-        context_tokens,
-        writer,
-    )?;
-    let state = TranscriptState {
+    let (header_rows, startup_transcript) = if fullscreen {
+        let mut startup = Vec::new();
+        let header_rows = render_startup(
+            renderer,
+            platform,
+            interactive,
+            true,
+            context_tokens,
+            &mut startup,
+        )?;
+        writer.write_all(&startup)?;
+        (
+            header_rows,
+            Some(String::from_utf8_lossy(&startup).into_owned()),
+        )
+    } else {
+        (
+            render_startup(
+                renderer,
+                platform,
+                interactive,
+                false,
+                context_tokens,
+                writer,
+            )?,
+            None,
+        )
+    };
+    let mut state = TranscriptState {
         footer_context: context_footer_status(renderer, platform, cwd, context_tokens),
         ..TranscriptState::default()
     };
+    if let Some(startup) = startup_transcript {
+        state.append(startup.trim_end_matches('\n'));
+    }
     Ok((header_rows, Arc::new(Mutex::new(state))))
 }
 
@@ -9555,6 +9578,11 @@ mod tests {
         }
         assert_eq!(transcript.scroll_offset, 0);
         assert_eq!(transcript.unseen_lines, 0);
+    }
+
+    #[test]
+    fn transcript_scroll_moves_eight_lines_per_step() {
+        assert_eq!(TranscriptState::SCROLL_STEP, 8);
     }
 
     #[test]
