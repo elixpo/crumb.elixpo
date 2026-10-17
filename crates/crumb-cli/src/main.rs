@@ -2169,6 +2169,7 @@ fn observe_agent_turn(
                 writer,
                 terminal.interactive,
                 terminal.fullscreen,
+                context.workspace,
             )?;
             refresh_active_footer(renderer, terminal.fullscreen)?;
             activity = Some(start_activity(renderer, "Thinking", terminal.fullscreen));
@@ -2428,8 +2429,9 @@ fn resolve_tool_approval(
     writer: &mut dyn Write,
     interactive: bool,
     fullscreen: bool,
+    workspace: &Path,
 ) -> Result<()> {
-    let request = pending.request();
+    let request = pending.request().clone();
     let detail = trusted_tool_detail(&request.tool, pending.arguments());
     writeln!(
         writer,
@@ -2473,6 +2475,41 @@ fn resolve_tool_approval(
                 )?;
                 return Ok(());
             }
+            TerminalKeyCode::Char('a') => {
+                persist_tool_permission(workspace, &request)?;
+                let accepted = pending.allow_once();
+                writeln!(
+                    writer,
+                    "◇ {} · {}",
+                    if accepted {
+                        "Tool allowed"
+                    } else {
+                        "Request expired"
+                    },
+                    request.tool
+                )?;
+                return Ok(());
+            }
+            TerminalKeyCode::Char('s') => {
+                persist_permission_mode(workspace, ApprovalMode::SensitiveOnly)?;
+                let accepted = pending.allow_once();
+                writeln!(
+                    writer,
+                    "◇ Permission level · ask on sensitive commands{}",
+                    if accepted { "" } else { " · request expired" }
+                )?;
+                return Ok(());
+            }
+            TerminalKeyCode::Char('f') => {
+                persist_permission_mode(workspace, ApprovalMode::FullAccess)?;
+                let accepted = pending.allow_once();
+                writeln!(
+                    writer,
+                    "◇ Permission level · full access{}",
+                    if accepted { "" } else { " · request expired" }
+                )?;
+                return Ok(());
+            }
             TerminalKeyCode::Esc | TerminalKeyCode::Char('n') => {
                 let denied = pending.deny();
                 writeln!(
@@ -2490,6 +2527,38 @@ fn resolve_tool_approval(
             _ => {}
         }
     }
+}
+
+fn persist_permission_mode(workspace: &Path, mode: ApprovalMode) -> Result<()> {
+    update_agent_config(workspace, |config| {
+        config.permissions.mode = mode;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn persist_tool_permission(workspace: &Path, request: &crumb_agent::ApprovalRequest) -> Result<()> {
+    update_agent_config(workspace, |config| {
+        let tool = request.tool.clone();
+        if tool.starts_with("mcp__") {
+            config.permissions.allow_mcp_tools.insert(tool);
+        } else {
+            match request.risk {
+                RiskClass::NetworkAccess => {
+                    config.permissions.allow_network_tools.insert(tool);
+                }
+                RiskClass::WriteWorkspace => {
+                    config.permissions.allow_workspace_tools.insert(tool);
+                }
+                RiskClass::ProcessExecution => {
+                    config.permissions.allow_execution_tools.insert(tool);
+                }
+                _ => bail!("this permission can only be granted once"),
+            }
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 fn trusted_tool_detail(name: &str, arguments: &serde_json::Value) -> Option<String> {
@@ -9535,6 +9604,41 @@ mod tests {
         assert!(permissions.allow_network_tools.is_empty());
         assert!(permissions.allow_workspace_tools.is_empty());
         assert!(permissions.allow_execution_tools.is_empty());
+        std::fs::remove_dir_all(workspace).expect("workspace removed");
+    }
+
+    #[test]
+    fn approval_prompt_choices_persist_user_owned_elevation() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-inline-grant-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace is created");
+        let request = crumb_agent::ApprovalRequest {
+            tool: "run_shell".to_owned(),
+            risk: RiskClass::ProcessExecution,
+            arguments_digest: "digest".to_owned(),
+        };
+
+        super::persist_tool_permission(&workspace, &request).expect("tool grant persists");
+        assert!(
+            read_agent_config(&workspace)
+                .expect("config reloads")
+                .permissions
+                .allow_execution_tools
+                .contains("run_shell")
+        );
+
+        super::persist_permission_mode(&workspace, ApprovalMode::FullAccess)
+            .expect("permission mode persists");
+        assert_eq!(
+            read_agent_config(&workspace)
+                .expect("config reloads")
+                .permissions
+                .mode,
+            ApprovalMode::FullAccess
+        );
         std::fs::remove_dir_all(workspace).expect("workspace removed");
     }
 

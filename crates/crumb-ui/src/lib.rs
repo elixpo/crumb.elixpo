@@ -809,7 +809,7 @@ impl Renderer {
         let short_digest = digest.get(..12).unwrap_or(digest);
         if self.settings.output == OutputMode::ScreenReader {
             let mut prompt = format!(
-                "Approval required for {name}, risk {risk}, request {short_digest}. Enter or y allows once; n or escape denies."
+                "Approval required for {name}, risk {risk}, request {short_digest}. Enter or y allows once; a always allows this tool; s selects sensitive-only mode; f selects full access; n or escape denies."
             );
             if let Some(detail) = detail {
                 let _ = write!(prompt, " Requested action: {detail}.");
@@ -827,7 +827,10 @@ impl Renderer {
             self.paint(name, "1"),
             detail_line,
             self.paint(&format!("risk {risk} · request {short_digest}"), "2"),
-            self.paint("Enter/y allow once · n/Esc deny", "2")
+            self.paint(
+                "Enter/y once · a always allow tool · s sensitive · f full access · n/Esc deny",
+                "2",
+            )
         )
     }
 
@@ -1791,7 +1794,7 @@ mod tests {
                 "0123456789abcdef",
                 None
             ),
-            "  [ CRUMB ]  Allow this tool once?\n  ╰──▶ write_file\n     risk workspace write · request 0123456789ab\n     Enter/y allow once · n/Esc deny"
+            "  [ CRUMB ]  Allow this tool once?\n  ╰──▶ write_file\n     risk workspace write · request 0123456789ab\n     Enter/y once · a always allow tool · s sensitive · f full access · n/Esc deny"
         );
         assert_eq!(
             renderer.agent_approval_prompt(
@@ -1800,7 +1803,7 @@ mod tests {
                 "0123456789abcdef",
                 Some("$ cargo test --workspace")
             ),
-            "  [ CRUMB ]  Allow this tool once?\n  ╰──▶ run_shell\n     $ cargo test --workspace\n     risk process execution · request 0123456789ab\n     Enter/y allow once · n/Esc deny"
+            "  [ CRUMB ]  Allow this tool once?\n  ╰──▶ run_shell\n     $ cargo test --workspace\n     risk process execution · request 0123456789ab\n     Enter/y once · a always allow tool · s sensitive · f full access · n/Esc deny"
         );
         assert_eq!(
             renderer.agent_tool_result("spawn_agents", true),
@@ -1853,7 +1856,7 @@ mod tests {
                 "0123456789abcdef",
                 None
             ),
-            "Approval required for write_file, risk workspace write, request 0123456789ab. Enter or y allows once; n or escape denies."
+            "Approval required for write_file, risk workspace write, request 0123456789ab. Enter or y allows once; a always allows this tool; s selects sensitive-only mode; f selects full access; n or escape denies."
         );
     }
 
