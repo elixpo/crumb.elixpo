@@ -339,8 +339,9 @@ impl NativeHarness {
         let mut usage = TokenUsage::default();
         let mut output_bytes = 0_usize;
         let mut retries = RequiredToolRetries::new(&definitions);
-        let mut require_tool = retry_status(&definitions, "run_shell") == RetryStatus::Ready
-            && user_requires_execution(&turn.user_message);
+        let mut require_tool = initial_tool_requirement(&definitions, &turn.user_message);
+        let (mut successful_tool_evidence, mut grounding_retry_used, mut suppress_tools_once) =
+            (false, false, false);
 
         loop {
             if metrics.model_rounds == self.limits.max_model_rounds.get() {
@@ -350,30 +351,31 @@ impl NativeHarness {
                 ));
             }
             metrics.model_rounds += 1;
-            let request = ChatRequest {
-                model: turn.model.clone(),
-                messages: messages.clone(),
-                tools: definitions.clone(),
-                tool_choice: if definitions.is_empty() {
-                    ToolChoice::None
-                } else if require_tool {
-                    ToolChoice::Required
-                } else {
-                    ToolChoice::Auto
-                },
-                max_output_tokens: turn.max_output_tokens,
-            };
+            let request = build_chat_request(
+                &turn,
+                &messages,
+                &definitions,
+                require_tool,
+                suppress_tools_once,
+            );
             let mut round = self
                 .run_model_round(request, cancellation, deadline, sink, &mut output_bytes)
                 .await?;
             require_tool = false;
-            usage.input_tokens = usage.input_tokens.saturating_add(round.usage.input_tokens);
-            usage.output_tokens = usage
-                .output_tokens
-                .saturating_add(round.usage.output_tokens);
+            suppress_tools_once = false;
+            record_usage(&mut usage, round.usage);
             if round.calls.is_empty() {
                 match round.finish {
                     Some(FinishReason::Stop | FinishReason::Other(_)) => {
+                        if prepare_grounding_retry(
+                            &mut messages,
+                            &round.text,
+                            successful_tool_evidence,
+                            &mut grounding_retry_used,
+                            &mut suppress_tools_once,
+                        ) {
+                            continue;
+                        }
                         if retries.prepare(&mut messages, &turn.user_message, &round.text) {
                             require_tool = true;
                             continue;
@@ -405,6 +407,7 @@ impl NativeHarness {
                 tool_calls: round.calls.clone(),
             });
             let mut failed_tools = Vec::new();
+            let mut round_succeeded = false;
             for call in round.calls {
                 if metrics.tool_calls == self.limits.max_tool_calls.get() {
                     return Err(HarnessError::new(
@@ -415,11 +418,15 @@ impl NativeHarness {
                 metrics.tool_calls += 1;
                 let result = self.execute_tool(session, &call, cancellation, deadline, sink)?;
                 add_output_bytes(&mut output_bytes, result.content.len(), self.limits)?;
-                if !result.success {
+                if result.success {
+                    round_succeeded = true;
+                } else {
                     failed_tools.push(call.name.clone());
                 }
                 messages.push(ChatMessage::tool_result(call.id, result.content));
             }
+            successful_tool_evidence |=
+                record_successful_tool_evidence(&mut messages, round_succeeded);
             if retries.prepare_failed_execution(&mut messages, &turn.user_message, &failed_tools) {
                 require_tool = true;
             }
@@ -701,6 +708,91 @@ fn should_retry_with_execution(user_message: &str, response: &str) -> bool {
     ]
     .iter()
     .any(|phrase| response.contains(phrase))
+}
+
+fn response_contradicts_successful_tool(response: &str) -> bool {
+    let response = response.to_ascii_lowercase();
+    [
+        "permission restriction",
+        "permission restrictions",
+        "due to permissions",
+        "due to permission",
+        "don't have permission",
+        "do not have permission",
+        "can't provide the contents",
+        "cannot provide the contents",
+        "can't provide the details",
+        "cannot provide the details",
+        "no specific details are available",
+    ]
+    .iter()
+    .any(|phrase| response.contains(phrase))
+}
+
+fn build_chat_request(
+    turn: &HarnessTurn,
+    messages: &[ChatMessage],
+    definitions: &[crumb_llm::ToolDefinition],
+    require_tool: bool,
+    suppress_tools: bool,
+) -> ChatRequest {
+    ChatRequest {
+        model: turn.model.clone(),
+        messages: messages.to_vec(),
+        tools: definitions.to_vec(),
+        tool_choice: if definitions.is_empty() || suppress_tools {
+            ToolChoice::None
+        } else if require_tool {
+            ToolChoice::Required
+        } else {
+            ToolChoice::Auto
+        },
+        max_output_tokens: turn.max_output_tokens,
+    }
+}
+
+fn record_successful_tool_evidence(messages: &mut Vec<ChatMessage>, round_succeeded: bool) -> bool {
+    if !round_succeeded {
+        return false;
+    }
+    messages.push(ChatMessage::text(
+        ChatRole::System,
+        "Use the successful tool result as authoritative evidence. Answer every requested item directly; do not invent an access or permission failure and do not add identity or unrelated information.",
+    ));
+    true
+}
+
+fn record_usage(total: &mut TokenUsage, round: TokenUsage) {
+    total.input_tokens = total.input_tokens.saturating_add(round.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(round.output_tokens);
+}
+
+fn initial_tool_requirement(definitions: &[crumb_llm::ToolDefinition], user_message: &str) -> bool {
+    retry_status(definitions, "run_shell") == RetryStatus::Ready
+        && user_requires_execution(user_message)
+}
+
+fn prepare_grounding_retry(
+    messages: &mut Vec<ChatMessage>,
+    response: &str,
+    successful_tool_evidence: bool,
+    grounding_retry_used: &mut bool,
+    suppress_tools_once: &mut bool,
+) -> bool {
+    if !successful_tool_evidence
+        || *grounding_retry_used
+        || !response_contradicts_successful_tool(response)
+    {
+        return false;
+    }
+    messages.push(ChatMessage::text(ChatRole::Assistant, response));
+    messages.push(ChatMessage::text(
+        ChatRole::System,
+        "The prior tool execution succeeded. Correct the answer using its result. Do not claim a permission or access restriction, do not repeat identity, and answer only the user's requested items. Do not call another tool.",
+    ));
+    *grounding_retry_used = true;
+    *suppress_tools_once = true;
+    true
 }
 
 fn user_requires_execution(user_message: &str) -> bool {
@@ -1057,6 +1149,11 @@ fn is_persona_boilerplate(sentence: &str, identity_requested: bool) -> bool {
         || sentence.starts_with("i'm an ai")
         || sentence.starts_with("i’m an ai")
         || sentence.starts_with("you can think of me as an ai");
+    let unsolicited_identity_aside = !identity_requested
+        && sentence.contains("identity")
+        && (sentence.contains("i am crumb")
+            || sentence.contains("i'm crumb")
+            || sentence.contains("i’m crumb"));
     let false_identity_denial = identity_requested
         && (sentence.contains("i don't have a name")
             || sentence.contains("i do not have a name")
@@ -1066,6 +1163,7 @@ fn is_persona_boilerplate(sentence: &str, identity_requested: bool) -> bool {
         || sentence.starts_with("if you need"))
         && (sentence.contains("let me know") || sentence.contains("feel free to ask"));
     (!identity_requested && identity_preamble)
+        || unsolicited_identity_aside
         || false_identity_denial
         || generic_invitation
         || sentence.starts_with("how can i help")
@@ -1509,9 +1607,11 @@ mod tests {
         assert!(!streamed.contains("placeholder"));
         let requests = provider.requests.lock().expect("request lock");
         assert_eq!(requests[0].messages[0].role, crumb_llm::ChatRole::System);
-        assert_eq!(
-            requests[1].messages.last().expect("tool result").role,
-            crumb_llm::ChatRole::Tool
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|message| message.role == crumb_llm::ChatRole::Tool)
         );
         drop(requests);
         let journal = export_session(root.path(), "harness-test").expect("session exports");
@@ -1535,6 +1635,55 @@ mod tests {
         for secret in ["weather in Pune", "Pune", "24 C", "Be warm and brief"] {
             assert!(!persisted.contains(secret));
         }
+    }
+
+    #[tokio::test]
+    async fn successful_tool_result_corrects_false_permission_refusal_without_rerunning() {
+        let refusal_round = vec![
+            ChatEvent::TextDelta(
+                "Sorry, I cannot provide the contents due to permission restrictions.\n\nAs for my identity, I am Crumb, an AI agent built by Elixpo."
+                    .to_owned(),
+            ),
+            ChatEvent::Finished(FinishReason::Stop),
+        ];
+        let corrected_round = vec![
+            ChatEvent::TextDelta("The requested folders are `one` and `two`.".to_owned()),
+            ChatEvent::Finished(FinishReason::Stop),
+        ];
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_round(),
+            refusal_round,
+            corrected_round,
+        ]));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let harness = NativeHarness::new(
+            provider.clone(),
+            tools(calls.clone()),
+            Arc::new(DenyAllApprovals),
+            HarnessLimits::default(),
+        );
+        let (root, mut session) = session(AgentMode::Auto);
+        let mut conversation = harness.conversation();
+        let mut events = Vec::new();
+
+        let outcome = harness
+            .run_turn(
+                &mut session,
+                &mut conversation,
+                turn(),
+                &CancellationToken::default(),
+                &mut events,
+            )
+            .await
+            .expect("turn succeeds");
+
+        assert_eq!(outcome.text, "The requested folders are `one` and `two`.");
+        assert_eq!(outcome.model_rounds, 3);
+        assert_eq!(outcome.tool_calls, 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let requests = provider.requests.lock().expect("request lock");
+        assert_eq!(requests[2].tool_choice, ToolChoice::None);
+        drop(root);
     }
 
     #[tokio::test]
@@ -1749,6 +1898,13 @@ mod tests {
                 "did the tests pass?"
             ),
             "The test suite passes."
+        );
+        assert_eq!(
+            super::sanitize_agent_response(
+                "The folder is `/tmp`.\n\nAs for my identity, I am Crumb, an AI agent built by Elixpo.",
+                "find the folder"
+            ),
+            "The folder is `/tmp`."
         );
         assert_eq!(
             super::sanitize_agent_response(
