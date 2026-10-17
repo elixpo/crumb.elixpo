@@ -23,6 +23,19 @@ pub enum AgentMode {
     Plan,
 }
 
+/// User-selected approval policy for tools that cross a trust boundary.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalMode {
+    /// Ask before every network, write, process, MCP, or privileged operation.
+    #[default]
+    AlwaysAsk,
+    /// Run ordinary operations automatically and ask before sensitive ones.
+    SensitiveOnly,
+    /// Run every registered tool without prompting. The model cannot select this mode.
+    FullAccess,
+}
+
 /// Controls optional AI assistance after a native command fails.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -349,6 +362,8 @@ pub struct OptimizerConfig {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToolPermissions {
+    /// Global approval behavior selected by the user.
+    pub mode: ApprovalMode,
     /// Network tools allowed without an interactive approval bridge.
     pub allow_network_tools: BTreeSet<String>,
     /// Workspace-write tools explicitly enabled by the user.

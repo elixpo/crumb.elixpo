@@ -758,21 +758,35 @@ impl Renderer {
         )
     }
 
-    /// Renders a trusted allow-once decision without exposing raw arguments.
+    /// Renders a trusted allow-once decision with an optional bounded summary.
     #[must_use]
-    pub fn agent_approval_prompt(&self, name: &str, risk: &str, digest: &str) -> String {
+    pub fn agent_approval_prompt(
+        &self,
+        name: &str,
+        risk: &str,
+        digest: &str,
+        detail: Option<&str>,
+    ) -> String {
         let short_digest = digest.get(..12).unwrap_or(digest);
         if self.settings.output == OutputMode::ScreenReader {
-            return format!(
+            let mut prompt = format!(
                 "Approval required for {name}, risk {risk}, request {short_digest}. Enter or y allows once; n or escape denies."
             );
+            if let Some(detail) = detail {
+                let _ = write!(prompt, " Requested action: {detail}.");
+            }
+            return prompt;
         }
+        let detail_line = detail.map_or_else(String::new, |detail| {
+            format!("\n     {}", self.paint(detail, "36;1"))
+        });
         format!(
-            "  {}  {}\n  {} {}\n     {}\n     {}",
+            "  {}  {}\n  {} {}{}\n     {}\n     {}",
             self.paint("[ CRUMB ]", "38;2;255;255;204;48;5;53;1"),
             self.paint("Allow this tool once?", "33;1"),
             self.paint("╰──▶", "33;1"),
             self.paint(name, "1"),
+            detail_line,
             self.paint(&format!("risk {risk} · request {short_digest}"), "2"),
             self.paint("Enter/y allow once · n/Esc deny", "2")
         )
@@ -1675,8 +1689,22 @@ mod tests {
             "  [ CRUMB ]  Approval required\n  ╰──▶ write_file · user permission required"
         );
         assert_eq!(
-            renderer.agent_approval_prompt("write_file", "workspace write", "0123456789abcdef"),
+            renderer.agent_approval_prompt(
+                "write_file",
+                "workspace write",
+                "0123456789abcdef",
+                None
+            ),
             "  [ CRUMB ]  Allow this tool once?\n  ╰──▶ write_file\n     risk workspace write · request 0123456789ab\n     Enter/y allow once · n/Esc deny"
+        );
+        assert_eq!(
+            renderer.agent_approval_prompt(
+                "run_shell",
+                "process execution",
+                "0123456789abcdef",
+                Some("$ cargo test --workspace")
+            ),
+            "  [ CRUMB ]  Allow this tool once?\n  ╰──▶ run_shell\n     $ cargo test --workspace\n     risk process execution · request 0123456789ab\n     Enter/y allow once · n/Esc deny"
         );
         assert_eq!(
             renderer.agent_tool_result("spawn_agents", true),
@@ -1706,7 +1734,12 @@ mod tests {
             "Approval required for tool write_file"
         );
         assert_eq!(
-            renderer.agent_approval_prompt("write_file", "workspace write", "0123456789abcdef"),
+            renderer.agent_approval_prompt(
+                "write_file",
+                "workspace write",
+                "0123456789abcdef",
+                None
+            ),
             "Approval required for write_file, risk workspace write, request 0123456789ab. Enter or y allows once; n or escape denies."
         );
     }

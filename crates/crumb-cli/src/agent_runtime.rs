@@ -78,6 +78,7 @@ impl ApprovalBroker for TurnApprovals {
 
 fn configured_approvals(config: &AgentConfig) -> ConfiguredApprovals {
     ConfiguredApprovals::new(config.permissions.allow_network_tools.clone())
+        .with_mode(config.permissions.mode)
         .with_workspace_tools(config.permissions.allow_workspace_tools.clone())
         .with_process_tools(config.permissions.allow_execution_tools.clone())
         .with_mcp_tools(config.permissions.allow_mcp_tools.clone())
@@ -162,7 +163,9 @@ impl EventSink for NativeEventBridge<'_> {
         let activity = match event {
             HarnessEvent::TurnStarted => Some(HarnessActivity::RequestAccepted),
             HarnessEvent::TextDelta(text) => Some(HarnessActivity::ResponseDelta { text }),
-            HarnessEvent::ToolRequested { name, .. } => Some(HarnessActivity::ToolStarted { name }),
+            HarnessEvent::ToolRequested { name, detail, .. } => {
+                Some(HarnessActivity::ToolStarted { name, detail })
+            }
             HarnessEvent::ToolProgress { label, .. } => Some(HarnessActivity::Progress { label }),
             HarnessEvent::ToolFinished { name, success, .. } => {
                 Some(HarnessActivity::ToolFinished { name, success })

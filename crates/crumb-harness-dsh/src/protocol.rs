@@ -69,16 +69,37 @@ pub struct Notification {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HarnessActivity {
     RequestAccepted,
-    ResponseDelta { text: String },
-    Status { state: String },
-    ToolStarted { name: String },
-    ApprovalRequired { name: String },
-    ToolOutput { name: String, bytes: Option<u64> },
-    ToolFinished { name: String, success: bool },
-    Completed { reason: String },
-    Failed { reason: String },
+    ResponseDelta {
+        text: String,
+    },
+    Status {
+        state: String,
+    },
+    ToolStarted {
+        name: String,
+        detail: Option<String>,
+    },
+    ApprovalRequired {
+        name: String,
+    },
+    ToolOutput {
+        name: String,
+        bytes: Option<u64>,
+    },
+    ToolFinished {
+        name: String,
+        success: bool,
+    },
+    Completed {
+        reason: String,
+    },
+    Failed {
+        reason: String,
+    },
     Cancelled,
-    Progress { label: String },
+    Progress {
+        label: String,
+    },
 }
 
 impl Notification {
@@ -100,7 +121,7 @@ impl Notification {
         match event_type {
             "agent/inbox/spliced" => Some(HarnessActivity::RequestAccepted),
             "tool/start" | "tool/call" | "tool/requested" => {
-                Some(HarnessActivity::ToolStarted { name })
+                Some(HarnessActivity::ToolStarted { name, detail: None })
             }
             "approval/requested" | "tool/approval" => {
                 Some(HarnessActivity::ApprovalRequired { name })
@@ -372,7 +393,8 @@ mod tests {
         assert_eq!(
             notification.activity(),
             Some(HarnessActivity::ToolStarted {
-                name: "shell31m run".to_owned()
+                name: "shell31m run".to_owned(),
+                detail: None,
             })
         );
         assert!(!format!("{:?}", notification.activity()).contains("secret command"));

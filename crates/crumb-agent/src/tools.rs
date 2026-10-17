@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentMode, CancellationToken, CredentialReference};
+use crate::{AgentMode, ApprovalMode, CancellationToken, CredentialReference};
 
 /// Deterministic risk assigned by Rust-owned tool metadata.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -178,6 +178,7 @@ impl ApprovalBroker for DenyAllApprovals {
 /// Approval policy derived only from explicit user configuration.
 #[derive(Clone, Debug, Default)]
 pub struct ConfiguredApprovals {
+    mode: ApprovalMode,
     network: BTreeSet<String>,
     workspace: BTreeSet<String>,
     processes: BTreeSet<String>,
@@ -188,11 +189,18 @@ impl ConfiguredApprovals {
     #[must_use]
     pub fn new(network_tools: BTreeSet<String>) -> Self {
         Self {
+            mode: ApprovalMode::AlwaysAsk,
             network: network_tools,
             workspace: BTreeSet::new(),
             processes: BTreeSet::new(),
             mcp: BTreeSet::new(),
         }
+    }
+
+    #[must_use]
+    pub const fn with_mode(mut self, mode: ApprovalMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     #[must_use]
@@ -218,20 +226,100 @@ impl ApprovalBroker for ConfiguredApprovals {
     fn decide(
         &self,
         request: &ApprovalRequest,
-        _arguments: &serde_json::Value,
+        arguments: &serde_json::Value,
         _cancellation: &CancellationToken,
     ) -> ApprovalDecision {
-        if (request.tool.starts_with("mcp__") && self.mcp.contains(&request.tool))
+        let explicitly_allowed = (request.tool.starts_with("mcp__")
+            && self.mcp.contains(&request.tool))
             || (request.risk == RiskClass::NetworkAccess && self.network.contains(&request.tool))
-            || (request.risk == RiskClass::WriteWorkspace && self.workspace.contains(&request.tool))
+            || (request.risk == RiskClass::WriteWorkspace
+                && self.workspace.contains(&request.tool))
             || (request.risk == RiskClass::ProcessExecution
-                && self.processes.contains(&request.tool))
-        {
-            ApprovalDecision::AllowOnce
-        } else {
-            ApprovalDecision::Deny
+                && self.processes.contains(&request.tool));
+        if explicitly_allowed {
+            return ApprovalDecision::AllowOnce;
+        }
+        match self.mode {
+            ApprovalMode::AlwaysAsk => ApprovalDecision::Deny,
+            ApprovalMode::FullAccess => ApprovalDecision::AllowOnce,
+            ApprovalMode::SensitiveOnly => {
+                if sensitive_request(request, arguments) {
+                    ApprovalDecision::Deny
+                } else {
+                    ApprovalDecision::AllowOnce
+                }
+            }
         }
     }
+}
+
+fn sensitive_request(request: &ApprovalRequest, arguments: &serde_json::Value) -> bool {
+    match request.risk {
+        RiskClass::ReadOnly | RiskClass::NetworkAccess | RiskClass::WriteWorkspace => false,
+        RiskClass::ProcessExecution => match request.tool.as_str() {
+            "run_shell" => arguments
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(sensitive_shell_command),
+            "run_disposable" => arguments
+                .get("script")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(sensitive_shell_command),
+            _ => true,
+        },
+        RiskClass::SystemMutation | RiskClass::CredentialSensitive | RiskClass::Destructive => true,
+    }
+}
+
+fn sensitive_shell_command(command: &str) -> bool {
+    let command = format!(" {} ", command.to_ascii_lowercase());
+    [
+        " sudo ",
+        " su ",
+        " rm ",
+        " rmdir ",
+        " shred ",
+        " chmod ",
+        " chown ",
+        " kill ",
+        " pkill ",
+        " killall ",
+        " dd ",
+        " mkfs",
+        " mount ",
+        " umount ",
+        " passwd ",
+        " useradd ",
+        " userdel ",
+        " systemctl ",
+        " service ",
+        " shutdown ",
+        " reboot ",
+        " poweroff ",
+        " apt install",
+        " apt remove",
+        " apt purge",
+        " dnf install",
+        " yum install",
+        " pacman -s",
+        " brew install",
+        " npm publish",
+        " cargo publish",
+        " git push",
+        " git reset --hard",
+        " git clean ",
+        " curl ",
+        " wget ",
+        " .ssh/",
+        " .aws/",
+        " .config/gcloud",
+        " /etc/",
+        " /usr/",
+        " /bin/",
+        " /sbin/",
+    ]
+    .iter()
+    .any(|marker| command.contains(marker))
 }
 
 /// Native implementation of one registered tool.
@@ -524,7 +612,7 @@ mod tests {
 
     use anyhow::Result;
 
-    use crate::{AgentMode, CancellationToken};
+    use crate::{AgentMode, ApprovalMode, CancellationToken};
 
     use super::{
         ApprovalBroker, ApprovalDecision, ApprovalRequest, ConfiguredApprovals, DenyAllApprovals,
@@ -699,6 +787,53 @@ mod tests {
         );
         assert_eq!(
             ConfiguredApprovals::default().decide(&request, &serde_json::json!({}), &cancellation),
+            ApprovalDecision::Deny
+        );
+    }
+
+    #[test]
+    fn approval_modes_distinguish_safe_and_sensitive_shell_commands() {
+        let request = ApprovalRequest {
+            tool: "run_shell".to_owned(),
+            risk: RiskClass::ProcessExecution,
+            arguments_digest: "digest".to_owned(),
+        };
+        let cancellation = CancellationToken::default();
+        let sensitive = ConfiguredApprovals::default().with_mode(ApprovalMode::SensitiveOnly);
+        assert_eq!(
+            sensitive.decide(
+                &request,
+                &serde_json::json!({"command":"cargo test --workspace"}),
+                &cancellation,
+            ),
+            ApprovalDecision::AllowOnce
+        );
+        assert_eq!(
+            sensitive.decide(
+                &request,
+                &serde_json::json!({"command":"sudo rm -rf /tmp/example"}),
+                &cancellation,
+            ),
+            ApprovalDecision::Deny
+        );
+        assert_eq!(
+            ConfiguredApprovals::default()
+                .with_mode(ApprovalMode::FullAccess)
+                .decide(
+                    &request,
+                    &serde_json::json!({"command":"sudo rm -rf /tmp/example"}),
+                    &cancellation,
+                ),
+            ApprovalDecision::AllowOnce
+        );
+        assert_eq!(
+            ConfiguredApprovals::default()
+                .with_mode(ApprovalMode::AlwaysAsk)
+                .decide(
+                    &request,
+                    &serde_json::json!({"command":"pwd"}),
+                    &cancellation,
+                ),
             ApprovalDecision::Deny
         );
     }

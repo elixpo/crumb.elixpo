@@ -276,6 +276,18 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "inspect agent permissions",
     },
     SlashCommand {
+        usage: "/permissions always-ask",
+        description: "ask before every privileged tool",
+    },
+    SlashCommand {
+        usage: "/permissions sensitive",
+        description: "ask only before sensitive commands",
+    },
+    SlashCommand {
+        usage: "/permissions full-access",
+        description: "run registered tools without prompts",
+    },
+    SlashCommand {
         usage: "/permissions allow-network ",
         description: "allow web_fetch or web_search",
     },

@@ -403,7 +403,8 @@ fn terminate(child: &mut Child) {
 fn descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: RUN_SHELL.to_owned(),
-        description: "Run a bounded command in Crumb's isolated agent shell.".to_owned(),
+        description: "Run a bounded shell command in the workspace, including pipelines and command chains. Use this to inspect, build, test, and operate the project instead of telling the user to run commands."
+            .to_owned(),
         input_schema: json!({
             "type":"object",
             "properties":{

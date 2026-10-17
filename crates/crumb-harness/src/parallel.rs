@@ -409,7 +409,10 @@ impl EventSink for TeamEvents {
     fn emit(&mut self, event: HarnessEvent) {
         let label = match event {
             HarnessEvent::TurnStarted => Some("Thinking".to_owned()),
-            HarnessEvent::ToolRequested { name, .. } => Some(tool_activity_label(&name)),
+            HarnessEvent::ToolRequested { name, detail, .. } => Some(detail.map_or_else(
+                || tool_activity_label(&name),
+                |detail| format!("{} · {detail}", tool_activity_label(&name)),
+            )),
             HarnessEvent::ToolProgress { label, .. } => Some(label),
             HarnessEvent::ToolFinished { name, success, .. } => Some(format!(
                 "{} · {}",

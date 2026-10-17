@@ -62,6 +62,7 @@ pub enum HarnessEvent {
     ToolRequested {
         id: String,
         name: String,
+        detail: Option<String>,
     },
     ToolProgress {
         id: String,
@@ -475,6 +476,7 @@ impl NativeHarness {
         sink.emit(HarnessEvent::ToolRequested {
             id: call.id.clone(),
             name: call.name.clone(),
+            detail: tool_request_detail(&call.name, &call.arguments),
         });
         let mut report_progress = |label: &str| {
             sink.emit(HarnessEvent::ToolProgress {
@@ -512,6 +514,32 @@ impl NativeHarness {
         });
         Ok(content)
     }
+}
+
+fn tool_request_detail(name: &str, arguments: &serde_json::Value) -> Option<String> {
+    let field = match name {
+        "run_shell" => "command",
+        "web_search" => "query",
+        "web_fetch" => "url",
+        _ => return None,
+    };
+    let raw = arguments.get(field)?.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut detail = String::with_capacity(raw.len().min(512));
+    for character in raw.chars() {
+        if detail.len() >= 512 {
+            detail.push('…');
+            break;
+        }
+        if character == '\n' || character == '\r' || character == '\t' {
+            detail.push(' ');
+        } else if !character.is_control() {
+            detail.push(character);
+        }
+    }
+    Some(detail)
 }
 
 fn system_messages(turn: &HarnessTurn) -> Vec<ChatMessage> {
@@ -1103,6 +1131,33 @@ mod tests {
         assert_eq!(
             super::sanitize_agent_response(markdown, "show the code"),
             markdown
+        );
+    }
+
+    #[test]
+    fn visible_tool_activity_includes_only_safe_transient_fields() {
+        assert_eq!(
+            super::tool_request_detail(
+                "run_shell",
+                &serde_json::json!({"command":"cargo test\n--workspace"})
+            )
+            .as_deref(),
+            Some("cargo test --workspace")
+        );
+        assert_eq!(
+            super::tool_request_detail(
+                "web_search",
+                &serde_json::json!({"query":"current Rust release"})
+            )
+            .as_deref(),
+            Some("current Rust release")
+        );
+        assert_eq!(
+            super::tool_request_detail(
+                "write_file",
+                &serde_json::json!({"path":"secret.txt", "content":"never expose this"})
+            ),
+            None
         );
     }
 

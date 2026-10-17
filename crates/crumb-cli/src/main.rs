@@ -25,14 +25,15 @@ use crossterm::terminal::{
     enable_raw_mode, size,
 };
 use crumb_agent::{
-    AgentConfig, AgentMode, BackendDiscovery, CacheRetention, CancellationToken, CommandCatalog,
-    CompatibilityFlag, ConfiguredApprovals, CredentialReference, HarnessConfig, InputRoute, JobId,
-    JobSchedule, JobState, JobStore, LiveConfig, McpServer, McpTransport, MistakePolicy, Modality,
-    ModelRoute, NewJob, OutputKind, PendingApproval, ProviderCompatibility, ProviderConfig,
-    ProviderHeader, ProviderModel, ProviderProtocol, ProviderTransport, RiskClass, RouteDecision,
-    RouteReason, SkillConfig, SteeringAction, SteeringQueue, TokenOptimizer, ToolHost, TurnStatus,
-    UnknownInputPolicy, export_session, list_sessions, search_sessions, session_summary,
-    set_session_archived, set_session_label, tool_activity_label, trash_session,
+    AgentConfig, AgentMode, ApprovalMode, BackendDiscovery, CacheRetention, CancellationToken,
+    CommandCatalog, CompatibilityFlag, ConfiguredApprovals, CredentialReference, HarnessConfig,
+    InputRoute, JobId, JobSchedule, JobState, JobStore, LiveConfig, McpServer, McpTransport,
+    MistakePolicy, Modality, ModelRoute, NewJob, OutputKind, PendingApproval,
+    ProviderCompatibility, ProviderConfig, ProviderHeader, ProviderModel, ProviderProtocol,
+    ProviderTransport, RiskClass, RouteDecision, RouteReason, SkillConfig, SteeringAction,
+    SteeringQueue, TokenOptimizer, ToolHost, TurnStatus, UnknownInputPolicy, export_session,
+    list_sessions, search_sessions, session_summary, set_session_archived, set_session_label,
+    tool_activity_label, trash_session,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
@@ -368,6 +369,7 @@ fn serve_mcp() -> Result<()> {
         host,
         Arc::new(
             ConfiguredApprovals::new(config.permissions.allow_network_tools.clone())
+                .with_mode(config.permissions.mode)
                 .with_workspace_tools(config.permissions.allow_workspace_tools.clone())
                 .with_process_tools(config.permissions.allow_execution_tools.clone())
                 .with_mcp_tools(config.permissions.allow_mcp_tools.clone()),
@@ -2058,6 +2060,7 @@ fn resolve_tool_approval(
     interactive: bool,
 ) -> Result<()> {
     let request = pending.request();
+    let detail = trusted_tool_detail(&request.tool, pending.arguments());
     writeln!(
         writer,
         "{}",
@@ -2065,6 +2068,7 @@ fn resolve_tool_approval(
             &request.tool,
             approval_risk_label(request.risk),
             &request.arguments_digest,
+            detail.as_deref(),
         )
     )?;
     writer.flush()?;
@@ -2111,6 +2115,37 @@ fn resolve_tool_approval(
             _ => {}
         }
     }
+}
+
+fn trusted_tool_detail(name: &str, arguments: &serde_json::Value) -> Option<String> {
+    let field = match name {
+        "run_shell" => "command",
+        "web_search" => "query",
+        "web_fetch" => "url",
+        _ => return None,
+    };
+    let raw = arguments.get(field)?.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut detail = String::with_capacity(raw.len().min(512));
+    for character in raw.chars() {
+        if detail.len() >= 512 {
+            detail.push('…');
+            break;
+        }
+        if character == '\n' || character == '\r' || character == '\t' {
+            detail.push(' ');
+        } else if !character.is_control() {
+            detail.push(character);
+        }
+    }
+    Some(match name {
+        "run_shell" => format!("$ {detail}"),
+        "web_search" => format!("search: {detail}"),
+        "web_fetch" => format!("fetch: {detail}"),
+        _ => detail,
+    })
 }
 
 const fn approval_risk_label(risk: RiskClass) -> &'static str {
@@ -2573,10 +2608,12 @@ fn harness_activity_label(activity: &HarnessActivity) -> String {
         HarnessActivity::RequestAccepted => "request accepted".to_owned(),
         HarnessActivity::ResponseDelta { .. } => "responding".to_owned(),
         HarnessActivity::Status { state } => format!("session {state}"),
-        HarnessActivity::ToolStarted { name } if name == "spawn_agents" => {
+        HarnessActivity::ToolStarted { name, .. } if name == "spawn_agents" => {
             "coordinating parallel agent team".to_owned()
         }
-        HarnessActivity::ToolStarted { name } => tool_activity_label(name),
+        HarnessActivity::ToolStarted { name, detail } => {
+            visible_tool_activity(name, detail.as_deref())
+        }
         HarnessActivity::ApprovalRequired { name } if name == "spawn_agents" => {
             "approval required · parallel agent team".to_owned()
         }
@@ -2616,7 +2653,7 @@ fn render_harness_activity(
             write_bounded_response_delta(writer, text, streamed_column)?;
             writer.flush()?;
         }
-        HarnessActivity::ToolStarted { name } if name == "spawn_agents" => {
+        HarnessActivity::ToolStarted { name, .. } if name == "spawn_agents" => {
             replace_activity(
                 indicator,
                 renderer,
@@ -2624,7 +2661,20 @@ fn render_harness_activity(
                 fullscreen,
             );
         }
-        HarnessActivity::ToolStarted { name } => {
+        HarnessActivity::ToolStarted {
+            name,
+            detail: Some(detail),
+        } => {
+            finish_activity_line(indicator, writer)?;
+            writeln!(
+                writer,
+                "{}",
+                renderer.agent_activity(&visible_tool_activity(name, Some(detail)))
+            )?;
+            writer.flush()?;
+            replace_activity(indicator, renderer, &tool_activity_label(name), fullscreen);
+        }
+        HarnessActivity::ToolStarted { name, detail: None } => {
             replace_activity(indicator, renderer, &tool_activity_label(name), fullscreen);
         }
         HarnessActivity::ToolOutput { name, .. } if name == "spawn_agents" => {
@@ -2680,6 +2730,16 @@ fn render_harness_activity(
         }
     }
     Ok(())
+}
+
+fn visible_tool_activity(name: &str, detail: Option<&str>) -> String {
+    match (name, detail) {
+        ("run_shell", Some(command)) => format!("Running command · $ {command}"),
+        ("web_search", Some(query)) => format!("Searching web · {query}"),
+        ("web_fetch", Some(url)) => format!("Fetching page · {url}"),
+        (_, Some(detail)) => format!("{} · {detail}", tool_activity_label(name)),
+        (_, None) => tool_activity_label(name),
+    }
 }
 
 fn finish_activity_line(
@@ -3166,77 +3226,49 @@ fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
                 .is_some_and(|routes| !routes.is_empty()),
         ),
     ] {
-        let granted = matches!(
+        let explicitly_granted = matches!(
             name,
             "current_time" | "read_file" | "list_directory" | "detect_stack"
         ) || config.permissions.allow_network_tools.contains(name)
             || config.permissions.allow_workspace_tools.contains(name)
             || config.permissions.allow_execution_tools.contains(name);
+        let (marker, policy) =
+            if explicitly_granted || config.permissions.mode == ApprovalMode::FullAccess {
+                ("●", "")
+            } else if config.permissions.mode == ApprovalMode::SensitiveOnly {
+                ("◐", " · asks if sensitive")
+            } else {
+                ("○", "")
+            };
         writeln!(
             writer,
-            "  {} {name:<18} {risk}{}",
-            if granted { "●" } else { "○" },
+            "  {marker} {name:<18} {risk}{policy}{}",
             if available { "" } else { " · unavailable" }
         )?;
     }
-    writeln!(writer, "  ● granted · ○ approval required/denied")?;
+    writeln!(
+        writer,
+        "  ● allowed · ◐ ask if sensitive · ○ always ask/denied"
+    )?;
     Ok(())
 }
 
 fn configure_permissions(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     let arguments = command.split_whitespace().skip(1).collect::<Vec<_>>();
     if arguments.is_empty() {
-        let config = read_agent_config(cwd)?;
-        writeln!(writer, "◆ Agent permissions")?;
-        writeln!(
-            writer,
-            "  network    {}",
-            joined_or_none(&config.permissions.allow_network_tools)
-        )?;
-        writeln!(
-            writer,
-            "  workspace  {}",
-            joined_or_none(&config.permissions.allow_workspace_tools)
-        )?;
-        writeln!(
-            writer,
-            "  execution  {}",
-            joined_or_none(&config.permissions.allow_execution_tools)
-        )?;
-        writeln!(
-            writer,
-            "  MCP        {}",
-            joined_or_none(&config.permissions.allow_mcp_tools)
-        )?;
-        writeln!(
-            writer,
-            "  Grants are user-owned; models cannot add or widen them."
-        )?;
+        show_permissions(cwd, writer)?;
+        return Ok(());
+    }
+    if select_permission_mode(&arguments, cwd, writer)? {
         return Ok(());
     }
     if arguments.as_slice() == ["allow-all"] {
-        update_agent_config(cwd, |config| {
-            config
-                .permissions
-                .allow_network_tools
-                .extend(["spawn_agents", "web_fetch", "web_search"].map(str::to_owned));
-            config
-                .permissions
-                .allow_workspace_tools
-                .insert("write_file".to_owned());
-            config
-                .permissions
-                .allow_execution_tools
-                .extend(["run_disposable", "run_shell"].map(str::to_owned));
-            Ok(())
-        })?;
-        writeln!(writer, "◆ Packaged agent tools allowed")?;
-        writeln!(writer, "  Network · workspace writes · execution")?;
+        grant_all_permissions(cwd, writer)?;
         return Ok(());
     }
     let [action, tool] = arguments.as_slice() else {
         bail!(
-            "usage: /permissions [allow-all|allow-network|deny-network|allow-workspace|deny-workspace|allow-execution|deny-execution <tool>]"
+            "usage: /permissions [always-ask|sensitive|full-access|allow-network|deny-network|allow-workspace|deny-workspace|allow-execution|deny-execution <tool>]"
         );
     };
     let (scope, allow) = match *action {
@@ -3280,6 +3312,106 @@ fn configure_permissions(command: &str, cwd: &Path, writer: &mut dyn Write) -> R
         if allow { "allowed" } else { "denied" }
     )?;
     Ok(())
+}
+
+fn select_permission_mode(arguments: &[&str], cwd: &Path, writer: &mut dyn Write) -> Result<bool> {
+    let selected_mode = match arguments {
+        ["always-ask"] | ["mode", "always-ask"] => Some(ApprovalMode::AlwaysAsk),
+        ["sensitive"] | ["mode", "sensitive"] => Some(ApprovalMode::SensitiveOnly),
+        ["full-access"] | ["mode", "full-access"] => Some(ApprovalMode::FullAccess),
+        _ => None,
+    };
+    let Some(mode) = selected_mode else {
+        return Ok(false);
+    };
+    update_agent_config(cwd, |config| {
+        config.permissions.mode = mode;
+        config.permissions.allow_network_tools.clear();
+        config.permissions.allow_workspace_tools.clear();
+        config.permissions.allow_execution_tools.clear();
+        config.permissions.allow_mcp_tools.clear();
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Permission level · {}", approval_mode_name(mode))?;
+    writeln!(
+        writer,
+        "  {}",
+        match mode {
+            ApprovalMode::AlwaysAsk => "Crumb asks before every privileged tool.",
+            ApprovalMode::SensitiveOnly => {
+                "Ordinary tools run directly; sensitive commands still require approval."
+            }
+            ApprovalMode::FullAccess => {
+                "All registered tools and shell commands run without prompting."
+            }
+        }
+    )?;
+    Ok(true)
+}
+
+fn grant_all_permissions(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    update_agent_config(cwd, |config| {
+        config.permissions.mode = ApprovalMode::FullAccess;
+        config
+            .permissions
+            .allow_network_tools
+            .extend(["spawn_agents", "web_fetch", "web_search"].map(str::to_owned));
+        config
+            .permissions
+            .allow_workspace_tools
+            .insert("write_file".to_owned());
+        config
+            .permissions
+            .allow_execution_tools
+            .extend(["run_disposable", "run_shell"].map(str::to_owned));
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Packaged agent tools allowed")?;
+    writeln!(writer, "  Network · workspace writes · execution")?;
+    Ok(())
+}
+
+fn show_permissions(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    writeln!(writer, "◆ Agent permissions")?;
+    writeln!(
+        writer,
+        "  level      {}",
+        approval_mode_name(config.permissions.mode)
+    )?;
+    writeln!(
+        writer,
+        "  network    {}",
+        joined_or_none(&config.permissions.allow_network_tools)
+    )?;
+    writeln!(
+        writer,
+        "  workspace  {}",
+        joined_or_none(&config.permissions.allow_workspace_tools)
+    )?;
+    writeln!(
+        writer,
+        "  execution  {}",
+        joined_or_none(&config.permissions.allow_execution_tools)
+    )?;
+    writeln!(
+        writer,
+        "  MCP        {}",
+        joined_or_none(&config.permissions.allow_mcp_tools)
+    )?;
+    writeln!(
+        writer,
+        "  Grants are user-owned; models cannot add or widen them."
+    )?;
+    Ok(())
+}
+
+const fn approval_mode_name(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::AlwaysAsk => "always ask",
+        ApprovalMode::SensitiveOnly => "ask on sensitive commands",
+        ApprovalMode::FullAccess => "full access",
+    }
 }
 
 fn joined_or_none(values: &std::collections::BTreeSet<String>) -> String {
@@ -8575,8 +8707,8 @@ mod tests {
 
     use crossterm::event::{Event as TerminalEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use crumb_agent::{
-        AgentConfig, CredentialReference, HarnessConfig, ProviderHeader, ProviderProtocol,
-        RiskClass, SkillConfig,
+        AgentConfig, ApprovalMode, CredentialReference, HarnessConfig, ProviderHeader,
+        ProviderProtocol, RiskClass, SkillConfig,
     };
     use crumb_marketplace::UpdateStatus;
     use crumb_memory::{MemoryScope, MemorySet, MemoryStore};
@@ -8768,6 +8900,17 @@ mod tests {
         assert!(permissions.allow_workspace_tools.contains("write_file"));
         assert!(permissions.allow_execution_tools.contains("run_shell"));
         assert!(permissions.allow_execution_tools.contains("run_disposable"));
+        assert_eq!(permissions.mode, ApprovalMode::FullAccess);
+
+        configure_permissions("/permissions sensitive", &workspace, &mut output)
+            .expect("sensitive approval mode is selected");
+        let permissions = read_agent_config(&workspace)
+            .expect("config reloads")
+            .permissions;
+        assert_eq!(permissions.mode, ApprovalMode::SensitiveOnly);
+        assert!(permissions.allow_network_tools.is_empty());
+        assert!(permissions.allow_workspace_tools.is_empty());
+        assert!(permissions.allow_execution_tools.is_empty());
         std::fs::remove_dir_all(workspace).expect("workspace removed");
     }
 
