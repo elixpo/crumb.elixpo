@@ -1874,7 +1874,7 @@ fn finish_agent_turn(
             PausedTurnAction::Cancel => Ok(AgentSequenceStep::Stop),
         },
         TurnInterruption::None | TurnInterruption::Paused => {
-            if streamed_response && result.is_ok() {
+            if streamed_response && result.is_ok() && !ui.terminal.fullscreen {
                 writeln!(ui.writer)?;
             } else {
                 render_agent_result(result, ui.renderer, ui.writer)?;
@@ -2708,6 +2708,11 @@ fn render_harness_activity(
 ) -> Result<()> {
     match activity {
         HarnessActivity::ResponseDelta { text } => {
+            if fullscreen {
+                *streamed_response = true;
+                replace_activity(indicator, renderer, "Writing response", fullscreen);
+                return Ok(());
+            }
             finish_activity_line(indicator, writer)?;
             if !*streamed_response {
                 write!(writer, "{} ", terminal_agent_response(renderer, ""))?;

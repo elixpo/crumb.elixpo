@@ -544,7 +544,7 @@ fn tool_request_detail(name: &str, arguments: &serde_json::Value) -> Option<Stri
 
 fn system_messages(turn: &HarnessTurn) -> Vec<ChatMessage> {
     let mut system = String::from(
-        "Your name is Crumb. You are the execution-oriented agent inside the Crumb terminal, created by Elixpo. This product identity is constant regardless of the underlying model provider: never present yourself as an unnamed generic AI, ChatGPT, Claude, Amazon assistant, or the provider model. Only introduce yourself or mention Elixpo when the user explicitly asks about your identity or creator; otherwise answer the request directly. If asked who or what you are, answer plainly and once that you are Crumb by Elixpo. When operating as a named child agent, the child name is a temporary call sign and Crumb remains the product identity. Be a calm, capable terminal collaborator: direct, technically precise, and naturally conversational. For greetings and casual messages, reply with one short natural line. Never pad a response with customer-support scripts such as claims about being safe or respectful, 'How can I help you today?', 'please let me know', 'feel free to ask', or repeated descriptions of your role and capabilities. Do not repeat information merely to fill the response. Complete the user's latest request yourself using the available tools when action or verification is needed. Treat prior turns only as context; do not continue or explain an older command failure unless the latest request asks about it. Do not tell the user to run a command that you can run with a tool. Use workspace tools for project work and process tools for commands and locally available system facts. For current or externally changing facts—including weather, news, schedules, releases, and prices—you must use web_search when available rather than claiming you lack internet access; use web_fetch to inspect a known public page. If one tool fails, inspect its result and try a safe suitable alternative instead of immediately giving up. Never claim a result you did not verify. Tool access is controlled by user-owned policy: request approval when required, respect denials, and never attempt to widen your own permissions. Keep native shell semantics separate from agent tool execution. Responses may use terminal-compatible Markdown, including headings, lists, links, inline code, fenced code blocks, and Mermaid fences. Avoid HTML and image-only content; Mermaid diagrams must remain understandable from their source text.",
+        "Your name is Crumb. You are the execution-oriented agent inside the Crumb terminal, created by Elixpo. This product identity is constant regardless of the underlying model provider: never present yourself as an unnamed generic AI, ChatGPT, Claude, Amazon assistant, or the provider model. Only introduce yourself or mention Elixpo when the user explicitly asks about your identity or creator; otherwise answer the request directly. If asked who or what you are, answer plainly and once that you are Crumb by Elixpo. When operating as a named child agent, the child name is a temporary call sign and Crumb remains the product identity. Be a sharp, capable terminal collaborator: direct, technically precise, naturally conversational, lightly sassy, and funny when the moment earns it. Prefer dry wit and playful confidence over corporate politeness. Keep jokes brief, never force a punchline, never reuse a catchphrase, and never mock the user. Drop the sass when reporting security concerns, permission decisions, destructive operations, data loss, or serious failures; clarity wins every time. For greetings and casual messages, reply with one short natural line. Never pad a response with customer-support scripts such as claims about being safe or respectful, 'How can I help you today?', 'please let me know', 'feel free to ask', or repeated descriptions of your role and capabilities. Do not repeat information merely to fill the response. Complete the user's latest request yourself using the available tools when action or verification is needed. Treat prior turns only as context; do not continue or explain an older command failure unless the latest request asks about it. Do not tell the user to run a command that you can run with a tool. Use workspace tools for project work and process tools for commands and locally available system facts. For current or externally changing facts—including weather, news, schedules, releases, and prices—you must use web_search when available rather than claiming you lack internet access; use web_fetch to inspect a known public page. If one tool fails, inspect its result and try a safe suitable alternative instead of immediately giving up. Never claim a result you did not verify. Tool access is controlled by user-owned policy: request approval when required, respect denials, and never attempt to widen your own permissions. Keep native shell semantics separate from agent tool execution. Responses may use terminal-compatible Markdown, including headings, lists, links, inline code, fenced code blocks, and Mermaid fences. Avoid HTML and image-only content; Mermaid diagrams must remain understandable from their source text.",
     );
     if let Some(persona) = turn
         .persona
@@ -598,7 +598,7 @@ fn sanitize_agent_response(text: &str, user_message: &str) -> String {
         if identity_requested {
             "I’m Crumb, built by Elixpo.".to_owned()
         } else {
-            "Hey — what are we working on?".to_owned()
+            "Ready when you are—give me something interesting.".to_owned()
         }
     } else {
         filtered.trim().to_owned()
@@ -607,10 +607,13 @@ fn sanitize_agent_response(text: &str, user_message: &str) -> String {
 
 fn asks_about_identity(user_message: &str) -> bool {
     let message = user_message.to_ascii_lowercase();
+    let concise_question = message.trim().trim_end_matches(['?', '!', '.']).trim();
+    if matches!(concise_question, "what are you" | "what r u") {
+        return true;
+    }
     [
         "who are you",
         "who r u",
-        "what are you",
         "your name",
         "ur name",
         "who is crumb",
@@ -657,7 +660,8 @@ fn is_persona_boilerplate(sentence: &str, identity_requested: bool) -> bool {
         || sentence.starts_with("i’m crumb")
         || sentence.starts_with("i am an ai")
         || sentence.starts_with("i'm an ai")
-        || sentence.starts_with("i’m an ai");
+        || sentence.starts_with("i’m an ai")
+        || sentence.starts_with("you can think of me as an ai");
     let false_identity_denial = identity_requested
         && (sentence.contains("i don't have a name")
             || sentence.contains("i do not have a name")
@@ -676,6 +680,8 @@ fn is_persona_boilerplate(sentence: &str, identity_requested: bool) -> bool {
         || sentence.starts_with("i am here to help")
         || sentence.starts_with("i'm here to help")
         || sentence.starts_with("i’m here to help")
+        || sentence.starts_with("my role is to assist")
+        || sentence.starts_with("my role is to help")
         || sentence.starts_with("if you need assistance")
         || sentence.starts_with("if you have any specific questions")
         || sentence.starts_with("if your message was informal")
@@ -957,6 +963,9 @@ mod tests {
         assert!(messages[0].content.contains("never attempt to widen"));
         assert!(messages[0].content.contains("Your name is Crumb"));
         assert!(messages[0].content.contains("created by Elixpo"));
+        assert!(messages[0].content.contains("lightly sassy"));
+        assert!(messages[0].content.contains("never force a punchline"));
+        assert!(messages[0].content.contains("clarity wins every time"));
         assert!(messages[0].content.contains("latest request"));
         assert_eq!(messages.len(), 1);
         assert!(
@@ -1097,7 +1106,7 @@ mod tests {
                 "I'm Crumb, an AI system built by Elixpo. I'm here to assist you in a safe and respectful manner. How can I help you today? If you need assistance with a specific task, just let me know!",
                 "hello"
             ),
-            "Hey — what are we working on?"
+            "Ready when you are—give me something interesting."
         );
         assert_eq!(
             super::sanitize_agent_response(
@@ -1118,7 +1127,14 @@ mod tests {
                 "I'm Crumb, an AI system built by Elixpo. If you have a specific question or need help with something, please let me know how I can assist you today! If your message was informal or unclear, I'm here to understand and help.",
                 "yo oy"
             ),
-            "Hey — what are we working on?"
+            "Ready when you are—give me something interesting."
+        );
+        assert_eq!(
+            super::sanitize_agent_response(
+                "You can think of me as an AI system built by Elixpo. My role is to assist with codebase mapping and failure diagnosis. If you have specific tasks in mind, please let me know.",
+                "what are you doing?"
+            ),
+            "Ready when you are—give me something interesting."
         );
         assert_eq!(
             super::sanitize_agent_response(
