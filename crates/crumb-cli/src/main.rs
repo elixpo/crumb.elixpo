@@ -39,7 +39,9 @@ use crumb_marketplace::{
     Catalog, InstallScope, Installer, Package, bundled_catalog, verify_package_files,
 };
 use crumb_mcp::{McpDispatcher, serve_stdio};
-use crumb_memory::{MemoryProvenance, MemoryRecord, MemoryScope, MemorySet, MemoryStore};
+use crumb_memory::{
+    MemoryProvenance, MemoryRecord, MemoryRetirement, MemoryScope, MemorySet, MemoryStore,
+};
 use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::shell_for;
 use crumb_optimize::{OptimizationPipeline, RtkOptimizer};
@@ -3836,6 +3838,13 @@ fn show_memory(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> 
             search_memory(&memory, command, writer)
         }
         "/memory conflicts" => show_memory_conflicts(&memory, writer),
+        command if command.starts_with("/memory resolve keep ") => {
+            resolve_memory_keep(&memory, command, writer)
+        }
+        command if command.starts_with("/memory resolve merge ") => {
+            resolve_memory_merge(&memory, command, writer)
+        }
+        "/memory repair" | "/memory repair check" => check_memory_repair(&memory, writer),
         command if command.starts_with("/memory remember ") => {
             let (store, entry) = parse_memory_entry(&memory, command, "/memory remember ")?;
             let added = store.remember_approved(entry)?;
@@ -3879,7 +3888,7 @@ fn show_memory(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> 
             Ok(())
         }
         _ => Err(anyhow!(
-            "usage: /memory [status | show [project|user] | inspect <scope> <id> | search <query> | conflicts | remember <scope> <text> | tag|untag <scope> <id> <tag> | replace <scope> <id> <text> | forget <scope> <id|index> | compact <scope>]"
+            "usage: /memory [status | show [project|user] | inspect <scope> <id> | search <query> | conflicts | resolve keep <topic> <id> | resolve merge <topic> <scope> <text> | repair | remember <scope> <text> | tag|untag <scope> <id> <tag> | replace <scope> <id> <text> | forget <scope> <id|index> | compact <scope>]"
         )),
     }
 }
@@ -3974,6 +3983,74 @@ fn replace_memory(memory: &MemorySet, command: &str, writer: &mut dyn Write) -> 
     Ok(())
 }
 
+fn resolve_memory_keep(memory: &MemorySet, command: &str, writer: &mut dyn Write) -> Result<()> {
+    let arguments = command.trim_start_matches("/memory resolve keep ").trim();
+    let (topic, id) = split_memory_value(arguments, "conflict topic and stable ID")?;
+    let resolution = memory.resolve_keep(topic, id)?;
+    writeln!(
+        writer,
+        "◆ Memory conflict `{}` · kept {} · retired {} source(s)",
+        resolution.topic,
+        resolution.resolution_id,
+        resolution.retired_ids.len()
+    )?;
+    Ok(())
+}
+
+fn resolve_memory_merge(memory: &MemorySet, command: &str, writer: &mut dyn Write) -> Result<()> {
+    let arguments = command.trim_start_matches("/memory resolve merge ").trim();
+    let (topic, remaining) = split_memory_value(arguments, "conflict topic, scope, and text")?;
+    let (scope, content) = split_memory_value(remaining, "scope and merged text")?;
+    let scope = select_memory_store(memory, scope)?.scope();
+    let resolution = memory.resolve_merge(topic, scope, content)?;
+    writeln!(
+        writer,
+        "◆ Memory conflict `{}` · merged as {} · retired {} source(s)",
+        resolution.topic,
+        resolution.resolution_id,
+        resolution.retired_ids.len()
+    )?;
+    Ok(())
+}
+
+fn check_memory_repair(memory: &MemorySet, writer: &mut dyn Write) -> Result<()> {
+    let status = memory.repair_check()?;
+    writeln!(writer, "◆ Memory repair check · valid")?;
+    writeln!(
+        writer,
+        "  project  {} records · legacy backup {}",
+        status.project_records,
+        if status.project_legacy_backup {
+            "available"
+        } else {
+            "none"
+        }
+    )?;
+    writeln!(
+        writer,
+        "  user     {} records · legacy backup {}",
+        status.user_records,
+        if status.user_legacy_backup {
+            "available"
+        } else {
+            "none"
+        }
+    )?;
+    Ok(())
+}
+
+fn split_memory_value<'a>(value: &'a str, expected: &str) -> Result<(&'a str, &'a str)> {
+    let boundary = value
+        .find(char::is_whitespace)
+        .with_context(|| format!("memory command requires {expected}"))?;
+    let (first, remaining) = value.split_at(boundary);
+    let remaining = remaining.trim();
+    if first.is_empty() || remaining.is_empty() {
+        bail!("memory command requires {expected}");
+    }
+    Ok((first, remaining))
+}
+
 fn show_memory_status(memory: &MemorySet, writer: &mut dyn Write) -> Result<()> {
     writeln!(writer, "◆ Approved memory")?;
     for store in [&memory.project, &memory.user] {
@@ -4045,6 +4122,17 @@ fn show_memory_record(record: &MemoryRecord, writer: &mut dyn Write) -> Result<(
         "  supersedes  {}",
         record.supersedes.as_deref().unwrap_or("none")
     )?;
+    match &record.retirement {
+        Some(MemoryRetirement::ConflictResolution {
+            topic,
+            resolution_id,
+            at_unix_ms,
+        }) => writeln!(
+            writer,
+            "  retired     conflict `{topic}` → {resolution_id} at {at_unix_ms} ms"
+        )?,
+        None => writeln!(writer, "  retired     no")?,
+    }
     writeln!(writer, "  content     {}", record.content)?;
     Ok(())
 }
@@ -5340,13 +5428,14 @@ mod tests {
     use crumb_agent::{
         AgentConfig, CredentialReference, ProviderHeader, ProviderProtocol, RiskClass,
     };
-    use crumb_memory::{MemoryScope, MemoryStore};
+    use crumb_memory::{MemoryScope, MemorySet, MemoryStore};
 
     use super::{
         ExitGesture, SessionCommandContext, agent_config_location, effort_display_name,
         effort_wire_name, failed_command_recovery, initial_agent_activity, openrouter_preset,
         parse_credential_reference, parse_provider_header, parse_resume_session_argument,
-        read_agent_config, show_marketplace, show_memory, suggestion_width, workspace_read_host,
+        read_agent_config, resolve_memory_keep, show_marketplace, show_memory, suggestion_width,
+        workspace_read_host,
     };
 
     #[test]
@@ -5600,6 +5689,46 @@ mod tests {
                 .any(|record| record.content == "Use four spaces for indentation")
         );
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
+    }
+
+    #[test]
+    fn memory_keep_command_resolves_an_explicit_conflict() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("crumb-memory-resolve-{suffix}"));
+        let memory = MemorySet {
+            user: MemoryStore::new(root.join("user.json"), MemoryScope::User),
+            project: MemoryStore::new(root.join("project.json"), MemoryScope::Project),
+        };
+        memory
+            .project
+            .remember_approved("Use tabs for indentation")
+            .expect("first memory");
+        memory
+            .project
+            .remember_approved("Use spaces for indentation")
+            .expect("second memory");
+        let records = memory.project.records().expect("records");
+        for record in &records {
+            memory
+                .project
+                .tag_approved(&record.id, "conflict:indentation")
+                .expect("conflict tag");
+        }
+        let kept_id = &records[1].id;
+        let mut output = Vec::new();
+        resolve_memory_keep(
+            &memory,
+            &format!("/memory resolve keep indentation {kept_id}"),
+            &mut output,
+        )
+        .expect("keep command");
+
+        assert_eq!(memory.conflicts().expect("resolved conflicts").len(), 0);
+        assert!(String::from_utf8(output).expect("UTF-8").contains(kept_id));
+        std::fs::remove_dir_all(root).expect("temporary memory can be removed");
     }
 
     #[test]

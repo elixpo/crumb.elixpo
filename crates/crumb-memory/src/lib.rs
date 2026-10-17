@@ -41,6 +41,17 @@ pub enum MemoryProvenance {
     LegacyMigration { source: String, index: usize },
 }
 
+/// Explicit user decision that retired an otherwise valid historical record.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum MemoryRetirement {
+    ConflictResolution {
+        topic: String,
+        resolution_id: String,
+        at_unix_ms: u64,
+    },
+}
+
 /// Versioned durable memory with provenance and future retrieval metadata.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MemoryRecord {
@@ -54,6 +65,8 @@ pub struct MemoryRecord {
     pub tags: Vec<String>,
     #[serde(default)]
     pub supersedes: Option<String>,
+    #[serde(default)]
+    pub retirement: Option<MemoryRetirement>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -129,6 +142,23 @@ pub struct MemoryRetrieval {
 pub struct MemorySearchMatch {
     pub record: MemoryRecord,
     pub lexical_hits: usize,
+}
+
+/// Result of one explicit conflict decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryResolution {
+    pub topic: String,
+    pub resolution_id: String,
+    pub retired_ids: Vec<String>,
+}
+
+/// Read-only validation result for both durable stores.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryRepairStatus {
+    pub project_records: usize,
+    pub user_records: usize,
+    pub project_legacy_backup: bool,
+    pub user_legacy_backup: bool,
 }
 
 impl MemoryRetrieval {
@@ -319,9 +349,192 @@ impl MemorySet {
             .iter()
             .filter_map(|record| record.supersedes.clone())
             .collect::<BTreeSet<_>>();
-        records.retain(|record| !superseded.contains(&record.id));
+        records.retain(|record| record.retirement.is_none() && !superseded.contains(&record.id));
         Ok(detect_conflicts(&records))
     }
+
+    /// Keeps one conflicting record and retires the other source records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown topic or ID, invalid storage, or failed persistence.
+    pub fn resolve_keep(&self, topic: &str, kept_id: &str) -> Result<MemoryResolution> {
+        let topic = normalized_topic(topic)?;
+        let original_user = self.user.records()?;
+        let original_project = self.project.records()?;
+        let conflict_ids = conflict_record_ids(&original_user, &original_project, &topic)?;
+        if !conflict_ids.iter().any(|id| id == kept_id) {
+            bail!("memory record `{kept_id}` is not part of conflict `{topic}`");
+        }
+        let timestamp = unix_timestamp_ms()?;
+        let mut user = original_user.clone();
+        let mut project = original_project.clone();
+        let retired_ids = retire_conflict_sources(
+            [&mut user, &mut project],
+            &conflict_ids,
+            kept_id,
+            &topic,
+            timestamp,
+        );
+        self.persist_resolution(&original_user, &user, &original_project, &project)?;
+        Ok(MemoryResolution {
+            topic,
+            resolution_id: kept_id.to_owned(),
+            retired_ids,
+        })
+    }
+
+    /// Creates one merged record and retires every conflicting source record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid content, scope, storage, or failed persistence.
+    pub fn resolve_merge(
+        &self,
+        topic: &str,
+        scope: MemoryScope,
+        content: &str,
+    ) -> Result<MemoryResolution> {
+        let topic = normalized_topic(topic)?;
+        let normalized = normalize_entry(content);
+        validate_entry(&normalized)?;
+        let original_user = self.user.records()?;
+        let original_project = self.project.records()?;
+        let conflict_ids = conflict_record_ids(&original_user, &original_project, &topic)?;
+        let timestamp = unix_timestamp_ms()?;
+        let provenance = MemoryProvenance::Manual;
+        let resolution_id = stable_record_id(scope, &normalized, &provenance);
+        if original_user
+            .iter()
+            .chain(&original_project)
+            .any(|record| record.id == resolution_id)
+        {
+            bail!("merged memory duplicates an existing record; use `keep` instead");
+        }
+        let merged = MemoryRecord {
+            id: resolution_id.clone(),
+            scope,
+            content: normalized,
+            created_at_unix_ms: timestamp,
+            updated_at_unix_ms: timestamp,
+            provenance,
+            tags: vec![format!("conflict:{topic}")],
+            supersedes: None,
+            retirement: None,
+        };
+        let mut user = original_user.clone();
+        let mut project = original_project.clone();
+        match scope {
+            MemoryScope::User => user.push(merged),
+            MemoryScope::Project => project.push(merged),
+        }
+        let retired_ids = retire_conflict_sources(
+            [&mut user, &mut project],
+            &conflict_ids,
+            &resolution_id,
+            &topic,
+            timestamp,
+        );
+        self.persist_resolution(&original_user, &user, &original_project, &project)?;
+        Ok(MemoryResolution {
+            topic,
+            resolution_id,
+            retired_ids,
+        })
+    }
+
+    /// Validates both stores and reports whether legacy rollback copies exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either store is invalid or unreadable.
+    pub fn repair_check(&self) -> Result<MemoryRepairStatus> {
+        Ok(MemoryRepairStatus {
+            project_records: self.project.records()?.len(),
+            user_records: self.user.records()?.len(),
+            project_legacy_backup: self.project.legacy_backup_path().is_file(),
+            user_legacy_backup: self.user.legacy_backup_path().is_file(),
+        })
+    }
+
+    fn persist_resolution(
+        &self,
+        original_user: &[MemoryRecord],
+        user: &[MemoryRecord],
+        original_project: &[MemoryRecord],
+        project: &[MemoryRecord],
+    ) -> Result<()> {
+        let user_changed = original_user != user;
+        let project_changed = original_project != project;
+        if user_changed {
+            self.user.write_records(user)?;
+        }
+        if project_changed && let Err(error) = self.project.write_records(project) {
+            if user_changed {
+                self.user
+                    .write_records(original_user)
+                    .context("failed to roll back user memory after project write failure")?;
+            }
+            return Err(error).context("failed to persist project memory resolution");
+        }
+        Ok(())
+    }
+}
+
+fn normalized_topic(topic: &str) -> Result<String> {
+    let topic = topic.trim().to_ascii_lowercase();
+    if !is_safe_metadata_value(&topic) {
+        bail!("memory conflict topic is invalid");
+    }
+    Ok(topic)
+}
+
+fn conflict_record_ids(
+    user: &[MemoryRecord],
+    project: &[MemoryRecord],
+    topic: &str,
+) -> Result<Vec<String>> {
+    let mut records = user
+        .iter()
+        .chain(project)
+        .filter(|record| record.retirement.is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    let superseded = records
+        .iter()
+        .filter_map(|record| record.supersedes.clone())
+        .collect::<BTreeSet<_>>();
+    records.retain(|record| !superseded.contains(&record.id));
+    detect_conflicts(&records)
+        .into_iter()
+        .find(|conflict| conflict.topic == topic)
+        .map(|conflict| conflict.record_ids)
+        .with_context(|| format!("memory conflict `{topic}` was not found"))
+}
+
+fn retire_conflict_sources(
+    stores: [&mut Vec<MemoryRecord>; 2],
+    conflict_ids: &[String],
+    resolution_id: &str,
+    topic: &str,
+    timestamp: u64,
+) -> Vec<String> {
+    let mut retired_ids = Vec::new();
+    for records in stores {
+        for record in records {
+            if record.id != resolution_id && conflict_ids.contains(&record.id) {
+                record.updated_at_unix_ms = timestamp;
+                record.retirement = Some(MemoryRetirement::ConflictResolution {
+                    topic: topic.to_owned(),
+                    resolution_id: resolution_id.to_owned(),
+                    at_unix_ms: timestamp,
+                });
+                retired_ids.push(record.id.clone());
+            }
+        }
+    }
+    retired_ids.sort();
+    retired_ids
 }
 
 fn push_context_line(context: &mut String, line: &str) -> bool {
@@ -422,6 +635,7 @@ impl MemoryStore {
             provenance,
             tags: Vec::new(),
             supersedes: None,
+            retirement: None,
         });
         self.write_records(&records)?;
         Ok(true)
@@ -544,6 +758,7 @@ impl MemoryStore {
             provenance,
             tags: previous.tags,
             supersedes: Some(previous.id),
+            retirement: None,
         };
         records.push(replacement.clone());
         self.write_records(&records)?;
@@ -633,6 +848,7 @@ impl MemoryStore {
                 provenance,
                 tags: Vec::new(),
                 supersedes: None,
+                retirement: None,
             });
         }
         validate_records(&records, self.scope)?;
@@ -695,7 +911,7 @@ fn retrieve_records(
         .collect::<BTreeSet<_>>();
     let active = records
         .into_iter()
-        .filter(|record| !superseded.contains(&record.id))
+        .filter(|record| record.retirement.is_none() && !superseded.contains(&record.id))
         .filter(|record| {
             policy.stale_after_ms.is_none_or(|maximum_age| {
                 now_unix_ms.saturating_sub(record.updated_at_unix_ms) <= maximum_age
@@ -889,6 +1105,18 @@ fn validate_records(records: &[MemoryRecord], scope: MemoryScope) -> Result<()> 
         {
             bail!("memory record has invalid supersession metadata");
         }
+        if let Some(MemoryRetirement::ConflictResolution {
+            topic,
+            resolution_id,
+            at_unix_ms,
+        }) = &record.retirement
+            && (!is_safe_metadata_value(topic)
+                || !is_valid_record_id(resolution_id)
+                || resolution_id == &record.id
+                || *at_unix_ms < record.created_at_unix_ms)
+        {
+            bail!("memory record has invalid retirement metadata");
+        }
     }
     Ok(())
 }
@@ -961,8 +1189,8 @@ fn looks_sensitive(entry: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        LEGACY_HEADER, MemoryFile, MemoryProvenance, MemoryRecord, MemoryScope, MemorySet,
-        MemoryStore, RetrievalPolicy, stable_record_id,
+        LEGACY_HEADER, MemoryFile, MemoryProvenance, MemoryRecord, MemoryRetirement, MemoryScope,
+        MemorySet, MemoryStore, RetrievalPolicy, stable_record_id,
     };
     use tempfile::tempdir;
 
@@ -1097,6 +1325,7 @@ mod tests {
             provenance,
             tags: Vec::new(),
             supersedes: None,
+            retirement: None,
         };
         std::fs::write(
             &path,
@@ -1350,6 +1579,137 @@ mod tests {
         assert!(set.search("", 10).is_err());
     }
 
+    #[test]
+    fn keep_resolution_retires_cross_scope_conflicts_without_losing_history() {
+        let directory = tempdir().expect("memory tempdir");
+        let set = memory_set(directory.path());
+        let user = record(
+            MemoryScope::User,
+            "Use tabs for indentation",
+            10,
+            &["conflict:indentation"],
+            None,
+        );
+        let project = record(
+            MemoryScope::Project,
+            "Use four spaces for indentation",
+            20,
+            &["conflict:indentation"],
+            None,
+        );
+        set.user
+            .write_records(std::slice::from_ref(&user))
+            .expect("user record");
+        set.project
+            .write_records(std::slice::from_ref(&project))
+            .expect("project record");
+
+        let resolution = set
+            .resolve_keep("Indentation", &project.id)
+            .expect("keep resolution");
+        assert_eq!(resolution.resolution_id, project.id);
+        assert_eq!(resolution.retired_ids.len(), 1);
+        assert_eq!(resolution.retired_ids[0], user.id);
+        assert_eq!(set.conflicts().expect("conflicts").len(), 0);
+        let retired = set
+            .user
+            .record(&user.id)
+            .expect("lookup")
+            .expect("retired record");
+        assert!(matches!(
+            retired.retirement,
+            Some(MemoryRetirement::ConflictResolution { resolution_id, .. })
+                if resolution_id == project.id
+        ));
+        let retrieval = set
+            .retrieve("indentation", &[], u64::MAX, RetrievalPolicy::default())
+            .expect("retrieval");
+        assert_eq!(retrieval.selected.len(), 1);
+        assert_eq!(retrieval.selected[0].record.id, project.id);
+        assert_eq!(set.search("indentation", 10).expect("history").len(), 2);
+    }
+
+    #[test]
+    fn merge_resolution_creates_one_active_record_and_repair_check_validates_stores() {
+        let directory = tempdir().expect("memory tempdir");
+        let set = memory_set(directory.path());
+        set.user
+            .write_records(&[record(
+                MemoryScope::User,
+                "Use tabs for indentation",
+                10,
+                &["conflict:indentation"],
+                None,
+            )])
+            .expect("user record");
+        set.project
+            .write_records(&[record(
+                MemoryScope::Project,
+                "Use four spaces for indentation",
+                20,
+                &["conflict:indentation"],
+                None,
+            )])
+            .expect("project record");
+
+        let resolution = set
+            .resolve_merge(
+                "indentation",
+                MemoryScope::Project,
+                "Use two spaces for indentation",
+            )
+            .expect("merge resolution");
+        assert_eq!(resolution.retired_ids.len(), 2);
+        assert_eq!(set.conflicts().expect("conflicts").len(), 0);
+        let retrieval = set
+            .retrieve("indentation", &[], u64::MAX, RetrievalPolicy::default())
+            .expect("retrieval");
+        assert_eq!(retrieval.selected.len(), 1);
+        assert_eq!(retrieval.selected[0].record.id, resolution.resolution_id);
+        let status = set.repair_check().expect("repair check");
+        assert_eq!(status.project_records, 2);
+        assert_eq!(status.user_records, 1);
+        assert!(!status.project_legacy_backup);
+    }
+
+    #[test]
+    fn cross_scope_resolution_rolls_back_when_second_store_cannot_be_written() {
+        let directory = tempdir().expect("memory tempdir");
+        let user = MemoryStore::new(directory.path().join("user.json"), MemoryScope::User);
+        let first = record(
+            MemoryScope::User,
+            "Use tabs for indentation",
+            10,
+            &["conflict:indentation"],
+            None,
+        );
+        let second = record(
+            MemoryScope::User,
+            "Use spaces for indentation",
+            20,
+            &["conflict:indentation"],
+            None,
+        );
+        let original = vec![first, second];
+        user.write_records(&original).expect("user records");
+        let blocker = directory.path().join("not-a-directory");
+        std::fs::write(&blocker, "block project parent").expect("blocker file");
+        let set = MemorySet {
+            user,
+            project: MemoryStore::new(blocker.join("project.json"), MemoryScope::Project),
+        };
+
+        assert!(
+            set.resolve_merge(
+                "indentation",
+                MemoryScope::Project,
+                "Use two spaces for indentation"
+            )
+            .is_err()
+        );
+        assert_eq!(set.user.records().expect("rolled back records"), original);
+    }
+
     fn memory_set(root: &std::path::Path) -> MemorySet {
         MemorySet {
             user: MemoryStore::new(root.join("user.json"), MemoryScope::User),
@@ -1374,6 +1734,7 @@ mod tests {
             provenance,
             tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
             supersedes,
+            retirement: None,
         }
     }
 }
