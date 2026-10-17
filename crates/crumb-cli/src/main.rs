@@ -41,8 +41,8 @@ use crumb_graph::{
 use crumb_harness_dsh::HarnessActivity;
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_marketplace::{
-    Catalog, InstallScope, Installer, McpTransport as MarketplaceMcpTransport, Package,
-    ReleaseTrust, bundled_catalog, verify_package_files,
+    Catalog, InstallScope, Installer, MAX_CATALOG_BYTES, McpTransport as MarketplaceMcpTransport,
+    Package, ReleaseTrust, RemoteCatalogCache, bundled_catalog, verify_package_files,
 };
 use crumb_mcp::{
     McpDispatcher, StdioMcpLimits, StreamableHttpLimits, register_stdio_servers,
@@ -86,6 +86,7 @@ use shell_completion::{CompletionShell, write_completion};
 const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
 const FULLSCREEN_SIDE_GUTTER: u16 = 2;
 const FULLSCREEN_TOP_GUTTER: u16 = 1;
+const MARKETPLACE_CATALOG_URL: &str = "https://crumb.elixpo.com/marketplace/catalog.json";
 
 fn main() -> Result<()> {
     let resume_session = resume_session_argument()?;
@@ -4952,6 +4953,46 @@ fn show_marketplace(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result
     if let Some(path) = command.strip_prefix("/marketplace validate ") {
         return validate_marketplace_path(path.trim(), cwd, writer);
     }
+    if command == "/marketplace sync" {
+        let bytes = download_marketplace_catalog()?;
+        let catalog = remote_marketplace_cache()?.store(&bytes)?;
+        writeln!(
+            writer,
+            "◆ Marketplace synced · {} packages · inspection only",
+            catalog.packages.len()
+        )?;
+        writeln!(
+            writer,
+            "  Remote metadata is cached but cannot be installed until cryptographic verification is enabled."
+        )?;
+        return Ok(());
+    }
+    if command == "/marketplace remote" {
+        let catalog = cached_remote_catalog()?;
+        writeln!(
+            writer,
+            "◆ Crumb public marketplace · remote cache · unverified · inspection only"
+        )?;
+        for package in &catalog.packages {
+            writeln!(
+                writer,
+                "  ○ {:<28} {:<7} {}",
+                package.id,
+                package_kind_name(package),
+                package.description
+            )?;
+        }
+        writeln!(writer, "  `/marketplace remote inspect <publisher/name>`")?;
+        return Ok(());
+    }
+    if let Some(id) = command.strip_prefix("/marketplace remote inspect ") {
+        let catalog = cached_remote_catalog()?;
+        let package = catalog
+            .package(id.trim())
+            .with_context(|| format!("remote marketplace package `{}` was not found", id.trim()))?;
+        writeln!(writer, "◆ Unverified remote metadata · inspection only")?;
+        return show_marketplace_package(&catalog, package, writer);
+    }
     let catalog = bundled_catalog()?;
     if command == "/marketplace" {
         let config = read_agent_config(cwd)?;
@@ -4980,6 +5021,7 @@ fn show_marketplace(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result
             writer,
             "  `/marketplace inspect <publisher/name>` · `/marketplace install <publisher/name> [--scope project|user]`"
         )?;
+        writeln!(writer, "  `/marketplace sync` · `/marketplace remote`")?;
         writeln!(
             writer,
             "  Installation verifies files; enabling capabilities is separate."
@@ -4996,8 +5038,72 @@ fn show_marketplace(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result
         return install_marketplace_package(&catalog, arguments, cwd, writer);
     }
     Err(anyhow!(
-        "usage: /marketplace [inspect <publisher/name> | install <publisher/name> [--scope project|user] | validate <catalog.json>]"
+        "usage: /marketplace [sync | remote [inspect <publisher/name>] | inspect <publisher/name> | install <publisher/name> [--scope project|user] | validate <catalog.json>]"
     ))
+}
+
+fn remote_marketplace_cache() -> Result<RemoteCatalogCache> {
+    let root = BaseDirs::new()
+        .context("home directory is unavailable")?
+        .home_dir()
+        .join(".crumb/marketplace/catalogs");
+    Ok(RemoteCatalogCache::new(root))
+}
+
+fn cached_remote_catalog() -> Result<Catalog> {
+    remote_marketplace_cache()?
+        .load()?
+        .context("no remote marketplace catalog is cached; run `/marketplace sync`")
+}
+
+fn download_marketplace_catalog() -> Result<Vec<u8>> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to prepare marketplace connection")?;
+    let response = client
+        .get(MARKETPLACE_CATALOG_URL)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .context("marketplace catalog is unavailable")?
+        .error_for_status()
+        .context("marketplace catalog request failed")?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    validate_marketplace_response(content_type, response.content_length())?;
+    read_bounded_catalog(response)
+}
+
+fn validate_marketplace_response(
+    content_type: Option<&str>,
+    content_length: Option<u64>,
+) -> Result<()> {
+    let media_type = content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !media_type.is_some_and(|value| value == "application/json" || value.ends_with("+json")) {
+        bail!("marketplace returned a non-JSON response");
+    }
+    if content_length.is_some_and(|length| length > MAX_CATALOG_BYTES as u64) {
+        bail!("remote marketplace catalog exceeds the size limit");
+    }
+    Ok(())
+}
+
+fn read_bounded_catalog(reader: impl Read) -> Result<Vec<u8>> {
+    let limit = u64::try_from(MAX_CATALOG_BYTES).unwrap_or(u64::MAX);
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > MAX_CATALOG_BYTES {
+        bail!("remote marketplace catalog exceeds the size limit");
+    }
+    Ok(bytes)
 }
 
 fn validate_marketplace_path(path: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
@@ -6225,6 +6331,7 @@ impl Drop for RawModeGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -6238,9 +6345,10 @@ mod tests {
         ExitGesture, SessionCommandContext, agent_config_location, configure_plugin,
         effort_display_name, effort_wire_name, failed_command_recovery, initial_agent_activity,
         openrouter_preset, parse_credential_reference, parse_provider_header,
-        parse_resume_session_argument, read_agent_config, resolve_memory_keep, show_graph,
-        show_marketplace, show_memory, show_profile_with_stores, suggestion_width,
-        validate_marketplace_path, workspace_read_host,
+        parse_resume_session_argument, read_agent_config, read_bounded_catalog,
+        resolve_memory_keep, show_graph, show_marketplace, show_memory, show_profile_with_stores,
+        suggestion_width, validate_marketplace_path, validate_marketplace_response,
+        workspace_read_host,
     };
 
     #[test]
@@ -6448,6 +6556,33 @@ mod tests {
         assert!(skill.path.ends_with("skills/code-review/SKILL.md"));
         assert!(workspace.join(&skill.path).is_file());
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
+    }
+
+    #[test]
+    fn marketplace_download_requires_bounded_json() {
+        assert!(
+            validate_marketplace_response(Some("application/json; charset=utf-8"), Some(42))
+                .is_ok()
+        );
+        assert!(validate_marketplace_response(Some("text/html"), Some(42)).is_err());
+        assert!(
+            validate_marketplace_response(
+                Some("application/json"),
+                Some((crumb_marketplace::MAX_CATALOG_BYTES + 1) as u64),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            read_bounded_catalog(Cursor::new(b"{}")).expect("small response should be accepted"),
+            b"{}"
+        );
+        assert!(
+            read_bounded_catalog(Cursor::new(vec![
+                b'x';
+                crumb_marketplace::MAX_CATALOG_BYTES + 1
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

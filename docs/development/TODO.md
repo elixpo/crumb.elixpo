@@ -126,6 +126,7 @@ engines remain replaceable; none may bypass Crumb's permission, credential, or s
   - [x] Supervise remote Streamable HTTP MCP servers ([issue #97](https://github.com/elixpo/crumb.elixpo/issues/97)).
 - [ ] [Build marketplace trust, publishing, updates, rollback, and revocation](https://github.com/elixpo/crumb.elixpo/issues/48).
   - [x] [WP-025: marketplace schema v2 trust metadata](https://github.com/elixpo/crumb.elixpo/issues/106).
+  - [x] [WP-026: bounded remote catalog sync and offline cache](https://github.com/elixpo/crumb.elixpo/issues/108).
   - Keep external packages disabled after installation until the user reviews and enables them.
   - Prefer standard remote MCP OAuth and OS-keyring credential references.
   - Prohibit arbitrary install hooks and implicit capability grants.

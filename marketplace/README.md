@@ -22,9 +22,12 @@ names only. Secret values do not belong in manifests, logs, or memory.
 4. Declare the minimum capabilities and connector scopes. Do not include credentials or hooks.
 5. Run `cargo test -p crumb-marketplace` and the workspace merge gate.
 
-The schema deliberately excludes arbitrary lifecycle scripts and secret values. Remote fetching,
-cryptographic Sigstore verification, updates, and rollback are separate explicit lifecycle steps;
-installation alone never enables a component.
+The schema deliberately excludes arbitrary lifecycle scripts and secret values. `/marketplace
+sync` can refresh the fixed public HTTPS catalog into a bounded, content-addressed cache. Cached
+remote metadata is labeled unverified and remains inspection-only; installs still come exclusively
+from the bundled catalog. Cryptographic Sigstore verification, remote artifact installation,
+updates, and rollback are separate explicit lifecycle steps. Installation alone never enables a
+component.
 
 Validate catalog structure against `schema/catalog.schema.json`. Crumb's Rust validator remains
 authoritative and additionally enforces publisher namespaces, unique immutable releases,
