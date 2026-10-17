@@ -71,7 +71,7 @@ mod device_auth;
 mod provider_projection;
 mod shell_completion;
 
-use agent_runtime::AgentRuntime;
+use agent_runtime::{AgentRuntime, apply_selected_profile};
 use completion::{COMPLETION_PALETTE_ROWS, CompletionWorkspace, CrumbCompleter};
 use shell_completion::{CompletionShell, write_completion};
 
@@ -1015,7 +1015,7 @@ struct AgentTerminal {
 }
 
 fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<ReplOutcome>> {
-    let agent_config = load_agent_config(context.cwd, context.writer);
+    let agent_config = load_effective_agent_config(context.cwd, context.writer)?;
     let decision = context
         .command_catalog
         .route(command, &agent_config.routing);
@@ -1143,6 +1143,20 @@ fn load_agent_config(cwd: &Path, writer: &mut dyn Write) -> AgentConfig {
             let mut config = AgentConfig::default();
             config.routing.unknown_input = UnknownInputPolicy::Native;
             config
+        }
+    }
+}
+
+fn load_effective_agent_config(cwd: &Path, writer: &mut dyn Write) -> Result<AgentConfig> {
+    let config = load_agent_config(cwd, writer);
+    match apply_selected_profile(&config, cwd) {
+        Ok(application) => Ok(application.config),
+        Err(error) => {
+            writeln!(
+                writer,
+                "warning: selected profile is unavailable; using project agent settings: {error}"
+            )?;
+            Ok(config)
         }
     }
 }
@@ -3849,6 +3863,7 @@ fn show_profile_with_stores(
             let requested = single_argument(parts, "usage: /profile show <id>")?;
             show_profile_document(&store.load(requested)?, writer)?;
         }
+        Some("effective") if parts.next().is_none() => show_effective_profile(cwd, writer)?,
         Some("create") => {
             let (id, label) = split_profile_label(arguments, "create")?;
             let profile = ProfileDocument::new(id, label)?;
@@ -3905,9 +3920,30 @@ fn show_profile_with_stores(
         }
         Some(_) => writeln!(
             writer,
-            "usage: /profile [list | show <id> | create <id> <label> | clone <source> <id> <label> | select <id> | clear | rename <source> <new-id> | export <id> [path] | import <path> | delete <id>]"
+            "usage: /profile [list | show <id> | effective | create <id> <label> | clone <source> <id> <label> | select <id> | clear | rename <source> <new-id> | export <id> [path] | import <path> | delete <id>]"
         )?,
     }
+    Ok(())
+}
+
+fn show_effective_profile(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    let application = apply_selected_profile(&config, cwd)?;
+    let Some(profile) = application.profile else {
+        writeln!(writer, "◇ No persona overrides active")?;
+        writeln!(writer, "  model, effort, skills, and permissions · project")?;
+        return Ok(());
+    };
+    writeln!(writer, "◆ Effective profile · {}", profile.id)?;
+    writeln!(writer, "  persona      profile:{}", profile.id)?;
+    writeln!(writer, "  model        {}", application.model_source)?;
+    writeln!(writer, "  effort       {}", application.effort_source)?;
+    writeln!(writer, "  skills       {}", application.skill_source)?;
+    writeln!(writer, "  memory       profile:{}", profile.id)?;
+    writeln!(
+        writer,
+        "  permissions  project (profiles cannot grant access)"
+    )?;
     Ok(())
 }
 

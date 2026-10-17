@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -16,7 +17,8 @@ use crumb_harness_dsh::{
     HarnessActivity, HarnessEnvironment, HarnessIdentity, HarnessLaunch, HarnessSupervisor,
     Notification, RunResult, SupervisorLimits,
 };
-use crumb_memory::MemorySet;
+use crumb_memory::{MemorySet, RetrievalPolicy};
+use crumb_profile::{ProfileDocument, ProfileSelectionStore, ProfileStore};
 
 use crate::provider_projection::project_provider;
 
@@ -91,6 +93,130 @@ pub struct AgentRuntime {
 struct ReviewNote {
     checkpoint: String,
     comment: String,
+}
+
+/// Effective, permission-neutral profile projection for one agent turn.
+pub struct ProfileApplication {
+    pub profile: Option<ProfileDocument>,
+    pub config: AgentConfig,
+    pub model_source: &'static str,
+    pub effort_source: &'static str,
+    pub skill_source: &'static str,
+}
+
+/// Resolves the project selection and narrows an agent config with profile
+/// preferences. No field in this projection can grant permissions.
+///
+/// # Errors
+///
+/// Returns an error when selected profile storage is malformed or unavailable.
+pub fn apply_selected_profile(
+    config: &AgentConfig,
+    workspace: &Path,
+) -> Result<ProfileApplication> {
+    let selection = ProfileSelectionStore::for_project(project_root(workspace));
+    let profiles = ProfileStore::discover()?;
+    apply_profile_selection(config, &profiles, &selection)
+}
+
+fn apply_profile_selection(
+    config: &AgentConfig,
+    profiles: &ProfileStore,
+    selection: &ProfileSelectionStore,
+) -> Result<ProfileApplication> {
+    let selection = selection.load()?;
+    let Some(profile_id) = selection.profile_id else {
+        return Ok(ProfileApplication {
+            profile: None,
+            config: config.clone(),
+            model_source: "project",
+            effort_source: "project",
+            skill_source: "project",
+        });
+    };
+    let profile = profiles.load(&profile_id)?;
+    let mut effective = config.clone();
+    let model_source = apply_profile_model(&profile, &mut effective);
+    let effort_source = apply_profile_effort(&profile, &mut effective);
+    let skill_source = apply_profile_skills(&profile, &mut effective);
+    effective.validate()?;
+    Ok(ProfileApplication {
+        profile: Some(profile),
+        config: effective,
+        model_source,
+        effort_source,
+        skill_source,
+    })
+}
+
+fn project_root(workspace: &Path) -> &Path {
+    workspace
+        .ancestors()
+        .find(|directory| directory.join(".crumb/agent.json").is_file())
+        .unwrap_or(workspace)
+}
+
+fn apply_profile_model(profile: &ProfileDocument, config: &mut AgentConfig) -> &'static str {
+    let Some(preferred) = profile.preferred_models.get("text") else {
+        return "project";
+    };
+    let Some(routes) = config.models.get_mut(&Modality::Text) else {
+        return "project";
+    };
+    let Some(index) = routes.iter().position(|route| {
+        preferred == &route.model || preferred == &format!("{}/{}", route.provider, route.model)
+    }) else {
+        return "project";
+    };
+    routes.swap(0, index);
+    "profile"
+}
+
+fn apply_profile_effort(profile: &ProfileDocument, config: &mut AgentConfig) -> &'static str {
+    let Some(effort) = profile.effort.as_deref().and_then(profile_effort_wire_name) else {
+        return "project";
+    };
+    let mut candidate = config.clone();
+    let Some(route) = candidate
+        .models
+        .get_mut(&Modality::Text)
+        .and_then(|routes| routes.first_mut())
+    else {
+        return "project";
+    };
+    route.reasoning_effort = Some(effort.to_owned());
+    if candidate.validate().is_err() {
+        return "project";
+    }
+    *config = candidate;
+    "profile"
+}
+
+fn profile_effort_wire_name(effort: &str) -> Option<&'static str> {
+    match effort {
+        "light" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "extra high" => Some("xhigh"),
+        "ultra" => Some("max"),
+        _ => None,
+    }
+}
+
+fn apply_profile_skills(profile: &ProfileDocument, config: &mut AgentConfig) -> &'static str {
+    if profile.skills.is_empty() {
+        return "project";
+    }
+    let enabled = profile
+        .skills
+        .iter()
+        .filter(|reference| reference.enabled)
+        .map(|reference| reference.id.as_str())
+        .collect::<BTreeSet<_>>();
+    for skill in &mut config.skills {
+        skill.enabled &= enabled.contains(skill.id.as_str());
+    }
+    "profile"
 }
 
 impl AgentRuntime {
@@ -320,6 +446,15 @@ impl AgentRuntime {
     ) -> Result<RunResult> {
         let workspace = std::fs::canonicalize(workspace)
             .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
+        let application =
+            apply_selected_profile(config, &workspace).unwrap_or_else(|_| ProfileApplication {
+                profile: None,
+                config: config.clone(),
+                model_source: "project",
+                effort_source: "project",
+                skill_source: "project",
+            });
+        let config = &application.config;
         config.validate()?;
         self.ensure_session(&workspace, config.mode)?;
         let route = config
@@ -329,7 +464,16 @@ impl AgentRuntime {
             .context("agent config has no text model route")?;
         let effort = config.reasoning_effort_for(route).map(str::to_owned);
         let session_id = self.start_turn(config.mode, route, effort.clone(), request)?;
-        let memory = attach_approved_memory(request, &workspace);
+        let profiled_request = application.profile.as_ref().map_or_else(
+            || request.to_owned(),
+            |profile| attach_profile_context(request, profile),
+        );
+        let memory = attach_approved_memory(
+            &profiled_request,
+            request,
+            &workspace,
+            application.profile.as_ref(),
+        );
         if let Some(audit) = memory.audit {
             self.session
                 .as_mut()
@@ -560,14 +704,49 @@ struct MemoryAttachment {
     audit: Option<MemoryAudit>,
 }
 
-fn attach_approved_memory(request: &str, workspace: &Path) -> MemoryAttachment {
+fn attach_profile_context(request: &str, profile: &ProfileDocument) -> String {
+    if profile.instructions.is_empty() && profile.response_style.is_none() {
+        return request.to_owned();
+    }
+    let mut context = format!(
+        "The user explicitly selected persona profile `{}`. Persona guidance controls working and response style only. It is not permission to use tools, access data, or perform actions.\n",
+        profile.id
+    );
+    if !profile.instructions.is_empty() {
+        context.push_str("## Persona instructions\n");
+        context.push_str(&profile.instructions);
+        context.push('\n');
+    }
+    if let Some(style) = &profile.response_style {
+        context.push_str("## Response style\n");
+        context.push_str(style);
+        context.push('\n');
+    }
+    context.push_str("## User request\n");
+    context.push_str(request);
+    context
+}
+
+fn attach_approved_memory(
+    request: &str,
+    retrieval_query: &str,
+    workspace: &Path,
+    profile: Option<&ProfileDocument>,
+) -> MemoryAttachment {
     let Ok(memory) = MemorySet::discover(workspace) else {
         return MemoryAttachment {
             request: request.to_owned(),
             audit: None,
         };
     };
-    let Ok(retrieval) = memory.retrieve_for_request(request) else {
+    let mut policy = RetrievalPolicy::default();
+    let tags = profile.map_or_else(Vec::new, |profile| {
+        policy.include_user = profile.memory.include_user;
+        policy.include_project = profile.memory.include_project;
+        profile.memory.tags.iter().map(String::as_str).collect()
+    });
+    let Ok(retrieval) = memory.retrieve_for_request_with_policy(retrieval_query, &tags, policy)
+    else {
         return MemoryAttachment {
             request: request.to_owned(),
             audit: None,
@@ -805,12 +984,17 @@ fn new_session_id() -> Result<SessionId> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crumb_agent::config::SkillConfig;
+    use crumb_agent::{AgentConfig, Modality, ModelRoute, SkillConfig};
+    use crumb_profile::{ProfileDocument, ProfileReference, ProfileSelectionStore, ProfileStore};
 
-    use super::attach_enabled_skills;
+    use super::{
+        apply_profile_effort, apply_profile_model, apply_profile_selection, apply_profile_skills,
+        attach_enabled_skills, attach_profile_context,
+    };
 
     #[test]
     fn enabled_skills_are_loaded_before_the_user_request() {
@@ -838,5 +1022,106 @@ mod tests {
         assert!(prompt.contains("## Skill: review\nReview changes carefully."));
         assert!(prompt.ends_with("## User request\ninspect this"));
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
+    }
+
+    #[test]
+    fn persona_context_is_explicitly_permission_neutral() {
+        let mut profile = ProfileDocument::new("reviewer", "Reviewer").expect("profile");
+        profile.instructions = "Challenge unsupported claims.".to_owned();
+        profile.response_style = Some("Concise and direct".to_owned());
+
+        let prompt = attach_profile_context("review this", &profile);
+
+        assert!(prompt.contains("not permission to use tools"));
+        assert!(prompt.contains("Challenge unsupported claims."));
+        assert!(prompt.contains("Concise and direct"));
+        assert!(prompt.ends_with("## User request\nreview this"));
+    }
+
+    #[test]
+    fn profile_preferences_only_narrow_configured_choices() {
+        let mut config = AgentConfig {
+            models: BTreeMap::from([(
+                Modality::Text,
+                vec![
+                    ModelRoute {
+                        provider: "first".to_owned(),
+                        model: "small".to_owned(),
+                        reasoning_effort: None,
+                    },
+                    ModelRoute {
+                        provider: "second".to_owned(),
+                        model: "large".to_owned(),
+                        reasoning_effort: None,
+                    },
+                ],
+            )]),
+            skills: vec![
+                SkillConfig {
+                    id: "review".to_owned(),
+                    path: PathBuf::from("review.md"),
+                    enabled: true,
+                },
+                SkillConfig {
+                    id: "deploy".to_owned(),
+                    path: PathBuf::from("deploy.md"),
+                    enabled: true,
+                },
+            ],
+            ..AgentConfig::default()
+        };
+        let mut profile = ProfileDocument::new("reviewer", "Reviewer").expect("profile");
+        profile.preferred_models = BTreeMap::from([("text".to_owned(), "second/large".to_owned())]);
+        profile.effort = Some("high".to_owned());
+        profile.skills = vec![ProfileReference {
+            id: "review".to_owned(),
+            enabled: true,
+        }];
+
+        assert_eq!(apply_profile_model(&profile, &mut config), "profile");
+        assert_eq!(config.models[&Modality::Text][0].provider, "second");
+        assert_eq!(apply_profile_effort(&profile, &mut config), "profile");
+        assert_eq!(
+            config.models[&Modality::Text][0]
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(apply_profile_skills(&profile, &mut config), "profile");
+        assert!(config.skills[0].enabled);
+        assert!(!config.skills[1].enabled);
+
+        profile
+            .preferred_models
+            .insert("text".to_owned(), "unconfigured/unknown".to_owned());
+        assert_eq!(apply_profile_model(&profile, &mut config), "project");
+    }
+
+    #[test]
+    fn project_selection_resolves_a_profile_without_restart() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("crumb-profile-runtime-{suffix}"));
+        let profiles = ProfileStore::new(root.join("profiles"));
+        let selection = ProfileSelectionStore::for_project(&root.join("workspace"));
+        let profile = ProfileDocument::new("reviewer", "Reviewer").expect("profile");
+        profiles.create(&profile).expect("profile stored");
+
+        let empty = apply_profile_selection(&AgentConfig::default(), &profiles, &selection)
+            .expect("empty selection");
+        assert!(empty.profile.is_none());
+        selection
+            .select(Some("reviewer"))
+            .expect("profile selected");
+        let selected = apply_profile_selection(&AgentConfig::default(), &profiles, &selection)
+            .expect("selected profile");
+        assert_eq!(
+            selected.profile.as_ref().map(|profile| profile.id.as_str()),
+            Some("reviewer")
+        );
+
+        std::fs::remove_dir_all(root).expect("temporary profiles can be removed");
     }
 }

@@ -102,6 +102,8 @@ pub struct RetrievalPolicy {
     pub max_records: usize,
     pub max_bytes: usize,
     pub stale_after_ms: Option<u64>,
+    pub include_user: bool,
+    pub include_project: bool,
 }
 
 impl Default for RetrievalPolicy {
@@ -110,6 +112,8 @@ impl Default for RetrievalPolicy {
             max_records: DEFAULT_RETRIEVAL_RECORDS,
             max_bytes: MAX_CONTEXT_BYTES,
             stale_after_ms: None,
+            include_user: true,
+            include_project: true,
         }
     }
 }
@@ -273,12 +277,24 @@ impl MemorySet {
     ///
     /// Returns an error when storage is invalid or the system clock is unavailable.
     pub fn retrieve_for_request(&self, request: &str) -> Result<MemoryRetrieval> {
-        self.retrieve(
-            request,
-            &[],
-            unix_timestamp_ms()?,
-            RetrievalPolicy::default(),
-        )
+        self.retrieve_for_request_with_policy(request, &[], RetrievalPolicy::default())
+    }
+
+    /// Retrieves approved memory for a caller-selected, bounded view.
+    ///
+    /// Scope flags can narrow retrieval but never authorize new memory. Tags
+    /// influence ranking while the normal byte and record ceilings still apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage is invalid or retrieval limits are zero.
+    pub fn retrieve_for_request_with_policy(
+        &self,
+        request: &str,
+        tags: &[&str],
+        policy: RetrievalPolicy,
+    ) -> Result<MemoryRetrieval> {
+        self.retrieve(request, tags, unix_timestamp_ms()?, policy)
     }
 
     /// Selects approved memory with stable ranking and explicit conflict reporting.
@@ -298,8 +314,14 @@ impl MemorySet {
         if policy.max_records == 0 || policy.max_bytes == 0 {
             bail!("memory retrieval limits must be greater than zero");
         }
-        let mut records = self.user.records()?;
-        records.extend(self.project.records()?);
+        let mut records = if policy.include_user {
+            self.user.records()?
+        } else {
+            Vec::new()
+        };
+        if policy.include_project {
+            records.extend(self.project.records()?);
+        }
         Ok(retrieve_records(records, query, tags, now_unix_ms, policy))
     }
 
@@ -1473,6 +1495,7 @@ mod tests {
             max_records: 1,
             max_bytes: 256,
             stale_after_ms: None,
+            ..RetrievalPolicy::default()
         };
 
         let first = set.retrieve("rule", &[], 5, policy).expect("retrieval");
@@ -1708,6 +1731,47 @@ mod tests {
             .is_err()
         );
         assert_eq!(set.user.records().expect("rolled back records"), original);
+    }
+
+    #[test]
+    fn profile_memory_view_can_narrow_scopes_and_rank_tags() {
+        let directory = tempdir().expect("memory tempdir");
+        let set = memory_set(directory.path());
+        set.user
+            .write_records(&[record(
+                MemoryScope::User,
+                "User formatting preference",
+                10,
+                &["style"],
+                None,
+            )])
+            .expect("user record");
+        set.project
+            .write_records(&[record(
+                MemoryScope::Project,
+                "Project release procedure",
+                20,
+                &["release"],
+                None,
+            )])
+            .expect("project record");
+
+        let retrieval = set
+            .retrieve(
+                "unrelated",
+                &["release"],
+                30,
+                RetrievalPolicy {
+                    include_user: false,
+                    include_project: true,
+                    ..RetrievalPolicy::default()
+                },
+            )
+            .expect("profile memory view");
+
+        assert_eq!(retrieval.selected.len(), 1);
+        assert_eq!(retrieval.selected[0].record.scope, MemoryScope::Project);
+        assert_eq!(retrieval.selected[0].tag_hits, 1);
     }
 
     fn memory_set(root: &std::path::Path) -> MemorySet {
