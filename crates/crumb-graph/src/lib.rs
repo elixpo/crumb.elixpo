@@ -17,6 +17,135 @@ pub use graphify::{
 pub const GRAPHIFY_SCHEMA_VERSION: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeSearchLimits {
+    pub max_files: usize,
+    pub max_file_bytes: usize,
+    pub max_total_bytes: usize,
+    pub max_results: usize,
+}
+
+impl Default for NativeSearchLimits {
+    fn default() -> Self {
+        Self {
+            max_files: 5_000,
+            max_file_bytes: 1024 * 1024,
+            max_total_bytes: 16 * 1024 * 1024,
+            max_results: 32,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeSearchHit {
+    pub source_file: PathBuf,
+    pub source_location: String,
+    pub preview: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeSearchEvidence {
+    pub hits: Vec<NativeSearchHit>,
+    pub scanned_files: usize,
+    pub truncated: bool,
+}
+
+/// Searches regular UTF-8 workspace files without following symlinks or
+/// entering generated, dependency, VCS, or Crumb state directories.
+///
+/// # Errors
+///
+/// Returns an error for invalid limits, an invalid query, or an unavailable
+/// workspace. Individual unreadable and non-UTF-8 files are skipped.
+pub fn native_project_search(
+    workspace: &Path,
+    query: &str,
+    limits: NativeSearchLimits,
+) -> Result<NativeSearchEvidence> {
+    validate_native_search(query, limits)?;
+    let workspace = fs::canonicalize(workspace).context("project workspace is unavailable")?;
+    let needle = query.trim().to_lowercase();
+    let mut directories = VecDeque::from([workspace.clone()]);
+    let mut hits = Vec::new();
+    let mut scanned_files = 0_usize;
+    let mut scanned_bytes = 0_usize;
+    let mut truncated = false;
+
+    'walk: while let Some(directory) = directories.pop_front() {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        let mut entries = entries
+            .filter_map(std::result::Result::ok)
+            .collect::<Vec<_>>();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if !ignored_search_directory(&entry.file_name()) {
+                    directories.push_back(entry.path());
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            if scanned_files == limits.max_files {
+                truncated = true;
+                break 'walk;
+            }
+            scanned_files += 1;
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let length = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+            if length > limits.max_file_bytes {
+                continue;
+            }
+            if scanned_bytes.saturating_add(length) > limits.max_total_bytes {
+                truncated = true;
+                break 'walk;
+            }
+            scanned_bytes = scanned_bytes.saturating_add(length);
+            let Ok(encoded) = fs::read(entry.path()) else {
+                continue;
+            };
+            let Ok(text) = std::str::from_utf8(&encoded) else {
+                continue;
+            };
+            for (index, line) in text.lines().enumerate() {
+                if !line.to_lowercase().contains(&needle) {
+                    continue;
+                }
+                let source_file = entry
+                    .path()
+                    .strip_prefix(&workspace)
+                    .context("native search escaped the workspace")?
+                    .to_path_buf();
+                hits.push(NativeSearchHit {
+                    source_file,
+                    source_location: format!("L{}", index + 1),
+                    preview: bounded_preview(line, 240),
+                });
+                if hits.len() == limits.max_results {
+                    truncated = true;
+                    break 'walk;
+                }
+            }
+        }
+    }
+    Ok(NativeSearchEvidence {
+        hits,
+        scanned_files,
+        truncated,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GraphLimits {
     pub max_bytes: usize,
     pub max_nodes: usize,
@@ -512,6 +641,42 @@ fn validate_limits(limits: GraphLimits) -> Result<()> {
     Ok(())
 }
 
+fn validate_native_search(query: &str, limits: NativeSearchLimits) -> Result<()> {
+    let query = query.trim();
+    if query.is_empty() || query.len() > 256 || query.chars().any(char::is_control) {
+        bail!("native project search query is invalid");
+    }
+    if limits.max_files == 0
+        || limits.max_file_bytes == 0
+        || limits.max_total_bytes == 0
+        || limits.max_results == 0
+    {
+        bail!("native project search limits must be positive");
+    }
+    Ok(())
+}
+
+fn ignored_search_directory(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(".git" | ".crumb" | "graphify-out" | "node_modules" | "target")
+    )
+}
+
+fn bounded_preview(line: &str, maximum: usize) -> String {
+    let line = line.trim();
+    if line.len() <= maximum {
+        return line.to_owned();
+    }
+    let boundary = line
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= maximum.saturating_sub(1))
+        .last()
+        .unwrap_or(0);
+    format!("{}…", &line[..boundary])
+}
+
 fn dependency_relation(relation: &str) -> bool {
     let relation = relation.to_ascii_lowercase();
     ["call", "import", "use", "depend", "inherit", "reference"]
@@ -630,5 +795,64 @@ mod tests {
         )
         .expect("escaping fixture");
         assert!(ProjectGraph::load(workspace.path(), &graph_path, GraphLimits::default()).is_err());
+    }
+
+    #[test]
+    fn native_search_is_bounded_deterministic_and_skips_generated_state() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+        fs::create_dir_all(workspace.path().join("target")).expect("generated directory");
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            "fn alpha() {}\nfn beta() { alpha(); }\n",
+        )
+        .expect("source fixture");
+        fs::write(workspace.path().join("target/leak.rs"), "alpha secret\n")
+            .expect("ignored fixture");
+
+        let evidence =
+            native_project_search(workspace.path(), "alpha", NativeSearchLimits::default())
+                .expect("native search");
+        assert_eq!(evidence.hits.len(), 2);
+        assert!(
+            evidence
+                .hits
+                .iter()
+                .all(|hit| hit.source_file == Path::new("src/lib.rs"))
+        );
+        assert_eq!(evidence.hits[0].source_location, "L1");
+        assert_eq!(evidence.hits[1].source_location, "L2");
+        assert!(!evidence.truncated);
+
+        let bounded = native_project_search(
+            workspace.path(),
+            "alpha",
+            NativeSearchLimits {
+                max_results: 1,
+                ..NativeSearchLimits::default()
+            },
+        )
+        .expect("bounded native search");
+        assert_eq!(bounded.hits.len(), 1);
+        assert!(bounded.truncated);
+    }
+
+    #[test]
+    fn native_search_rejects_invalid_queries_and_limits() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            native_project_search(workspace.path(), "\n", NativeSearchLimits::default()).is_err()
+        );
+        assert!(
+            native_project_search(
+                workspace.path(),
+                "query",
+                NativeSearchLimits {
+                    max_files: 0,
+                    ..NativeSearchLimits::default()
+                },
+            )
+            .is_err()
+        );
     }
 }

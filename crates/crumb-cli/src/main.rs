@@ -36,7 +36,7 @@ use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credentia
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
 use crumb_graph::{
     EdgeConfidence, EvidenceFreshness, GraphEvidence, GraphLimits, GraphSettingsStore,
-    GraphifyAdapter, ProjectGraph,
+    GraphifyAdapter, NativeSearchEvidence, NativeSearchLimits, ProjectGraph, native_project_search,
 };
 use crumb_harness_dsh::HarnessActivity;
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
@@ -4280,13 +4280,11 @@ fn show_graph(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
             Ok(())
         }
         command if command.starts_with("/graph query ") => {
-            require_graph_enabled(&settings)?;
             let query = command.trim_start_matches("/graph query ").trim();
             if query.is_empty() {
                 bail!("graph query cannot be empty");
             }
-            let graph = load_project_graph(cwd, &settings)?;
-            render_graph_evidence(&graph.query(query), writer)
+            query_graph_with_fallback(cwd, &settings, query, writer)
         }
         command if command.starts_with("/graph explain ") => {
             require_graph_enabled(&settings)?;
@@ -4462,6 +4460,34 @@ fn load_project_graph(cwd: &Path, settings: &crumb_graph::GraphSettings) -> Resu
     ProjectGraph::load(cwd, &cwd.join(&settings.graph_path), GraphLimits::default())
 }
 
+fn query_graph_with_fallback(
+    cwd: &Path,
+    settings: &crumb_graph::GraphSettings,
+    query: &str,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    if settings.enabled
+        && let Ok(graph) = load_project_graph(cwd, settings)
+    {
+        let evidence = graph.query(query);
+        let fresh = evidence
+            .nodes
+            .iter()
+            .all(|node| matches!(node.provenance.freshness, EvidenceFreshness::Fresh));
+        if !evidence.nodes.is_empty() && fresh {
+            return render_graph_evidence(&evidence, writer);
+        }
+        if !fresh {
+            writeln!(
+                writer,
+                "◇ Matching graph evidence is stale; using bounded native search"
+            )?;
+        }
+    }
+    let evidence = native_project_search(cwd, query, NativeSearchLimits::default())?;
+    render_native_search_evidence(&evidence, writer)
+}
+
 fn configure_graphify_mcp(
     cwd: &Path,
     settings: &crumb_graph::GraphSettings,
@@ -4538,6 +4564,30 @@ fn render_graph_evidence(evidence: &GraphEvidence, writer: &mut dyn Write) -> Re
     }
     if evidence.truncated {
         writeln!(writer, "  … result truncated at the configured graph limit")?;
+    }
+    Ok(())
+}
+
+fn render_native_search_evidence(
+    evidence: &NativeSearchEvidence,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    if evidence.hits.is_empty() {
+        writeln!(writer, "◇ No project evidence found")?;
+        return Ok(());
+    }
+    writeln!(writer, "◆ Native project evidence · bounded local fallback")?;
+    for hit in &evidence.hits {
+        writeln!(
+            writer,
+            "  ◇ {}:{} · {}",
+            hit.source_file.display(),
+            hit.source_location,
+            hit.preview
+        )?;
+    }
+    if evidence.truncated {
+        writeln!(writer, "  … result truncated at the native search limit")?;
     }
     Ok(())
 }
@@ -7441,7 +7491,10 @@ mod tests {
         let mut output = Vec::new();
         show_graph("/graph status", &workspace, &mut output).expect("status is available");
         assert!(String::from_utf8_lossy(&output).contains("disabled"));
-        assert!(show_graph("/graph query alpha", &workspace, &mut output).is_err());
+        output.clear();
+        show_graph("/graph query alpha", &workspace, &mut output)
+            .expect("disabled graph uses native fallback");
+        assert!(String::from_utf8_lossy(&output).contains("Native project evidence"));
 
         let store = crumb_graph::GraphSettingsStore::for_workspace(&workspace);
         let mut settings = store.load_or_default().expect("default settings");
@@ -7452,6 +7505,16 @@ mod tests {
         let rendered = String::from_utf8(output).expect("UTF-8 output");
         assert!(rendered.contains("alpha [alpha]"));
         assert!(rendered.contains("source.rs:L1"));
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(workspace.join("source.rs"), "fn alpha_changed() {}\n")
+            .expect("source can change");
+        let mut output = Vec::new();
+        show_graph("/graph query alpha", &workspace, &mut output)
+            .expect("stale graph uses native fallback");
+        let rendered = String::from_utf8(output).expect("UTF-8 output");
+        assert!(rendered.contains("graph evidence is stale"));
+        assert!(rendered.contains("Native project evidence"));
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
     }
 
