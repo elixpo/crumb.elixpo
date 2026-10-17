@@ -129,7 +129,8 @@ engines remain replaceable; none may bypass Crumb's permission, credential, or s
   - [x] [WP-026: bounded remote catalog sync and offline cache](https://github.com/elixpo/crumb.elixpo/issues/108).
   - [x] [WP-027: signed catalog and per-artifact Sigstore verification](https://github.com/elixpo/crumb.elixpo/issues/110).
   - [x] [WP-028: persist and manage installed marketplace releases](https://github.com/elixpo/crumb.elixpo/issues/114).
-  - [x] [WP-029: plan authenticated marketplace updates and revocations](https://github.com/elixpo/crumb.elipxo/issues/116).
+  - [x] [WP-029: plan authenticated marketplace updates and revocations](https://github.com/elixpo/crumb.elixpo/issues/116).
+  - [x] [WP-030: activate verified marketplace rollback releases](https://github.com/elixpo/crumb.elixpo/issues/118).
   - Keep external packages disabled after installation until the user reviews and enables them.
   - Prefer standard remote MCP OAuth and OS-keyring credential references.
   - Prohibit arbitrary install hooks and implicit capability grants.

@@ -1046,6 +1046,99 @@ impl InstallationStore {
         Ok(release)
     }
 
+    /// Selects a recorded rollback target without changing activation state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a pinned active release or when no requested prior release exists.
+    pub fn rollback_target(
+        &self,
+        package_id: &str,
+        version: Option<&str>,
+    ) -> Result<InstalledRelease> {
+        if !valid_package_id(package_id)
+            || version.is_some_and(|value| Version::parse(value).is_err())
+        {
+            bail!("marketplace rollback target is invalid");
+        }
+        let state = self.load()?;
+        let active = state
+            .releases
+            .iter()
+            .find(|release| release.package.id == package_id && release.active)
+            .with_context(|| format!("marketplace package `{package_id}` is not installed"))?;
+        if active.pinned {
+            bail!("package is pinned; unpin it before rollback");
+        }
+        let target = if let Some(version) = version {
+            state.releases.iter().find(|release| {
+                release.package.id == package_id
+                    && release.package.version == version
+                    && !release.active
+            })
+        } else {
+            let active_version = Version::parse(&active.package.version)?;
+            state
+                .releases
+                .iter()
+                .filter(|release| release.package.id == package_id && !release.active)
+                .filter_map(|release| {
+                    Version::parse(&release.package.version)
+                        .ok()
+                        .filter(|candidate| candidate < &active_version)
+                        .map(|candidate| (candidate, release))
+                })
+                .max_by(|left, right| left.0.cmp(&right.0))
+                .map(|(_, release)| release)
+        }
+        .with_context(|| format!("no recorded rollback release exists for `{package_id}`"))?;
+        verify_package_files(&target.package, &self.package_root(&target.package))?;
+        Ok(target.clone())
+    }
+
+    /// Atomically activates one already-recorded and locally verified release.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for pinned, missing, tampered, or invalid releases and write failures.
+    pub fn activate(&self, package_id: &str, version: &str) -> Result<InstalledRelease> {
+        if !valid_package_id(package_id) || Version::parse(version).is_err() {
+            bail!("marketplace activation target is invalid");
+        }
+        let mut state = self.load()?;
+        if state.releases.iter().any(|release| {
+            release.package.id == package_id
+                && release.active
+                && release.pinned
+                && release.package.version != version
+        }) {
+            bail!("package is pinned; unpin it before changing versions");
+        }
+        let position = state
+            .releases
+            .iter()
+            .position(|release| {
+                release.package.id == package_id && release.package.version == version
+            })
+            .with_context(|| {
+                format!("marketplace release `{package_id}@{version}` is not recorded")
+            })?;
+        verify_package_files(
+            &state.releases[position].package,
+            &self.package_root(&state.releases[position].package),
+        )?;
+        for release in &mut state.releases {
+            if release.package.id == package_id {
+                release.active = false;
+                release.pinned = false;
+            }
+        }
+        state.releases[position].active = true;
+        let activated = state.releases[position].clone();
+        self.save(&state)?;
+        Ok(activated)
+    }
+
     /// Checks every recorded release against its immutable artifact metadata.
     ///
     /// # Errors
@@ -1680,6 +1773,53 @@ mod tests {
             .expect("state symlink");
             assert!(InstallationStore::new(scope.path()).list().is_err());
         }
+    }
+
+    #[test]
+    fn rollback_selects_and_activates_a_verified_prior_release() {
+        let scope = tempdir().expect("scope tempdir");
+        let store = InstallationStore::new(scope.path());
+        let source = tempdir().expect("source tempdir");
+        fs::write(source.path().join("SKILL.md"), "version one").expect("first fixture");
+        let mut first = catalog(&format!("{:x}", Sha256::digest(b"version one")), "SKILL.md")
+            .packages
+            .remove(0);
+        first.artifacts[0].size_bytes = 11;
+        let installed = Installer::new(store.packages_root())
+            .install(&first, source.path())
+            .expect("first release");
+        store.record(&installed).expect("record first release");
+
+        fs::write(source.path().join("SKILL.md"), "version two").expect("second fixture");
+        let mut second = first.clone();
+        second.version = "2.0.0".to_owned();
+        second.artifacts[0].sha256 = format!("{:x}", Sha256::digest(b"version two"));
+        let installed = Installer::new(store.packages_root())
+            .install(&second, source.path())
+            .expect("second release");
+        store.record(&installed).expect("record second release");
+
+        store
+            .set_pinned("crumb/review", true)
+            .expect("pin active release");
+        assert!(store.rollback_target("crumb/review", None).is_err());
+        store
+            .set_pinned("crumb/review", false)
+            .expect("unpin active release");
+        let first_root = store.packages_root().join("crumb--review/1.0.0/SKILL.md");
+        fs::write(&first_root, "tampered").expect("tamper prior release");
+        assert!(store.rollback_target("crumb/review", None).is_err());
+        fs::write(&first_root, "version one").expect("restore prior release");
+
+        let target = store
+            .rollback_target("crumb/review", None)
+            .expect("prior release target");
+        assert_eq!(target.package.version, "1.0.0");
+        let activated = store
+            .activate("crumb/review", "1.0.0")
+            .expect("activate prior release");
+        assert_eq!(activated.package.version, "1.0.0");
+        assert!(activated.active);
     }
 
     #[test]
