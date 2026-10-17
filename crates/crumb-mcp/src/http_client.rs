@@ -564,6 +564,8 @@ mod tests {
             }),
             "tools/list" if malformed_list => {
                 let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{");
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
                 return;
             }
             "tools/list" => json!({
