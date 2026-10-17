@@ -1,10 +1,11 @@
 #![cfg(target_os = "windows")]
 
+use std::io::Read;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::{NativeShell, ShellKind};
 use crumb_pty::{CommandSpec, SystemPty, TerminalSize};
@@ -12,6 +13,18 @@ use crumb_pty::{CommandSpec, SystemPty, TerminalSize};
 const POWERSHELL_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct DeterministicPowerShell;
+
+struct DeterministicCmd;
+
+impl NativeShell for DeterministicCmd {
+    fn kind(&self) -> ShellKind {
+        ShellKind::PowerShell
+    }
+
+    fn command_spec(&self) -> CommandSpec {
+        CommandSpec::new("cmd.exe").arg("/Q").arg("/K")
+    }
+}
 
 impl NativeShell for DeterministicPowerShell {
     fn kind(&self) -> ShellKind {
@@ -54,6 +67,9 @@ fn powershell_state_persists_in_one_resizable_conpty() {
 }
 
 fn exercise_persistent_powershell() -> Result<String> {
+    let cmd_output = exercise_cmd_input()?;
+    eprintln!("cmd.exe ConPTY probe completed: {cmd_output:?}");
+
     let mut session = ShellSession::start(
         &DeterministicPowerShell,
         &SystemPty,
@@ -71,4 +87,22 @@ fn exercise_persistent_powershell() -> Result<String> {
     }
     session.shutdown()?;
     Ok(String::from_utf8(output)?)
+}
+
+fn exercise_cmd_input() -> Result<String> {
+    let mut process = DeterministicCmd.spawn(&SystemPty, TerminalSize::new(24, 80))?;
+    let mut reader = process.try_clone_reader()?;
+    let reader_worker = thread::spawn(move || {
+        let mut output = String::new();
+        reader.read_to_string(&mut output)?;
+        Ok::<_, std::io::Error>(output)
+    });
+
+    process.write_input(b"echo __CRUMB_CMD_READY__\r\nexit\r\n")?;
+    eprintln!("cmd.exe ConPTY probe input written");
+    process.wait()?;
+    reader_worker
+        .join()
+        .map_err(|_| anyhow!("ConPTY cmd.exe reader thread panicked"))?
+        .map_err(Into::into)
 }

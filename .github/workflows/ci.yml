@@ -30,11 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # portable-pty 0.9.0 currently stalls while delivering ConPTY input on
-        # the Windows Server 2025 image behind windows-latest. Keep exercising
-        # the real PowerShell lifecycle on the stable 2022 image until the
-        # upstream backend supports that image.
-        os: [ubuntu-latest, macos-latest, windows-2022]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
