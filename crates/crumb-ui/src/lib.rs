@@ -605,6 +605,38 @@ impl Renderer {
         }
     }
 
+    /// Renders a durable tool outcome in the scrolling transcript.
+    #[must_use]
+    pub fn agent_tool_result(&self, name: &str, success: bool) -> String {
+        let state = if success { "completed" } else { "failed" };
+        if self.settings.output == OutputMode::ScreenReader {
+            return format!("Tool {name} {state}");
+        }
+        let color = if success { "32;1" } else { "31;1" };
+        format!(
+            "  {}  {}\n  {} {}",
+            self.paint("[ CRUMB ]", "38;2;255;255;204;48;5;53;1"),
+            self.paint(&format!("Tool {state}"), color),
+            self.paint("╰──▶", color),
+            self.paint(name, "1")
+        )
+    }
+
+    /// Renders an approval request without implying that the model can grant it.
+    #[must_use]
+    pub fn agent_approval_required(&self, name: &str) -> String {
+        if self.settings.output == OutputMode::ScreenReader {
+            return format!("Approval required for tool {name}");
+        }
+        format!(
+            "  {}  {}\n  {} {}",
+            self.paint("[ CRUMB ]", "38;2;255;255;204;48;5;53;1"),
+            self.paint("Approval required", "33;1"),
+            self.paint("╰──▶", "33;1"),
+            self.paint(&format!("{name} · user permission required"), "1")
+        )
+    }
+
     /// Starts a single-line terminal activity animation.
     #[must_use]
     pub fn activity(&self, label: &str) -> ActivityIndicator {
@@ -1161,6 +1193,48 @@ mod tests {
         let handoff = renderer.session_handoff(Duration::from_secs(1), None, 0);
         assert!(handoff.contains("╭───╮   ╭───╮"));
         assert!(handoff.contains("\x1b[38;2;128;128;128m"));
+    }
+
+    #[test]
+    fn agent_events_distinguish_tool_results_and_user_owned_approval() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Rich,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+
+        assert_eq!(
+            renderer.agent_tool_result("web_fetch", true),
+            "  [ CRUMB ]  Tool completed\n  ╰──▶ web_fetch"
+        );
+        assert_eq!(
+            renderer.agent_tool_result("write_file", false),
+            "  [ CRUMB ]  Tool failed\n  ╰──▶ write_file"
+        );
+        assert_eq!(
+            renderer.agent_approval_required("write_file"),
+            "  [ CRUMB ]  Approval required\n  ╰──▶ write_file · user permission required"
+        );
+    }
+
+    #[test]
+    fn screen_reader_agent_events_avoid_decorative_components() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::ScreenReader,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+
+        assert_eq!(
+            renderer.agent_tool_result("web_fetch", true),
+            "Tool web_fetch completed"
+        );
+        assert_eq!(
+            renderer.agent_approval_required("write_file"),
+            "Approval required for tool write_file"
+        );
     }
 
     #[test]
