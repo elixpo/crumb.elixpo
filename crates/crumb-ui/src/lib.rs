@@ -297,11 +297,28 @@ impl Renderer {
     /// Renders the persistent keyboard guide below the full-screen composer.
     #[must_use]
     pub fn composer_hotkeys(&self, terminal_width: u16) -> String {
-        let guide = if terminal_width < 80 {
-            "Enter send · Tab complete · PgUp/PgDn scroll · / commands"
+        let guide = if terminal_width < 52 {
+            "↵ send · Tab complete · / commands"
+        } else if terminal_width < 80 {
+            "Enter send · Tab complete · PgUp/PgDn · / commands"
         } else {
-            "Enter send/steer · Ctrl+Enter queue · PgUp/PgDn scroll · Tab complete · @ context · / commands · ? help"
+            "Enter send · Ctrl+Enter queue · PgUp/PgDn scroll · Tab · @ · / · ?"
         };
+        let guide = fit_terminal_text(guide, usize::from(terminal_width.saturating_sub(2)));
+        self.paint(&format!("  {guide}"), "2")
+    }
+
+    /// Renders the fixed keyboard guide while an agent turn is active.
+    #[must_use]
+    pub fn composer_active_hotkeys(&self, terminal_width: u16) -> String {
+        let guide = if terminal_width < 52 {
+            "↵ steer · ^↵ queue · ^C cancel"
+        } else if terminal_width < 80 {
+            "Enter steer · Ctrl+Enter queue · Ctrl+C cancel"
+        } else {
+            "Type a follow-up · Enter steer · Ctrl+Enter queue · /pause · Ctrl+C cancel"
+        };
+        let guide = fit_terminal_text(guide, usize::from(terminal_width.saturating_sub(2)));
         self.paint(&format!("  {guide}"), "2")
     }
 
@@ -1665,6 +1682,25 @@ mod tests {
         let handoff = renderer.session_handoff(Duration::from_secs(1), None, 0);
         assert!(handoff.contains("╭───╮   ╭───╮"));
         assert!(handoff.contains("\x1b[38;2;128;128;128m"));
+    }
+
+    #[test]
+    fn active_footer_keeps_steering_controls_visible() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+
+        let wide = renderer.composer_active_hotkeys(120);
+        assert!(wide.contains("Enter steer"));
+        assert!(wide.contains("Ctrl+Enter queue"));
+        assert!(wide.contains("/pause"));
+        assert!(wide.contains("Ctrl+C cancel"));
+        let narrow = renderer.composer_active_hotkeys(60);
+        assert!(narrow.contains("Enter steer"));
+        assert!(narrow.contains("Ctrl+C cancel"));
     }
 
     #[test]

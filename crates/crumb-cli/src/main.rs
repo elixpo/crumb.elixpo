@@ -1617,6 +1617,7 @@ fn handle_agent_boundary(
         )
     )?;
     writer.flush()?;
+    refresh_active_footer(renderer, terminal.fullscreen)?;
     if runtime.is_none() {
         match AgentRuntime::new() {
             Ok(created) => *runtime = Some(created),
@@ -1959,6 +1960,7 @@ fn observe_agent_turn(
     terminal: AgentTerminal,
     initial_activity: &str,
 ) -> Result<TurnObservation> {
+    refresh_active_footer(renderer, terminal.fullscreen)?;
     let mut activity = Some(start_activity(
         renderer,
         initial_activity,
@@ -1981,7 +1983,14 @@ fn observe_agent_turn(
             if let Some(indicator) = activity.take() {
                 indicator.finish();
             }
-            resolve_tool_approval(pending, renderer, writer, terminal.interactive)?;
+            resolve_tool_approval(
+                pending,
+                renderer,
+                writer,
+                terminal.interactive,
+                terminal.fullscreen,
+            )?;
+            refresh_active_footer(renderer, terminal.fullscreen)?;
             activity = Some(start_activity(renderer, "Thinking", terminal.fullscreen));
             input.redraw(writer)?;
         }
@@ -1997,28 +2006,26 @@ fn observe_agent_turn(
                     writer,
                     terminal.fullscreen,
                 )?;
+                refresh_active_footer(renderer, terminal.fullscreen)?;
                 input.redraw(writer)?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        if terminal.interactive
-            && poll_terminal_event(Duration::from_millis(10))?
-            && let TerminalEvent::Key(key) = read_terminal_event()?
-            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-        {
-            if let Some(indicator) = activity.take() {
-                indicator.finish();
-            }
-            if input.handle_key(key.code, key.modifiers, &task, steering, writer)?
-                == SteeringInputAction::Background
-            {
+        if terminal.interactive && poll_terminal_event(Duration::from_millis(10))? {
+            let background = handle_active_terminal_event(
+                &read_terminal_event()?,
+                &mut input,
+                &mut activity,
+                &task,
+                steering,
+                writer,
+                terminal,
+            )?;
+            if background {
                 input.clear_line(writer)?;
                 drop(enhanced_keys);
                 drop(raw_mode);
-                if let Some(indicator) = activity.take() {
-                    indicator.finish();
-                }
                 task.detach_interrupt();
                 return Ok(TurnObservation::Backgrounded(task));
             }
@@ -2035,6 +2042,7 @@ fn observe_agent_turn(
             writer,
             terminal.fullscreen,
         )?;
+        refresh_active_footer(renderer, terminal.fullscreen)?;
         input.redraw(writer)?;
     }
     let interruption = input.interruption;
@@ -2053,11 +2061,56 @@ fn observe_agent_turn(
     ))
 }
 
+fn handle_active_terminal_event(
+    event: &TerminalEvent,
+    input: &mut SteeringInput,
+    activity: &mut Option<crumb_ui::ActivityIndicator>,
+    task: &agent_runtime::AgentTurnTask,
+    steering: &mut SteeringQueue,
+    writer: &mut dyn Write,
+    terminal: AgentTerminal,
+) -> Result<bool> {
+    match event {
+        TerminalEvent::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+        {
+            if let Some(indicator) = activity.take() {
+                indicator.finish();
+            }
+            Ok(
+                input.handle_key(key.code, key.modifiers, task, steering, writer)?
+                    == SteeringInputAction::Background,
+            )
+        }
+        TerminalEvent::Resize(_, _) => {
+            refresh_active_footer(input.renderer, terminal.fullscreen)?;
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn refresh_active_footer(renderer: Renderer, fullscreen: bool) -> io::Result<()> {
+    if !fullscreen {
+        return Ok(());
+    }
+    let (columns, rows) = size()?;
+    let mut terminal = io::stderr();
+    write!(
+        terminal,
+        "\x1b7\x1b[{};1H\x1b[2K{}\x1b8",
+        rows,
+        renderer.composer_active_hotkeys(columns)
+    )?;
+    terminal.flush()
+}
+
 fn resolve_tool_approval(
     pending: PendingApproval,
     renderer: Renderer,
     writer: &mut dyn Write,
     interactive: bool,
+    fullscreen: bool,
 ) -> Result<()> {
     let request = pending.request();
     let detail = trusted_tool_detail(&request.tool, pending.arguments());
@@ -2078,7 +2131,12 @@ fn resolve_tool_approval(
         return Ok(());
     }
     loop {
-        let TerminalEvent::Key(key) = read_terminal_event()? else {
+        let event = read_terminal_event()?;
+        if matches!(event, TerminalEvent::Resize(_, _)) {
+            refresh_active_footer(renderer, fullscreen)?;
+            continue;
+        }
+        let TerminalEvent::Key(key) = event else {
             continue;
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -2418,6 +2476,7 @@ fn wait_for_paused_turn(
         "◇ Turn paused · /resume continue · Enter steer · Ctrl+Enter queue · /cancel stop"
     )?;
     writer.flush()?;
+    refresh_active_footer(renderer, terminal.fullscreen)?;
     let mut input = SteeringInput::new(renderer, steering_bytes);
     let raw_mode = terminal
         .interactive
@@ -2434,7 +2493,12 @@ fn wait_for_paused_turn(
         if !poll_terminal_event(Duration::from_millis(100))? {
             continue;
         }
-        let TerminalEvent::Key(key) = read_terminal_event()? else {
+        let event = read_terminal_event()?;
+        if matches!(event, TerminalEvent::Resize(_, _)) {
+            refresh_active_footer(renderer, terminal.fullscreen)?;
+            continue;
+        }
+        let TerminalEvent::Key(key) = event else {
             continue;
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
