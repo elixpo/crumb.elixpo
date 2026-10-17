@@ -593,7 +593,10 @@ fn dispatch_repl_event(
             writeln!(
                 context.writer,
                 "{}",
-                context.renderer.command_error(&error.to_string())
+                context.renderer.command_error_for_width(
+                    &error.to_string(),
+                    size().map_or(80, |(columns, _)| columns),
+                )
             )?;
             Ok(None)
         }
@@ -617,7 +620,11 @@ fn handle_repl_event(
         InputEvent::BuiltIn(command)
             if matches!(&command, BuiltInCommand::Auth(AuthAction::Login)) =>
         {
-            writeln!(context.writer, "{}", context.renderer.agent_response(""))?;
+            writeln!(
+                context.writer,
+                "{}",
+                terminal_agent_response(context.renderer, "")
+            )?;
             handle_builtin(
                 command,
                 context.session,
@@ -644,7 +651,7 @@ fn handle_repl_event(
                 writeln!(
                     context.writer,
                     "{}",
-                    context.renderer.agent_response(output.trim_end())
+                    terminal_agent_response(context.renderer, output.trim_end())
                 )?;
             }
             Ok(outcome)
@@ -1573,11 +1580,12 @@ fn handle_agent_boundary(
     writeln!(
         writer,
         "{}",
-        renderer.agent_header(
+        renderer.agent_header_for_width(
             &model,
             effort,
             agent_mode_name(config.mode),
             (!loaded_skills.is_empty()).then_some(loaded_skills.as_str()),
+            size().map_or(80, |(columns, _)| columns),
         )
     )?;
     writer.flush()?;
@@ -1588,7 +1596,11 @@ fn handle_agent_boundary(
                 writeln!(
                     writer,
                     "{}",
-                    renderer.agent_error(&error.to_string(), false)
+                    renderer.agent_error_for_width(
+                        &error.to_string(),
+                        false,
+                        size().map_or(80, |(columns, _)| columns),
+                    )
                 )?;
                 return Ok(());
             }
@@ -1621,25 +1633,67 @@ fn render_agent_result(
                 matches!(reason, "error" | "failed" | "cancelled" | "canceled")
             }) =>
         {
-            writeln!(writer, "{}", renderer.agent_response(""))?;
+            writeln!(writer, "{}", terminal_agent_response(renderer, ""))?;
         }
         Ok(_) if visible.as_deref().is_none_or(str::is_empty) => {
             writeln!(
                 writer,
                 "{}",
-                renderer.agent_response("Turn completed without a text response.")
+                terminal_agent_response(renderer, "Turn completed without a text response.")
             )?;
         }
         Ok(_) => writeln!(
             writer,
             "{}",
-            renderer.agent_response(visible.as_deref().unwrap_or_default())
+            terminal_agent_response(renderer, visible.as_deref().unwrap_or_default())
         )?,
         Err(error) => {
             let message = error.to_string();
             let cancelled = message.to_ascii_lowercase().contains("cancel");
-            writeln!(writer, "{}", renderer.agent_error(&message, cancelled))?;
+            writeln!(
+                writer,
+                "{}",
+                renderer.agent_error_for_width(
+                    &message,
+                    cancelled,
+                    size().map_or(80, |(columns, _)| columns),
+                )
+            )?;
         }
+    }
+    Ok(())
+}
+
+fn terminal_agent_response(renderer: Renderer, response: &str) -> String {
+    let terminal_width = size().map_or(80, |(columns, _)| columns);
+    renderer.agent_response_for_width(response, terminal_width)
+}
+
+fn write_bounded_response_delta(
+    writer: &mut dyn Write,
+    text: &str,
+    column: &mut usize,
+) -> io::Result<()> {
+    const RESPONSE_INDENT: &str = "        ";
+    let right_boundary =
+        usize::from(size().map_or(80, |(columns, _)| columns).saturating_sub(2)).max(9);
+    for character in text.chars() {
+        if character == '\n' {
+            write!(writer, "\n{RESPONSE_INDENT}")?;
+            *column = RESPONSE_INDENT.len();
+            continue;
+        }
+        let width = if character == '\t' { 4 } else { 1 };
+        if column.saturating_add(width) > right_boundary {
+            write!(writer, "\n{RESPONSE_INDENT}")?;
+            *column = RESPONSE_INDENT.len();
+        }
+        if character == '\t' {
+            write!(writer, "    ")?;
+        } else {
+            write!(writer, "{character}")?;
+        }
+        *column = column.saturating_add(width);
     }
     Ok(())
 }
@@ -1773,8 +1827,7 @@ fn finish_agent_turn(
             writeln!(
                 ui.writer,
                 "{}",
-                ui.renderer
-                    .agent_response("Steering to your latest instruction.")
+                terminal_agent_response(ui.renderer, "Steering to your latest instruction.")
             )?;
             Ok(AgentSequenceStep::RunFollowUps)
         }
@@ -1884,6 +1937,7 @@ fn observe_agent_turn(
         terminal.fullscreen,
     ));
     let mut streamed_response = false;
+    let mut streamed_column = 0_usize;
     let mut input = SteeringInput::new(renderer, steering_bytes);
     let raw_mode = terminal
         .interactive
@@ -1910,6 +1964,7 @@ fn observe_agent_turn(
                     &event,
                     &mut activity,
                     &mut streamed_response,
+                    &mut streamed_column,
                     renderer,
                     writer,
                     terminal.fullscreen,
@@ -1947,6 +2002,7 @@ fn observe_agent_turn(
             &event,
             &mut activity,
             &mut streamed_response,
+            &mut streamed_column,
             renderer,
             writer,
             terminal.fullscreen,
@@ -2531,6 +2587,7 @@ fn render_harness_activity(
     activity: &HarnessActivity,
     indicator: &mut Option<crumb_ui::ActivityIndicator>,
     streamed_response: &mut bool,
+    streamed_column: &mut usize,
     renderer: Renderer,
     writer: &mut dyn Write,
     fullscreen: bool,
@@ -2539,10 +2596,11 @@ fn render_harness_activity(
         HarnessActivity::ResponseDelta { text } => {
             finish_activity_line(indicator, writer)?;
             if !*streamed_response {
-                write!(writer, "{} ", renderer.agent_response(""))?;
+                write!(writer, "{} ", terminal_agent_response(renderer, ""))?;
                 *streamed_response = true;
+                *streamed_column = 8;
             }
-            write!(writer, "{text}")?;
+            write_bounded_response_delta(writer, text, streamed_column)?;
             writer.flush()?;
         }
         HarnessActivity::ToolStarted { name } if name == "spawn_agents" => {
@@ -8455,6 +8513,7 @@ mod tests {
         sanitize_transcript_output, set_skill_enabled, show_graph, show_marketplace, show_memory,
         show_profile_with_stores, suggestion_width, unregister_local_skill,
         validate_marketplace_path, validate_marketplace_response, workspace_read_host,
+        write_bounded_response_delta,
     };
 
     #[test]
@@ -8794,6 +8853,18 @@ mod tests {
                 reedline::ReedlineEvent::ExecuteHostCommand(expected.to_owned())
             );
         }
+    }
+
+    #[test]
+    fn streamed_agent_text_stays_inside_the_ui_margin() {
+        let mut output = Vec::new();
+        let mut column = 8;
+        write_bounded_response_delta(&mut output, &"word ".repeat(40), &mut column)
+            .expect("response delta renders");
+        let output = String::from_utf8(output).expect("terminal output is utf-8");
+
+        assert!(output.lines().all(|line| line.chars().count() <= 78));
+        assert!(output.lines().count() > 1);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::env;
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -481,6 +482,19 @@ impl Renderer {
         mode: &str,
         skill: Option<&str>,
     ) -> String {
+        self.agent_header_for_width(model, effort, mode, skill, u16::MAX)
+    }
+
+    /// Renders Harness context without crossing the terminal UI margins.
+    #[must_use]
+    pub fn agent_header_for_width(
+        &self,
+        model: &str,
+        effort: Option<&str>,
+        mode: &str,
+        skill: Option<&str>,
+        terminal_width: u16,
+    ) -> String {
         let mut details = vec![format!("model {model}"), format!("mode {mode}")];
         if let Some(effort) = effort {
             details.push(format!("effort {effort}"));
@@ -491,19 +505,42 @@ impl Renderer {
         if self.settings.output == OutputMode::ScreenReader {
             format!("Crumb agent\n{}", details.join(", "))
         } else {
-            format!(
-                "  {}  {}",
-                self.paint(CRUMB_BADGE, "38;2;255;255;204;48;5;53;1"),
-                self.paint(&details.join(" · "), "2")
-            )
+            let prefix = format!(
+                "  {}  ",
+                self.paint(CRUMB_BADGE, "38;2;255;255;204;48;5;53;1")
+            );
+            let prefix_width = 2 + CRUMB_BADGE.chars().count() + 2;
+            let content_width = usize::from(terminal_width.saturating_sub(2))
+                .saturating_sub(prefix_width)
+                .max(1);
+            wrap_terminal_line(&details.join(" · "), content_width)
+                .into_iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    let prefix = if index == 0 {
+                        prefix.clone()
+                    } else {
+                        " ".repeat(prefix_width)
+                    };
+                    format!("{prefix}{}", self.paint(&line, "2"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         }
     }
 
     /// Renders one committed Harness response without protocol metadata.
     #[must_use]
     pub fn agent_response(&self, response: &str) -> String {
+        self.agent_response_for_width(response, u16::MAX)
+    }
+
+    /// Renders one committed Harness response inside the terminal UI margins.
+    #[must_use]
+    pub fn agent_response_for_width(&self, response: &str, terminal_width: u16) -> String {
         let response = visible_agent_text(response);
-        let response = render_terminal_markdown(*self, &response);
+        let content_width = usize::from(terminal_width.saturating_sub(10)).max(1);
+        let response = render_terminal_markdown(*self, &response, content_width);
         if self.settings.output == OutputMode::ScreenReader {
             return response;
         }
@@ -522,15 +559,32 @@ impl Renderer {
     /// Renders a recoverable command failure without ending the terminal session.
     #[must_use]
     pub fn command_error(&self, message: &str) -> String {
+        self.command_error_for_width(message, u16::MAX)
+    }
+
+    /// Renders a recoverable command failure inside the terminal UI margins.
+    #[must_use]
+    pub fn command_error_for_width(&self, message: &str, terminal_width: u16) -> String {
         if self.settings.output == OutputMode::ScreenReader {
             return format!("Crumb command failed: {message}");
         }
-        format!(
-            "  {}  {}\n  {} {message}",
+        let mut output = format!(
+            "  {}  {}",
             self.paint("[ CRUMB ]", "38;2;255;255;204;48;5;53;1"),
-            self.paint("Command failed", "31;1"),
-            self.paint("╰──▶", "31;1")
-        )
+            self.paint("Command failed", "31;1")
+        );
+        let content_width = usize::from(terminal_width.saturating_sub(9)).max(1);
+        for (index, line) in wrap_terminal_line(message, content_width)
+            .into_iter()
+            .enumerate()
+        {
+            if index == 0 {
+                let _ = write!(output, "\n  {} {line}", self.paint("╰──▶", "31;1"));
+            } else {
+                let _ = write!(output, "\n        {line}");
+            }
+        }
+        output
     }
 
     /// Renders the persistent handoff shown after leaving the alternate screen.
@@ -583,6 +637,17 @@ impl Renderer {
     /// Renders a Harness failure without conflating it with native shell output.
     #[must_use]
     pub fn agent_error(&self, message: &str, cancelled: bool) -> String {
+        self.agent_error_for_width(message, cancelled, u16::MAX)
+    }
+
+    /// Renders a Harness failure inside the terminal UI margins.
+    #[must_use]
+    pub fn agent_error_for_width(
+        &self,
+        message: &str,
+        cancelled: bool,
+        terminal_width: u16,
+    ) -> String {
         let (marker, title) = if cancelled {
             ("■", "Agent cancelled")
         } else {
@@ -591,15 +656,23 @@ impl Renderer {
         if self.settings.output == OutputMode::ScreenReader {
             return format!("{title}: {message}");
         }
-        format!(
-            "  {} {} {}\n  {} {}\n  {}",
+        let mut output = format!(
+            "  {} {} {}",
             self.paint("│", "35"),
             self.paint(marker, if cancelled { "33;1" } else { "31;1" }),
-            self.paint(title, "1"),
-            self.paint("│", "35"),
-            self.paint(message, "2"),
-            self.paint("╰─", "35")
-        )
+            self.paint(title, "1")
+        );
+        let content_width = usize::from(terminal_width.saturating_sub(6)).max(1);
+        for line in wrap_terminal_line(message, content_width) {
+            let _ = write!(
+                output,
+                "\n  {} {}",
+                self.paint("│", "35"),
+                self.paint(&line, "2")
+            );
+        }
+        let _ = write!(output, "\n  {}", self.paint("╰─", "35"));
+        output
     }
 
     /// Renders one transient Harness activity update.
@@ -1097,7 +1170,7 @@ pub fn visible_agent_text(response: &str) -> String {
         .map_or_else(|| visible.to_owned(), |body| body.trim().to_owned())
 }
 
-fn render_terminal_markdown(ui: Renderer, markdown: &str) -> String {
+fn render_terminal_markdown(ui: Renderer, markdown: &str, content_width: usize) -> String {
     let mut output_lines = Vec::new();
     let mut fence: Option<String> = None;
 
@@ -1127,17 +1200,83 @@ fn render_terminal_markdown(ui: Renderer, markdown: &str) -> String {
         }
 
         if fence.is_some() {
-            output_lines.push(format!("{} {line}", ui.paint("│", "2")));
+            for chunk in wrap_terminal_line(line, content_width.saturating_sub(2).max(1)) {
+                output_lines.push(format!("{} {chunk}", ui.paint("│", "2")));
+            }
             continue;
         }
 
-        output_lines.push(render_markdown_line(ui, line));
+        for line in wrap_markdown_source_line(line, content_width) {
+            output_lines.push(render_markdown_line(ui, &line));
+        }
     }
 
     if fence.is_some() {
         output_lines.push(ui.paint("└─", "2"));
     }
     output_lines.join("\n")
+}
+
+fn wrap_markdown_source_line(line: &str, width: usize) -> Vec<String> {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+    let indent_width = indent.chars().count();
+    let available = width.saturating_sub(indent_width).max(1);
+
+    for marker in ["- ", "* ", "+ ", "> "] {
+        if let Some(body) = trimmed.strip_prefix(marker) {
+            let chunks = wrap_terminal_line(body, available.saturating_sub(2).max(1));
+            return chunks
+                .into_iter()
+                .enumerate()
+                .map(|(index, chunk)| {
+                    let continuation = if index == 0 || marker == "> " {
+                        marker
+                    } else {
+                        "  "
+                    };
+                    format!("{indent}{continuation}{chunk}")
+                })
+                .collect();
+        }
+    }
+
+    if let Some((level, heading)) = markdown_heading(trimmed) {
+        let chunks = wrap_terminal_line(heading, available);
+        return chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, chunk)| {
+                if index == 0 {
+                    format!("{indent}{} {chunk}", "#".repeat(level))
+                } else {
+                    format!("{indent}{chunk}")
+                }
+            })
+            .collect();
+    }
+
+    wrap_terminal_line(trimmed, available)
+        .into_iter()
+        .map(|chunk| format!("{indent}{chunk}"))
+        .collect()
+}
+
+fn wrap_terminal_line(line: &str, width: usize) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+    let mut wrapped = Vec::new();
+    let mut pending = line.to_owned();
+    loop {
+        let (head, remainder) = split_terminal_line(&pending, width);
+        wrapped.push(head);
+        let Some(remainder) = remainder else {
+            break;
+        };
+        pending = remainder;
+    }
+    wrapped
 }
 
 fn render_markdown_line(renderer: Renderer, line: &str) -> String {
@@ -1438,6 +1577,22 @@ mod tests {
         assert!(output.contains("┌─ mermaid diagram · source"));
         assert!(output.contains("│ graph TD"));
         assert!(!output.contains("```"));
+    }
+
+    #[test]
+    fn agent_output_wraps_inside_terminal_ui_margins() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let response = "A deliberately long response line that must remain inside the UI margins.\n- A similarly long list item that also wraps cleanly.\n```text\nlong code output that must remain bounded too\n```";
+        let output = renderer.agent_response_for_width(response, 44);
+
+        assert!(output.lines().all(|line| line.chars().count() <= 42));
+        assert_eq!(output.matches("• ").count(), 1);
+        assert!(output.matches("│ ").count() >= 2);
     }
 
     #[test]
