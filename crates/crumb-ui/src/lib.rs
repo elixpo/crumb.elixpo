@@ -318,6 +318,12 @@ impl Renderer {
         self.paint(&format!("  ╰{}╯", "─".repeat(inner)), "2")
     }
 
+    /// Renders the fixed divider between startup context and the transcript.
+    #[must_use]
+    pub fn transcript_divider(&self, available_width: u16) -> String {
+        self.paint(&"─".repeat(usize::from(available_width)), "2")
+    }
+
     /// Renders one vertical composer edge.
     #[must_use]
     pub fn composer_side_border(&self) -> String {

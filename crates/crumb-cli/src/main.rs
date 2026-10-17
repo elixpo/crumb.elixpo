@@ -572,7 +572,7 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
             dispatch_repl_event(event, &mut context)?
         };
         writer.flush()?;
-        transcript.record_output(&writer.into_capture());
+        transcript.record_output(&writer.into_capture())?;
         match outcome {
             Some(ReplOutcome::Exit) => {
                 return finish_managed_repl(screen, renderer, started_at, agent_runtime.as_ref());
@@ -758,6 +758,11 @@ impl FullscreenTranscript {
     fn position_composer(&self) -> io::Result<()> {
         if self.enabled {
             position_composer(self.renderer, self.header_rows)?;
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            render_transcript_footer(&state, self.renderer, self.header_rows)?;
         }
         Ok(())
     }
@@ -774,23 +779,30 @@ impl FullscreenTranscript {
                 self.started,
             )?;
             if let Some(rendered) = rendered {
-                self.state
+                let mut state = self
+                    .state
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .append(&rendered);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.append(&rendered) {
+                    render_transcript_view(&state, self.renderer, self.header_rows)?;
+                }
             }
             self.started = true;
         }
         Ok(())
     }
 
-    fn record_output(&mut self, output: &[u8]) {
+    fn record_output(&mut self, output: &[u8]) -> io::Result<()> {
         if self.enabled && !output.is_empty() {
-            self.state
+            let mut state = self
+                .state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .append(&String::from_utf8_lossy(output));
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.append(&String::from_utf8_lossy(output)) {
+                render_transcript_view(&state, self.renderer, self.header_rows)?;
+            }
         }
+        Ok(())
     }
 
     fn scroll(&mut self, direction: TranscriptScroll) -> io::Result<()> {
@@ -802,7 +814,7 @@ impl FullscreenTranscript {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.scroll(direction, self.header_rows);
-        render_transcript_view(&state, self.header_rows)
+        render_transcript_view(&state, self.renderer, self.header_rows)
     }
 }
 
@@ -810,22 +822,32 @@ impl FullscreenTranscript {
 struct TranscriptState {
     lines: VecDeque<String>,
     scroll_offset: usize,
+    unseen_lines: usize,
 }
 
 impl TranscriptState {
     const MAX_LINES: usize = 4_096;
     const SCROLL_STEP: usize = 1;
 
-    fn append(&mut self, output: &str) {
-        self.scroll_offset = 0;
-        self.lines.extend(
-            sanitize_transcript_output(output)
-                .split('\n')
-                .map(str::to_owned),
-        );
+    fn append(&mut self, output: &str) -> bool {
+        let appended = sanitize_transcript_output(output)
+            .split('\n')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let appended_lines = appended.len();
+        let preserve_viewport = self.scroll_offset > 0;
+        if preserve_viewport {
+            self.scroll_offset = self.scroll_offset.saturating_add(appended_lines);
+            self.unseen_lines = self.unseen_lines.saturating_add(appended_lines);
+        } else {
+            self.unseen_lines = 0;
+        }
+        self.lines.extend(appended);
         while self.lines.len() > Self::MAX_LINES {
             self.lines.pop_front();
         }
+        self.scroll_offset = self.scroll_offset.min(self.lines.len().saturating_sub(1));
+        preserve_viewport
     }
 
     fn scroll(&mut self, direction: TranscriptScroll, header_rows: u16) {
@@ -840,6 +862,9 @@ impl TranscriptState {
                 .min(maximum),
             TranscriptScroll::Down => self.scroll_offset.saturating_sub(Self::SCROLL_STEP),
         };
+        if self.scroll_offset == 0 {
+            self.unseen_lines = 0;
+        }
     }
 }
 
@@ -1039,7 +1064,15 @@ fn render_startup(
             writeln!(writer)?;
         }
         writeln!(writer, "{welcome}")?;
-        let content_rows = u16::try_from(welcome.lines().count()).unwrap_or(u16::MAX);
+        writeln!(
+            writer,
+            "{}{}",
+            " ".repeat(usize::from(FULLSCREEN_SIDE_GUTTER)),
+            renderer.transcript_divider(content_width)
+        )?;
+        let content_rows = u16::try_from(welcome.lines().count())
+            .unwrap_or(u16::MAX)
+            .saturating_add(1);
         return Ok(content_rows.saturating_add(FULLSCREEN_TOP_GUTTER));
     }
     let branding = renderer.branding_for_width(terminal_width);
@@ -7597,6 +7630,10 @@ impl CompletionOverlay {
 
     fn paint_overlay(&self, body: &str) -> String {
         let (columns, top, composer_row) = self.overlay_rows();
+        let transcript = self
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut frame = String::new();
         let mut lines = body.lines();
         for row in top..composer_row {
@@ -7611,6 +7648,17 @@ impl CompletionOverlay {
             composer_row.saturating_add(4),
             self.renderer.composer_idle_status()
         );
+        if let Some((column, indicator)) =
+            transcript_new_content_indicator(&transcript, self.renderer, columns)
+        {
+            let _ = write!(
+                frame,
+                "\x1b[{};{}H{}",
+                composer_row.saturating_add(4),
+                column.saturating_add(1),
+                indicator
+            );
+        }
         let _ = write!(
             frame,
             "\x1b[{};1H\x1b[2K{}",
@@ -7625,7 +7673,7 @@ impl CompletionOverlay {
             .transcript
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = render_transcript_view(&transcript, self.header_rows);
+        let _ = render_transcript_view(&transcript, self.renderer, self.header_rows);
     }
 
     fn restore_overlay_frame(&self) -> String {
@@ -8186,7 +8234,11 @@ fn prepare_fullscreen_submission(
     Ok(None)
 }
 
-fn render_transcript_view(state: &TranscriptState, header_rows: u16) -> io::Result<()> {
+fn render_transcript_view(
+    state: &TranscriptState,
+    renderer: Renderer,
+    header_rows: u16,
+) -> io::Result<()> {
     let (top, bottom, _, _) = fullscreen_rows(header_rows)?;
     let height = bottom.saturating_sub(top) as usize + 1;
     let end = state.lines.len().saturating_sub(state.scroll_offset);
@@ -8201,8 +8253,56 @@ fn render_transcript_view(state: &TranscriptState, header_rows: u16) -> io::Resu
         crossterm::execute!(writer, MoveTo(0, row))?;
         write!(writer, "{line}")?;
     }
+    render_transcript_footer_with_writer(&mut writer, state, renderer, header_rows)?;
     write!(writer, "\x1b8")?;
     writer.flush()
+}
+
+fn render_transcript_footer(
+    state: &TranscriptState,
+    renderer: Renderer,
+    header_rows: u16,
+) -> io::Result<()> {
+    let mut writer = io::stdout();
+    write!(writer, "\x1b7")?;
+    render_transcript_footer_with_writer(&mut writer, state, renderer, header_rows)?;
+    write!(writer, "\x1b8")?;
+    writer.flush()
+}
+
+fn render_transcript_footer_with_writer(
+    writer: &mut impl Write,
+    state: &TranscriptState,
+    renderer: Renderer,
+    header_rows: u16,
+) -> io::Result<()> {
+    let (columns, _) = size()?;
+    let (_, _, composer_row, footer_row) = fullscreen_rows(header_rows)?;
+    crossterm::execute!(
+        writer,
+        MoveTo(0, composer_row.saturating_add(3)),
+        Clear(ClearType::CurrentLine)
+    )?;
+    write!(writer, "{}", renderer.composer_idle_status())?;
+    if let Some((column, indicator)) = transcript_new_content_indicator(state, renderer, columns) {
+        crossterm::execute!(writer, MoveTo(column, composer_row.saturating_add(3)))?;
+        write!(writer, "{indicator}")?;
+    }
+    crossterm::execute!(writer, MoveTo(0, footer_row), Clear(ClearType::CurrentLine))?;
+    write!(writer, "{}", renderer.composer_hotkeys(columns))
+}
+
+fn transcript_new_content_indicator(
+    state: &TranscriptState,
+    renderer: Renderer,
+    columns: u16,
+) -> Option<(u16, String)> {
+    (state.scroll_offset > 0 && state.unseen_lines > 0).then(|| {
+        let label = format!("↓ {} new below", state.unseen_lines);
+        let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+        let column = columns.saturating_sub(width.saturating_add(2));
+        (column, renderer.composer_status(&label))
+    })
 }
 
 fn sanitize_transcript_output(output: &str) -> String {
@@ -8484,12 +8584,12 @@ mod tests {
 
     use super::{
         CrumbEditMode, ExitGesture, MarketplaceContent, PausedSubmission, SessionCommandContext,
-        SteeringAction, TerminalModeTracker, TranscriptCapture, agent_config_location,
-        configure_permissions, configure_plugin, effort_display_name, effort_wire_name,
-        failed_command_recovery, initial_agent_activity, marketplace_update_blocker,
-        openrouter_preset, parse_credential_reference, parse_paused_submission,
-        parse_provider_header, parse_resume_session_argument, read_agent_config,
-        read_bounded_response, register_local_skill, resolve_memory_keep,
+        SteeringAction, TerminalModeTracker, TranscriptCapture, TranscriptScroll, TranscriptState,
+        agent_config_location, configure_permissions, configure_plugin, effort_display_name,
+        effort_wire_name, failed_command_recovery, initial_agent_activity,
+        marketplace_update_blocker, openrouter_preset, parse_credential_reference,
+        parse_paused_submission, parse_provider_header, parse_resume_session_argument,
+        read_agent_config, read_bounded_response, register_local_skill, resolve_memory_keep,
         sanitize_transcript_output, set_skill_enabled, show_graph, show_marketplace, show_memory,
         show_profile_with_stores, suggestion_width, unregister_local_skill,
         validate_marketplace_path, validate_marketplace_response, workspace_read_host,
@@ -8845,6 +8945,23 @@ mod tests {
 
         assert!(output.lines().all(|line| line.chars().count() <= 78));
         assert!(output.lines().count() > 1);
+    }
+
+    #[test]
+    fn appended_transcript_lines_preserve_a_scrolled_viewport() {
+        let mut transcript = TranscriptState::default();
+        assert!(!transcript.append("one\ntwo\nthree"));
+        transcript.scroll_offset = 2;
+
+        assert!(transcript.append("four\nfive"));
+        assert_eq!(transcript.scroll_offset, 4);
+        assert_eq!(transcript.unseen_lines, 2);
+
+        for _ in 0..4 {
+            transcript.scroll(TranscriptScroll::Down, 0);
+        }
+        assert_eq!(transcript.scroll_offset, 0);
+        assert_eq!(transcript.unseen_lines, 0);
     }
 
     #[test]
