@@ -1567,8 +1567,34 @@ fn skill_is_relevant(skill: &SkillConfig, request: &str) -> bool {
             "skill file",
             "skill.md",
         ]),
+        "crumb-commands" => crumb_command_skill_relevant(&request),
         _ => true,
     }
+}
+
+fn crumb_command_skill_relevant(request: &str) -> bool {
+    [
+        "crumb command",
+        "slash command",
+        "shortcut",
+        "what does",
+        "how do i use",
+        "question mark",
+        "permissions",
+        "model pack",
+        "session command",
+        "memory command",
+        "/help",
+        "/pack",
+        "/model",
+        "/effort",
+        "/session",
+        "/memory",
+        "/permissions",
+        "? config",
+    ]
+    .iter()
+    .any(|term| request.contains(term))
 }
 
 fn estimate_tokens(text: &str) -> u64 {

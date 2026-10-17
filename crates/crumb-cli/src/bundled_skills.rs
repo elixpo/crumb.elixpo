@@ -15,6 +15,7 @@ pub(crate) const DEFAULT_IDS: &[&str] = &[
     "web-research",
     "karpathy-guidelines",
     "skill-authoring",
+    "crumb-commands",
 ];
 
 pub(crate) struct BundledSkill {
@@ -91,6 +92,10 @@ pub(crate) static ALL: &[BundledSkill] = &[
     skill!(
         "skill-authoring",
         "create or update focused reusable Crumb Agent Skills"
+    ),
+    skill!(
+        "crumb-commands",
+        "explain Crumb commands, shortcuts, model packs, sessions, memory, and permissions"
     ),
 ];
 
