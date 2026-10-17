@@ -5011,6 +5011,10 @@ fn handle_marketplace_lifecycle(command: &str, cwd: &Path, writer: &mut dyn Writ
         uninstall_marketplace_package(arguments, cwd, writer)?;
         return Ok(true);
     }
+    if let Some(arguments) = command.strip_prefix("/marketplace rollback ") {
+        rollback_marketplace_package(arguments, cwd, writer)?;
+        return Ok(true);
+    }
     Ok(false)
 }
 
@@ -5076,7 +5080,7 @@ fn show_marketplace_catalog(command: &str, cwd: &Path, writer: &mut dyn Write) -
         )?;
         writeln!(
             writer,
-            "  `/marketplace updates|installed [--scope project|user]` · `pin` · `unpin` · `doctor` · `uninstall`"
+            "  `/marketplace updates|installed [--scope project|user]` · `pin` · `unpin` · `doctor` · `rollback` · `uninstall`"
         )?;
         writeln!(
             writer,
@@ -5094,7 +5098,7 @@ fn show_marketplace_catalog(command: &str, cwd: &Path, writer: &mut dyn Write) -
         return install_marketplace_package(&catalog, arguments, cwd, writer);
     }
     Err(anyhow!(
-        "usage: /marketplace [sync | remote [inspect <publisher/name>] | inspect <publisher/name> | install <publisher/name> [--scope project|user] | install-remote <publisher/name> [--scope project|user] | updates|installed [--scope project|user] | pin|unpin|uninstall <publisher/name> [--scope project|user] | doctor [--scope project|user] | validate <catalog.json>]"
+        "usage: /marketplace [sync | remote [inspect <publisher/name>] | inspect <publisher/name> | install <publisher/name> [--scope project|user] | install-remote <publisher/name> [--scope project|user] | updates|installed [--scope project|user] | pin|unpin|uninstall <publisher/name> [--scope project|user] | rollback <publisher/name> [--to <version>] [--scope project|user] | doctor [--scope project|user] | validate <catalog.json>]"
     ))
 }
 
@@ -5483,6 +5487,24 @@ fn parse_marketplace_scope_argument(arguments: &str, command: &str) -> Result<In
     }
 }
 
+fn parse_marketplace_rollback_arguments(
+    arguments: &str,
+) -> Result<(&str, Option<&str>, InstallScope)> {
+    let parts = arguments.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        [id] | [id, "--scope", "project"] => Ok((id, None, InstallScope::Project)),
+        [id, "--to", version] => Ok((id, Some(version), InstallScope::Project)),
+        [id, "--scope", "user"] => Ok((id, None, InstallScope::User)),
+        [id, "--to", version, "--scope", "project"] => {
+            Ok((id, Some(version), InstallScope::Project))
+        }
+        [id, "--to", version, "--scope", "user"] => Ok((id, Some(version), InstallScope::User)),
+        _ => Err(anyhow!(
+            "usage: /marketplace rollback <publisher/name> [--to <version>] [--scope project|user]"
+        )),
+    }
+}
+
 fn marketplace_install_store(
     scope: InstallScope,
     project_root: &Path,
@@ -5642,6 +5664,52 @@ fn uninstall_marketplace_package(
     Ok(())
 }
 
+fn rollback_marketplace_package(arguments: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let (id, version, scope) = parse_marketplace_rollback_arguments(arguments)?;
+    let (_, project_root) = agent_config_location(cwd);
+    let store = marketplace_install_store(scope, &project_root)?;
+    let current = store
+        .list()?
+        .into_iter()
+        .find(|release| release.package.id == id && release.active)
+        .with_context(|| format!("marketplace package `{id}` is not installed"))?;
+    let target = store.rollback_target(id, version)?;
+    let client = marketplace_http_client()?;
+    let verifier = SigstoreVerifier::production()?;
+    let catalog = download_verified_marketplace_catalog(&client, &verifier)?;
+    if catalog.revocations.iter().any(|revocation| {
+        revocation.package == target.package.id && revocation.version == target.package.version
+    }) {
+        bail!(
+            "rollback target `{id}@{}` is revoked",
+            target.package.version
+        );
+    }
+    ensure_marketplace_components_disabled(&current, scope, &project_root, cwd)?;
+    let activated = store.activate(id, &target.package.version)?;
+    if let Err(error) =
+        replace_marketplace_components(&current, &activated, scope, &project_root, cwd)
+    {
+        store
+            .activate(id, &current.package.version)
+            .context("rollback configuration failed and prior activation could not be restored")?;
+        return Err(error).context("rollback configuration failed; prior activation was restored");
+    }
+    writeln!(
+        writer,
+        "◆ Rolled back {} {} → {} · {} scope",
+        id,
+        current.package.version,
+        target.package.version,
+        install_scope_name(scope)
+    )?;
+    writeln!(
+        writer,
+        "  Target artifacts verified; components remain disabled."
+    )?;
+    Ok(())
+}
+
 fn register_installed_package(
     installed: &crumb_marketplace::InstalledPackage,
     scope: InstallScope,
@@ -5791,6 +5859,102 @@ fn unregister_marketplace_components(
                     && server.credential.is_none()
             })
         });
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn replace_marketplace_components(
+    current: &InstalledRelease,
+    target: &InstalledRelease,
+    scope: InstallScope,
+    project_root: &Path,
+    cwd: &Path,
+) -> Result<()> {
+    let current_root = marketplace_release_root(current, scope, project_root)?;
+    let target_root = marketplace_release_root(target, scope, project_root)?;
+    let current_executable = std::env::current_exe().context("Crumb executable is unavailable")?;
+    update_agent_config(cwd, |config| {
+        config.skills.retain(|skill| {
+            !current.package.skills.iter().any(|entry| {
+                skill.id == entry.id
+                    && !skill.enabled
+                    && skill.path
+                        == marketplace_component_path(
+                            &current_root,
+                            &entry.path,
+                            scope,
+                            project_root,
+                        )
+            })
+        });
+        config.mcp_servers.retain(|server| {
+            !current.package.mcp_servers.iter().any(|entry| {
+                let transport = match entry.transport {
+                    MarketplaceMcpTransport::Stdio => crumb_agent::McpTransport::Stdio,
+                    MarketplaceMcpTransport::StreamableHttp => {
+                        crumb_agent::McpTransport::StreamableHttp
+                    }
+                };
+                let command = match entry.command.as_deref() {
+                    Some("crumb") => current_executable.clone(),
+                    Some(command) => PathBuf::from(command),
+                    None => PathBuf::new(),
+                };
+                server.id == entry.id
+                    && !server.enabled
+                    && server.transport == transport
+                    && server.command == command
+                    && server.arguments == entry.arguments
+                    && server.url == entry.url
+                    && server.credential.is_none()
+            })
+        });
+        for entry in &target.package.skills {
+            if config.skills.iter().any(|skill| skill.id == entry.id) {
+                bail!(
+                    "skill `{}` conflicts with an existing registration",
+                    entry.id
+                );
+            }
+            config.skills.push(SkillConfig {
+                id: entry.id.clone(),
+                path: marketplace_component_path(&target_root, &entry.path, scope, project_root),
+                enabled: false,
+            });
+        }
+        for entry in &target.package.mcp_servers {
+            if config
+                .mcp_servers
+                .iter()
+                .any(|server| server.id == entry.id)
+            {
+                bail!(
+                    "MCP server `{}` conflicts with an existing registration",
+                    entry.id
+                );
+            }
+            let transport = match entry.transport {
+                MarketplaceMcpTransport::Stdio => crumb_agent::McpTransport::Stdio,
+                MarketplaceMcpTransport::StreamableHttp => {
+                    crumb_agent::McpTransport::StreamableHttp
+                }
+            };
+            let command = match entry.command.as_deref() {
+                Some("crumb") => current_executable.clone(),
+                Some(command) => PathBuf::from(command),
+                None => PathBuf::new(),
+            };
+            config.mcp_servers.push(McpServer {
+                id: entry.id.clone(),
+                transport,
+                command,
+                arguments: entry.arguments.clone(),
+                url: entry.url.clone(),
+                credential: None,
+                enabled: false,
+            });
+        }
         Ok(())
     })?;
     Ok(())
