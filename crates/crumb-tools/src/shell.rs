@@ -470,10 +470,23 @@ mod tests {
     }
 
     fn config(timeout: Duration) -> AgentShellConfig {
+        #[cfg(unix)]
+        let (program, arguments, path) = (
+            PathBuf::from("/bin/sh"),
+            vec![OsString::from("-c")],
+            Some(OsString::from("/usr/bin:/bin")),
+        );
+        #[cfg(windows)]
+        let (program, arguments, path) = (
+            PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+            vec![OsString::from("/C")],
+            None,
+        );
+
         AgentShellConfig {
-            program: PathBuf::from("/bin/sh"),
-            arguments: vec![OsString::from("-c")],
-            path: Some(OsString::from("/usr/bin:/bin")),
+            program,
+            arguments,
+            path,
             max_output_bytes: 256,
             timeout,
         }
