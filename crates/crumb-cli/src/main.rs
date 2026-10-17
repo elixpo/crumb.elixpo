@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
+use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -47,6 +48,7 @@ use crumb_native::shell_for;
 use crumb_optimize::{OptimizationPipeline, RtkOptimizer};
 use crumb_platform::Platform;
 use crumb_pollinations::{PollinationsSearchConfig, register_web_search_tool};
+use crumb_profile::{ProfileDocument, ProfileSelectionStore, ProfileStore};
 use crumb_pty::{PtyInput, PtyResizer, SystemPty, TerminalSize};
 use crumb_repl::{ReplOutcome, read_classified_line};
 use crumb_tools::{
@@ -2013,6 +2015,7 @@ fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
                 "/tools",
                 "/permissions",
                 "/memory",
+                "/profile",
             ][..],
         ),
         (
@@ -2140,6 +2143,9 @@ fn show_reserved(
         }
         command if command == "/memory" || command.starts_with("/memory ") => {
             show_memory(command, cwd, writer)?;
+        }
+        command if command == "/profile" || command.starts_with("/profile ") => {
+            show_profile(command, cwd, writer)?;
         }
         command if command == "/review" || command.starts_with("/review ") => {
             show_reviews(command, cwd, runtime, writer)?;
@@ -3818,6 +3824,267 @@ fn show_plugins(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     Ok(())
 }
 
+const MAX_PROFILE_IMPORT_BYTES: u64 = 64 * 1024;
+
+fn show_profile(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let store = ProfileStore::discover()?;
+    let (_, project_root) = agent_config_location(cwd);
+    let selection = ProfileSelectionStore::for_project(&project_root);
+    show_profile_with_stores(command, cwd, &store, &selection, writer)
+}
+
+fn show_profile_with_stores(
+    command: &str,
+    cwd: &Path,
+    store: &ProfileStore,
+    selection: &ProfileSelectionStore,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let arguments = command.strip_prefix("/profile").unwrap_or_default().trim();
+    let mut parts = arguments.split_whitespace();
+    match parts.next() {
+        None => show_active_profile(store, selection, writer)?,
+        Some("list") if parts.next().is_none() => show_profile_list(store, selection, writer)?,
+        Some("show") => {
+            let requested = single_argument(parts, "usage: /profile show <id>")?;
+            show_profile_document(&store.load(requested)?, writer)?;
+        }
+        Some("create") => {
+            let (id, label) = split_profile_label(arguments, "create")?;
+            let profile = ProfileDocument::new(id, label)?;
+            store.create(&profile)?;
+            writeln!(writer, "◆ Profile created · {}", profile.id)?;
+            writeln!(writer, "  {}", profile.label)?;
+        }
+        Some("clone") => {
+            let (source, remaining) = split_once_required(
+                arguments.strip_prefix("clone").unwrap_or_default().trim(),
+                "usage: /profile clone <source> <id> <label>",
+            )?;
+            let (id, label) =
+                split_once_required(remaining, "usage: /profile clone <source> <id> <label>")?;
+            let profile = store.clone_profile(source, id, label)?;
+            writeln!(writer, "◆ Profile cloned · {} → {}", source, profile.id)?;
+        }
+        Some("select") => {
+            let id = single_argument(parts, "usage: /profile select <id>")?;
+            store.load(id)?;
+            selection.select(Some(id))?;
+            writeln!(writer, "◆ Profile selected · {id}")?;
+            writeln!(writer, "  Active immediately for this project")?;
+        }
+        Some("clear") if parts.next().is_none() => {
+            selection.select(None)?;
+            writeln!(writer, "◇ Project profile cleared")?;
+        }
+        Some("rename") => {
+            let source = parts
+                .next()
+                .context("usage: /profile rename <source> <new-id>")?;
+            let id = single_argument(parts, "usage: /profile rename <source> <new-id>")?;
+            let was_active = selection.load()?.profile_id.as_deref() == Some(source);
+            let renamed = store.rename(source, id)?;
+            if was_active {
+                selection.select(Some(&renamed.id))?;
+            }
+            writeln!(writer, "◆ Profile renamed · {source} → {}", renamed.id)?;
+        }
+        Some("export") => {
+            export_profile(parts, cwd, store, writer)?;
+        }
+        Some("import") => {
+            import_profile(parts, cwd, store, writer)?;
+        }
+        Some("delete") => {
+            let id = single_argument(parts, "usage: /profile delete <id>")?;
+            if selection.load()?.profile_id.as_deref() == Some(id) {
+                bail!("profile `{id}` is active; run `/profile clear` before deleting it");
+            }
+            store.delete(id)?;
+            writeln!(writer, "◇ Profile deleted · {id}")?;
+        }
+        Some(_) => writeln!(
+            writer,
+            "usage: /profile [list | show <id> | create <id> <label> | clone <source> <id> <label> | select <id> | clear | rename <source> <new-id> | export <id> [path] | import <path> | delete <id>]"
+        )?,
+    }
+    Ok(())
+}
+
+fn export_profile<'a>(
+    mut arguments: impl Iterator<Item = &'a str>,
+    cwd: &Path,
+    store: &ProfileStore,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let id = arguments
+        .next()
+        .context("usage: /profile export <id> [path]")?;
+    let destination = arguments.next();
+    if arguments.next().is_some() {
+        bail!("usage: /profile export <id> [path]");
+    }
+    let exported = store.export(id)?;
+    let Some(path) = destination else {
+        writeln!(writer, "{exported}")?;
+        return Ok(());
+    };
+    let path = resolve_profile_path(cwd, path);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "profile export destination `{}` is unavailable",
+                path.display()
+            )
+        })?;
+    file.write_all(exported.as_bytes())?;
+    file.sync_all()?;
+    writeln!(writer, "◆ Profile exported · {}", path.display())?;
+    Ok(())
+}
+
+fn import_profile<'a>(
+    arguments: impl Iterator<Item = &'a str>,
+    cwd: &Path,
+    store: &ProfileStore,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let path = resolve_profile_path(
+        cwd,
+        single_argument(arguments, "usage: /profile import <path>")?,
+    );
+    let metadata = std::fs::symlink_metadata(&path)
+        .with_context(|| format!("profile import `{}` was not found", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_PROFILE_IMPORT_BYTES {
+        bail!("profile import must be a regular file no larger than 64 KiB");
+    }
+    let contents = std::fs::read_to_string(&path)?;
+    let profile = store.import(&contents)?;
+    writeln!(writer, "◆ Profile imported · {}", profile.id)?;
+    writeln!(
+        writer,
+        "  External skills and connectors remain disabled until explicitly enabled"
+    )?;
+    Ok(())
+}
+
+fn show_active_profile(
+    store: &ProfileStore,
+    selection: &ProfileSelectionStore,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let Some(id) = selection.load()?.profile_id else {
+        writeln!(writer, "◇ No project profile selected")?;
+        writeln!(
+            writer,
+            "  Use `/profile list` or `/profile create <id> <label>`"
+        )?;
+        return Ok(());
+    };
+    let profile = store
+        .load(&id)
+        .with_context(|| format!("selected profile `{id}` is unavailable"))?;
+    writeln!(writer, "◆ Active profile · {}", profile.id)?;
+    writeln!(writer, "  {}", profile.label)?;
+    Ok(())
+}
+
+fn show_profile_list(
+    store: &ProfileStore,
+    selection: &ProfileSelectionStore,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let profiles = store.list()?;
+    let active = selection.load()?.profile_id;
+    writeln!(writer, "◆ Persona profiles")?;
+    if profiles.is_empty() {
+        writeln!(writer, "  No profiles created")?;
+    }
+    for id in profiles {
+        let profile = store.load(&id)?;
+        let marker = if active.as_deref() == Some(id.as_str()) {
+            "●"
+        } else {
+            "○"
+        };
+        writeln!(writer, "  {marker} {:<18} {}", profile.id, profile.label)?;
+    }
+    Ok(())
+}
+
+fn show_profile_document(profile: &ProfileDocument, writer: &mut dyn Write) -> Result<()> {
+    writeln!(writer, "◆ Profile · {}", profile.id)?;
+    writeln!(writer, "  label       {}", profile.label)?;
+    writeln!(
+        writer,
+        "  effort      {}",
+        profile.effort.as_deref().unwrap_or("inherit")
+    )?;
+    writeln!(
+        writer,
+        "  instructions {} bytes · style {}",
+        profile.instructions.len(),
+        profile.response_style.as_deref().unwrap_or("inherit")
+    )?;
+    writeln!(
+        writer,
+        "  memory      user {} · project {} · {} tags",
+        profile.memory.include_user,
+        profile.memory.include_project,
+        profile.memory.tags.len()
+    )?;
+    writeln!(
+        writer,
+        "  references  {} skills · {} connectors · {} models",
+        profile.skills.len(),
+        profile.connectors.len(),
+        profile.preferred_models.len()
+    )?;
+    Ok(())
+}
+
+fn single_argument<'a>(
+    mut arguments: impl Iterator<Item = &'a str>,
+    usage: &str,
+) -> Result<&'a str> {
+    let argument = arguments.next().with_context(|| usage.to_owned())?;
+    if arguments.next().is_some() {
+        bail!(usage.to_owned());
+    }
+    Ok(argument)
+}
+
+fn split_profile_label<'a>(arguments: &'a str, action: &str) -> Result<(&'a str, &'a str)> {
+    split_once_required(
+        arguments.strip_prefix(action).unwrap_or_default().trim(),
+        &format!("usage: /profile {action} <id> <label>"),
+    )
+}
+
+fn split_once_required<'a>(input: &'a str, usage: &str) -> Result<(&'a str, &'a str)> {
+    let boundary = input
+        .find(char::is_whitespace)
+        .with_context(|| usage.to_owned())?;
+    let (first, remaining) = input.split_at(boundary);
+    let remaining = remaining.trim();
+    if first.is_empty() || remaining.is_empty() {
+        bail!(usage.to_owned());
+    }
+    Ok((first, remaining))
+}
+
+fn resolve_profile_path(cwd: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
 fn show_memory(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     let (_, project_root) = agent_config_location(cwd);
     let memory = MemorySet::discover(&project_root)?;
@@ -5028,7 +5295,7 @@ fn prompt_model_status(cwd: &Path) -> String {
     let Ok(config) = read_agent_config(cwd) else {
         return "native".to_owned();
     };
-    config
+    let mut status = config
         .models
         .get(&Modality::Text)
         .and_then(|routes| routes.first())
@@ -5044,7 +5311,22 @@ fn prompt_model_status(cwd: &Path) -> String {
                     agent_mode_name(config.mode)
                 )
             },
-        )
+        );
+    if let Some(profile) = selected_profile_id(cwd) {
+        status.push_str(" · profile ");
+        status.push_str(&profile);
+    }
+    status
+}
+
+fn selected_profile_id(cwd: &Path) -> Option<String> {
+    let (_, project_root) = agent_config_location(cwd);
+    let selection = ProfileSelectionStore::for_project(&project_root)
+        .load()
+        .ok()?
+        .profile_id?;
+    ProfileStore::discover().ok()?.load(&selection).ok()?;
+    Some(selection)
 }
 
 fn compact_token_count(tokens: u64) -> String {
@@ -5429,13 +5711,14 @@ mod tests {
         AgentConfig, CredentialReference, ProviderHeader, ProviderProtocol, RiskClass,
     };
     use crumb_memory::{MemoryScope, MemorySet, MemoryStore};
+    use crumb_profile::{ProfileSelectionStore, ProfileStore};
 
     use super::{
         ExitGesture, SessionCommandContext, agent_config_location, effort_display_name,
         effort_wire_name, failed_command_recovery, initial_agent_activity, openrouter_preset,
         parse_credential_reference, parse_provider_header, parse_resume_session_argument,
-        read_agent_config, resolve_memory_keep, show_marketplace, show_memory, suggestion_width,
-        workspace_read_host,
+        read_agent_config, resolve_memory_keep, show_marketplace, show_memory,
+        show_profile_with_stores, suggestion_width, workspace_read_host,
     };
 
     #[test]
@@ -5625,6 +5908,63 @@ mod tests {
         assert!(skill.path.ends_with("skills/code-review/SKILL.md"));
         assert!(workspace.join(&skill.path).is_file());
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
+    }
+
+    #[test]
+    fn profile_commands_manage_project_selection_without_agent_access() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("crumb-profile-cli-{suffix}"));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace can be created");
+        let profiles = ProfileStore::new(root.join("profiles"));
+        let selection = ProfileSelectionStore::for_project(&workspace);
+        let mut output = Vec::new();
+
+        for command in [
+            "/profile create reviewer Careful code reviewer",
+            "/profile select reviewer",
+            "/profile",
+            "/profile rename reviewer maintainer",
+            "/profile list",
+        ] {
+            show_profile_with_stores(command, &workspace, &profiles, &selection, &mut output)
+                .expect("profile command succeeds");
+        }
+        assert!(
+            show_profile_with_stores(
+                "/profile delete maintainer",
+                &workspace,
+                &profiles,
+                &selection,
+                &mut output,
+            )
+            .is_err()
+        );
+        show_profile_with_stores(
+            "/profile clear",
+            &workspace,
+            &profiles,
+            &selection,
+            &mut output,
+        )
+        .expect("selection clears");
+        show_profile_with_stores(
+            "/profile delete maintainer",
+            &workspace,
+            &profiles,
+            &selection,
+            &mut output,
+        )
+        .expect("inactive profile deletes");
+
+        let output = String::from_utf8(output).expect("profile output is UTF-8");
+        assert!(output.contains("Active profile · reviewer"));
+        assert!(output.contains("Profile renamed · reviewer → maintainer"));
+        assert_eq!(profiles.list().expect("profile list"), Vec::<String>::new());
+        std::fs::remove_dir_all(root).expect("temporary profiles can be removed");
     }
 
     #[test]

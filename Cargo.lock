@@ -528,6 +528,7 @@ dependencies = [
  "crumb-optimize",
  "crumb-platform",
  "crumb-pollinations",
+ "crumb-profile",
  "crumb-pty",
  "crumb-repl",
  "crumb-tools",
