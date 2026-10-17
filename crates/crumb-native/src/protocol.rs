@@ -77,7 +77,7 @@ impl CompletionProtocol {
                 self.token
             ),
             ShellKind::PowerShell =>
-                "Remove-Module PSReadLine -ErrorAction SilentlyContinue; $global:LASTEXITCODE = $null\r\n"
+                "Remove-Module PSReadLine -ErrorAction SilentlyContinue; $global:LASTEXITCODE = $null\r"
                     .to_owned(),
         }
     }
@@ -134,7 +134,7 @@ impl CompletionProtocol {
 
     fn powershell_submission(&self, command: &str, sequence: u64) -> String {
         format!(
-            "$global:LASTEXITCODE=$null; {command}; $__crumb_status = if ($?) {{ 0 }} elseif ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }}; $__crumb_cwd_hex = [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes((Get-Location).Path)).ToLowerInvariant(); [Console]::Write([char]0x1e + 'crumb:{}:{sequence}:' + $__crumb_status + ':' + $__crumb_cwd_hex + [char]0x1f)\r\n",
+            "$global:LASTEXITCODE=$null; {command}; $__crumb_status = if ($?) {{ 0 }} elseif ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }}; $__crumb_cwd_hex = [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes((Get-Location).Path)).ToLowerInvariant(); [Console]::Write([char]0x1e + 'crumb:{}:{sequence}:' + $__crumb_status + ':' + $__crumb_cwd_hex + [char]0x1f)\r",
             self.token
         )
     }
@@ -227,7 +227,7 @@ mod tests {
 
         assert_eq!(
             submission,
-            "$global:LASTEXITCODE=$null; Set-Location C:\\\\; $__crumb_status = if ($?) { 0 } elseif ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 1 }; $__crumb_cwd_hex = [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes((Get-Location).Path)).ToLowerInvariant(); [Console]::Write([char]0x1e + 'crumb:abc123:9:' + $__crumb_status + ':' + $__crumb_cwd_hex + [char]0x1f)\r\n"
+            "$global:LASTEXITCODE=$null; Set-Location C:\\\\; $__crumb_status = if ($?) { 0 } elseif ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 1 }; $__crumb_cwd_hex = [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes((Get-Location).Path)).ToLowerInvariant(); [Console]::Write([char]0x1e + 'crumb:abc123:9:' + $__crumb_status + ':' + $__crumb_cwd_hex + [char]0x1f)\r"
         );
     }
 

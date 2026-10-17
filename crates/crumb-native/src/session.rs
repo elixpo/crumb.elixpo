@@ -251,7 +251,7 @@ fn no_op_command(kind: ShellKind) -> &'static str {
 fn exit_command(kind: ShellKind) -> &'static str {
     match kind {
         ShellKind::Bash | ShellKind::Zsh => "exit\n",
-        ShellKind::PowerShell => "exit\r\n",
+        ShellKind::PowerShell => "exit\r",
     }
 }
 
