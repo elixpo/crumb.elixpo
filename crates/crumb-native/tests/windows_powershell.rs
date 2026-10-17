@@ -22,7 +22,6 @@ impl NativeShell for DeterministicPowerShell {
         CommandSpec::new("pwsh")
             .arg("-NoLogo")
             .arg("-NoProfile")
-            .arg("-NonInteractive")
             .arg("-NoExit")
     }
 }
