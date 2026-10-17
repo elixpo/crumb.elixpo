@@ -510,14 +510,14 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
         runtime_context_tokens(agent_runtime.as_ref()),
         &mut stdout.lock(),
     )?;
-    let completion_workspace = CompletionWorkspace::new(initial_cwd);
     let mut line_editor = optional_line_editor(
         interactive,
         history.as_ref(),
-        completion_workspace,
+        CompletionWorkspace::new(initial_cwd),
         renderer,
         header_rows,
         Arc::clone(&transcript_state),
+        fullscreen,
     )?;
     let mut transcript =
         FullscreenTranscript::new(fullscreen, renderer, header_rows, transcript_state.clone());
@@ -526,9 +526,8 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
     loop {
         transcript.capture_cursor();
         let cwd = active_cwd(session.as_ref())?;
-        let terminal_width = size().map_or(80, |(columns, _)| columns);
         let status = prompt_model_status(&cwd);
-        let prompt = render_prompt(renderer, &cwd, platform, last_exit_code, terminal_width);
+        let prompt = render_repl_prompt(renderer, &cwd, platform, last_exit_code);
         transcript.position_composer()?;
         let submission = read_repl_submission(
             line_editor.as_mut(),
@@ -537,6 +536,7 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
             &cwd,
             &prompt,
             &status,
+            fullscreen,
         )?;
         let (event, submitted_input) = match next_repl_action(submission, &mut exit_gesture) {
             ReplLoopAction::Input(event, input) => (event, input),
@@ -586,6 +586,21 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
             None => {}
         }
     }
+}
+
+fn render_repl_prompt(
+    renderer: Renderer,
+    cwd: &Path,
+    platform: Platform,
+    last_exit_code: Option<i32>,
+) -> String {
+    render_prompt(
+        renderer,
+        cwd,
+        platform,
+        last_exit_code,
+        size().map_or(80, |(columns, _)| columns),
+    )
 }
 
 fn dispatch_repl_event(
@@ -976,6 +991,7 @@ fn read_repl_submission(
     cwd: &Path,
     prompt: &str,
     status: &str,
+    fullscreen: bool,
 ) -> Result<ReplSubmission> {
     let Some(editor) = editor else {
         let mut writer = stdout.lock();
@@ -987,9 +1003,11 @@ fn read_repl_submission(
             }));
     };
     editor.workspace.set(cwd);
-    let signal = editor
-        .editor
-        .read_line(&CrumbPrompt::new(prompt.to_owned(), format!("{status}  ")))?;
+    let signal = editor.editor.read_line(&CrumbPrompt::new(
+        prompt.to_owned(),
+        format!("{status}  "),
+        fullscreen,
+    ))?;
     Ok(match signal {
         Signal::Success(command) => {
             ReplSubmission::Input(crumb_repl::classify_input(&command), Some(command))
@@ -8291,9 +8309,19 @@ fn optional_line_editor(
     renderer: Renderer,
     header_rows: u16,
     transcript: Arc<Mutex<TranscriptState>>,
+    fullscreen: bool,
 ) -> Result<Option<InteractiveLineEditor>> {
     interactive
-        .then(|| create_line_editor(history, workspace, renderer, header_rows, transcript))
+        .then(|| {
+            create_line_editor(
+                history,
+                workspace,
+                renderer,
+                header_rows,
+                transcript,
+                fullscreen,
+            )
+        })
         .transpose()
 }
 
@@ -8303,6 +8331,7 @@ fn create_line_editor(
     renderer: Renderer,
     header_rows: u16,
     transcript: Arc<Mutex<TranscriptState>>,
+    fullscreen: bool,
 ) -> Result<InteractiveLineEditor> {
     let mut interactive_history = FileBackedHistory::new(INTERACTIVE_HISTORY_CAPACITY)?;
     if let Some(history) = history {
@@ -8389,10 +8418,15 @@ fn create_line_editor(
         .with_padding(0)
         .with_cursor_offset(i16::try_from(FULLSCREEN_SIDE_GUTTER).unwrap_or(2))
         .with_correct_cursor_pos(true);
-    let menu = CompletionOverlay::new(menu, renderer, header_rows, transcript);
+    let menu = CompletionOverlay::new(menu, renderer, header_rows, Arc::clone(&transcript));
     let editor = Reedline::create()
         .with_history(Box::new(interactive_history))
-        .with_hinter(Box::new(CrumbHinter::default()))
+        .with_hinter(Box::new(CrumbHinter::new(fullscreen.then_some(
+            ComposerDock {
+                renderer,
+                transcript,
+            },
+        ))))
         .with_completer(Box::new(CrumbCompleter::new(workspace.clone())))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
         .with_persistent_menus(true)
@@ -8439,19 +8473,44 @@ fn suggestion_width(terminal_columns: u16) -> usize {
 struct CrumbPrompt {
     rendered: String,
     right: String,
+    anchor_to_composer: bool,
 }
 
 struct CrumbHinter {
     history: DefaultHinter,
     placeholder_visible: bool,
+    dock: Option<ComposerDock>,
 }
 
-impl Default for CrumbHinter {
-    fn default() -> Self {
+struct ComposerDock {
+    renderer: Renderer,
+    transcript: Arc<Mutex<TranscriptState>>,
+}
+
+impl CrumbHinter {
+    fn new(dock: Option<ComposerDock>) -> Self {
         Self {
             history: DefaultHinter::default().with_style(Style::new().fg(Color::DarkGray)),
             placeholder_visible: false,
+            dock,
         }
+    }
+
+    fn with_dock(&self, hint: String) -> String {
+        let Some(dock) = &self.dock else {
+            return hint;
+        };
+        let columns = size().map_or(80, |(columns, _)| columns);
+        let state = dock
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        format!(
+            "{hint}\n{}\n{}\n{}",
+            dock.renderer.composer_idle_status(),
+            state.footer_context,
+            dock.renderer.composer_hotkeys(columns)
+        )
     }
 }
 
@@ -8468,7 +8527,7 @@ impl Hinter for CrumbHinter {
         if self.placeholder_visible {
             let placeholder =
                 "Ask Crumb anything or type a command · @ context · / commands · Tab complete";
-            return if use_ansi_coloring {
+            let hint = if use_ansi_coloring {
                 Style::new()
                     .fg(Color::DarkGray)
                     .bold()
@@ -8477,9 +8536,12 @@ impl Hinter for CrumbHinter {
             } else {
                 placeholder.to_owned()
             };
+            return self.with_dock(hint);
         }
-        self.history
-            .handle(line, pos, history, use_ansi_coloring, cwd)
+        let hint = self
+            .history
+            .handle(line, pos, history, use_ansi_coloring, cwd);
+        self.with_dock(hint)
     }
 
     fn complete_hint(&self) -> String {
@@ -8500,14 +8562,26 @@ impl Hinter for CrumbHinter {
 }
 
 impl CrumbPrompt {
-    const fn new(rendered: String, right: String) -> Self {
-        Self { rendered, right }
+    const fn new(rendered: String, right: String, anchor_to_composer: bool) -> Self {
+        Self {
+            rendered,
+            right,
+            anchor_to_composer,
+        }
     }
 }
 
 impl Prompt for CrumbPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
-        Cow::Borrowed(&self.rendered)
+        if !self.anchor_to_composer {
+            return Cow::Borrowed(&self.rendered);
+        }
+        let rows = size().map_or(FULLSCREEN_COMPOSER_ROWS, |(_, rows)| rows);
+        Cow::Owned(format!(
+            "{}{}",
+            composer_anchor_sequence(rows),
+            self.rendered
+        ))
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
@@ -8651,8 +8725,13 @@ fn position_composer(renderer: Renderer, header_rows: u16) -> io::Result<()> {
     write!(writer, "{}", renderer.composer_idle_status())?;
     crossterm::execute!(writer, MoveTo(0, footer_row), Clear(ClearType::CurrentLine))?;
     write!(writer, "{}", renderer.composer_hotkeys(columns))?;
-    writer.flush()?;
-    crossterm::execute!(writer, MoveTo(0, composer_row))
+    crossterm::execute!(writer, MoveTo(0, composer_row))?;
+    writer.flush()
+}
+
+fn composer_anchor_sequence(terminal_rows: u16) -> String {
+    let composer_row = terminal_rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
+    format!("\x1b[{};1H", composer_row.saturating_add(1))
 }
 
 fn render_idle_composer(
@@ -9068,15 +9147,16 @@ mod tests {
     use super::{
         CrumbEditMode, ExitGesture, MarketplaceContent, PausedSubmission, SessionCommandContext,
         SteeringAction, TerminalModeTracker, TranscriptCapture, TranscriptScroll, TranscriptState,
-        active_scroll_direction, agent_config_location, configure_permissions, configure_plugin,
-        effort_display_name, effort_wire_name, failed_command_recovery, fixed_footer_frame,
-        initial_agent_activity, marketplace_update_blocker, openrouter_preset,
-        parse_credential_reference, parse_paused_submission, parse_provider_header,
-        parse_resume_session_argument, read_agent_config, read_bounded_response,
-        register_local_skill, resolve_memory_keep, sanitize_transcript_output, set_skill_enabled,
-        show_graph, show_marketplace, show_memory, show_profile_with_stores, suggestion_width,
-        unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
-        visible_tool_activity, workspace_read_host, write_bounded_response_delta,
+        active_scroll_direction, agent_config_location, composer_anchor_sequence,
+        configure_permissions, configure_plugin, effort_display_name, effort_wire_name,
+        failed_command_recovery, fixed_footer_frame, initial_agent_activity,
+        marketplace_update_blocker, openrouter_preset, parse_credential_reference,
+        parse_paused_submission, parse_provider_header, parse_resume_session_argument,
+        read_agent_config, read_bounded_response, register_local_skill, resolve_memory_keep,
+        sanitize_transcript_output, set_skill_enabled, show_graph, show_marketplace, show_memory,
+        show_profile_with_stores, suggestion_width, unregister_local_skill,
+        validate_marketplace_path, validate_marketplace_response, visible_tool_activity,
+        workspace_read_host, write_bounded_response_delta,
     };
 
     #[test]
@@ -9909,6 +9989,12 @@ mod tests {
             frame,
             "\x1b7\x1b[40;1H\x1b[2K  Type a follow-up · Enter steer · Ctrl+Enter queue · /pause · Ctrl+C cancel\x1b8"
         );
+    }
+
+    #[test]
+    fn fullscreen_prompt_is_anchored_above_the_fixed_footer() {
+        assert_eq!(composer_anchor_sequence(40), "\x1b[35;1H");
+        assert_eq!(composer_anchor_sequence(4), "\x1b[1;1H");
     }
 
     #[test]
