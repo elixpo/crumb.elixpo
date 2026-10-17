@@ -693,6 +693,36 @@ impl AgentRuntime {
 const MAX_SKILL_BYTES: usize = 64 * 1024;
 const MAX_SKILL_CONTEXT_BYTES: usize = 128 * 1024;
 
+pub(crate) fn validate_skill_path(path: &Path, workspace: &Path) -> Result<PathBuf> {
+    let configured_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    };
+    let path = if configured_path.is_dir() {
+        configured_path.join("SKILL.md")
+    } else {
+        configured_path
+    };
+    let path = std::fs::canonicalize(&path)
+        .with_context(|| format!("skill file `{}` is unavailable", path.display()))?;
+    let metadata = std::fs::metadata(&path)
+        .with_context(|| format!("skill file `{}` is unavailable", path.display()))?;
+    if !metadata.is_file() {
+        bail!("skill path must resolve to a regular SKILL.md file");
+    }
+    let bytes = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    if bytes > MAX_SKILL_BYTES {
+        bail!("skill file exceeds the {MAX_SKILL_BYTES} byte limit");
+    }
+    std::str::from_utf8(
+        &std::fs::read(&path)
+            .with_context(|| format!("skill file `{}` could not be read", path.display()))?,
+    )
+    .context("skill file must be UTF-8")?;
+    Ok(path)
+}
+
 struct MemoryAudit {
     record_ids: Vec<String>,
     conflict_topics: Vec<String>,
@@ -787,26 +817,8 @@ fn attach_enabled_skills(
         "User-selected skills are active for this turn. Follow their instructions when relevant.\n",
     );
     for skill in enabled {
-        let configured_path = if skill.path.is_absolute() {
-            skill.path.clone()
-        } else {
-            workspace.join(&skill.path)
-        };
-        let path = if configured_path.is_dir() {
-            configured_path.join("SKILL.md")
-        } else {
-            configured_path
-        };
-        let metadata = std::fs::metadata(&path)
-            .with_context(|| format!("loaded skill `{}` is unavailable", skill.id))?;
-        let bytes = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
-        if bytes > MAX_SKILL_BYTES {
-            bail!(
-                "loaded skill `{}` exceeds the {} byte limit",
-                skill.id,
-                MAX_SKILL_BYTES
-            );
-        }
+        let path = validate_skill_path(&skill.path, workspace)
+            .with_context(|| format!("loaded skill `{}` is invalid", skill.id))?;
         let instructions = std::fs::read_to_string(&path)
             .with_context(|| format!("loaded skill `{}` must be UTF-8", skill.id))?;
         let projected = context
@@ -992,8 +1004,8 @@ mod tests {
     use crumb_profile::{ProfileDocument, ProfileReference, ProfileSelectionStore, ProfileStore};
 
     use super::{
-        apply_profile_effort, apply_profile_model, apply_profile_selection, apply_profile_skills,
-        attach_enabled_skills, attach_profile_context,
+        AgentRuntime, apply_profile_effort, apply_profile_model, apply_profile_selection,
+        apply_profile_skills, attach_enabled_skills, attach_profile_context, validate_skill_path,
     };
 
     #[test]
@@ -1022,6 +1034,48 @@ mod tests {
         assert!(prompt.contains("## Skill: review\nReview changes carefully."));
         assert!(prompt.ends_with("## User request\ninspect this"));
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
+    }
+
+    #[test]
+    fn skill_files_are_validated_before_registration_or_loading() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-skill-validation-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let oversized = workspace.join("oversized.md");
+        std::fs::write(&oversized, vec![b'x'; super::MAX_SKILL_BYTES + 1])
+            .expect("oversized fixture");
+        assert!(validate_skill_path(&oversized, &workspace).is_err());
+
+        let binary = workspace.join("binary.md");
+        std::fs::write(&binary, [0xff, 0xfe]).expect("binary fixture");
+        assert!(validate_skill_path(&binary, &workspace).is_err());
+
+        let directory = workspace.join("review");
+        std::fs::create_dir(&directory).expect("skill directory");
+        std::fs::write(directory.join("SKILL.md"), "# Review\n").expect("skill fixture");
+        assert_eq!(
+            validate_skill_path(PathBuf::from("review").as_path(), &workspace)
+                .expect("directory resolves"),
+            directory
+                .join("SKILL.md")
+                .canonicalize()
+                .expect("canonical")
+        );
+        std::fs::remove_dir_all(workspace).expect("workspace removed");
+    }
+
+    #[test]
+    fn process_harness_context_accounting_compacts_at_the_configured_threshold() {
+        let mut runtime = AgentRuntime::new().expect("runtime");
+        runtime.record_token_estimate(&"x".repeat(400), None, 100, true);
+        assert_eq!(runtime.token_usage(), (16, 100, 1));
+
+        let mut unmanaged = AgentRuntime::new().expect("runtime");
+        unmanaged.record_token_estimate(&"x".repeat(400), None, 100, false);
+        assert_eq!(unmanaged.token_usage(), (100, 100, 0));
     }
 
     #[test]

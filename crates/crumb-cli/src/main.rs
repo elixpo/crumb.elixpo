@@ -81,7 +81,7 @@ mod device_auth;
 mod provider_projection;
 mod shell_completion;
 
-use agent_runtime::{AgentRuntime, apply_selected_profile};
+use agent_runtime::{AgentRuntime, apply_selected_profile, validate_skill_path};
 use completion::{COMPLETION_PALETTE_ROWS, CompletionWorkspace, CrumbCompleter};
 use shell_completion::{CompletionShell, write_completion};
 
@@ -2147,7 +2147,10 @@ fn show_skills(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
             skill.id
         )?;
     }
-    writeln!(writer, "  `/skills load <id>` · `/skills unload <id>`")?;
+    writeln!(
+        writer,
+        "  `/skills add <id> <path>` · `/skills load|unload <id>` · `/skills remove <id>`"
+    )?;
     Ok(())
 }
 
@@ -2196,6 +2199,12 @@ fn show_reserved(
         }
         command if command == "/skills unload" || command.starts_with("/skills unload ") => {
             set_skill_enabled(command, cwd, false, writer)?;
+        }
+        command if command == "/skills add" || command.starts_with("/skills add ") => {
+            register_local_skill(command, cwd, writer)?;
+        }
+        command if command == "/skills remove" || command.starts_with("/skills remove ") => {
+            unregister_local_skill(command, cwd, writer)?;
         }
         command if command == "/config provider" || command.starts_with("/config provider ") => {
             configure_provider(command, cwd, writer)?;
@@ -2261,6 +2270,70 @@ fn set_skill_enabled(
         "◆ Skill {} · {id}",
         if enabled { "loaded" } else { "unloaded" }
     )?;
+    Ok(())
+}
+
+fn register_local_skill(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let arguments = command
+        .strip_prefix("/skills add")
+        .map(str::trim)
+        .filter(|arguments| !arguments.is_empty())
+        .context("usage: /skills add <id> <path>")?;
+    let (id, path) = arguments
+        .split_once(char::is_whitespace)
+        .map(|(id, path)| (id.trim(), path.trim()))
+        .filter(|(id, path)| !id.is_empty() && !path.is_empty())
+        .context("usage: /skills add <id> <path>")?;
+    validate_skill_id(id)?;
+    let path = validate_skill_path(Path::new(path), cwd)?;
+    update_agent_config(cwd, |config| {
+        if config.skills.iter().any(|skill| skill.id == id) {
+            bail!("skill `{id}` is already configured");
+        }
+        config.skills.push(SkillConfig {
+            id: id.to_owned(),
+            path: path.clone(),
+            enabled: false,
+        });
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Skill registered · {id}")?;
+    writeln!(writer, "  disabled · run `/skills load {id}` after review")?;
+    Ok(())
+}
+
+fn unregister_local_skill(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let id = command
+        .strip_prefix("/skills remove")
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .context("usage: /skills remove <id>")?;
+    update_agent_config(cwd, |config| {
+        let skill = config
+            .skills
+            .iter()
+            .find(|skill| skill.id == id)
+            .with_context(|| format!("skill `{id}` is not configured"))?;
+        if skill.enabled {
+            bail!("skill `{id}` is loaded; run `/skills unload {id}` first");
+        }
+        config.skills.retain(|skill| skill.id != id);
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Skill registration removed · {id}")?;
+    writeln!(writer, "  source file was not deleted")?;
+    Ok(())
+}
+
+fn validate_skill_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("skill ID must contain only letters, numbers, dot, dash, or underscore");
+    }
     Ok(())
 }
 
@@ -7134,9 +7207,10 @@ mod tests {
         configure_plugin, effort_display_name, effort_wire_name, failed_command_recovery,
         initial_agent_activity, marketplace_update_blocker, openrouter_preset,
         parse_credential_reference, parse_provider_header, parse_resume_session_argument,
-        read_agent_config, read_bounded_response, resolve_memory_keep, show_graph,
-        show_marketplace, show_memory, show_profile_with_stores, suggestion_width,
-        validate_marketplace_path, validate_marketplace_response, workspace_read_host,
+        read_agent_config, read_bounded_response, register_local_skill, resolve_memory_keep,
+        set_skill_enabled, show_graph, show_marketplace, show_memory, show_profile_with_stores,
+        suggestion_width, unregister_local_skill, validate_marketplace_path,
+        validate_marketplace_response, workspace_read_host,
     };
 
     #[test]
@@ -7157,6 +7231,47 @@ mod tests {
 
         assert!(!gesture.register_interrupt_at(started));
         assert!(gesture.register_interrupt_at(started + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn local_skills_require_explicit_loading_and_unregister_without_deletion() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-local-skill-{suffix}"));
+        let skill_directory = workspace.join("external skill");
+        std::fs::create_dir_all(&skill_directory).expect("skill directory");
+        let skill_path = skill_directory.join("SKILL.md");
+        std::fs::write(&skill_path, "# Review\nInspect changes carefully.\n").expect("skill file");
+        let mut output = Vec::new();
+
+        register_local_skill("/skills add review external skill", &workspace, &mut output)
+            .expect("skill registers");
+        let config = read_agent_config(&workspace).expect("config loads");
+        assert_eq!(config.skills.len(), 1);
+        assert!(!config.skills[0].enabled);
+        assert_eq!(
+            config.skills[0].path,
+            skill_path.canonicalize().expect("path")
+        );
+
+        set_skill_enabled("/skills load review", &workspace, true, &mut output)
+            .expect("skill loads");
+        assert!(unregister_local_skill("/skills remove review", &workspace, &mut output).is_err());
+        set_skill_enabled("/skills unload review", &workspace, false, &mut output)
+            .expect("skill unloads");
+        unregister_local_skill("/skills remove review", &workspace, &mut output)
+            .expect("skill registration is removed");
+        assert_eq!(
+            read_agent_config(&workspace)
+                .expect("config loads")
+                .skills
+                .len(),
+            0
+        );
+        assert!(skill_path.is_file());
+        std::fs::remove_dir_all(workspace).expect("workspace removed");
     }
 
     #[test]
