@@ -9,6 +9,9 @@ use crumb_pty::{PtyBackend, PtyInput, PtyProcess, PtyResizer, TerminalSize};
 use crate::protocol::{CommandCompletion, CompletionProtocol};
 use crate::{NativeShell, ShellKind};
 
+const CURSOR_QUERY: &[u8] = b"\x1b[6n";
+const CURSOR_ORIGIN: &[u8] = b"\x1b[1;1R";
+
 /// Result of submitting one native command.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandOutcome {
@@ -44,6 +47,7 @@ pub struct ShellSession {
     process: PtyProcess,
     reader: Box<dyn Read + Send>,
     protocol: CompletionProtocol,
+    terminal_control: TerminalControl,
     next_sequence: u64,
     cwd: PathBuf,
 }
@@ -76,6 +80,7 @@ impl ShellSession {
             process,
             reader,
             protocol,
+            terminal_control: TerminalControl::default(),
             next_sequence: 1,
             cwd: PathBuf::new(),
         };
@@ -171,8 +176,12 @@ impl ShellSession {
             }
 
             let decoded = self.protocol.decode(&buffer[..bytes_read])?;
-            if !decoded.visible.is_empty() {
-                output.write_all(&decoded.visible)?;
+            let (visible, cursor_queries) = self.terminal_control.filter(&decoded.visible);
+            for _ in 0..cursor_queries {
+                self.process.write_input(CURSOR_ORIGIN)?;
+            }
+            if !visible.is_empty() {
+                output.write_all(&visible)?;
                 output.flush()?;
             }
             if let Some(completion) = decoded
@@ -186,6 +195,48 @@ impl ShellSession {
     }
 }
 
+#[derive(Default)]
+struct TerminalControl {
+    pending: Vec<u8>,
+}
+
+impl TerminalControl {
+    fn filter(&mut self, input: &[u8]) -> (Vec<u8>, usize) {
+        self.pending.extend_from_slice(input);
+        let mut visible = Vec::with_capacity(self.pending.len());
+        let mut cursor_queries = 0;
+
+        loop {
+            let Some(start) = find_subslice(&self.pending, CURSOR_QUERY) else {
+                let retained = matching_suffix_len(&self.pending, CURSOR_QUERY);
+                let visible_end = self.pending.len() - retained;
+                visible.extend(self.pending.drain(..visible_end));
+                break;
+            };
+
+            visible.extend(self.pending.drain(..start));
+            self.pending.drain(..CURSOR_QUERY.len());
+            cursor_queries += 1;
+        }
+
+        (visible, cursor_queries)
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn matching_suffix_len(input: &[u8], prefix: &[u8]) -> usize {
+    let maximum = input.len().min(prefix.len().saturating_sub(1));
+    (1..=maximum)
+        .rev()
+        .find(|length| input.ends_with(&prefix[..*length]))
+        .unwrap_or(0)
+}
+
 fn no_op_command(kind: ShellKind) -> &'static str {
     match kind {
         ShellKind::Bash | ShellKind::Zsh => ":",
@@ -196,6 +247,24 @@ fn no_op_command(kind: ShellKind) -> &'static str {
 fn exit_command(kind: ShellKind) -> &'static str {
     match kind {
         ShellKind::Bash | ShellKind::Zsh => "exit\n",
-        ShellKind::PowerShell => "exit\r\n",
+        ShellKind::PowerShell => "exit\r",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TerminalControl;
+
+    #[test]
+    fn cursor_queries_are_hidden_and_counted_across_chunks() {
+        let mut control = TerminalControl::default();
+
+        let (first, first_queries) = control.filter(b"before\x1b[");
+        let (second, second_queries) = control.filter(b"6nafter\x1b[6n");
+
+        assert_eq!(first, b"before");
+        assert_eq!(first_queries, 0);
+        assert_eq!(second, b"after");
+        assert_eq!(second_queries, 2);
     }
 }

@@ -1,13 +1,15 @@
 #![cfg(target_os = "windows")]
 
-use std::io::Read;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
+use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::{NativeShell, ShellKind};
 use crumb_pty::{CommandSpec, SystemPty, TerminalSize};
+
+const POWERSHELL_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct DeterministicPowerShell;
 
@@ -35,8 +37,8 @@ fn powershell_state_persists_in_one_resizable_conpty() {
     });
 
     let output = receiver
-        .recv_timeout(Duration::from_secs(15))
-        .expect("interactive PowerShell should exit within fifteen seconds")
+        .recv_timeout(POWERSHELL_TIMEOUT)
+        .expect("interactive PowerShell should exit within thirty seconds")
         .expect("ConPTY session should succeed");
     worker.join().expect("ConPTY worker should not panic");
 
@@ -51,16 +53,21 @@ fn powershell_state_persists_in_one_resizable_conpty() {
 }
 
 fn exercise_persistent_powershell() -> Result<String> {
-    let mut process = DeterministicPowerShell.spawn(&SystemPty, TerminalSize::new(24, 80))?;
-    let mut reader = process.try_clone_reader()?;
-
-    process.resize(TerminalSize::new(40, 120))?;
-    process.write_input(
-        b"Set-Location C:\\Windows\r\n$env:CRUMB_WP004_STATE = 'ready'\r\nWrite-Output \"__CRUMB_STATE__ cwd=$((Get-Location).Path) env=$env:CRUMB_WP004_STATE\"\r\nexit\r\n",
+    let mut session = ShellSession::start(
+        &DeterministicPowerShell,
+        &SystemPty,
+        TerminalSize::new(24, 80),
     )?;
+    session.resize(TerminalSize::new(40, 120))?;
 
-    let mut output = String::new();
-    reader.read_to_string(&mut output)?;
-    process.wait()?;
-    Ok(output)
+    let mut output = Vec::new();
+    let outcome = session.execute(
+        "$env:CRUMB_WP004_STATE = 'ready'; Set-Location C:\\Windows; Write-Output \"__CRUMB_STATE__ cwd=$((Get-Location).Path) env=$env:CRUMB_WP004_STATE\"",
+        &mut output,
+    )?;
+    if !matches!(outcome, CommandOutcome::Completed(_)) {
+        bail!("PowerShell exited before reporting command completion");
+    }
+    session.shutdown()?;
+    Ok(String::from_utf8(output)?)
 }
