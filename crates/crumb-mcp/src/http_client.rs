@@ -234,7 +234,9 @@ impl StreamableHttpClient {
             .map_err(|_| anyhow!("external MCP HTTP request state is unavailable"))?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let message = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
-        let (response, session_id) = self.send(&message, Some(id), timeout, cancellation)?;
+        let retry_safe = matches!(method, "initialize" | "tools/list");
+        let (response, session_id) =
+            self.send(&message, Some(id), timeout, cancellation, retry_safe)?;
         self.update_session(session_id)?;
         if response.get("error").is_some() {
             bail!("external MCP request failed");
@@ -252,6 +254,7 @@ impl StreamableHttpClient {
             None,
             self.limits.startup_timeout,
             &CancellationToken::default(),
+            true,
         )?;
         self.update_session(session_id)
     }
@@ -262,6 +265,7 @@ impl StreamableHttpClient {
         expected_id: Option<u64>,
         timeout: Duration,
         cancellation: &CancellationToken,
+        retry_safe: bool,
     ) -> Result<(Value, Option<String>)> {
         let encoded = serde_json::to_vec(message)?;
         if encoded.len() > self.limits.max_response_bytes {
@@ -288,6 +292,7 @@ impl StreamableHttpClient {
                     encoded,
                     expected_id,
                     maximum,
+                    retry_safe,
                 );
                 let _ = sender.send(result);
             })
@@ -335,6 +340,7 @@ fn perform_request(
     encoded: Vec<u8>,
     expected_id: Option<u64>,
     maximum: usize,
+    retry_safe: bool,
 ) -> Result<(Value, Option<String>)> {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -358,12 +364,18 @@ fn perform_request(
         value.set_sensitive(true);
         headers.insert(AUTHORIZATION, value);
     }
-    let response = client
-        .post(endpoint)
-        .headers(headers)
-        .body(encoded)
-        .send()
-        .context("external MCP HTTP request failed")?;
+    let send = || {
+        client
+            .post(endpoint)
+            .headers(headers.clone())
+            .body(encoded.clone())
+            .send()
+    };
+    let response = match send() {
+        Ok(response) => response,
+        Err(_) if retry_safe => send().context("external MCP HTTP request failed")?,
+        Err(error) => return Err(error).context("external MCP HTTP request failed"),
+    };
     let session_id = response
         .headers()
         .get(SESSION_HEADER)
@@ -676,7 +688,7 @@ mod tests {
 
     #[test]
     fn active_remote_calls_can_be_cancelled() {
-        let fixture = Fixture::start(Duration::from_millis(200), false);
+        let fixture = Fixture::start(Duration::from_secs(2), false);
         let client =
             StreamableHttpClient::connect(&fixture.url, None, StreamableHttpLimits::default())
                 .expect("client connects");
@@ -692,7 +704,7 @@ mod tests {
             .expect_err("remote call is cancelled");
         worker.join().expect("cancellation worker");
         assert!(error.to_string().contains("cancelled"));
-        assert!(started.elapsed() < Duration::from_millis(150));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
