@@ -548,15 +548,21 @@ impl Renderer {
         }
         let details = [runtime, session, resume];
         let art = trim_art(PANDA_CLOSING);
+        let art_lines = art.lines().collect::<Vec<_>>();
+        let detail_start = art_lines.len().saturating_sub(details.len()) / 2;
         let art_width = art
             .lines()
             .map(|line| line.chars().count())
             .max()
             .unwrap_or_default();
-        art.lines()
+        art_lines
+            .into_iter()
             .enumerate()
             .map(|(index, line)| {
-                let detail = details.get(index).map_or("", String::as_str);
+                let detail = index
+                    .checked_sub(detail_start)
+                    .and_then(|detail_index| details.get(detail_index))
+                    .map_or("", String::as_str);
                 format!(
                     "  {}   {}",
                     self.paint(&format!("{line:<art_width$}"), "38;2;128;128;128"),
@@ -1121,9 +1127,9 @@ mod tests {
                 .chars()
                 .count()
         };
-        let runtime_column = detail_column(lines[0], "Runtime");
-        assert_eq!(detail_column(lines[1], "Session"), runtime_column);
-        assert_eq!(detail_column(lines[2], "Resume"), runtime_column);
+        let runtime_column = detail_column(lines[2], "Runtime");
+        assert_eq!(detail_column(lines[3], "Session"), runtime_column);
+        assert_eq!(detail_column(lines[4], "Resume"), runtime_column);
         assert!(runtime_column <= 20);
     }
 
