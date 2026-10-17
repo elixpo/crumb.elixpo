@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 pub const GRAPHIFY_PINNED_VERSION: &str = "0.9.92";
 const VERSION_OUTPUT_LIMIT: usize = 4096;
+const GRAPHIFY_EXTRACT_ARGS: [&str; 5] = ["extract", ".", "--out", ".", "--code-only"];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -204,7 +205,7 @@ impl GraphifyAdapter {
         }
         let mut command = Command::new(&self.settings.command);
         command
-            .args(["extract", ".", "--out", "."])
+            .args(GRAPHIFY_EXTRACT_ARGS)
             .current_dir(workspace)
             .env_clear()
             .env("PYTHONHASHSEED", "0")
@@ -213,7 +214,12 @@ impl GraphifyAdapter {
             .stderr(Stdio::null());
         preserve_runtime_path(&mut command);
         let mut child = command.spawn().context("Graphify could not be started")?;
-        wait_for_child(&mut child, timeout, cancelled)?;
+        wait_for_child(
+            &mut child,
+            timeout,
+            cancelled,
+            "Graphify extraction failed; run `graphify extract . --out . --code-only` directly for diagnostics",
+        )?;
         let graph_path = self.graph_path(workspace);
         if !graph_path.is_file() {
             bail!("Graphify completed without producing graph.json");
@@ -248,7 +254,12 @@ fn run_probe(command: &Path, argument: &str) -> Result<String> {
             .read_to_end(&mut output)
             .map(|_| output)
     });
-    wait_for_child(&mut child, Duration::from_secs(5), || false)?;
+    wait_for_child(
+        &mut child,
+        Duration::from_secs(5),
+        || false,
+        "Graphify probe failed",
+    )?;
     let output = reader
         .join()
         .map_err(|_| anyhow::anyhow!("Graphify version reader failed"))??;
@@ -258,7 +269,12 @@ fn run_probe(command: &Path, argument: &str) -> Result<String> {
     String::from_utf8(output).context("Graphify version output is invalid")
 }
 
-fn wait_for_child<F>(child: &mut Child, timeout: Duration, cancelled: F) -> Result<()>
+fn wait_for_child<F>(
+    child: &mut Child,
+    timeout: Duration,
+    cancelled: F,
+    failure_message: &str,
+) -> Result<()>
 where
     F: Fn() -> bool,
 {
@@ -277,7 +293,7 @@ where
             .context("Graphify process state is unavailable")?
         {
             Some(status) if status.success() => return Ok(()),
-            Some(_) => bail!("Graphify failed"),
+            Some(status) => bail!("{failure_message} ({status})"),
             None => thread::sleep(Duration::from_millis(25)),
         }
     }
@@ -331,6 +347,7 @@ mod tests {
         let settings = GraphSettings::default();
         assert!(!settings.enabled);
         assert_eq!(settings.expected_version, GRAPHIFY_PINNED_VERSION);
+        assert!(GRAPHIFY_EXTRACT_ARGS.contains(&"--code-only"));
         settings.validate().expect("defaults validate");
     }
 
