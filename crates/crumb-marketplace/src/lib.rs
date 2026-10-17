@@ -9,11 +9,13 @@ use chrono::DateTime;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tempfile::Builder;
+use tempfile::{Builder, NamedTempFile};
 use url::Url;
 
 const MAX_ARTIFACT_BYTES: usize = 256 * 1024;
 const MAX_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum accepted size for a downloaded marketplace catalog.
+pub const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 const BUNDLED_CATALOG: &[u8] = include_bytes!("../../../marketplace/catalog.json");
 #[cfg(test)]
 const PUBLIC_CATALOG: &[u8] =
@@ -329,6 +331,137 @@ impl Catalog {
 /// Returns an error when build-time catalog metadata is invalid.
 pub fn bundled_catalog() -> Result<Catalog> {
     Catalog::parse(BUNDLED_CATALOG)
+}
+
+/// Immutable, content-addressed cache for validated remote catalogs.
+///
+/// Cached metadata remains inspection-only until a separate trust verifier authenticates it.
+pub struct RemoteCatalogCache {
+    root: PathBuf,
+}
+
+impl RemoteCatalogCache {
+    #[must_use]
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// Validates and atomically publishes one downloaded catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for oversized or invalid metadata and filesystem failures. Existing
+    /// valid cache entries are left untouched on failure.
+    pub fn store(&self, bytes: &[u8]) -> Result<Catalog> {
+        if bytes.is_empty() || bytes.len() > MAX_CATALOG_BYTES {
+            bail!("remote marketplace catalog exceeds the size limit");
+        }
+        let catalog = Catalog::parse(bytes)?;
+        fs::create_dir_all(&self.root).with_context(|| {
+            format!(
+                "failed to create marketplace catalog cache {}",
+                self.root.display()
+            )
+        })?;
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let received_at = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let destination = self.root.join(format!("{received_at:020}-{digest}.json"));
+        let mut staging = NamedTempFile::new_in(&self.root)?;
+        set_private_permissions(staging.path())?;
+        std::io::Write::write_all(&mut staging, bytes)?;
+        staging.as_file().sync_all()?;
+        match staging.persist_noclobber(&destination) {
+            Ok(_) => {}
+            Err(_error) if destination.exists() => {}
+            Err(error) => return Err(error.error.into()),
+        }
+        self.prune(3);
+        Ok(catalog)
+    }
+
+    /// Loads the newest valid cached catalog, skipping corrupt entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cache directory cannot be inspected.
+    pub fn load(&self) -> Result<Option<Catalog>> {
+        if !self.root.exists() {
+            return Ok(None);
+        }
+        let mut entries = cache_entries(&self.root)?;
+        entries.sort_by(|left, right| right.0.cmp(&left.0));
+        for (_, path) in entries {
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !metadata.file_type().is_file() || metadata.len() > MAX_CATALOG_BYTES as u64 {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            if !cache_entry_matches_digest(&path, &bytes) {
+                continue;
+            }
+            if let Ok(catalog) = Catalog::parse(&bytes) {
+                return Ok(Some(catalog));
+            }
+        }
+        Ok(None)
+    }
+
+    fn prune(&self, retain: usize) {
+        let Ok(mut entries) = cache_entries(&self.root) else {
+            return;
+        };
+        entries.sort_by(|left, right| right.0.cmp(&left.0));
+        for (_, path) in entries.into_iter().skip(retain) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn cache_entries(root: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+            continue;
+        }
+        let Some(name) = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        entries.push((name, path));
+    }
+    Ok(entries)
+}
+
+fn cache_entry_matches_digest(path: &Path, bytes: &[u8]) -> bool {
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    path.file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|name| name.rsplit_once('-'))
+        .is_some_and(|(_, expected)| expected.len() == 64 && actual.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 impl Package {
@@ -831,8 +964,8 @@ fn current_platform() -> MarketplacePlatform {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTRIBUTOR_SCHEMA, Catalog, Installer, PUBLIC_CATALOG, PUBLIC_SCHEMA, Revocation,
-        bundled_catalog,
+        CONTRIBUTOR_SCHEMA, Catalog, Installer, MAX_CATALOG_BYTES, PUBLIC_CATALOG, PUBLIC_SCHEMA,
+        RemoteCatalogCache, Revocation, bundled_catalog,
     };
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -934,5 +1067,40 @@ mod tests {
         let public_schema: serde_json::Value =
             serde_json::from_slice(PUBLIC_SCHEMA).expect("public schema should parse");
         assert_eq!(contributor_schema, public_schema);
+    }
+
+    #[test]
+    fn remote_cache_keeps_the_last_valid_catalog() {
+        let directory = tempdir().expect("cache tempdir");
+        let cache = RemoteCatalogCache::new(directory.path());
+        let original = catalog_json(&"a".repeat(64), "SKILL.md");
+        let stored = cache
+            .store(original.as_bytes())
+            .expect("valid catalog should be cached");
+
+        assert!(cache.store(b"not JSON").is_err());
+        assert_eq!(
+            cache.load().expect("cache should load"),
+            Some(stored),
+            "a failed refresh must not replace the previous catalog"
+        );
+    }
+
+    #[test]
+    fn remote_cache_skips_corrupt_newer_entries_and_bounds_input() {
+        let directory = tempdir().expect("cache tempdir");
+        let cache = RemoteCatalogCache::new(directory.path());
+        let original = catalog_json(&"a".repeat(64), "SKILL.md");
+        let stored = cache
+            .store(original.as_bytes())
+            .expect("valid catalog should be cached");
+        fs::write(
+            directory.path().join("99999999999999999999-corrupt.json"),
+            original.replace("crumb-public", "tampered-public"),
+        )
+        .expect("corrupt cache fixture");
+
+        assert_eq!(cache.load().expect("cache should fall back"), Some(stored));
+        assert!(cache.store(&vec![b'x'; MAX_CATALOG_BYTES + 1]).is_err());
     }
 }

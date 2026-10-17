@@ -232,6 +232,18 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "inspect a marketplace package",
     },
     SlashCommand {
+        usage: "/marketplace sync",
+        description: "refresh inspection-only remote metadata",
+    },
+    SlashCommand {
+        usage: "/marketplace remote",
+        description: "browse cached remote metadata",
+    },
+    SlashCommand {
+        usage: "/marketplace remote inspect ",
+        description: "inspect a cached remote package",
+    },
+    SlashCommand {
         usage: "/marketplace install ",
         description: "verify and install a package",
     },
