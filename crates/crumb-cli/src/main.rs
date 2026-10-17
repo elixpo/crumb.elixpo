@@ -479,6 +479,7 @@ fn shell_tool_config(config: &AgentConfig, max_output_bytes: usize) -> AgentShel
         program: disposable.program,
         arguments: disposable.arguments,
         path: disposable.path,
+        inherit_environment: config.permissions.mode == ApprovalMode::FullAccess,
         max_output_bytes: disposable.max_output_bytes,
         timeout: Duration::from_secs(config.limits.max_shell_command_seconds),
     }
@@ -2069,6 +2070,13 @@ struct ActiveTurnContext<'a> {
     live_context_tokens: &'a mut u64,
 }
 
+#[derive(Default)]
+struct HarnessRenderState {
+    streamed_response: bool,
+    streamed_column: usize,
+    active_tool: Option<(String, Option<String>)>,
+}
+
 fn promote_agent_turn(
     task: agent_runtime::AgentTurnTask,
     request: &str,
@@ -2138,7 +2146,7 @@ fn observe_agent_turn(
         initial_activity,
         terminal.fullscreen,
     ));
-    let (mut streamed_response, mut streamed_column) = (false, 0_usize);
+    let mut render_state = HarnessRenderState::default();
     let mut input = SteeringInput::new(renderer, steering_bytes, terminal.fullscreen);
     let raw_mode = terminal
         .interactive
@@ -2171,8 +2179,7 @@ fn observe_agent_turn(
                     &event,
                     &mut input,
                     &mut activity,
-                    &mut streamed_response,
-                    &mut streamed_column,
+                    &mut render_state,
                     renderer,
                     writer,
                     terminal,
@@ -2208,8 +2215,7 @@ fn observe_agent_turn(
             &event,
             &mut input,
             &mut activity,
-            &mut streamed_response,
-            &mut streamed_column,
+            &mut render_state,
             renderer,
             writer,
             terminal,
@@ -2229,7 +2235,7 @@ fn observe_agent_turn(
         Box::new(runtime),
         result,
         interruption,
-        streamed_response,
+        render_state.streamed_response,
     ))
 }
 
@@ -2238,8 +2244,7 @@ fn render_observed_activity(
     event: &HarnessActivity,
     input: &mut SteeringInput,
     activity: &mut Option<crumb_ui::ActivityIndicator>,
-    streamed_response: &mut bool,
-    streamed_column: &mut usize,
+    render_state: &mut HarnessRenderState,
     renderer: Renderer,
     writer: &mut dyn Write,
     terminal: &AgentTerminal,
@@ -2271,8 +2276,7 @@ fn render_observed_activity(
         render_harness_activity(
             event,
             activity,
-            streamed_response,
-            streamed_column,
+            render_state,
             renderer,
             writer,
             terminal.fullscreen,
@@ -3023,8 +3027,7 @@ fn harness_activity_label(activity: &HarnessActivity) -> String {
 fn render_harness_activity(
     activity: &HarnessActivity,
     indicator: &mut Option<crumb_ui::ActivityIndicator>,
-    streamed_response: &mut bool,
-    streamed_column: &mut usize,
+    state: &mut HarnessRenderState,
     renderer: Renderer,
     writer: &mut dyn Write,
     fullscreen: bool,
@@ -3032,20 +3035,21 @@ fn render_harness_activity(
     match activity {
         HarnessActivity::ResponseDelta { text } => {
             if fullscreen {
-                *streamed_response = true;
+                state.streamed_response = true;
                 replace_activity(indicator, renderer, "Writing response", fullscreen);
                 return Ok(());
             }
             finish_activity_line(indicator, writer)?;
-            if !*streamed_response {
+            if !state.streamed_response {
                 write!(writer, "{} ", terminal_agent_response(renderer, ""))?;
-                *streamed_response = true;
-                *streamed_column = 8;
+                state.streamed_response = true;
+                state.streamed_column = 8;
             }
-            write_bounded_response_delta(writer, text, streamed_column)?;
+            write_bounded_response_delta(writer, text, &mut state.streamed_column)?;
             writer.flush()?;
         }
         HarnessActivity::ToolStarted { name, .. } if name == "spawn_agents" => {
+            state.active_tool = Some((name.clone(), None));
             replace_activity(
                 indicator,
                 renderer,
@@ -3057,16 +3061,16 @@ fn render_harness_activity(
             name,
             detail: Some(detail),
         } => {
-            finish_activity_line(indicator, writer)?;
-            writeln!(
-                writer,
-                "{}",
-                renderer.agent_activity(&visible_tool_activity(name, Some(detail)))
-            )?;
-            writer.flush()?;
-            replace_activity(indicator, renderer, &tool_activity_label(name), fullscreen);
+            state.active_tool = Some((name.clone(), Some(detail.clone())));
+            replace_activity(
+                indicator,
+                renderer,
+                &visible_tool_activity(name, Some(detail)),
+                fullscreen,
+            );
         }
         HarnessActivity::ToolStarted { name, detail: None } => {
+            state.active_tool = Some((name.clone(), None));
             replace_activity(indicator, renderer, &tool_activity_label(name), fullscreen);
         }
         HarnessActivity::ToolOutput { name, .. } if name == "spawn_agents" => {
@@ -3085,12 +3089,9 @@ fn render_harness_activity(
             replace_activity(indicator, renderer, &label, fullscreen);
         }
         HarnessActivity::ToolFinished { name, success } => {
-            finish_activity_line(indicator, writer)?;
-            writeln!(writer, "{}", renderer.agent_tool_result(name, *success))?;
-            writer.flush()?;
-            if *success {
-                replace_activity(indicator, renderer, "Thinking", fullscreen);
-            }
+            render_finished_tool(
+                name, *success, indicator, state, renderer, writer, fullscreen,
+            )?;
         }
         HarnessActivity::ApprovalRequired { name } => {
             finish_activity_line(indicator, writer)?;
@@ -3098,6 +3099,7 @@ fn render_harness_activity(
             writer.flush()?;
         }
         HarnessActivity::Failed { .. } | HarnessActivity::Cancelled => {
+            state.active_tool = None;
             finish_activity_line(indicator, writer)?;
             writeln!(
                 writer,
@@ -3107,7 +3109,7 @@ fn render_harness_activity(
             writer.flush()?;
         }
         HarnessActivity::Completed { .. } => {
-            if !*streamed_response {
+            if !state.streamed_response {
                 replace_activity(indicator, renderer, "Thinking", fullscreen);
             }
         }
@@ -3125,6 +3127,37 @@ fn render_harness_activity(
     Ok(())
 }
 
+fn render_finished_tool(
+    name: &str,
+    success: bool,
+    indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    state: &mut HarnessRenderState,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    fullscreen: bool,
+) -> Result<()> {
+    finish_activity_line(indicator, writer)?;
+    let detail = state
+        .active_tool
+        .take()
+        .filter(|(active_name, _)| active_name == name)
+        .and_then(|(_, detail)| detail);
+    if name == "spawn_agents" || detail.is_none() {
+        writeln!(writer, "{}", renderer.agent_tool_result(name, success))?;
+    } else {
+        writeln!(
+            writer,
+            "{}",
+            renderer.agent_activity(&finished_tool_activity(name, detail.as_deref(), success))
+        )?;
+    }
+    writer.flush()?;
+    if success {
+        replace_activity(indicator, renderer, "Thinking", fullscreen);
+    }
+    Ok(())
+}
+
 fn visible_tool_activity(name: &str, detail: Option<&str>) -> String {
     match (name, detail) {
         ("run_shell", Some(command)) => format!("Running command · $ {command}"),
@@ -3132,6 +3165,24 @@ fn visible_tool_activity(name: &str, detail: Option<&str>) -> String {
         ("web_fetch", Some(url)) => format!("Fetching page · {url}"),
         (_, Some(detail)) => format!("{} · {detail}", tool_activity_label(name)),
         (_, None) => tool_activity_label(name),
+    }
+}
+
+fn finished_tool_activity(name: &str, detail: Option<&str>, success: bool) -> String {
+    let verb = match (name, success) {
+        ("run_shell", true) => "Ran command",
+        ("run_shell", false) => "Command failed",
+        ("web_search", true) => "Searched the web",
+        ("web_search", false) => "Web search failed",
+        ("web_fetch", true) => "Fetched page",
+        ("web_fetch", false) => "Page fetch failed",
+        (_, true) => "Tool completed",
+        (_, false) => "Tool failed",
+    };
+    match (name, detail) {
+        ("run_shell", Some(command)) => format!("{verb} · $ {command}"),
+        (_, Some(detail)) => format!("{verb} · {detail}"),
+        (_, None) => format!("{verb} · {name}"),
     }
 }
 
@@ -9238,14 +9289,15 @@ mod tests {
         TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
         agent_config_location, completion_footer_frame, composer_anchor_sequence,
         configure_permissions, configure_plugin, effort_display_name, effort_wire_name,
-        failed_command_recovery, fixed_footer_frame, initial_agent_activity,
-        marketplace_update_blocker, openrouter_preset, parse_credential_reference,
-        parse_paused_submission, parse_provider_header, parse_resume_session_argument,
-        read_agent_config, read_bounded_response, register_local_skill, resolve_memory_keep,
-        sanitize_transcript_output, set_skill_enabled, should_auto_enable_rtk, show_graph,
-        show_marketplace, show_memory, show_profile_with_stores, suggestion_width,
-        unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
-        visible_tool_activity, workspace_read_host, write_bounded_response_delta,
+        failed_command_recovery, finished_tool_activity, fixed_footer_frame,
+        initial_agent_activity, marketplace_update_blocker, openrouter_preset,
+        parse_credential_reference, parse_paused_submission, parse_provider_header,
+        parse_resume_session_argument, read_agent_config, read_bounded_response,
+        register_local_skill, resolve_memory_keep, sanitize_transcript_output, set_skill_enabled,
+        shell_tool_config, should_auto_enable_rtk, show_graph, show_marketplace, show_memory,
+        show_profile_with_stores, suggestion_width, unregister_local_skill,
+        validate_marketplace_path, validate_marketplace_response, visible_tool_activity,
+        workspace_read_host, write_bounded_response_delta,
     };
 
     #[test]
@@ -10115,6 +10167,26 @@ mod tests {
             visible_tool_activity("run_shell", Some("command -v g++ && g++ --version")),
             "Running command · $ command -v g++ && g++ --version"
         );
+        assert_eq!(
+            finished_tool_activity("run_shell", Some("command -v g++ && g++ --version"), true,),
+            "Ran command · $ command -v g++ && g++ --version"
+        );
+        assert_eq!(
+            finished_tool_activity("web_search", Some("Crumb terminal agent"), true),
+            "Searched the web · Crumb terminal agent"
+        );
+    }
+
+    #[test]
+    fn only_full_access_shell_inherits_the_terminal_environment() {
+        let mut config = AgentConfig::default();
+        assert!(!shell_tool_config(&config, 1024).inherit_environment);
+
+        config.permissions.mode = ApprovalMode::SensitiveOnly;
+        assert!(!shell_tool_config(&config, 1024).inherit_environment);
+
+        config.permissions.mode = ApprovalMode::FullAccess;
+        assert!(shell_tool_config(&config, 1024).inherit_environment);
     }
 
     #[test]

@@ -25,6 +25,10 @@ pub struct AgentShellConfig {
     pub program: PathBuf,
     pub arguments: Vec<OsString>,
     pub path: Option<OsString>,
+    /// Preserve the launching terminal's environment for explicitly selected
+    /// full-access sessions. Safer permission modes keep the isolated
+    /// PATH-only environment.
+    pub inherit_environment: bool,
     pub max_output_bytes: usize,
     pub timeout: Duration,
 }
@@ -137,10 +141,12 @@ fn run_shell(
         .args(&config.arguments)
         .arg(command)
         .current_dir(workspace)
-        .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if !config.inherit_environment {
+        process.env_clear();
+    }
     if let Some(path) = &config.path {
         process.env("PATH", path);
     }
@@ -403,7 +409,7 @@ fn terminate(child: &mut Child) {
 fn descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: RUN_SHELL.to_owned(),
-        description: "Run a bounded shell command in the workspace, including pipelines and command chains. Use this to inspect, build, test, and operate the project instead of telling the user to run commands."
+        description: "Execute a bounded shell command in the workspace, including pipelines and command chains. Use it directly for local inspection, authenticated CLIs, builds, tests, package managers, Git, and project operations instead of telling the user to run commands. The user's permission policy decides whether the command runs immediately or requires approval."
             .to_owned(),
         input_schema: json!({
             "type":"object",
@@ -488,6 +494,7 @@ mod tests {
             program,
             arguments,
             path,
+            inherit_environment: false,
             max_output_bytes: 256,
             timeout,
         }
@@ -550,6 +557,30 @@ mod tests {
         assert!(output.text.contains("PATH=/usr/bin:/bin"));
         assert!(!output.text.contains("HOME="));
         assert!(output.text.len() <= 256);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_access_shell_can_inherit_the_terminal_environment() {
+        let mut config = config(Duration::from_secs(1));
+        config.inherit_environment = true;
+        let mut host = ToolHost::default();
+        register_shell_tool(
+            &mut host,
+            &std::env::current_dir().expect("current directory is available"),
+            config,
+        )
+        .expect("shell tool is registered");
+        let output = host
+            .call(
+                "run_shell",
+                &json!({"command":"printf %s \"${HOME:+available}\""}),
+                AgentMode::Auto,
+                &AllowOnce,
+                &CancellationToken::default(),
+            )
+            .expect("approved shell call succeeds");
+        assert!(output.text.contains("stdout:\navailable\n"));
     }
 
     #[cfg(unix)]
