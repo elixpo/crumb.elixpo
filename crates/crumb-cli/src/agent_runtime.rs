@@ -1169,10 +1169,15 @@ fn attach_enabled_skills(
         "User-selected skills are active for this turn. Follow their instructions when relevant.\n",
     );
     for skill in enabled {
-        let path = validate_skill_path(&skill.path, workspace)
-            .with_context(|| format!("loaded skill `{}` is invalid", skill.id))?;
-        let instructions = std::fs::read_to_string(&path)
-            .with_context(|| format!("loaded skill `{}` must be UTF-8", skill.id))?;
+        let instructions =
+            if let Some(instructions) = crate::bundled_skills::instructions(&skill.path) {
+                instructions.to_owned()
+            } else {
+                let path = validate_skill_path(&skill.path, workspace)
+                    .with_context(|| format!("loaded skill `{}` is invalid", skill.id))?;
+                std::fs::read_to_string(&path)
+                    .with_context(|| format!("loaded skill `{}` must be UTF-8", skill.id))?
+            };
         let projected = context
             .len()
             .saturating_add(instructions.len())
@@ -1349,7 +1354,7 @@ fn new_session_id() -> Result<SessionId> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crumb_agent::{AgentConfig, Modality, ModelRoute, SkillConfig};
@@ -1386,6 +1391,21 @@ mod tests {
         assert!(prompt.contains("## Skill: review\nReview changes carefully."));
         assert!(prompt.ends_with("## User request\ninspect this"));
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
+    }
+
+    #[test]
+    fn bundled_skills_are_loaded_from_the_binary() {
+        let skills = [SkillConfig {
+            id: "failure-autopsy".to_owned(),
+            path: crate::bundled_skills::path("failure-autopsy"),
+            enabled: true,
+        }];
+
+        let prompt = attach_enabled_skills("diagnose this", &skills, Path::new("."))
+            .expect("bundled skill context loads");
+
+        assert!(prompt.contains("## Skill: failure-autopsy"));
+        assert!(prompt.contains("first causal error"));
     }
 
     #[test]

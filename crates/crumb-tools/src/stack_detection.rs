@@ -1,14 +1,12 @@
 //! Read-only manifest scanner exposed as the `detect_stack` agent tool.
 //!
 //! Detects project language(s), package manager, and build/test tooling
-//! from repo manifests. Never writes inside the scanned workspace, except
-//! for its own cache under `<workspace>/.crumb/cache/stack-detection.json`
-//! (already a Crumb-reserved path, excluded from model-writable targets in
-//! `workspace::resolve_write_target`).
+//! from repo manifests. Detection and its process-local cache never write to
+//! the scanned workspace.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -22,7 +20,6 @@ use sha2::{Digest, Sha256};
 use crate::bounded_text;
 
 const DETECT_STACK: &str = "detect_stack";
-const CACHE_RELATIVE_PATH: [&str; 3] = [".crumb", "cache", "stack-detection.json"];
 const MAX_SCANNED_SUBDIRECTORIES: usize = 64;
 
 const IGNORED_SUBDIRS: &[&str] = &[
@@ -93,12 +90,20 @@ pub fn register_stack_detection_tool(
     if !root.is_dir() {
         bail!("workspace root must be a directory");
     }
-    host.register(descriptor(), Arc::new(DetectStack { root, limits }))
+    host.register(
+        descriptor(),
+        Arc::new(DetectStack {
+            root,
+            limits,
+            cache: Mutex::new(None),
+        }),
+    )
 }
 
 struct DetectStack {
     root: PathBuf,
     limits: StackDetectionLimits,
+    cache: Mutex<Option<CacheFile>>,
 }
 
 impl ToolHandler for DetectStack {
@@ -121,9 +126,18 @@ fn detect_stack(
     let fingerprint = fingerprint(&tool.root);
     ensure_active(cancellation)?;
 
-    if !refresh && let Some(mut cached) = read_cache(&tool.root, &fingerprint) {
-        cached.cache_hit = true;
-        return Ok(tool_output(&cached, tool.limits.max_output_bytes));
+    if !refresh {
+        let cache = tool
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stack detection cache is unavailable"))?;
+        if let Some(cached) = cache.as_ref()
+            && cached.fingerprint == fingerprint
+        {
+            let mut result = cached.result.clone();
+            result.cache_hit = true;
+            return Ok(tool_output(&result, tool.limits.max_output_bytes));
+        }
     }
 
     let languages = scan(&tool.root);
@@ -135,8 +149,13 @@ fn detect_stack(
         cache_hit: false,
     };
 
-    // Best-effort: failing to persist the cache must never fail detection.
-    let _ = write_cache(&tool.root, &fingerprint, &result);
+    *tool
+        .cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("stack detection cache is unavailable"))? = Some(CacheFile {
+        fingerprint,
+        result: result.clone(),
+    });
 
     Ok(tool_output(&result, tool.limits.max_output_bytes))
 }
@@ -509,39 +528,10 @@ fn fingerprint_dir(dir: &Path, label: &str, out: &mut Vec<String>) {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct CacheFile {
     fingerprint: String,
     result: DetectedStack,
-}
-
-fn cache_path(root: &Path) -> PathBuf {
-    let mut path = root.to_path_buf();
-    for segment in CACHE_RELATIVE_PATH {
-        path.push(segment);
-    }
-    path
-}
-
-fn read_cache(root: &Path, expected_fingerprint: &str) -> Option<DetectedStack> {
-    let contents = fs::read_to_string(cache_path(root)).ok()?;
-    let cached: CacheFile = serde_json::from_str(&contents).ok()?;
-    (cached.fingerprint == expected_fingerprint).then_some(cached.result)
-}
-
-fn write_cache(root: &Path, fingerprint: &str, result: &DetectedStack) -> Result<()> {
-    let path = cache_path(root);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create cache dir `{}`", parent.display()))?;
-    }
-    let file = CacheFile {
-        fingerprint: fingerprint.to_owned(),
-        result: result.clone(),
-    };
-    let encoded =
-        serde_json::to_string_pretty(&file).context("failed to encode stack detection cache")?;
-    fs::write(&path, encoded).with_context(|| format!("failed to write cache `{}`", path.display()))
 }
 
 fn now_unix() -> u64 {
@@ -570,7 +560,7 @@ fn optional_bool(arguments: &Value, name: &str) -> Result<Option<bool>> {
 fn descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: DETECT_STACK.to_owned(),
-        description: "Detect project language(s), package manager, and build/test tooling from repo manifests. Read-only; cached per workspace.".to_owned(),
+        description: "Detect project language(s), package manager, and build/test tooling from repo manifests. Read-only; cached only for this process.".to_owned(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -693,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_is_reused_across_calls_and_lives_under_dot_crumb() {
+    fn cache_is_reused_without_writing_to_the_workspace() {
         let workspace = TempWorkspace::new();
         fs::write(workspace.path().join("Cargo.toml"), "").expect("fixture is written");
         let bound_host = host(workspace.path());
@@ -704,12 +694,7 @@ mod tests {
         let second = call(&bound_host, &json!({}));
         assert!(second.text.contains("from cache"));
 
-        assert!(
-            workspace
-                .path()
-                .join(".crumb/cache/stack-detection.json")
-                .is_file()
-        );
+        assert!(!workspace.path().join(".crumb").exists());
     }
 
     #[test]

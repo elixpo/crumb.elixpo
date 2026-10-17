@@ -295,13 +295,15 @@ fn is_setting_command(usage: &str) -> bool {
 }
 
 fn configured_skill_actions(workspace: &Path) -> Vec<(String, String)> {
-    let Some(path) = config_path(workspace) else {
-        return Vec::new();
-    };
-    let Ok(config) = LiveConfig::new(path).load() else {
-        return Vec::new();
-    };
-    config
+    let config = config_path(workspace)
+        .and_then(|path| LiveConfig::new(path).load().ok())
+        .unwrap_or_default();
+    let configured_ids = config
+        .skills
+        .iter()
+        .map(|skill| skill.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut actions = config
         .skills
         .into_iter()
         .flat_map(|skill| {
@@ -324,7 +326,19 @@ fn configured_skill_actions(workspace: &Path) -> Vec<(String, String)> {
             }
             actions
         })
-        .collect()
+        .collect::<Vec<_>>();
+    actions.extend(
+        crate::bundled_skills::ALL
+            .iter()
+            .filter(|skill| !configured_ids.contains(skill.id))
+            .map(|skill| {
+                (
+                    format!("/skills load {}", skill.id),
+                    format!("load bundled skill · {}", skill.description),
+                )
+            }),
+    );
+    actions
 }
 
 fn reference_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Suggestion> {
@@ -541,6 +555,27 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.value == "/help")
         );
+    }
+
+    #[test]
+    fn settings_palette_includes_offline_bundled_skills_without_a_config() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-bundled-menu-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace is created");
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(workspace.clone()));
+
+        let result = completer.complete("?", 1);
+
+        assert!(
+            result
+                .suggestions()
+                .iter()
+                .any(|candidate| { candidate.value == "/skills load failure-autopsy" })
+        );
+        std::fs::remove_dir_all(workspace).expect("workspace removed");
     }
 
     #[test]

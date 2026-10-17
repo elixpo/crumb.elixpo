@@ -125,6 +125,8 @@ engines remain replaceable; none may bypass Crumb's permission, credential, or s
 
 - [ ] [Expand the public skill and connector ecosystem](https://github.com/elixpo/crumb.elixpo/issues/46).
   - [x] [WP-034: register external skills and qualify Harness context lifecycle](https://github.com/elixpo/crumb.elixpo/issues/126).
+  - [x] Bundle an offline core skill set with explicit load/unload controls.
+  - [x] Add read-only stack detection and approval-gated disposable tool execution.
   - Defer all connector implementation until the connector-free terminal is release-ready.
 - [ ] [Supervise and authorize third-party MCP servers](https://github.com/elixpo/crumb.elixpo/issues/47).
   - [x] Supervise bounded local STDIO MCP servers ([PR #96](https://github.com/elixpo/crumb.elixpo/pull/96)).
