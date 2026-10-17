@@ -84,7 +84,10 @@ impl WindowsPowerShell {
     fn legacy_command_spec() -> CommandSpec {
         CommandSpec::new("powershell.exe")
             .arg("-NoLogo")
+            .arg("-NonInteractive")
             .arg("-NoExit")
+            .arg("-Command")
+            .arg("-")
     }
 }
 
@@ -94,7 +97,12 @@ impl NativeShell for WindowsPowerShell {
     }
 
     fn command_spec(&self) -> CommandSpec {
-        CommandSpec::new("pwsh").arg("-NoLogo").arg("-NoExit")
+        CommandSpec::new("pwsh")
+            .arg("-NoLogo")
+            .arg("-NonInteractive")
+            .arg("-NoExit")
+            .arg("-Command")
+            .arg("-")
     }
 
     fn builtin_commands(&self) -> &'static [&'static str] {
@@ -170,6 +178,9 @@ mod tests {
 
         assert_eq!(shell.kind(), ShellKind::PowerShell);
         assert_eq!(command.program(), "pwsh");
-        assert_eq!(command.args(), ["-NoLogo", "-NoExit"]);
+        assert_eq!(
+            command.args(),
+            ["-NoLogo", "-NonInteractive", "-NoExit", "-Command", "-"]
+        );
     }
 }
