@@ -129,7 +129,8 @@ impl CompletionProtocol {
     }
 
     fn posix_submission(command: &str, sequence: u64) -> String {
-        format!("__crumb_seq={sequence}; stty echo; {command}\n")
+        let command = command.replace('\'', "'\\''");
+        format!("__crumb_seq={sequence}; stty echo; eval '{command}'\n")
     }
 
     fn powershell_submission(&self, command: &str, sequence: u64) -> String {
@@ -215,7 +216,23 @@ mod tests {
 
         let submission = protocol.submission(crate::ShellKind::Bash, "cd /tmp", 7);
 
-        assert_eq!(submission, "__crumb_seq=7; stty echo; cd /tmp\n");
+        assert_eq!(submission, "__crumb_seq=7; stty echo; eval 'cd /tmp'\n");
+    }
+
+    #[test]
+    fn posix_submission_quotes_commands_without_exposing_them_to_outer_parsing() {
+        let protocol = CompletionProtocol::with_token("abc123".to_owned());
+
+        let submission = protocol.submission(
+            crate::ShellKind::Bash,
+            "printf '%s\\n' \"hello world\"; echo (broken)",
+            8,
+        );
+
+        assert_eq!(
+            submission,
+            "__crumb_seq=8; stty echo; eval 'printf '\\''%s\\n'\\'' \"hello world\"; echo (broken)'\n"
+        );
     }
 
     #[test]

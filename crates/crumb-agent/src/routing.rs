@@ -139,7 +139,7 @@ impl CommandCatalog {
                 None,
             );
         }
-        if has_shell_syntax(trimmed) {
+        if has_unambiguous_shell_syntax(trimmed) {
             return decision(InputRoute::Native, RouteReason::ShellSyntax, input, None);
         }
         let Some(command) = command_word(trimmed) else {
@@ -157,6 +157,9 @@ impl CommandCatalog {
                 input,
                 None,
             );
+        }
+        if has_shell_syntax(trimmed) {
+            return decision(InputRoute::Native, RouteReason::ShellSyntax, input, None);
         }
         if looks_like_path(command)
             || (self.powershell_commands && looks_like_powershell_command(command))
@@ -225,7 +228,7 @@ fn looks_like_sentence(input: &str) -> bool {
     let words = input.split_whitespace().collect::<Vec<_>>();
     let first = words
         .first()
-        .map_or("", |word| word.trim_matches(['.', ',', '!', '?', ':']));
+        .map_or("", |word| word.trim_matches(sentence_punctuation));
     let question_lead = matches!(
         first.to_ascii_lowercase().as_str(),
         "what"
@@ -244,6 +247,11 @@ fn looks_like_sentence(input: &str) -> bool {
             | "are"
             | "do"
             | "does"
+            | "search"
+            | "explain"
+            | "describe"
+            | "review"
+            | "summarize"
     );
     if words.len() >= 3 && (input.ends_with('?') || question_lead) {
         return true;
@@ -253,7 +261,7 @@ fn looks_like_sentence(input: &str) -> bool {
             word.starts_with('-')
                 || word.contains('=')
                 || !word
-                    .trim_matches(['.', ',', '!', '?', ':'])
+                    .trim_matches(sentence_punctuation)
                     .chars()
                     .all(|character| character.is_alphabetic() || character == '\'')
         })
@@ -262,9 +270,23 @@ fn looks_like_sentence(input: &str) -> bool {
     }
     let lengths = words
         .iter()
-        .map(|word| word.trim_matches(['.', ',', '!', '?', ':']).chars().count());
+        .map(|word| word.trim_matches(sentence_punctuation).chars().count());
     lengths.clone().filter(|length| *length <= 3).count() >= 2
         && lengths.filter(|length| *length >= 5).count() >= 2
+}
+
+fn sentence_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '.' | ',' | '!' | '?' | ':' | '(' | ')' | '[' | ']'
+    )
+}
+
+fn has_unambiguous_shell_syntax(input: &str) -> bool {
+    input
+        .chars()
+        .any(|character| matches!(character, '|' | '&' | ';' | '<' | '>' | '$' | '`' | '\n'))
+        || input.starts_with(['.', '/', '~'])
 }
 
 fn decision(
@@ -426,6 +448,7 @@ mod tests {
             "what's the time in Kolkata now?",
             "what is the time in Kolkata now",
             "how can I inspect this project",
+            "search about ayushman bhattacharya (elixpo) and tell me what you find?",
         ] {
             let decision = catalog.route(question, &RoutePolicy::default());
             assert_eq!(decision.route, InputRoute::Agent, "{question}");
