@@ -30,8 +30,9 @@ pub use routing::{
     CommandCatalog, InputRoute, RouteDecision, RoutePolicy, RouteReason, UnknownInputPolicy,
 };
 pub use session::{
-    AgentSession, CancellationToken, SessionEvent, SessionExport, SessionId, SessionJournal,
-    SessionSummary, TurnStatus, export_session, list_sessions, search_sessions, session_summary,
+    AgentSession, CancellationToken, SessionAttachment, SessionEvent, SessionExport, SessionId,
+    SessionJournal, SessionSummary, TurnStatus, attach_session_context, detach_session_context,
+    export_session, list_sessions, search_sessions, session_attachments, session_summary,
     set_session_archived, set_session_label, trash_session,
 };
 pub use steering::{SteeringAction, SteeringQueue};

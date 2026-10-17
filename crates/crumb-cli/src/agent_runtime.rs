@@ -10,7 +10,8 @@ use crumb_agent::config::SkillConfig;
 use crumb_agent::session::TurnStatus;
 use crumb_agent::{
     AgentConfig, AgentMode, AgentSession, BackendDiscovery, CancellationToken, HarnessConfig,
-    Modality, SessionId, SessionJournal, session_summary,
+    Modality, SessionAttachment, SessionId, SessionJournal, attach_session_context,
+    detach_session_context, session_attachments, session_summary,
 };
 use crumb_harness_cli::{CodingCliLaunch, run_text as run_coding_cli_text};
 use crumb_harness_dsh::{
@@ -327,6 +328,46 @@ impl AgentRuntime {
     #[must_use]
     pub fn active_session_id(&self) -> Option<&str> {
         self.session.as_ref().map(|session| session.id().as_str())
+    }
+
+    /// Ensures a session exists and persists one typed context reference.
+    pub fn attach_context(
+        &mut self,
+        workspace: &Path,
+        mode: AgentMode,
+        attachment: SessionAttachment,
+    ) -> Result<bool> {
+        let workspace = std::fs::canonicalize(workspace)
+            .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
+        self.ensure_session(&workspace, mode)?;
+        let session = self
+            .session
+            .as_ref()
+            .context("agent session is unavailable")?;
+        attach_session_context(&session_root(&workspace), session.id().as_str(), attachment)
+    }
+
+    /// Removes one typed context reference from the active session.
+    pub fn detach_context(
+        &mut self,
+        workspace: &Path,
+        attachment: &SessionAttachment,
+    ) -> Result<bool> {
+        let workspace = std::fs::canonicalize(workspace)
+            .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
+        let session = self.session.as_ref().context("no active agent session")?;
+        if session.workspace() != workspace {
+            bail!("active session belongs to a different workspace");
+        }
+        detach_session_context(&session_root(&workspace), session.id().as_str(), attachment)
+    }
+
+    /// Returns persistent context references for the active session.
+    pub fn attached_context(&self) -> Result<Vec<SessionAttachment>> {
+        let Some(session) = self.session.as_ref() else {
+            return Ok(Vec::new());
+        };
+        session_attachments(&session_root(session.workspace()), session.id().as_str())
     }
 
     /// Returns estimated context, total session tokens, and compaction count.

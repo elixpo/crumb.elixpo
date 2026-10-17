@@ -77,12 +77,14 @@ use reedline::{
 
 mod agent_runtime;
 mod completion;
+mod context;
 mod device_auth;
 mod provider_projection;
 mod shell_completion;
 
 use agent_runtime::{AgentRuntime, apply_selected_profile, validate_skill_path};
 use completion::{COMPLETION_PALETTE_ROWS, CompletionWorkspace, CrumbCompleter};
+use context::{parse_attachment, resolve_request_context};
 use shell_completion::{CompletionShell, write_completion};
 
 const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
@@ -1065,10 +1067,23 @@ struct AgentTerminal {
 
 fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<ReplOutcome>> {
     let agent_config = load_effective_agent_config(context.cwd, context.writer)?;
-    let decision = context
+    let mut decision = context
         .command_catalog
         .route(command, &agent_config.routing);
     if !matches!(decision.route, InputRoute::Native) {
+        let persistent = context
+            .agent_runtime
+            .as_ref()
+            .map(AgentRuntime::attached_context)
+            .transpose()?
+            .unwrap_or_default();
+        decision.payload = resolve_request_context(
+            &decision.payload,
+            &persistent,
+            context.cwd,
+            &agent_config,
+            &configured_optimization_pipeline(&agent_config),
+        )?;
         let decision = context.command_context.attach_to(decision, &agent_config);
         handle_agent_boundary(
             &decision,
@@ -1983,7 +1998,7 @@ fn handle_builtin(
     match command {
         BuiltInCommand::Auth(action) => handle_auth(action, writer)?,
         BuiltInCommand::Connectors => handle_auth(AuthAction::Status, writer)?,
-        BuiltInCommand::Context => show_reference_help(writer)?,
+        BuiltInCommand::Context => show_context(agent_runtime.as_ref(), writer)?,
         BuiltInCommand::Exit => {
             shutdown_session(session.take())?;
             return Ok(Some(ReplOutcome::Exit));
@@ -2124,6 +2139,23 @@ fn show_reference_help(writer: &mut dyn Write) -> Result<()> {
     Ok(())
 }
 
+fn show_context(runtime: Option<&AgentRuntime>, writer: &mut dyn Write) -> Result<()> {
+    show_reference_help(writer)?;
+    let attachments = runtime
+        .map(AgentRuntime::attached_context)
+        .transpose()?
+        .unwrap_or_default();
+    writeln!(writer, "\nPersistent session context:")?;
+    if attachments.is_empty() {
+        writeln!(writer, "  none")?;
+    } else {
+        for attachment in attachments {
+            writeln!(writer, "  {}", attachment.display_reference())?;
+        }
+    }
+    Ok(())
+}
+
 fn show_skills(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     let config = read_agent_config(cwd)?;
     if config.skills.is_empty() {
@@ -2194,6 +2226,12 @@ fn show_reserved(
         command if command.starts_with("/effort use ") => {
             set_reasoning_effort(command, cwd, writer)?;
         }
+        command if command == "/attach" || command.starts_with("/attach ") => {
+            configure_session_attachment(command, cwd, runtime, true, writer)?;
+        }
+        command if command == "/detach" || command.starts_with("/detach ") => {
+            configure_session_attachment(command, cwd, runtime, false, writer)?;
+        }
         command if command == "/skills load" || command.starts_with("/skills load ") => {
             set_skill_enabled(command, cwd, true, writer)?;
         }
@@ -2239,6 +2277,54 @@ fn show_reserved(
             writeln!(writer, "◇ {command}")?;
             writeln!(writer, "  Reserved by Crumb; not available in this build.")?;
         }
+    }
+    Ok(())
+}
+
+fn configure_session_attachment(
+    command: &str,
+    cwd: &Path,
+    runtime: &mut Option<AgentRuntime>,
+    attach: bool,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let action = if attach { "/attach" } else { "/detach" };
+    let reference = command
+        .strip_prefix(action)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("usage: {action} <@file:path|@folder:path>"))?;
+    let attachment = parse_attachment(reference, cwd)?;
+    let runtime = if let Some(runtime) = runtime.as_mut() {
+        runtime
+    } else if attach {
+        runtime.insert(AgentRuntime::new()?)
+    } else {
+        bail!("no active agent session");
+    };
+    let changed = if attach {
+        let config = read_agent_config(cwd)?;
+        runtime.attach_context(cwd, config.mode, attachment.clone())?
+    } else {
+        runtime.detach_context(cwd, &attachment)?
+    };
+    writeln!(
+        writer,
+        "{} {} · {}",
+        if changed { "◆" } else { "◇" },
+        if attach { "Attached" } else { "Detached" },
+        attachment.display_reference()
+    )?;
+    if !changed {
+        writeln!(
+            writer,
+            "  {}",
+            if attach {
+                "already attached"
+            } else {
+                "was not attached"
+            }
+        )?;
     }
     Ok(())
 }
