@@ -353,6 +353,8 @@ pub struct ToolPermissions {
     pub allow_network_tools: BTreeSet<String>,
     /// Workspace-write tools explicitly enabled by the user.
     pub allow_workspace_tools: BTreeSet<String>,
+    /// Process-execution tools explicitly enabled by the user.
+    pub allow_execution_tools: BTreeSet<String>,
     /// Supervised MCP tools explicitly allowed by the user.
     #[serde(alias = "allow_process_tools")]
     pub allow_mcp_tools: BTreeSet<String>,
@@ -457,6 +459,7 @@ impl AgentConfig {
             .allow_network_tools
             .iter()
             .chain(&self.permissions.allow_workspace_tools)
+            .chain(&self.permissions.allow_execution_tools)
             .any(|tool| !valid_identifier(tool))
             || self
                 .permissions

@@ -63,10 +63,11 @@ use crumb_profile::{ProfileDocument, ProfileSelectionStore, ProfileStore};
 use crumb_pty::{PtyInput, PtyResizer, SystemPty, TerminalSize};
 use crumb_repl::{ReplOutcome, read_classified_line};
 use crumb_tools::{
-    CheckpointDecision, CheckpointStatus, CheckpointStore, DisposableToolConfig,
+    AgentShellConfig, CheckpointDecision, CheckpointStatus, CheckpointStore, DisposableToolConfig,
     StackDetectionLimits, WebFetchLimits, WorkspaceToolLimits, WorkspaceWriteLimits,
-    register_disposable_tool, register_stack_detection_tool, register_web_fetch_tool,
-    register_workspace_read_tools, register_workspace_write_tool,
+    register_current_time_tool, register_disposable_tool, register_shell_tool_with_optimizer,
+    register_stack_detection_tool, register_web_fetch_tool, register_workspace_read_tools,
+    register_workspace_write_tool,
 };
 use crumb_ui::{GitSegment, PromptContext, Renderer, StartupContext, UiSettings};
 use directories::BaseDirs;
@@ -366,6 +367,7 @@ fn serve_mcp() -> Result<()> {
         Arc::new(
             ConfiguredApprovals::new(config.permissions.allow_network_tools.clone())
                 .with_workspace_tools(config.permissions.allow_workspace_tools.clone())
+                .with_process_tools(config.permissions.allow_execution_tools.clone())
                 .with_mcp_tools(config.permissions.allow_mcp_tools.clone()),
         ),
         config.mode,
@@ -392,6 +394,7 @@ fn workspace_read_host(
     let max_file_write_bytes = usize::try_from(config.limits.max_file_write_bytes)
         .map_err(|_| anyhow!("max_file_write_bytes exceeds this platform's address space"))?;
     let mut host = ToolHost::default();
+    register_current_time_tool(&mut host)?;
     register_workspace_read_tools(
         &mut host,
         workspace,
@@ -416,6 +419,12 @@ fn workspace_read_host(
         &mut host,
         workspace,
         disposable_tool_config(config, max_output_bytes),
+    )?;
+    register_shell_tool_with_optimizer(
+        &mut host,
+        workspace,
+        shell_tool_config(config, max_output_bytes),
+        Arc::new(configured_optimization_pipeline(config)),
     )?;
     register_web_fetch_tool(
         &mut host,
@@ -460,6 +469,17 @@ fn disposable_tool_config(config: &AgentConfig, max_output_bytes: usize) -> Disp
         max_script_bytes: max_output_bytes.min(64 * 1024),
         max_input_bytes: max_output_bytes.saturating_mul(4),
         max_output_bytes,
+    }
+}
+
+fn shell_tool_config(config: &AgentConfig, max_output_bytes: usize) -> AgentShellConfig {
+    let disposable = disposable_tool_config(config, max_output_bytes);
+    AgentShellConfig {
+        program: disposable.program,
+        arguments: disposable.arguments,
+        path: disposable.path,
+        max_output_bytes: disposable.max_output_bytes,
+        timeout: Duration::from_secs(config.limits.max_shell_command_seconds),
     }
 }
 
@@ -1549,6 +1569,7 @@ fn handle_agent_boundary(
         .map(|skill| skill.id.as_str())
         .collect::<Vec<_>>()
         .join(", ");
+    write!(writer, "\r\x1b[2K")?;
     writeln!(
         writer,
         "{}",
@@ -3026,11 +3047,13 @@ fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     let config = read_agent_config(cwd)?;
     writeln!(writer, "◆ Agent tools")?;
     for (name, risk, available) in [
+        ("current_time", "local time", true),
         ("read_file", "workspace read", true),
         ("list_directory", "workspace read", true),
         ("detect_stack", "workspace read", true),
         ("write_file", "workspace write", true),
         ("run_disposable", "one-shot process", true),
+        ("run_shell", "workspace process", true),
         ("spawn_agents", "parallel analysis", true),
         ("web_fetch", "network", true),
         (
@@ -3042,9 +3065,12 @@ fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
                 .is_some_and(|routes| !routes.is_empty()),
         ),
     ] {
-        let granted = matches!(name, "read_file" | "list_directory" | "detect_stack")
-            || config.permissions.allow_network_tools.contains(name)
-            || config.permissions.allow_workspace_tools.contains(name);
+        let granted = matches!(
+            name,
+            "current_time" | "read_file" | "list_directory" | "detect_stack"
+        ) || config.permissions.allow_network_tools.contains(name)
+            || config.permissions.allow_workspace_tools.contains(name)
+            || config.permissions.allow_execution_tools.contains(name);
         writeln!(
             writer,
             "  {} {name:<18} {risk}{}",
@@ -3073,6 +3099,11 @@ fn configure_permissions(command: &str, cwd: &Path, writer: &mut dyn Write) -> R
         )?;
         writeln!(
             writer,
+            "  execution  {}",
+            joined_or_none(&config.permissions.allow_execution_tools)
+        )?;
+        writeln!(
+            writer,
             "  MCP        {}",
             joined_or_none(&config.permissions.allow_mcp_tools)
         )?;
@@ -3082,31 +3113,69 @@ fn configure_permissions(command: &str, cwd: &Path, writer: &mut dyn Write) -> R
         )?;
         return Ok(());
     }
-    let [action, tool] = arguments.as_slice() else {
-        bail!("usage: /permissions [allow-network|deny-network <tool>]");
-    };
-    if !matches!(*tool, "web_fetch" | "web_search" | "spawn_agents") {
-        bail!("network permission tool must be web_fetch, web_search, or spawn_agents");
-    }
-    let allow = match *action {
-        "allow-network" => true,
-        "deny-network" => false,
-        _ => bail!("usage: /permissions [allow-network|deny-network <tool>]"),
-    };
-    update_agent_config(cwd, |config| {
-        if allow {
+    if arguments.as_slice() == ["allow-all"] {
+        update_agent_config(cwd, |config| {
             config
                 .permissions
                 .allow_network_tools
-                .insert((*tool).to_owned());
+                .extend(["spawn_agents", "web_fetch", "web_search"].map(str::to_owned));
+            config
+                .permissions
+                .allow_workspace_tools
+                .insert("write_file".to_owned());
+            config
+                .permissions
+                .allow_execution_tools
+                .extend(["run_disposable", "run_shell"].map(str::to_owned));
+            Ok(())
+        })?;
+        writeln!(writer, "◆ Packaged agent tools allowed")?;
+        writeln!(writer, "  Network · workspace writes · execution")?;
+        return Ok(());
+    }
+    let [action, tool] = arguments.as_slice() else {
+        bail!(
+            "usage: /permissions [allow-all|allow-network|deny-network|allow-workspace|deny-workspace|allow-execution|deny-execution <tool>]"
+        );
+    };
+    let (scope, allow) = match *action {
+        "allow-network" => ("network", true),
+        "deny-network" => ("network", false),
+        "allow-workspace" => ("workspace", true),
+        "deny-workspace" => ("workspace", false),
+        "allow-execution" => ("execution", true),
+        "deny-execution" => ("execution", false),
+        _ => bail!("unknown permission action `{action}`"),
+    };
+    match scope {
+        "network" if !matches!(*tool, "web_fetch" | "web_search" | "spawn_agents") => {
+            bail!("network permission tool must be web_fetch, web_search, or spawn_agents");
+        }
+        "workspace" if *tool != "write_file" => {
+            bail!("workspace permission tool must be write_file");
+        }
+        "execution" if !matches!(*tool, "run_disposable" | "run_shell") => {
+            bail!("execution permission tool must be run_disposable or run_shell");
+        }
+        _ => {}
+    }
+    update_agent_config(cwd, |config| {
+        let grants = match scope {
+            "network" => &mut config.permissions.allow_network_tools,
+            "workspace" => &mut config.permissions.allow_workspace_tools,
+            "execution" => &mut config.permissions.allow_execution_tools,
+            _ => unreachable!("validated permission scope"),
+        };
+        if allow {
+            grants.insert((*tool).to_owned());
         } else {
-            config.permissions.allow_network_tools.remove(*tool);
+            grants.remove(*tool);
         }
         Ok(())
     })?;
     writeln!(
         writer,
-        "◆ Network permission · {tool} {}",
+        "◆ {scope} permission · {tool} {}",
         if allow { "allowed" } else { "denied" }
     )?;
     Ok(())
@@ -8299,14 +8368,15 @@ mod tests {
 
     use super::{
         ExitGesture, MarketplaceContent, PausedSubmission, SessionCommandContext, SteeringAction,
-        TerminalModeTracker, TranscriptCapture, agent_config_location, configure_plugin,
-        effort_display_name, effort_wire_name, failed_command_recovery, initial_agent_activity,
-        marketplace_update_blocker, openrouter_preset, parse_credential_reference,
-        parse_paused_submission, parse_provider_header, parse_resume_session_argument,
-        read_agent_config, read_bounded_response, register_local_skill, resolve_memory_keep,
-        sanitize_transcript_output, set_skill_enabled, show_graph, show_marketplace, show_memory,
-        show_profile_with_stores, suggestion_width, unregister_local_skill,
-        validate_marketplace_path, validate_marketplace_response, workspace_read_host,
+        TerminalModeTracker, TranscriptCapture, agent_config_location, configure_permissions,
+        configure_plugin, effort_display_name, effort_wire_name, failed_command_recovery,
+        initial_agent_activity, marketplace_update_blocker, openrouter_preset,
+        parse_credential_reference, parse_paused_submission, parse_provider_header,
+        parse_resume_session_argument, read_agent_config, read_bounded_response,
+        register_local_skill, resolve_memory_keep, sanitize_transcript_output, set_skill_enabled,
+        show_graph, show_marketplace, show_memory, show_profile_with_stores, suggestion_width,
+        unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
+        workspace_read_host,
     };
 
     #[test]
@@ -8459,6 +8529,29 @@ mod tests {
     }
 
     #[test]
+    fn packaged_tools_can_be_explicitly_granted_by_the_user() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-tool-grants-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace is created");
+        let mut output = Vec::new();
+
+        configure_permissions("/permissions allow-all", &workspace, &mut output)
+            .expect("packaged tools are granted");
+        let permissions = read_agent_config(&workspace)
+            .expect("config loads")
+            .permissions;
+
+        assert!(permissions.allow_network_tools.contains("web_search"));
+        assert!(permissions.allow_workspace_tools.contains("write_file"));
+        assert!(permissions.allow_execution_tools.contains("run_shell"));
+        assert!(permissions.allow_execution_tools.contains("run_disposable"));
+        std::fs::remove_dir_all(workspace).expect("workspace removed");
+    }
+
+    #[test]
     fn friendly_effort_names_map_to_harness_values() {
         for (friendly, wire) in [
             ("light", "low"),
@@ -8567,12 +8660,14 @@ mod tests {
         let host = workspace_read_host(&workspace, &AgentConfig::default(), None)
             .expect("workspace tools are registered");
         let tools = host.tools().collect::<Vec<_>>();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 8);
         for (name, risk) in [
+            ("current_time", RiskClass::ReadOnly),
             ("detect_stack", RiskClass::ReadOnly),
             ("list_directory", RiskClass::ReadOnly),
             ("read_file", RiskClass::ReadOnly),
             ("run_disposable", RiskClass::ProcessExecution),
+            ("run_shell", RiskClass::ProcessExecution),
             ("web_fetch", RiskClass::NetworkAccess),
             ("write_file", RiskClass::WriteWorkspace),
         ] {

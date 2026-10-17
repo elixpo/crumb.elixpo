@@ -1,6 +1,7 @@
 //! Bounded Pollinations web search exposed through Crumb's native tool policy.
 
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -96,6 +97,7 @@ pub fn register_web_search_tool(
     )
 }
 
+#[derive(Clone)]
 struct PollinationsSearch {
     client: Client,
     config: PollinationsSearchConfig,
@@ -112,11 +114,21 @@ impl ToolHandler for PollinationsSearch {
         if query.len() > MAX_QUERY_BYTES {
             bail!("web search query exceeds the byte limit");
         }
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .context("failed to start web search runtime")?;
-        runtime.block_on(self.search(query, cancellation))
+        let tool = self.clone();
+        let query = query.to_owned();
+        let cancellation = cancellation.clone();
+        thread::Builder::new()
+            .name("crumb-web-search".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("failed to start web search runtime")?;
+                runtime.block_on(tool.search(&query, &cancellation))
+            })
+            .context("failed to start web search worker")?
+            .join()
+            .map_err(|_| anyhow!("web search worker failed"))?
     }
 }
 

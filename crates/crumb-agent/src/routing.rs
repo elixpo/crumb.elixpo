@@ -223,6 +223,31 @@ const fn route_for_unknown(policy: UnknownInputPolicy) -> InputRoute {
 
 fn looks_like_sentence(input: &str) -> bool {
     let words = input.split_whitespace().collect::<Vec<_>>();
+    let first = words
+        .first()
+        .map_or("", |word| word.trim_matches(['.', ',', '!', '?', ':']));
+    let question_lead = matches!(
+        first.to_ascii_lowercase().as_str(),
+        "what"
+            | "what's"
+            | "whats"
+            | "who"
+            | "where"
+            | "when"
+            | "why"
+            | "how"
+            | "can"
+            | "could"
+            | "would"
+            | "should"
+            | "is"
+            | "are"
+            | "do"
+            | "does"
+    );
+    if words.len() >= 3 && (input.ends_with('?') || question_lead) {
+        return true;
+    }
     if words.len() < 5
         || words.iter().any(|word| {
             word.starts_with('-')
@@ -230,7 +255,7 @@ fn looks_like_sentence(input: &str) -> bool {
                 || !word
                     .trim_matches(['.', ',', '!', '?', ':'])
                     .chars()
-                    .all(char::is_alphabetic)
+                    .all(|character| character.is_alphabetic() || character == '\'')
         })
     {
         return false;
@@ -392,6 +417,20 @@ mod tests {
 
         assert_eq!(decision.route, InputRoute::Agent);
         assert_eq!(decision.reason, RouteReason::NaturalLanguageCandidate);
+    }
+
+    #[test]
+    fn conversational_questions_never_fall_through_to_shell_typo_recovery() {
+        let catalog = CommandCatalog::with_commands(["whatis".to_owned(), "date".to_owned()]);
+        for question in [
+            "what's the time in Kolkata now?",
+            "what is the time in Kolkata now",
+            "how can I inspect this project",
+        ] {
+            let decision = catalog.route(question, &RoutePolicy::default());
+            assert_eq!(decision.route, InputRoute::Agent, "{question}");
+            assert_eq!(decision.reason, RouteReason::NaturalLanguageCandidate);
+        }
     }
 
     #[test]

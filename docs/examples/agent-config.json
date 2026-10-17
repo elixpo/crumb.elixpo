@@ -81,6 +81,7 @@
   "permissions": {
     "allow_network_tools": ["web_fetch", "web_search"],
     "allow_workspace_tools": ["write_file"],
+    "allow_execution_tools": ["run_disposable", "run_shell"],
     "allow_mcp_tools": []
   },
   "optimizers": [

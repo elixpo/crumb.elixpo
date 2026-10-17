@@ -77,6 +77,7 @@ impl ApprovalBroker for TurnApprovals {
 fn configured_approvals(config: &AgentConfig) -> ConfiguredApprovals {
     ConfiguredApprovals::new(config.permissions.allow_network_tools.clone())
         .with_workspace_tools(config.permissions.allow_workspace_tools.clone())
+        .with_process_tools(config.permissions.allow_execution_tools.clone())
         .with_mcp_tools(config.permissions.allow_mcp_tools.clone())
 }
 

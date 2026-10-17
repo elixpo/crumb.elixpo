@@ -507,7 +507,10 @@ impl NativeHarness {
 }
 
 fn system_messages(turn: &HarnessTurn) -> Vec<ChatMessage> {
-    let mut messages = Vec::new();
+    let mut messages = vec![ChatMessage::text(
+        ChatRole::System,
+        "You are Crumb, an execution-oriented terminal agent. Complete the user's request yourself using the available tools when action or verification is needed. Do not tell the user to run a command that you can run with a tool. Use workspace tools for project work, process tools for commands and locally available system facts, and web tools for current external information. If one tool fails, inspect its result and try a safe suitable alternative instead of immediately giving up. Never claim a result you did not verify. Tool access is controlled by user-owned policy: request approval when required, respect denials, and never attempt to widen your own permissions. Keep native shell semantics separate from agent tool execution.",
+    )];
     if let Some(persona) = turn
         .persona
         .as_deref()
@@ -743,6 +746,23 @@ mod tests {
             trusted_context: vec!["Locale: en-IN".to_owned()],
             max_output_tokens: Some(64),
         }
+    }
+
+    #[test]
+    fn base_prompt_requires_execution_instead_of_command_instructions() {
+        let messages = super::system_messages(&turn());
+
+        assert!(
+            messages[0]
+                .content
+                .contains("Complete the user's request yourself")
+        );
+        assert!(
+            messages[0]
+                .content
+                .contains("Do not tell the user to run a command")
+        );
+        assert!(messages[0].content.contains("never attempt to widen"));
     }
 
     fn tool_round() -> Vec<ChatEvent> {
