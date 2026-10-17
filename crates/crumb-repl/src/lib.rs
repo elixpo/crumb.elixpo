@@ -264,6 +264,10 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "inspect a persona profile",
     },
     SlashCommand {
+        usage: "/profile effective",
+        description: "show effective profile preference sources",
+    },
+    SlashCommand {
         usage: "/profile create ",
         description: "create a persona profile",
     },
