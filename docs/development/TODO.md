@@ -113,6 +113,7 @@ engines remain replaceable; none may bypass Crumb's permission, credential, or s
 - [ ] [Add provenance-aware memory retrieval and conflict handling](https://github.com/elixpo/crumb.elixpo/issues/43).
 - [ ] [Add named personas and portable agent profiles](https://github.com/elixpo/crumb.elixpo/issues/44).
 - [ ] [Add graph-grounded project context with an optional Graphify adapter](https://github.com/elixpo/crumb.elixpo/issues/45).
+  - [ ] [WP-024: provider-neutral graph core and pinned Graphify adapter](https://github.com/elixpo/crumb.elixpo/issues/100).
   - Keep Graphify opt-in, local-first, pinned, and replaceable.
   - Require source/edge provenance, freshness detection, bounded retrieval, and native-search fallback.
   - Route its MCP surface through Crumb's approval and supervision boundary.

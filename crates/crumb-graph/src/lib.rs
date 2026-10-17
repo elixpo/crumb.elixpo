@@ -8,6 +8,12 @@ use std::time::SystemTime;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+mod graphify;
+
+pub use graphify::{
+    GRAPHIFY_PINNED_VERSION, GraphSettings, GraphSettingsStore, GraphifyAdapter, GraphifyStatus,
+};
+
 pub const GRAPHIFY_SCHEMA_VERSION: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

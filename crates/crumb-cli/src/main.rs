@@ -25,15 +25,19 @@ use crossterm::terminal::{
 use crumb_agent::{
     AgentConfig, AgentMode, BackendDiscovery, CacheRetention, CancellationToken, CommandCatalog,
     CompatibilityFlag, ConfiguredApprovals, CredentialReference, HarnessConfig, InputRoute, JobId,
-    JobSchedule, JobState, JobStore, LiveConfig, McpServer, MistakePolicy, Modality, ModelRoute,
-    NewJob, OutputKind, ProviderCompatibility, ProviderConfig, ProviderHeader, ProviderModel,
-    ProviderProtocol, ProviderTransport, RouteDecision, RouteReason, SkillConfig, SteeringAction,
-    SteeringQueue, TokenOptimizer, ToolHost, TurnStatus, UnknownInputPolicy, export_session,
-    list_sessions, search_sessions, session_summary, set_session_archived, set_session_label,
-    trash_session,
+    JobSchedule, JobState, JobStore, LiveConfig, McpServer, McpTransport, MistakePolicy, Modality,
+    ModelRoute, NewJob, OutputKind, ProviderCompatibility, ProviderConfig, ProviderHeader,
+    ProviderModel, ProviderProtocol, ProviderTransport, RouteDecision, RouteReason, SkillConfig,
+    SteeringAction, SteeringQueue, TokenOptimizer, ToolHost, TurnStatus, UnknownInputPolicy,
+    export_session, list_sessions, search_sessions, session_summary, set_session_archived,
+    set_session_label, trash_session,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
+use crumb_graph::{
+    EdgeConfidence, EvidenceFreshness, GraphEvidence, GraphLimits, GraphSettingsStore,
+    GraphifyAdapter, ProjectGraph,
+};
 use crumb_harness_dsh::HarnessActivity;
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_marketplace::{
@@ -305,7 +309,8 @@ fn launch_due_jobs(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
 
 fn serve_mcp() -> Result<()> {
     let workspace = current_process_dir()?;
-    let config = read_agent_config(&workspace)?;
+    let mut config = read_agent_config(&workspace)?;
+    enforce_graphify_pin(&workspace, &mut config);
     let search_api_key = pollinations_environment_key();
     let mut host = workspace_read_host(&workspace, &config, search_api_key)?;
     let mut diagnostics = register_stdio_servers(
@@ -2064,6 +2069,7 @@ fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
                 "/tools",
                 "/permissions",
                 "/memory",
+                "/graph",
                 "/profile",
             ][..],
         ),
@@ -2195,6 +2201,9 @@ fn show_reserved(
         }
         command if command == "/memory" || command.starts_with("/memory ") => {
             show_memory(command, cwd, writer)?;
+        }
+        command if command == "/graph" || command.starts_with("/graph ") => {
+            show_graph(command, cwd, writer)?;
         }
         command if command == "/profile" || command.starts_with("/profile ") => {
             show_profile(command, cwd, writer)?;
@@ -4228,6 +4237,286 @@ fn resolve_profile_path(cwd: &Path, path: &str) -> PathBuf {
     }
 }
 
+fn enforce_graphify_pin(workspace: &Path, config: &mut AgentConfig) {
+    let Some(server) = config
+        .mcp_servers
+        .iter_mut()
+        .find(|server| server.id == "graphify" && server.enabled)
+    else {
+        return;
+    };
+    let Ok(settings) = GraphSettingsStore::for_workspace(workspace).load_or_default() else {
+        server.enabled = false;
+        return;
+    };
+    let compatible = settings.enabled
+        && GraphifyAdapter::new(settings).is_ok_and(|adapter| adapter.status().compatible);
+    if !compatible {
+        server.enabled = false;
+    }
+}
+
+fn show_graph(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let store = GraphSettingsStore::for_workspace(cwd);
+    let mut settings = store.load_or_default()?;
+    match command {
+        "/graph" | "/graph status" => show_graph_status(cwd, &settings, writer),
+        "/graph build" | "/graph refresh" => {
+            let adapter = GraphifyAdapter::new(settings.clone())?;
+            writeln!(writer, "◆ Building local project graph · Graphify")?;
+            let graph_path = adapter.build(cwd, Duration::from_secs(600), || false)?;
+            let graph = ProjectGraph::load(cwd, &graph_path, GraphLimits::default())?;
+            let status = graph.status();
+            writeln!(
+                writer,
+                "  ready · {} nodes · {} edges · {} stale sources",
+                status.nodes, status.edges, status.stale_sources
+            )?;
+            writeln!(
+                writer,
+                "  run `/graph enable` to expose supervised graph tools"
+            )?;
+            Ok(())
+        }
+        "/graph enable" => {
+            let adapter = GraphifyAdapter::new(settings.clone())?;
+            let adapter_status = adapter.status();
+            if !adapter_status.available {
+                bail!(
+                    "Graphify is not installed; install graphifyy=={} explicitly",
+                    settings.expected_version
+                );
+            }
+            if !adapter_status.compatible {
+                bail!(
+                    "Graphify version is incompatible; expected {}",
+                    settings.expected_version
+                );
+            }
+            let graph_path = adapter.graph_path(cwd);
+            ProjectGraph::load(cwd, &graph_path, GraphLimits::default())?;
+            settings.enabled = true;
+            store.save(&settings)?;
+            configure_graphify_mcp(cwd, &settings, &graph_path, true)?;
+            writeln!(writer, "◆ Project graph enabled · Graphify")?;
+            writeln!(
+                writer,
+                "  MCP tools remain denied until `/plugins allow mcp__graphify__<tool>`"
+            )?;
+            Ok(())
+        }
+        "/graph disable" => {
+            settings.enabled = false;
+            store.save(&settings)?;
+            configure_graphify_mcp(cwd, &settings, &settings.graph_path, false)?;
+            writeln!(writer, "◇ Project graph disabled")?;
+            Ok(())
+        }
+        command if command.starts_with("/graph query ") => {
+            require_graph_enabled(&settings)?;
+            let query = command.trim_start_matches("/graph query ").trim();
+            if query.is_empty() {
+                bail!("graph query cannot be empty");
+            }
+            let graph = load_project_graph(cwd, &settings)?;
+            render_graph_evidence(&graph.query(query), writer)
+        }
+        command if command.starts_with("/graph explain ") => {
+            require_graph_enabled(&settings)?;
+            let id = command.trim_start_matches("/graph explain ").trim();
+            if id.is_empty() {
+                bail!("graph node ID cannot be empty");
+            }
+            let graph = load_project_graph(cwd, &settings)?;
+            render_graph_evidence(&graph.explain(id), writer)
+        }
+        command if command.starts_with("/graph path ") => {
+            require_graph_enabled(&settings)?;
+            let arguments = command
+                .trim_start_matches("/graph path ")
+                .split_whitespace()
+                .collect::<Vec<_>>();
+            let [source, target] = arguments.as_slice() else {
+                bail!("usage: /graph path <source-node> <target-node>");
+            };
+            let graph = load_project_graph(cwd, &settings)?;
+            render_graph_evidence(&graph.shortest_path(source, target), writer)
+        }
+        _ => bail!(
+            "usage: /graph [status | build | refresh | enable | disable | query <text> | explain <node> | path <source> <target>]"
+        ),
+    }
+}
+
+fn show_graph_status(
+    cwd: &Path,
+    settings: &crumb_graph::GraphSettings,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let adapter = GraphifyAdapter::new(settings.clone())?;
+    let adapter_status = adapter.status();
+    writeln!(writer, "◆ Local project graph")?;
+    writeln!(
+        writer,
+        "  state       {}",
+        if settings.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    )?;
+    writeln!(
+        writer,
+        "  adapter     Graphify {} · expected {}",
+        adapter_status
+            .detected_version
+            .as_deref()
+            .unwrap_or("not installed"),
+        settings.expected_version
+    )?;
+    let graph_path = adapter.graph_path(cwd);
+    match ProjectGraph::load(cwd, &graph_path, GraphLimits::default()) {
+        Ok(graph) => {
+            let status = graph.status();
+            writeln!(
+                writer,
+                "  graph       {} nodes · {} edges",
+                status.nodes, status.edges
+            )?;
+            writeln!(
+                writer,
+                "  freshness   {} stale sources",
+                status.stale_sources
+            )?;
+            writeln!(writer, "  source      {}", status.graph_path.display())?;
+        }
+        Err(_) => writeln!(writer, "  graph       unavailable · run `/graph build`")?,
+    }
+    if adapter_status.available && !adapter_status.compatible {
+        writeln!(
+            writer,
+            "  warning     incompatible adapter; graph MCP is blocked"
+        )?;
+    }
+    Ok(())
+}
+
+fn require_graph_enabled(settings: &crumb_graph::GraphSettings) -> Result<()> {
+    if !settings.enabled {
+        bail!("project graph is disabled; run `/graph enable` after building it");
+    }
+    Ok(())
+}
+
+fn load_project_graph(cwd: &Path, settings: &crumb_graph::GraphSettings) -> Result<ProjectGraph> {
+    ProjectGraph::load(cwd, &cwd.join(&settings.graph_path), GraphLimits::default())
+}
+
+fn configure_graphify_mcp(
+    cwd: &Path,
+    settings: &crumb_graph::GraphSettings,
+    graph_path: &Path,
+    enabled: bool,
+) -> Result<()> {
+    let command = graphify_mcp_command(&settings.command);
+    let argument = graph_path.to_string_lossy().into_owned();
+    update_agent_config(cwd, |config| {
+        if let Some(server) = config
+            .mcp_servers
+            .iter_mut()
+            .find(|server| server.id == "graphify")
+        {
+            server.transport = McpTransport::Stdio;
+            server.command.clone_from(&command);
+            server.arguments = vec![argument.clone()];
+            server.url = None;
+            server.credential = None;
+            server.enabled = enabled;
+        } else {
+            config.mcp_servers.push(McpServer {
+                id: "graphify".to_owned(),
+                transport: McpTransport::Stdio,
+                command,
+                arguments: vec![argument],
+                url: None,
+                credential: None,
+                enabled,
+            });
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn graphify_mcp_command(command: &Path) -> PathBuf {
+    let parent = command.parent().filter(|path| !path.as_os_str().is_empty());
+    parent.map_or_else(
+        || PathBuf::from("graphify-mcp"),
+        |path| path.join("graphify-mcp"),
+    )
+}
+
+fn render_graph_evidence(evidence: &GraphEvidence, writer: &mut dyn Write) -> Result<()> {
+    if evidence.nodes.is_empty() {
+        writeln!(writer, "◇ No graph evidence found")?;
+        return Ok(());
+    }
+    writeln!(writer, "◆ Graph evidence · untrusted local context")?;
+    for node in &evidence.nodes {
+        writeln!(
+            writer,
+            "  ◇ {} [{}] · {}{} · {}",
+            node.label,
+            node.id,
+            node.provenance.source_file.display(),
+            node.provenance
+                .source_location
+                .as_deref()
+                .map_or_else(String::new, |location| format!(":{location}")),
+            freshness_name(node.provenance.freshness)
+        )?;
+    }
+    for edge in &evidence.edges {
+        writeln!(
+            writer,
+            "  {} --{}--> {} · {} · {}{}",
+            edge.source,
+            edge.relation,
+            edge.target,
+            confidence_name(edge.provenance.confidence),
+            edge.provenance.source_file.display(),
+            edge.provenance
+                .source_location
+                .as_deref()
+                .map_or_else(String::new, |location| format!(":{location}"))
+        )?;
+        if let Some(rationale) = &edge.rationale {
+            writeln!(writer, "    {rationale}")?;
+        }
+    }
+    if evidence.truncated {
+        writeln!(writer, "  … result truncated at the configured graph limit")?;
+    }
+    Ok(())
+}
+
+const fn freshness_name(freshness: EvidenceFreshness) -> &'static str {
+    match freshness {
+        EvidenceFreshness::Fresh => "fresh",
+        EvidenceFreshness::Changed => "stale: changed",
+        EvidenceFreshness::Deleted => "stale: deleted",
+        EvidenceFreshness::Unverifiable => "stale: unverifiable",
+    }
+}
+
+const fn confidence_name(confidence: EdgeConfidence) -> &'static str {
+    match confidence {
+        EdgeConfidence::Extracted => "extracted",
+        EdgeConfidence::Inferred => "inferred",
+        EdgeConfidence::Unknown => "unknown confidence",
+    }
+}
+
 fn show_memory(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     let (_, project_root) = agent_config_location(cwd);
     let memory = MemorySet::discover(&project_root)?;
@@ -5866,8 +6155,9 @@ mod tests {
         ExitGesture, SessionCommandContext, agent_config_location, configure_plugin,
         effort_display_name, effort_wire_name, failed_command_recovery, initial_agent_activity,
         openrouter_preset, parse_credential_reference, parse_provider_header,
-        parse_resume_session_argument, read_agent_config, resolve_memory_keep, show_marketplace,
-        show_memory, show_profile_with_stores, suggestion_width, workspace_read_host,
+        parse_resume_session_argument, read_agent_config, resolve_memory_keep, show_graph,
+        show_marketplace, show_memory, show_profile_with_stores, suggestion_width,
+        workspace_read_host,
     };
 
     #[test]
@@ -6091,6 +6381,43 @@ mod tests {
                 .allow_mcp_tools
                 .contains("mcp__crumb-workspace__read_file")
         );
+        std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
+    }
+
+    #[test]
+    fn graph_commands_are_local_bounded_and_disabled_by_default() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-graph-{suffix}"));
+        std::fs::create_dir_all(workspace.join("graphify-out"))
+            .expect("graph directory can be created");
+        std::fs::write(workspace.join("source.rs"), "fn alpha() {}\n")
+            .expect("source can be created");
+        std::fs::write(
+            workspace.join("graphify-out/graph.json"),
+            br#"{
+                "graph":{"schema_version":1,"graphify_version":"0.9.92"},
+                "nodes":[{"id":"alpha","label":"alpha","source_file":"source.rs","source_location":"L1"}],
+                "links":[]
+            }"#,
+        )
+        .expect("graph can be created");
+        let mut output = Vec::new();
+        show_graph("/graph status", &workspace, &mut output).expect("status is available");
+        assert!(String::from_utf8_lossy(&output).contains("disabled"));
+        assert!(show_graph("/graph query alpha", &workspace, &mut output).is_err());
+
+        let store = crumb_graph::GraphSettingsStore::for_workspace(&workspace);
+        let mut settings = store.load_or_default().expect("default settings");
+        settings.enabled = true;
+        store.save(&settings).expect("settings save");
+        output.clear();
+        show_graph("/graph query alpha", &workspace, &mut output).expect("local query");
+        let rendered = String::from_utf8(output).expect("UTF-8 output");
+        assert!(rendered.contains("alpha [alpha]"));
+        assert!(rendered.contains("source.rs:L1"));
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
     }
 

@@ -268,6 +268,38 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "deduplicate approved memory",
     },
     SlashCommand {
+        usage: "/graph",
+        description: "show local project graph status",
+    },
+    SlashCommand {
+        usage: "/graph build",
+        description: "explicitly build the local project graph",
+    },
+    SlashCommand {
+        usage: "/graph refresh",
+        description: "explicitly rebuild the local project graph",
+    },
+    SlashCommand {
+        usage: "/graph query ",
+        description: "query bounded local graph evidence",
+    },
+    SlashCommand {
+        usage: "/graph explain ",
+        description: "explain one graph node with provenance",
+    },
+    SlashCommand {
+        usage: "/graph path ",
+        description: "find a bounded path between two nodes",
+    },
+    SlashCommand {
+        usage: "/graph enable",
+        description: "enable the pinned Graphify MCP adapter",
+    },
+    SlashCommand {
+        usage: "/graph disable",
+        description: "disable project graph context",
+    },
+    SlashCommand {
         usage: "/profile",
         description: "show the active persona profile",
     },

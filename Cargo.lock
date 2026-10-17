@@ -518,6 +518,7 @@ dependencies = [
  "crumb-agent",
  "crumb-auth",
  "crumb-core",
+ "crumb-graph",
  "crumb-harness-cli",
  "crumb-harness-dsh",
  "crumb-history",
