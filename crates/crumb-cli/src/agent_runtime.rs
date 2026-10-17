@@ -729,12 +729,13 @@ impl AgentRuntime {
         }
         let skill_context = load_enabled_skill_context(&config.skills, &workspace, request)?;
         let prepared_request = attach_skill_context(&memory.request, &skill_context);
-        let mut trusted_context = memory.context.into_iter().collect::<Vec<_>>();
-        trusted_context.push(runtime_session_context(
+        let trusted_context = runtime_context(
+            memory.context,
+            request,
             self.token_usage(),
             context_token_budget(config, route),
-        ));
-        trusted_context.push(runtime_workspace_context(&workspace));
+            &workspace,
+        );
         let dispatched_request = if native {
             request
         } else {
@@ -1123,15 +1124,44 @@ fn runtime_session_context(
     context_limit: u64,
 ) -> String {
     format!(
-        "## Runtime session state (authoritative)\nThe active Crumb process retains prior completed user and assistant turns in its model conversation. Current estimated context: ~{context_tokens}/{context_limit} tokens. Total estimated session usage: ~{session_tokens} tokens. Automatic compactions: {compactions}. Persistent attachments and approved memory are separate from the live conversation. Never claim that every interaction starts fresh."
+        "Runtime session (authoritative): conversation retains completed turns; context ~{context_tokens}/{context_limit} tokens; session usage ~{session_tokens}; compactions {compactions}. Attachments and approved memory are separate. Never claim every interaction starts fresh."
     )
 }
 
 fn runtime_workspace_context(workspace: &Path) -> String {
     format!(
-        "## Runtime workspace (authoritative)\nThe current working directory is `{}`. run_shell starts in this directory but may inspect parent directories, the user's home directory, absolute paths, and installed programs when policy permits. Workspace read/write tools are intentionally limited to this directory. When asked to locate a named file or folder without an explicit workspace-only constraint, do not assume it is nested below the current directory: inspect the current path, its ancestors, and then the home directory with one valid bounded command. Prefer RTK-compatible commands and never invent paths from a failed or empty search.",
+        "Runtime workspace (authoritative): cwd=`{}`. run_shell may inspect ancestors, home, absolute paths, and installed programs when policy permits; file tools stay workspace-scoped. For an unscoped locate request inspect cwd, ancestors, then home with valid bounded commands. Never invent paths or results.",
         workspace.display()
     )
+}
+
+fn runtime_context(
+    memory: Option<String>,
+    request: &str,
+    usage: (u64, u64, u32),
+    context_limit: u64,
+    workspace: &Path,
+) -> Vec<String> {
+    let mut context = memory.into_iter().collect::<Vec<_>>();
+    if request_needs_session_context(request) {
+        context.push(runtime_session_context(usage, context_limit));
+    }
+    context.push(runtime_workspace_context(workspace));
+    context
+}
+
+fn request_needs_session_context(request: &str) -> bool {
+    let request = request.to_ascii_lowercase();
+    [
+        "context",
+        "token",
+        "session",
+        "memory",
+        "remember",
+        "compaction",
+    ]
+    .iter()
+    .any(|term| request.contains(term))
 }
 
 const MAX_SKILL_BYTES: usize = 64 * 1024;
@@ -1298,9 +1328,7 @@ fn load_enabled_skill_context(
             .chars()
             .filter(|character| !character.is_control())
             .collect::<String>();
-        contexts.push(format!(
-            "## Active skill: {label}\nThe following instructions are loaded and must be applied when relevant:\n{instructions}"
-        ));
+        contexts.push(format!("## Skill: {label}\n{instructions}"));
         context_bytes = projected;
     }
     Ok(contexts)
@@ -1311,17 +1339,36 @@ fn skill_is_relevant(skill: &SkillConfig, request: &str) -> bool {
         return true;
     }
     let request = request.to_ascii_lowercase();
-    let contains_any = |terms: &[&str]| terms.iter().any(|term| request.contains(term));
+    let words = request
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    let padded_words = format!(" {words} ");
+    let contains_any = |terms: &[&str]| {
+        terms.iter().any(|term| {
+            if term.contains(' ') {
+                request.contains(term)
+            } else {
+                padded_words.contains(&format!(" {term} "))
+            }
+        })
+    };
     match skill.id.as_str() {
         "codebase-map" => contains_any(&[
             "repo",
+            "repository",
             "project",
             "codebase",
-            "file",
-            "folder",
-            "directory",
             "source",
             "cargo",
+            "project structure",
+            "source tree",
         ]),
         "failure-autopsy" => contains_any(&[
             "fail", "error", "broken", "crash", "bug", "wrong", "diagnose", "debug",
@@ -1594,8 +1641,7 @@ mod tests {
             .expect("skill context can be loaded");
         let prompt = attach_skill_context("inspect this", &context);
 
-        assert!(prompt.contains("## Active skill: review"));
-        assert!(prompt.contains("loaded and must be applied"));
+        assert!(prompt.contains("## Skill: review"));
         assert!(prompt.contains("Review changes carefully."));
         assert!(prompt.ends_with("## User request\ninspect this"));
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
@@ -1613,12 +1659,12 @@ mod tests {
             .expect("bundled skill context loads");
         let prompt = attach_skill_context("diagnose this", &context);
 
-        assert!(prompt.contains("## Active skill: failure-autopsy"));
+        assert!(prompt.contains("## Skill: failure-autopsy"));
         assert!(prompt.contains("first causal error"));
     }
 
     #[test]
-    fn unrelated_bundled_skills_are_not_sent_to_the_model() {
+    fn bundled_skills_only_load_for_semantically_relevant_requests() {
         let skills = [
             SkillConfig {
                 id: "codebase-map".to_owned(),
@@ -1632,16 +1678,20 @@ mod tests {
             },
         ];
 
-        let context = load_enabled_skill_context(
+        let filesystem_context = load_enabled_skill_context(
             &skills,
             Path::new("."),
-            "find the project folder on my computer",
+            "find the elixpo_projects folder on my computer",
         )
         .expect("relevant bundled skills load");
+        let code_context =
+            load_enabled_skill_context(&skills, Path::new("."), "map this repository source tree")
+                .expect("codebase skill loads");
 
-        assert_eq!(context.len(), 1);
-        assert!(context[0].contains("codebase-map"));
-        assert!(!context[0].contains("web-research"));
+        assert_eq!(filesystem_context.len(), 0);
+        assert_eq!(code_context.len(), 1);
+        assert!(code_context[0].contains("codebase-map"));
+        assert!(!code_context[0].contains("web-research"));
     }
 
     #[test]
@@ -1691,10 +1741,10 @@ mod tests {
         let context = super::runtime_session_context((1_250, 4_800, 2), 64_000);
 
         assert!(context.contains("~1250/64000 tokens"));
-        assert!(context.contains("~4800 tokens"));
-        assert!(context.contains("Automatic compactions: 2"));
-        assert!(context.contains("retains prior completed user and assistant turns"));
-        assert!(context.contains("Never claim that every interaction starts fresh"));
+        assert!(context.contains("session usage ~4800"));
+        assert!(context.contains("compactions 2"));
+        assert!(context.contains("conversation retains completed turns"));
+        assert!(context.contains("Never claim every interaction starts fresh"));
     }
 
     #[test]
@@ -1702,9 +1752,19 @@ mod tests {
         let context = super::runtime_workspace_context(Path::new("/home/user/projects/crumb"));
 
         assert!(context.contains("`/home/user/projects/crumb`"));
-        assert!(context.contains("inspect parent directories"));
-        assert!(context.contains("then the home directory"));
-        assert!(context.contains("never invent paths"));
+        assert!(context.contains("inspect ancestors"));
+        assert!(context.contains("then home"));
+        assert!(context.contains("Never invent paths"));
+    }
+
+    #[test]
+    fn session_metrics_are_only_sent_when_the_user_asks_about_them() {
+        assert!(!super::request_needs_session_context(
+            "find the project folder"
+        ));
+        assert!(super::request_needs_session_context(
+            "how many context tokens are left?"
+        ));
     }
 
     #[test]

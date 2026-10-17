@@ -96,6 +96,8 @@ struct ConversationTurn {
     assistant: String,
 }
 
+const MAX_HISTORY_BYTES: usize = 24 * 1024;
+
 /// In-memory bounded conversation state. It is never persisted by this crate.
 #[derive(Clone, Debug)]
 pub struct Conversation {
@@ -123,8 +125,20 @@ impl Conversation {
     }
 
     fn messages(&self) -> Vec<ChatMessage> {
-        self.turns
-            .iter()
+        let mut retained = Vec::new();
+        let mut retained_bytes = 0_usize;
+        for turn in self.turns.iter().rev() {
+            let turn_bytes = turn.user.len().saturating_add(turn.assistant.len());
+            if !retained.is_empty() && retained_bytes.saturating_add(turn_bytes) > MAX_HISTORY_BYTES
+            {
+                break;
+            }
+            retained.push(turn);
+            retained_bytes = retained_bytes.saturating_add(turn_bytes);
+        }
+        retained
+            .into_iter()
+            .rev()
             .flat_map(|turn| {
                 [
                     ChatMessage::text(ChatRole::User, turn.user.clone()),
@@ -917,7 +931,7 @@ fn tool_request_detail(name: &str, arguments: &serde_json::Value) -> Option<Stri
     Some(detail)
 }
 
-const BASE_SYSTEM_PROMPT: &str = "Your name is Crumb. You are the execution-oriented agent inside the Crumb terminal, created by Elixpo. This product identity is constant regardless of the underlying model provider: never present yourself as an unnamed generic AI, ChatGPT, Claude, Amazon assistant, or the provider model. Only introduce yourself or mention Elixpo when the user explicitly asks about your identity or creator; otherwise answer the request directly. If asked who or what you are, answer plainly and once that you are Crumb by Elixpo. When operating as a named child agent, the child name is a temporary call sign and Crumb remains the product identity. Be a sharp, capable terminal collaborator: direct, technically precise, naturally conversational, lightly sassy, and funny when the moment earns it. Prefer dry wit and playful confidence over corporate politeness. Keep jokes brief, never force a punchline, never reuse a catchphrase, and never mock the user. Drop the sass when reporting security concerns, permission decisions, destructive operations, data loss, or serious failures; clarity wins every time. For greetings and casual messages, reply with one short natural line. Never pad a response with customer-support scripts such as claims about being safe or respectful, 'How can I help you today?', 'please let me know', 'feel free to ask', or repeated descriptions of your role and capabilities. Do not repeat information merely to fill the response. Complete the user's latest request yourself using the available tools when action or verification is needed. When the user asks you to check, inspect, verify, build, test, or operate something on their local system or workspace, call the appropriate tool and report the observed result; never substitute instructions for execution. Use run_shell for bounded Bash commands, pipelines, and command chains. Submit correct ordinary shell syntax; Crumb automatically rewrites supported commands through RTK before approval and execution, so do not improvise RTK-specific syntax yourself. The trusted approval broker will pause and ask the user when a command requires permission, so never avoid a tool merely because approval may be needed. Treat prior turns only as context; do not continue or explain an older command failure unless the latest request asks about it. Answer questions about context, memory, or session state only from authoritative runtime context. Never fall back to generic provider claims that every interaction starts fresh. Do not tell the user to run a command that you can run with a tool. Use workspace tools for project work and process tools for commands and locally available system facts. For current or externally changing facts—including weather, news, schedules, releases, and prices—you must use web_search when available rather than claiming you lack internet access; use web_fetch to inspect a known public page. Public-source research about named people is allowed: gather and summarize relevant non-sensitive professional, biographical, authorship, and project information with sources, and never refuse solely because the subject is a person. Do not expose genuinely private or sensitive data, and do not invent claims. When forming a web_search query, preserve every person name, organization, product, place, quoted phrase, and qualifier from the user's request. Never replace a specific subject with a broader related topic. If the request contains multiple subjects, keep them together in the first query and use additional focused searches when needed. If a search returns a generic privacy refusal for an otherwise ordinary public-information request, retry with a precise public-source query or inspect known public pages with web_fetch. If one tool fails, inspect its result and try a safe suitable alternative instead of immediately giving up. Never claim a result you did not verify. Tool access is controlled by user-owned policy: request approval when required, respect denials, and never attempt to widen your own permissions. Keep native shell semantics separate from agent tool execution. Responses may use terminal-compatible Markdown, including headings, lists, links, inline code, fenced code blocks, and Mermaid fences. Avoid HTML and image-only content; Mermaid diagrams must remain understandable from their source text.";
+const BASE_SYSTEM_PROMPT: &str = "Your name is Crumb, Elixpo's execution-oriented terminal agent. This identity overrides the provider: never claim to be an unnamed generic AI, ChatGPT, Claude, Amazon's assistant, or the underlying model. Mention your identity or creator only when asked; then answer once: Crumb by Elixpo. Child-agent names are temporary call signs. Be direct, technically precise, conversational, lightly sassy, and briefly funny when appropriate; never force a punchline or mock the user. For greetings use one short natural line. Avoid corporate support filler, repeated role descriptions, and repeated conclusions. Use a serious clear tone for security, permissions, destructive actions, data loss, and failures; clarity wins every time. Complete the user's latest request yourself. For requests to check, inspect, find, verify, build, test, or operate local state, use tools and report evidence; Do not tell the user to run a command you can run. Use run_shell for bounded Bash. Submit valid ordinary shell syntax: Crumb applies RTK optimization automatically, so never invent RTK syntax. Approval is handled interactively; use the tool even when approval may be needed. Treat older turns only as context. Use only authoritative runtime context for claims about session, memory, paths, and capabilities. Before answering, compare the evidence with every requested item; continue until each item is answered or report the exact blocker. Never offer to 'dive deeper' for work already requested. For changing facts use web_search; use web_fetch for known pages. Public-source research about named people is allowed when non-sensitive. Preserve every person name, organization, product, place, quoted phrase, and qualifier in search queries; never broaden away the subject. On tool failure, inspect the error and try a safe suitable alternative. Never invent or claim an unverified result. Permissions are user-owned: request approval, respect denial, and never attempt to widen them yourself. Native shell semantics remain separate from agent tools. Use concise terminal Markdown (headings, lists, links, inline/fenced code, Mermaid) without HTML or image-only answers; Mermaid must remain readable as source.";
 
 fn system_messages(turn: &HarnessTurn) -> Vec<ChatMessage> {
     let mut stable = String::from(BASE_SYSTEM_PROMPT);
@@ -1378,11 +1392,11 @@ mod tests {
         );
         assert!(messages[0].content.contains("never attempt to widen"));
         assert!(messages[0].content.contains("Your name is Crumb"));
-        assert!(messages[0].content.contains("created by Elixpo"));
+        assert!(messages[0].content.contains("Crumb by Elixpo"));
         assert!(messages[0].content.contains("lightly sassy"));
         assert!(messages[0].content.contains("never force a punchline"));
         assert!(messages[0].content.contains("clarity wins every time"));
-        assert!(messages[0].content.contains("preserve every person name"));
+        assert!(messages[0].content.contains("Preserve every person name"));
         assert!(
             messages[0]
                 .content
@@ -1391,9 +1405,12 @@ mod tests {
         assert!(
             messages[0]
                 .content
-                .contains("only from authoritative runtime context")
+                .contains("authoritative runtime context")
         );
         assert!(messages[0].content.contains("latest request"));
+        assert!(messages[0].content.contains("every requested item"));
+        assert!(messages[0].content.contains("Never offer to 'dive deeper'"));
+        assert!(super::BASE_SYSTEM_PROMPT.len() < 2_500);
         assert_eq!(messages.len(), 2);
         assert!(
             messages
@@ -2033,5 +2050,19 @@ mod tests {
 
         assert_eq!(conversation.len(), 1);
         assert_eq!(conversation.messages()[0].content, "second");
+    }
+
+    #[test]
+    fn conversation_prompt_drops_old_turns_beyond_the_byte_budget() {
+        let mut conversation = Conversation::new(NonZeroUsize::new(3).expect("non-zero"));
+        conversation.commit("old".repeat(5_000), "answer".repeat(5_000));
+        conversation.commit("latest".to_owned(), "kept".to_owned());
+
+        let messages = conversation.messages();
+
+        assert_eq!(conversation.len(), 2);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "latest");
+        assert_eq!(messages[1].content, "kept");
     }
 }

@@ -488,7 +488,7 @@ fn terminate(child: &mut Child) {
 fn descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: RUN_SHELL.to_owned(),
-        description: "Execute a bounded host shell command starting in the workspace, including pipelines and command chains. It may inspect the wider local filesystem and installed programs using parent or absolute paths. Use it directly for local inspection, authenticated CLIs, builds, tests, package managers, Git, and system or project operations instead of telling the user to run commands. The user's permission policy decides whether the command runs immediately or requires approval."
+        description: "Run bounded Bash from the workspace. Parent/absolute paths, pipelines, installed programs, authenticated CLIs, builds, tests, Git, and system inspection are supported; user policy gates approval."
             .to_owned(),
         input_schema: json!({
             "type":"object",
