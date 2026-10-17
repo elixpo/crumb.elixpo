@@ -56,9 +56,9 @@ use directories::BaseDirs;
 use nu_ansi_term::{Color, Style};
 use reedline::{
     Completer, DefaultHinter, EditCommand, Editor, Emacs, FileBackedHistory, Hinter, History,
-    HistoryItem, IdeMenu, KeyCode, KeyModifiers, Menu, MenuBuilder, MenuEvent, Painter, Prompt,
-    PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent,
-    ReedlineMenu, Signal, Suggestion, default_emacs_keybindings,
+    HistoryItem, IdeMenu, KeyCode, KeyModifiers, Menu, MenuBuilder, MenuEvent, MenuSettings,
+    Painter, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
+    ReedlineEvent, ReedlineMenu, Signal, Suggestion, default_emacs_keybindings,
 };
 
 mod agent_runtime;
@@ -4450,6 +4450,10 @@ impl CompletionOverlay {
 }
 
 impl Menu for CompletionOverlay {
+    fn settings(&self) -> &MenuSettings {
+        self.menu.settings()
+    }
+
     fn name(&self) -> &'static str {
         "completion_menu"
     }
