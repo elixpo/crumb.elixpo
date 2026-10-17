@@ -69,11 +69,15 @@ impl ShellSession {
     ) -> Result<Self> {
         let kind = shell.kind();
         let mut process = shell.spawn(backend, size)?;
+        #[cfg(target_os = "windows")]
+        eprintln!("native shell spawned");
         let reader = process.try_clone_reader()?;
         let protocol = CompletionProtocol::new();
         let bootstrap = protocol.bootstrap(kind);
         let readiness = protocol.submission(kind, no_op_command(kind), 0);
         process.write_input(format!("{bootstrap}{readiness}").as_bytes())?;
+        #[cfg(target_os = "windows")]
+        eprintln!("native shell initialization written");
 
         let mut session = Self {
             kind,
