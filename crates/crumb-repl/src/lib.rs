@@ -292,6 +292,18 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "find a bounded path between two nodes",
     },
     SlashCommand {
+        usage: "/graph dependencies ",
+        description: "trace bounded dependencies from one node",
+    },
+    SlashCommand {
+        usage: "/graph impact ",
+        description: "trace bounded reverse impact for one node",
+    },
+    SlashCommand {
+        usage: "/graph owners ",
+        description: "show ownership relationships for one node",
+    },
+    SlashCommand {
         usage: "/graph enable",
         description: "enable the pinned Graphify MCP adapter",
     },

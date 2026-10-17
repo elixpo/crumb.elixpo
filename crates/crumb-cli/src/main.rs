@@ -4261,50 +4261,8 @@ fn show_graph(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     let mut settings = store.load_or_default()?;
     match command {
         "/graph" | "/graph status" => show_graph_status(cwd, &settings, writer),
-        "/graph build" | "/graph refresh" => {
-            let adapter = GraphifyAdapter::new(settings.clone())?;
-            writeln!(writer, "◆ Building local project graph · Graphify")?;
-            let graph_path = adapter.build(cwd, Duration::from_secs(600), || false)?;
-            let graph = ProjectGraph::load(cwd, &graph_path, GraphLimits::default())?;
-            let status = graph.status();
-            writeln!(
-                writer,
-                "  ready · {} nodes · {} edges · {} stale sources",
-                status.nodes, status.edges, status.stale_sources
-            )?;
-            writeln!(
-                writer,
-                "  run `/graph enable` to expose supervised graph tools"
-            )?;
-            Ok(())
-        }
-        "/graph enable" => {
-            let adapter = GraphifyAdapter::new(settings.clone())?;
-            let adapter_status = adapter.status();
-            if !adapter_status.available {
-                bail!(
-                    "Graphify is not installed; install graphifyy=={} explicitly",
-                    settings.expected_version
-                );
-            }
-            if !adapter_status.compatible {
-                bail!(
-                    "Graphify version is incompatible; expected {}",
-                    settings.expected_version
-                );
-            }
-            let graph_path = adapter.graph_path(cwd);
-            ProjectGraph::load(cwd, &graph_path, GraphLimits::default())?;
-            settings.enabled = true;
-            store.save(&settings)?;
-            configure_graphify_mcp(cwd, &settings, &graph_path, true)?;
-            writeln!(writer, "◆ Project graph enabled · Graphify")?;
-            writeln!(
-                writer,
-                "  MCP tools remain denied until `/plugins allow mcp__graphify__<tool>`"
-            )?;
-            Ok(())
-        }
+        "/graph build" | "/graph refresh" => build_graph(cwd, &settings, writer),
+        "/graph enable" => enable_graph(cwd, &store, &mut settings, writer),
         "/graph disable" => {
             settings.enabled = false;
             store.save(&settings)?;
@@ -4342,10 +4300,87 @@ fn show_graph(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
             let graph = load_project_graph(cwd, &settings)?;
             render_graph_evidence(&graph.shortest_path(source, target), writer)
         }
+        command
+            if command.starts_with("/graph dependencies ")
+                || command.starts_with("/graph impact ")
+                || command.starts_with("/graph owners ") =>
+        {
+            require_graph_enabled(&settings)?;
+            let (operation, id) = command
+                .trim_start_matches("/graph ")
+                .split_once(' ')
+                .context("graph query requires a node ID")?;
+            let id = id.trim();
+            if id.is_empty() {
+                bail!("graph node ID cannot be empty");
+            }
+            let graph = load_project_graph(cwd, &settings)?;
+            let evidence = match operation {
+                "dependencies" => graph.dependencies(id),
+                "impact" => graph.impact(id),
+                "owners" => graph.owners(id),
+                _ => unreachable!("guarded graph operation"),
+            };
+            render_graph_evidence(&evidence, writer)
+        }
         _ => bail!(
-            "usage: /graph [status | build | refresh | enable | disable | query <text> | explain <node> | path <source> <target>]"
+            "usage: /graph [status | build | refresh | enable | disable | query <text> | explain <node> | path <source> <target> | dependencies|impact|owners <node>]"
         ),
     }
+}
+
+fn build_graph(
+    cwd: &Path,
+    settings: &crumb_graph::GraphSettings,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let adapter = GraphifyAdapter::new(settings.clone())?;
+    writeln!(writer, "◆ Building local project graph · Graphify")?;
+    let graph_path = adapter.build(cwd, Duration::from_secs(600), || false)?;
+    let status = ProjectGraph::load(cwd, &graph_path, GraphLimits::default())?.status();
+    writeln!(
+        writer,
+        "  ready · {} nodes · {} edges · {} stale sources",
+        status.nodes, status.edges, status.stale_sources
+    )?;
+    writeln!(
+        writer,
+        "  run `/graph enable` to expose supervised graph tools"
+    )?;
+    Ok(())
+}
+
+fn enable_graph(
+    cwd: &Path,
+    store: &GraphSettingsStore,
+    settings: &mut crumb_graph::GraphSettings,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let adapter = GraphifyAdapter::new(settings.clone())?;
+    let status = adapter.status();
+    if !status.available {
+        bail!(
+            "Graphify is not installed; install graphifyy=={} explicitly",
+            settings.expected_version
+        );
+    }
+    if !status.compatible {
+        bail!(
+            "Graphify version is incompatible; expected {}",
+            settings.expected_version
+        );
+    }
+    let graph_path = adapter.graph_path(cwd);
+    ProjectGraph::load(cwd, &graph_path, GraphLimits::default())?;
+    settings.enabled = true;
+    store.save(settings)?;
+    configure_graphify_mcp(cwd, settings, &graph_path, true)?;
+    writeln!(writer, "◆ Project graph enabled · Graphify")?;
+    writeln!(
+        writer,
+        "  MCP tools remain denied until `/plugins allow mcp__graphify__<tool>`"
+    )?;
+    Ok(())
 }
 
 fn show_graph_status(

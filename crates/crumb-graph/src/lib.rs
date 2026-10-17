@@ -259,6 +259,35 @@ impl ProjectGraph {
     }
 
     #[must_use]
+    pub fn dependencies(&self, id: &str) -> GraphEvidence {
+        self.directional(id, false)
+    }
+
+    #[must_use]
+    pub fn impact(&self, id: &str) -> GraphEvidence {
+        self.directional(id, true)
+    }
+
+    #[must_use]
+    pub fn owners(&self, id: &str) -> GraphEvidence {
+        if !self.nodes.contains_key(id) {
+            return self.evidence(&BTreeSet::new(), false);
+        }
+        let mut selected = BTreeSet::from([id.to_owned()]);
+        for edge in self.edges.iter().filter(|edge| {
+            (edge.source == id || edge.target == id)
+                && edge.relation.to_ascii_lowercase().contains("own")
+        }) {
+            selected.insert(edge.source.clone());
+            selected.insert(edge.target.clone());
+            if selected.len() >= self.limits.max_results {
+                break;
+            }
+        }
+        self.evidence(&selected, false)
+    }
+
+    #[must_use]
     pub fn neighborhood(&self, id: &str, depth: usize) -> GraphEvidence {
         if !self.nodes.contains_key(id) || depth == 0 {
             return self.evidence(&BTreeSet::new(), false);
@@ -336,6 +365,38 @@ impl ProjectGraph {
             current = previous;
         }
         self.evidence(&selected, false)
+    }
+
+    fn directional(&self, id: &str, reverse: bool) -> GraphEvidence {
+        if !self.nodes.contains_key(id) {
+            return self.evidence(&BTreeSet::new(), false);
+        }
+        let mut selected = BTreeSet::from([id.to_owned()]);
+        let mut queue = VecDeque::from([(id.to_owned(), 0_usize)]);
+        let mut truncated = false;
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth == self.limits.max_depth {
+                continue;
+            }
+            for edge in self.edges.iter().filter(|edge| {
+                let connected = if reverse {
+                    edge.target == current
+                } else {
+                    edge.source == current
+                };
+                connected && dependency_relation(&edge.relation)
+            }) {
+                let next = if reverse { &edge.source } else { &edge.target };
+                if selected.len() == self.limits.max_results {
+                    truncated = true;
+                    break;
+                }
+                if selected.insert(next.clone()) {
+                    queue.push_back((next.clone(), depth + 1));
+                }
+            }
+        }
+        self.evidence(&selected, truncated)
     }
 
     fn evidence(&self, selected: &BTreeSet<String>, truncated: bool) -> GraphEvidence {
@@ -433,6 +494,13 @@ fn validate_limits(limits: GraphLimits) -> Result<()> {
     Ok(())
 }
 
+fn dependency_relation(relation: &str) -> bool {
+    let relation = relation.to_ascii_lowercase();
+    ["call", "import", "use", "depend", "inherit", "reference"]
+        .iter()
+        .any(|candidate| relation.contains(candidate))
+}
+
 fn validate_text(value: &str, maximum: usize, label: &str) -> Result<()> {
     if value.is_empty() || value.len() > maximum || value.chars().any(char::is_control) {
         bail!("project graph {label} is invalid");
@@ -505,6 +573,8 @@ mod tests {
         assert_eq!(evidence.edges[0].provenance.source_file, Path::new("a.rs"));
         assert_eq!(evidence.edges[0].rationale.as_deref(), Some("direct call"));
         assert_eq!(graph.shortest_path("a", "b").nodes.len(), 2);
+        assert_eq!(graph.dependencies("a").nodes.len(), 2);
+        assert_eq!(graph.impact("b").nodes.len(), 2);
     }
 
     #[test]
