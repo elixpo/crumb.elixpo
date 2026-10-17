@@ -4360,13 +4360,19 @@ fn enable_graph(
     let status = adapter.status();
     if !status.available {
         bail!(
-            "Graphify is not installed; install graphifyy=={} explicitly",
+            "Graphify is not installed; install graphifyy[mcp]=={} explicitly",
             settings.expected_version
         );
     }
     if !status.compatible {
         bail!(
             "Graphify version is incompatible; expected {}",
+            settings.expected_version
+        );
+    }
+    if !adapter.mcp_available() {
+        bail!(
+            "Graphify MCP is unavailable; install graphifyy[mcp]=={} explicitly",
             settings.expected_version
         );
     }
@@ -4453,7 +4459,7 @@ fn configure_graphify_mcp(
     graph_path: &Path,
     enabled: bool,
 ) -> Result<()> {
-    let command = graphify_mcp_command(&settings.command);
+    let command = GraphifyAdapter::new(settings.clone())?.mcp_command();
     let argument = graph_path.to_string_lossy().into_owned();
     update_agent_config(cwd, |config| {
         if let Some(server) = config
@@ -4481,14 +4487,6 @@ fn configure_graphify_mcp(
         Ok(())
     })?;
     Ok(())
-}
-
-fn graphify_mcp_command(command: &Path) -> PathBuf {
-    let parent = command.parent().filter(|path| !path.as_os_str().is_empty());
-    parent.map_or_else(
-        || PathBuf::from("graphify-mcp"),
-        |path| path.join("graphify-mcp"),
-    )
 }
 
 fn render_graph_evidence(evidence: &GraphEvidence, writer: &mut dyn Write) -> Result<()> {
