@@ -46,7 +46,7 @@ jobs:
     steps:
       - name: Authorize exact request
         id: gate
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           INPUT_SCOPE: ${{ inputs.scope }}
           INPUT_NUMBER: ${{ inputs.number }}

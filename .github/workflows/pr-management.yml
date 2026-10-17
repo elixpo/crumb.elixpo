@@ -21,7 +21,7 @@ jobs:
           fetch-depth: 0
 
       - name: Auto-assign PR author
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const pr = context.payload.pull_request;
@@ -44,7 +44,7 @@ jobs:
             }
 
       - name: Auto-label based on changed files
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const pr = context.payload.pull_request;
@@ -162,7 +162,7 @@ jobs:
             console.log('Labels applied successfully.');
 
       - name: Link to issue from branch name
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const pr = context.payload.pull_request;
