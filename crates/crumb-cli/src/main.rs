@@ -788,7 +788,7 @@ struct TranscriptState {
 
 impl TranscriptState {
     const MAX_LINES: usize = 4_096;
-    const SCROLL_STEP: usize = 3;
+    const SCROLL_STEP: usize = 1;
 
     fn append(&mut self, output: &str) {
         self.scroll_offset = 0;
@@ -2448,7 +2448,13 @@ fn harness_activity_label(activity: &HarnessActivity) -> String {
     match activity {
         HarnessActivity::RequestAccepted => "request accepted".to_owned(),
         HarnessActivity::Status { state } => format!("session {state}"),
+        HarnessActivity::ToolStarted { name } if name == "spawn_agents" => {
+            "coordinating parallel agent team".to_owned()
+        }
         HarnessActivity::ToolStarted { name } => format!("tool started · {name}"),
+        HarnessActivity::ApprovalRequired { name } if name == "spawn_agents" => {
+            "approval required · parallel agent team".to_owned()
+        }
         HarnessActivity::ApprovalRequired { name } => format!("approval required · {name}"),
         HarnessActivity::ToolOutput { name, bytes } => bytes.map_or_else(
             || format!("tool output · {name}"),
@@ -2473,8 +2479,24 @@ fn render_harness_activity(
     fullscreen: bool,
 ) -> Result<()> {
     match activity {
+        HarnessActivity::ToolStarted { name } if name == "spawn_agents" => {
+            replace_activity(
+                indicator,
+                renderer,
+                "Coordinating Koi · Nyx · Rune · Echo",
+                fullscreen,
+            );
+        }
         HarnessActivity::ToolStarted { name } => {
             replace_activity(indicator, renderer, &format!("Using {name}"), fullscreen);
+        }
+        HarnessActivity::ToolOutput { name, .. } if name == "spawn_agents" => {
+            replace_activity(
+                indicator,
+                renderer,
+                "Collecting parallel findings",
+                fullscreen,
+            );
         }
         HarnessActivity::ToolOutput { name, bytes } => {
             let label = bytes.map_or_else(
