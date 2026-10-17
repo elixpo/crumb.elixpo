@@ -200,13 +200,38 @@ fn resolve_credential(reference: &CredentialReference) -> Result<(String, Secret
 
 pub(crate) fn resolve_credential_secret(reference: &CredentialReference) -> Result<SecretString> {
     match reference {
-        CredentialReference::Environment { name } => environment_secret(name, "credential"),
+        CredentialReference::Environment { name } => resolve_environment_credential(name),
         CredentialReference::Keyring { service, account } => {
             OsCredentialStore::named(service, account)?
                 .get()?
                 .with_context(|| format!("keyring reference `{service}/{account}` is empty"))
         }
     }
+}
+
+fn resolve_environment_credential(name: &str) -> Result<SecretString> {
+    prefer_environment_or_pollinations_oauth(name, environment_secret(name, "credential"), || {
+        Ok(OsCredentialStore::new()?.get()?)
+    })
+}
+
+fn prefer_environment_or_pollinations_oauth(
+    name: &str,
+    environment: Result<SecretString>,
+    oauth: impl FnOnce() -> Result<Option<SecretString>>,
+) -> Result<SecretString> {
+    match environment {
+        Ok(secret) => Ok(secret),
+        Err(environment_error) if is_pollinations_environment(name) => match oauth()? {
+            Some(secret) => Ok(secret),
+            None => Err(environment_error).context("crumb.elixpo OAuth credential is unavailable"),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+fn is_pollinations_environment(name: &str) -> bool {
+    matches!(name, "POLLINATIONS_API_KEY" | "POLLINATIONS_KEY")
 }
 
 fn environment_secret(name: &str, label: &str) -> Result<SecretString> {
@@ -329,7 +354,10 @@ mod tests {
         AgentConfig, Modality, ModelRoute, ProviderConfig, ProviderModel, ProviderProtocol,
     };
 
-    use super::project_provider;
+    use anyhow::anyhow;
+    use crumb_auth::SecretString;
+
+    use super::{prefer_environment_or_pollinations_oauth, project_provider};
 
     #[test]
     fn projection_uses_exact_provider_model_and_contains_no_secret_field() {
@@ -362,5 +390,31 @@ mod tests {
         assert!(!projection.providers_json.contains("api_key"));
         assert!(matches!(projection.environment.as_slice(), []));
         assert_eq!(projection.max_tokens, Some(4_096));
+    }
+
+    #[test]
+    fn pollinations_environment_reference_falls_back_to_oauth_keyring() {
+        let secret = prefer_environment_or_pollinations_oauth(
+            "POLLINATIONS_KEY",
+            Err(anyhow!("environment missing")),
+            || Ok(Some(SecretString::new("oauth-secret"))),
+        )
+        .expect("OAuth credential is used");
+
+        assert_eq!(secret.expose(), "oauth-secret");
+    }
+
+    #[test]
+    fn unrelated_environment_reference_never_uses_pollinations_oauth() {
+        let result = prefer_environment_or_pollinations_oauth(
+            "OTHER_API_KEY",
+            Err(anyhow!("environment missing")),
+            || panic!("OAuth fallback must not be consulted"),
+        );
+        let Err(error) = result else {
+            panic!("unrelated environment unexpectedly resolved");
+        };
+
+        assert!(error.to_string().contains("environment missing"));
     }
 }
