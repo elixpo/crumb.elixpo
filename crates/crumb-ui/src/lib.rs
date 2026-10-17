@@ -314,9 +314,9 @@ impl Renderer {
         let guide = if terminal_width < 52 {
             "↵ steer · ^↵ queue · ^C cancel"
         } else if terminal_width < 80 {
-            "Enter steer · Ctrl+Enter queue · Ctrl+C cancel"
+            "Enter steer · PgUp/PgDn scroll · Ctrl+C cancel"
         } else {
-            "Type a follow-up · Enter steer · Ctrl+Enter queue · /pause · Ctrl+C cancel"
+            "Type a follow-up · Enter steer · Ctrl+Enter queue · PgUp/PgDn scroll · /pause · Ctrl+C cancel"
         };
         let guide = fit_terminal_text(guide, usize::from(terminal_width.saturating_sub(2)));
         self.paint(&format!("  {guide}"), "2")
@@ -1693,6 +1693,7 @@ mod tests {
         let wide = renderer.composer_active_hotkeys(120);
         assert!(wide.contains("Enter steer"));
         assert!(wide.contains("Ctrl+Enter queue"));
+        assert!(wide.contains("PgUp/PgDn scroll"));
         assert!(wide.contains("/pause"));
         assert!(wide.contains("Ctrl+C cancel"));
         let narrow = renderer.composer_active_hotkeys(60);

@@ -486,8 +486,7 @@ fn shell_tool_config(config: &AgentConfig, max_output_bytes: usize) -> AgentShel
 
 fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
     let started_at = Instant::now();
-    let stdin = io::stdin();
-    let stdout = io::stdout();
+    let (stdin, stdout) = (io::stdin(), io::stdout());
     let interactive = stdin.is_terminal() && stdout.is_terminal();
     let renderer = Renderer::new(UiSettings::from_environment(interactive));
     let fullscreen = interactive && std::env::var_os("CRUMB_INLINE").is_none();
@@ -521,7 +520,7 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
         Arc::clone(&transcript_state),
     )?;
     let mut transcript =
-        FullscreenTranscript::new(fullscreen, renderer, header_rows, transcript_state);
+        FullscreenTranscript::new(fullscreen, renderer, header_rows, transcript_state.clone());
     let mut exit_gesture = ExitGesture::default();
 
     loop {
@@ -571,6 +570,8 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
                 writer: &mut writer,
                 last_exit_code: &mut last_exit_code,
                 command_context: &mut command_context,
+                transcript: &transcript_state,
+                header_rows,
             };
             dispatch_repl_event(event, &mut context)?
         };
@@ -1448,12 +1449,27 @@ struct InputContext<'a> {
     writer: &'a mut dyn Write,
     last_exit_code: &'a mut Option<i32>,
     command_context: &'a mut SessionCommandContext,
+    transcript: &'a Arc<Mutex<TranscriptState>>,
+    header_rows: u16,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct AgentTerminal {
     interactive: bool,
     fullscreen: bool,
+    transcript: Arc<Mutex<TranscriptState>>,
+    header_rows: u16,
+}
+
+impl AgentTerminal {
+    fn from_input(context: &InputContext<'_>) -> Self {
+        Self {
+            interactive: context.interactive,
+            fullscreen: context.fullscreen,
+            transcript: Arc::clone(context.transcript),
+            header_rows: context.header_rows,
+        }
+    }
 }
 
 fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<ReplOutcome>> {
@@ -1464,6 +1480,7 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
     if !matches!(decision.route, InputRoute::Native) {
         prepare_agent_context(&mut decision, context, &agent_config)?;
         let decision = context.command_context.attach_to(decision, &agent_config);
+        let terminal = AgentTerminal::from_input(context);
         handle_agent_boundary(
             &decision,
             &agent_config,
@@ -1471,10 +1488,7 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
             context.agent_runtime,
             context.renderer,
             context.writer,
-            AgentTerminal {
-                interactive: context.interactive,
-                fullscreen: context.fullscreen,
-            },
+            &terminal,
         )?;
         record_history(
             context.history,
@@ -1527,6 +1541,7 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
                     failed_command_recovery(command, completion.exit_code),
                     &agent_config,
                 );
+                let terminal = AgentTerminal::from_input(context);
                 handle_agent_boundary(
                     &recovery,
                     &agent_config,
@@ -1534,10 +1549,7 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
                     context.agent_runtime,
                     context.renderer,
                     context.writer,
-                    AgentTerminal {
-                        interactive: context.interactive,
-                        fullscreen: context.fullscreen,
-                    },
+                    &terminal,
                 )?;
             }
             Ok(None)
@@ -1667,7 +1679,7 @@ fn handle_agent_boundary(
     runtime: &mut Option<AgentRuntime>,
     renderer: Renderer,
     writer: &mut dyn Write,
-    terminal: AgentTerminal,
+    terminal: &AgentTerminal,
 ) -> Result<()> {
     if matches!(decision.route, InputRoute::Native) {
         unreachable!("native input is handled by the shell path");
@@ -1810,7 +1822,7 @@ fn execute_agent_sequence(
     runtime: &mut Option<AgentRuntime>,
     renderer: Renderer,
     writer: &mut dyn Write,
-    terminal: AgentTerminal,
+    terminal: &AgentTerminal,
 ) -> Result<()> {
     let activity_capacity = usize::try_from(config.limits.max_activity_events)
         .context("max_activity_events exceeds this platform's address space")?;
@@ -1924,7 +1936,7 @@ struct AgentTurnUi<'a> {
     steering_bytes: usize,
     renderer: Renderer,
     writer: &'a mut dyn Write,
-    terminal: AgentTerminal,
+    terminal: &'a AgentTerminal,
 }
 
 fn finish_agent_turn(
@@ -1982,7 +1994,7 @@ enum TurnObservation {
 }
 
 struct ActiveTurnContext<'a> {
-    terminal: AgentTerminal,
+    terminal: &'a AgentTerminal,
     workspace: &'a Path,
     live_context_tokens: &'a mut u64,
 }
@@ -2056,8 +2068,7 @@ fn observe_agent_turn(
         initial_activity,
         terminal.fullscreen,
     ));
-    let mut streamed_response = false;
-    let mut streamed_column = 0_usize;
+    let (mut streamed_response, mut streamed_column) = (false, 0_usize);
     let mut input = SteeringInput::new(renderer, steering_bytes, terminal.fullscreen);
     let raw_mode = terminal
         .interactive
@@ -2098,6 +2109,7 @@ fn observe_agent_turn(
                     context.workspace,
                     context.live_context_tokens,
                 )?;
+                preserve_active_scroll(context, renderer)?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2160,7 +2172,7 @@ fn render_observed_activity(
     streamed_column: &mut usize,
     renderer: Renderer,
     writer: &mut dyn Write,
-    terminal: AgentTerminal,
+    terminal: &AgentTerminal,
     workspace: &Path,
     live_context_tokens: &mut u64,
 ) -> Result<()> {
@@ -2221,8 +2233,20 @@ fn handle_active_terminal_event(
     task: &agent_runtime::AgentTurnTask,
     steering: &mut SteeringQueue,
     writer: &mut dyn Write,
-    terminal: AgentTerminal,
+    terminal: &AgentTerminal,
 ) -> Result<bool> {
+    if let Some(direction) = active_scroll_direction(event) {
+        if terminal.fullscreen {
+            let mut state = terminal
+                .transcript
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.scroll(direction, terminal.header_rows);
+            render_transcript_view(&state, input.renderer, terminal.header_rows)?;
+            refresh_active_footer(input.renderer, true)?;
+        }
+        return Ok(false);
+    }
     match event {
         TerminalEvent::Key(key)
             if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
@@ -2243,6 +2267,50 @@ fn handle_active_terminal_event(
         }
         _ => Ok(false),
     }
+}
+
+fn active_scroll_direction(event: &TerminalEvent) -> Option<TranscriptScroll> {
+    match event {
+        TerminalEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
+            Some(TranscriptScroll::Up)
+        }
+        TerminalEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => {
+            Some(TranscriptScroll::Down)
+        }
+        TerminalEvent::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && key.code == TerminalKeyCode::PageUp =>
+        {
+            Some(TranscriptScroll::Up)
+        }
+        TerminalEvent::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && key.code == TerminalKeyCode::PageDown =>
+        {
+            Some(TranscriptScroll::Down)
+        }
+        _ => None,
+    }
+}
+
+fn preserve_active_scroll(context: &ActiveTurnContext<'_>, renderer: Renderer) -> io::Result<()> {
+    if !context.terminal.fullscreen {
+        return Ok(());
+    }
+    let mut state = context
+        .terminal
+        .transcript
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.scroll_offset == 0 {
+        return Ok(());
+    }
+    // Live activity is captured as a batch when the turn settles. Until then,
+    // advertise that content exists below without counting provider chunks as
+    // transcript lines.
+    state.unseen_lines = state.unseen_lines.max(1);
+    render_transcript_view(&state, renderer, context.terminal.header_rows)?;
+    refresh_active_footer(renderer, true)
 }
 
 fn refresh_active_footer(renderer: Renderer, fullscreen: bool) -> io::Result<()> {
@@ -2650,7 +2718,7 @@ fn wait_for_paused_turn(
     steering_bytes: usize,
     renderer: Renderer,
     writer: &mut dyn Write,
-    terminal: AgentTerminal,
+    terminal: &AgentTerminal,
 ) -> Result<PausedTurnAction> {
     writeln!(
         writer,
@@ -8960,7 +9028,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use crossterm::event::{Event as TerminalEvent, KeyModifiers, MouseEvent, MouseEventKind};
+    use crossterm::event::{
+        Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+    };
     use crumb_agent::{
         AgentConfig, ApprovalMode, CredentialReference, HarnessConfig, ProviderHeader,
         ProviderProtocol, RiskClass, SkillConfig,
@@ -8972,15 +9042,15 @@ mod tests {
     use super::{
         CrumbEditMode, ExitGesture, MarketplaceContent, PausedSubmission, SessionCommandContext,
         SteeringAction, TerminalModeTracker, TranscriptCapture, TranscriptScroll, TranscriptState,
-        agent_config_location, configure_permissions, configure_plugin, effort_display_name,
-        effort_wire_name, failed_command_recovery, fixed_footer_frame, initial_agent_activity,
-        marketplace_update_blocker, openrouter_preset, parse_credential_reference,
-        parse_paused_submission, parse_provider_header, parse_resume_session_argument,
-        read_agent_config, read_bounded_response, register_local_skill, resolve_memory_keep,
-        sanitize_transcript_output, set_skill_enabled, show_graph, show_marketplace, show_memory,
-        show_profile_with_stores, suggestion_width, unregister_local_skill,
-        validate_marketplace_path, validate_marketplace_response, visible_tool_activity,
-        workspace_read_host, write_bounded_response_delta,
+        active_scroll_direction, agent_config_location, configure_permissions, configure_plugin,
+        effort_display_name, effort_wire_name, failed_command_recovery, fixed_footer_frame,
+        initial_agent_activity, marketplace_update_blocker, openrouter_preset,
+        parse_credential_reference, parse_paused_submission, parse_provider_header,
+        parse_resume_session_argument, read_agent_config, read_bounded_response,
+        register_local_skill, resolve_memory_keep, sanitize_transcript_output, set_skill_enabled,
+        show_graph, show_marketplace, show_memory, show_profile_with_stores, suggestion_width,
+        unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
+        visible_tool_activity, workspace_read_host, write_bounded_response_delta,
     };
 
     #[test]
@@ -9331,6 +9401,25 @@ mod tests {
                 reedline::ReedlineEvent::ExecuteHostCommand(expected.to_owned())
             );
         }
+    }
+
+    #[test]
+    fn active_turn_reserves_mouse_and_page_keys_for_transcript_scrolling() {
+        let scroll_up = TerminalEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(
+            active_scroll_direction(&scroll_up),
+            Some(TranscriptScroll::Up)
+        ));
+        let page_down = TerminalEvent::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert!(matches!(
+            active_scroll_direction(&page_down),
+            Some(TranscriptScroll::Down)
+        ));
     }
 
     #[test]
