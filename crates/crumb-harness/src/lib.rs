@@ -325,7 +325,8 @@ impl NativeHarness {
         let mut usage = TokenUsage::default();
         let mut output_bytes = 0_usize;
         let mut retries = RequiredToolRetries::new(&definitions);
-        let mut require_tool = false;
+        let mut require_tool = retry_status(&definitions, "run_shell") == RetryStatus::Ready
+            && user_requires_execution(&turn.user_message);
 
         loop {
             if metrics.model_rounds == self.limits.max_model_rounds.get() {
@@ -601,12 +602,39 @@ fn prepare_execution_retry(
     messages.push(ChatMessage::text(ChatRole::Assistant, response));
     messages.push(ChatMessage::text(
         ChatRole::System,
-        "Execution is required for this turn. Do not give the user commands or instructions to perform the requested check. Call an available tool now, prefer run_shell for local system or workspace inspection, then report the verified result. The approval broker will ask the user if this exact operation needs permission.",
+        "Execution is required for this turn. Do not give the user commands or instructions to perform the requested check. Call an available tool now, prefer run_shell for local system or workspace inspection, then report the verified result. run_shell can inspect the host filesystem and installed programs; its starting directory is not an access boundary. The approval broker will ask the user if this exact operation needs permission.",
     ));
     true
 }
 
 fn should_retry_with_execution(user_message: &str, response: &str) -> bool {
+    if !user_requires_execution(user_message) {
+        return false;
+    }
+    let response = response.to_ascii_lowercase();
+    [
+        "open your terminal",
+        "type the following command",
+        "you can use the terminal",
+        "you can run",
+        "try running",
+        "run the following command",
+        "here's how you can",
+        "here is how you can",
+        "i can't directly access",
+        "i cannot directly access",
+        "i can't access your local",
+        "i cannot access your local",
+        "i can't inspect your local",
+        "i cannot inspect your local",
+        "i don't have access to your local",
+        "i do not have access to your local",
+    ]
+    .iter()
+    .any(|phrase| response.contains(phrase))
+}
+
+fn user_requires_execution(user_message: &str) -> bool {
     let user_message = user_message.to_ascii_lowercase();
     if [
         "how do i",
@@ -623,14 +651,22 @@ fn should_retry_with_execution(user_message: &str, response: &str) -> bool {
     {
         return false;
     }
-    let asks_for_action = [
+    [
         "check",
         "verify",
         "inspect",
         "find out",
+        "can you see",
+        "can you access",
+        "is there",
+        "does this exist",
         "do i have",
         "on my laptop",
         "on my computer",
+        "on my system",
+        "here?",
+        "folder named",
+        "file named",
         "in this repo",
         "in this project",
         "for me",
@@ -640,21 +676,7 @@ fn should_retry_with_execution(user_message: &str, response: &str) -> bool {
         "test ",
     ]
     .iter()
-    .any(|phrase| user_message.contains(phrase));
-    let response = response.to_ascii_lowercase();
-    let deferred_to_user = [
-        "open your terminal",
-        "type the following command",
-        "you can use the terminal",
-        "you can run",
-        "try running",
-        "run the following command",
-        "here's how you can",
-        "here is how you can",
-    ]
-    .iter()
-    .any(|phrase| response.contains(phrase));
-    asks_for_action && deferred_to_user
+    .any(|phrase| user_message.contains(phrase))
 }
 
 fn prepare_research_retry(
@@ -1534,7 +1556,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(streamed, "g++ is installed and available.");
         let requests = provider.requests.lock().expect("request lock");
-        assert_eq!(requests[0].tool_choice, ToolChoice::Auto);
+        assert_eq!(requests[0].tool_choice, ToolChoice::Required);
         assert_eq!(requests[1].tool_choice, ToolChoice::Required);
         assert_eq!(requests[2].tool_choice, ToolChoice::Auto);
         assert!(requests[1].messages.iter().any(|message| {
@@ -1556,6 +1578,14 @@ mod tests {
         assert!(super::should_retry_with_execution(
             "do I have g++ here? check my laptop",
             "Open your terminal and type the following command: g++ --version"
+        ));
+        assert!(super::should_retry_with_execution(
+            "can you see a folder named elixpo_project here?",
+            "Sorry, but I can't directly access or inspect your local files or folders."
+        ));
+        assert!(super::should_retry_with_execution(
+            "is there a file named Cargo.toml in this project?",
+            "I do not have access to your local filesystem."
         ));
     }
 
