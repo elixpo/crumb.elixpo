@@ -814,8 +814,10 @@ mod tests {
     use crate::{AgentMode, TurnStatus};
 
     use super::{
-        AgentSession, CancellationToken, SessionEvent, SessionId, SessionJournal, export_session,
-        search_sessions, session_summary, set_session_archived, set_session_label, trash_session,
+        AgentSession, CancellationToken, SessionAttachment, SessionEvent, SessionId,
+        SessionJournal, attach_session_context, detach_session_context, export_session,
+        search_sessions, session_attachments, session_summary, set_session_archived,
+        set_session_label, trash_session,
     };
 
     #[test]
@@ -887,6 +889,35 @@ mod tests {
         let trashed = trash_session(&root, id.as_str()).expect("session moves to trash");
         assert!(trashed.is_dir());
         assert!(session_summary(&root, id.as_str()).is_err());
+        fs::remove_dir_all(root).expect("fixture is removed");
+    }
+
+    #[test]
+    fn session_context_persists_typed_references_without_contents() {
+        let root = temporary_root();
+        let id = SessionId::new("attachment-session").expect("valid session id");
+        let journal = SessionJournal::open(&root, &id).expect("journal opens");
+        drop(
+            AgentSession::start(id.clone(), AgentMode::Auto, root.clone(), journal)
+                .expect("session starts"),
+        );
+        let attachment = SessionAttachment::File("README.md".into());
+        assert!(
+            attach_session_context(&root, id.as_str(), attachment.clone()).expect("attachment")
+        );
+        assert!(!attach_session_context(&root, id.as_str(), attachment.clone()).expect("dedupe"));
+        assert_eq!(
+            session_attachments(&root, id.as_str()).expect("attachments"),
+            vec![attachment.clone()]
+        );
+        assert!(detach_session_context(&root, id.as_str(), &attachment).expect("detach"));
+        assert_eq!(
+            session_attachments(&root, id.as_str()).expect("attachments"),
+            Vec::new()
+        );
+        let metadata =
+            fs::read_to_string(root.join(id.as_str()).join("metadata.jsonl")).expect("metadata");
+        assert!(!metadata.contains("file contents"));
         fs::remove_dir_all(root).expect("fixture is removed");
     }
 
