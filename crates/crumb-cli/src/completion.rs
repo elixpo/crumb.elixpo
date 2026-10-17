@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crumb_agent::LiveConfig;
-use nu_ansi_term::{Color, Style};
 use reedline::{Completer, CompletionResult, Span, Suggestion};
 
 pub const COMPLETION_PALETTE_ROWS: u16 = 9;
@@ -53,15 +52,14 @@ impl Completer for CrumbCompleter {
         } else {
             native_path_suggestions(prefix, pos, &self.workspace.get())
         };
-        CompletionResult::fresh(if suggestions.is_empty() {
-            vec![no_records_suggestion(prefix, pos)]
-        } else {
-            fill_palette(suggestions)
-        })
+        CompletionResult::fresh(fill_palette(suggestions))
     }
 }
 
 fn fill_palette(mut suggestions: Vec<Suggestion>) -> Vec<Suggestion> {
+    if suggestions.is_empty() {
+        return suggestions;
+    }
     let visible_rows = usize::from(COMPLETION_PALETTE_ROWS);
     if suggestions.len() >= visible_rows {
         return suggestions;
@@ -270,28 +268,6 @@ fn native_path_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Sugg
         .collect::<Vec<_>>();
     suggestions.sort_by(|left, right| left.value.cmp(&right.value));
     suggestions
-}
-
-fn no_records_suggestion(line: &str, pos: usize) -> Suggestion {
-    let (start, token) = current_token(line);
-    let label = " NO RECORD FOUND ";
-    let chip = if std::env::var_os("NO_COLOR").is_some() {
-        label.to_owned()
-    } else {
-        Style::new()
-            .fg(Color::Fixed(250))
-            .on(Color::Fixed(238))
-            .bold()
-            .paint(label)
-            .to_string()
-    };
-    Suggestion {
-        value: token.to_owned(),
-        display_override: Some(format!("  {chip}")),
-        span: Span::new(start, pos),
-        append_whitespace: false,
-        ..Suggestion::default()
-    }
 }
 
 fn config_path(workspace: &Path) -> Option<PathBuf> {
@@ -529,19 +505,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_completion_uses_a_non_inserting_footer_chip() {
+    fn empty_completion_renders_no_menu_rows() {
         let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
         let line = "cd this-path-does-not-exist";
         let result = completer.complete(line, line.len());
-        let suggestion = &result.suggestions()[0];
-
-        assert_eq!(suggestion.value, "this-path-does-not-exist");
-        assert!(
-            suggestion
-                .display_override
-                .as_deref()
-                .is_some_and(|display| display.contains("NO RECORD FOUND"))
-        );
-        assert!(!suggestion.append_whitespace);
+        assert_eq!(result.suggestions(), []);
     }
 }

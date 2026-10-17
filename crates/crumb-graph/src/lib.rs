@@ -125,8 +125,10 @@ struct RawNode {
     id: String,
     #[serde(default)]
     label: String,
-    #[serde(default, alias = "type")]
+    #[serde(default)]
     file_type: Option<String>,
+    #[serde(default, rename = "type")]
+    node_type: Option<String>,
     #[serde(default)]
     source_file: Option<PathBuf>,
     #[serde(default)]
@@ -168,8 +170,13 @@ impl ProjectGraph {
         if encoded.len() > limits.max_bytes {
             bail!("project graph exceeds the byte limit");
         }
-        let raw: RawGraph =
-            serde_json::from_slice(&encoded).context("project graph is malformed")?;
+        let raw: RawGraph = serde_json::from_slice(&encoded).map_err(|error| {
+            anyhow::anyhow!(
+                "project graph is malformed at line {} column {}: {error}",
+                error.line(),
+                error.column()
+            )
+        })?;
         if raw.graph.schema_version != GRAPHIFY_SCHEMA_VERSION {
             bail!("project graph schema is incompatible");
         }
@@ -183,6 +190,9 @@ impl ProjectGraph {
         for node in raw.nodes {
             validate_text(&node.id, 256, "node ID")?;
             validate_text(&node.label, 2048, "node label")?;
+            if let Some(kind) = node.node_type.as_deref().or(node.file_type.as_deref()) {
+                validate_text(kind, 128, "node type")?;
+            }
             validate_source(node.source_file.as_deref())?;
             if nodes.insert(node.id.clone(), node).is_some() {
                 bail!("project graph contains duplicate node IDs");
@@ -431,7 +441,7 @@ impl ProjectGraph {
         GraphNode {
             id: node.id.clone(),
             label: node.label.clone(),
-            kind: node.file_type.clone(),
+            kind: node.node_type.clone().or_else(|| node.file_type.clone()),
             provenance: self.provenance(
                 node.source_file.as_deref(),
                 node.source_location.clone(),
@@ -552,7 +562,7 @@ mod tests {
                 "multigraph": false,
                 "graph": {"schema_version": 1, "graphify_version": "0.9.92"},
                 "nodes": [
-                    {"id":"a","label":"alpha","file_type":"code","source_file":"a.rs","source_location":"L1"},
+                    {"id":"a","label":"alpha","file_type":"code","type":"function","source_file":"a.rs","source_location":"L1"},
                     {"id":"b","label":"beta","file_type":"code","source_file":"b.rs","source_location":"L1"}
                 ],
                 "links": [{
@@ -574,6 +584,7 @@ mod tests {
         let evidence = graph.explain("a");
         assert_eq!(evidence.nodes.len(), 2);
         assert_eq!(evidence.edges.len(), 1);
+        assert_eq!(evidence.nodes[0].kind.as_deref(), Some("function"));
         assert_eq!(
             evidence.edges[0].provenance.confidence,
             EdgeConfidence::Extracted
