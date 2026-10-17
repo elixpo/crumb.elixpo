@@ -4984,6 +4984,10 @@ fn show_marketplace(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result
 }
 
 fn handle_marketplace_lifecycle(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<bool> {
+    if let Some(arguments) = command.strip_prefix("/marketplace update ") {
+        update_marketplace_package(arguments, cwd, writer)?;
+        return Ok(true);
+    }
     if let Some(arguments) = command.strip_prefix("/marketplace updates") {
         let scope = parse_marketplace_scope_argument(arguments, "updates")?;
         show_marketplace_updates(scope, cwd, writer)?;
@@ -5080,7 +5084,7 @@ fn show_marketplace_catalog(command: &str, cwd: &Path, writer: &mut dyn Write) -
         )?;
         writeln!(
             writer,
-            "  `/marketplace updates|installed [--scope project|user]` · `pin` · `unpin` · `doctor` · `rollback` · `uninstall`"
+            "  `/marketplace update <publisher/name> [--scope project|user]` · `updates|installed` · `pin` · `unpin` · `doctor` · `rollback` · `uninstall`"
         )?;
         writeln!(
             writer,
@@ -5098,7 +5102,7 @@ fn show_marketplace_catalog(command: &str, cwd: &Path, writer: &mut dyn Write) -
         return install_marketplace_package(&catalog, arguments, cwd, writer);
     }
     Err(anyhow!(
-        "usage: /marketplace [sync | remote [inspect <publisher/name>] | inspect <publisher/name> | install <publisher/name> [--scope project|user] | install-remote <publisher/name> [--scope project|user] | updates|installed [--scope project|user] | pin|unpin|uninstall <publisher/name> [--scope project|user] | rollback <publisher/name> [--to <version>] [--scope project|user] | doctor [--scope project|user] | validate <catalog.json>]"
+        "usage: /marketplace [sync | remote [inspect <publisher/name>] | inspect <publisher/name> | install <publisher/name> [--scope project|user] | install-remote <publisher/name> [--scope project|user] | update <publisher/name> [--scope project|user] | updates|installed [--scope project|user] | pin|unpin|uninstall <publisher/name> [--scope project|user] | rollback <publisher/name> [--to <version>] [--scope project|user] | doctor [--scope project|user] | validate <catalog.json>]"
     ))
 }
 
@@ -5230,30 +5234,14 @@ fn install_remote_marketplace_package(
         .iter()
         .find(|publisher| publisher.id == package.publisher)
         .context("remote package publisher is unavailable")?;
-    let mut downloads = BTreeMap::new();
-    for artifact in &package.artifacts {
-        let url = artifact
-            .url
-            .as_deref()
-            .context("remote artifact URL is unavailable")?;
-        let bundle_url = artifact
-            .bundle_url
-            .as_deref()
-            .context("remote artifact Sigstore bundle URL is unavailable")?;
-        let maximum_bytes =
-            usize::try_from(artifact.size_bytes).context("remote artifact size is unsupported")?;
-        let bytes =
-            download_marketplace_url(&client, url, maximum_bytes, MarketplaceContent::Artifact)?;
-        let bundle = download_marketplace_url(
-            &client,
-            bundle_url,
-            MAX_SIGSTORE_BUNDLE_BYTES,
-            MarketplaceContent::Json,
-        )?;
-        downloads.insert(artifact.path.clone(), SignedArtifact { bytes, bundle });
-    }
+    let downloads = download_marketplace_artifacts(&client, package)?;
     let (_, project_root) = agent_config_location(cwd);
     let store = marketplace_install_store(scope, &project_root)?;
+    if store.list()?.into_iter().any(|release| {
+        release.package.id == id && release.active && release.package.version != package.version
+    }) {
+        bail!("package `{id}` is already installed; use `/marketplace update {id}`");
+    }
     let installed = Installer::new(store.packages_root())
         .install_sigstore(package, publisher, &downloads, &verifier)?;
     store.record(&installed)?;
@@ -5271,6 +5259,35 @@ fn install_remote_marketplace_package(
         package.artifacts.len()
     )?;
     Ok(())
+}
+
+fn download_marketplace_artifacts(
+    client: &reqwest::blocking::Client,
+    package: &Package,
+) -> Result<BTreeMap<PathBuf, SignedArtifact>> {
+    let mut downloads = BTreeMap::new();
+    for artifact in &package.artifacts {
+        let url = artifact
+            .url
+            .as_deref()
+            .context("remote artifact URL is unavailable")?;
+        let bundle_url = artifact
+            .bundle_url
+            .as_deref()
+            .context("remote artifact Sigstore bundle URL is unavailable")?;
+        let maximum_bytes =
+            usize::try_from(artifact.size_bytes).context("remote artifact size is unsupported")?;
+        let bytes =
+            download_marketplace_url(client, url, maximum_bytes, MarketplaceContent::Artifact)?;
+        let bundle = download_marketplace_url(
+            client,
+            bundle_url,
+            MAX_SIGSTORE_BUNDLE_BYTES,
+            MarketplaceContent::Json,
+        )?;
+        downloads.insert(artifact.path.clone(), SignedArtifact { bytes, bundle });
+    }
+    Ok(downloads)
 }
 
 fn download_verified_marketplace_catalog(
@@ -5589,6 +5606,88 @@ fn show_marketplace_updates(scope: InstallScope, cwd: &Path, writer: &mut dyn Wr
         "  Read-only plan; no artifacts were downloaded or changed."
     )?;
     Ok(())
+}
+
+fn update_marketplace_package(arguments: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let (id, scope) = parse_marketplace_install_arguments(arguments, "update")?;
+    let (_, project_root) = agent_config_location(cwd);
+    let store = marketplace_install_store(scope, &project_root)?;
+    let releases = store.list()?;
+    let current = releases
+        .iter()
+        .find(|release| release.package.id == id && release.active)
+        .with_context(|| format!("marketplace package `{id}` is not installed"))?
+        .clone();
+    let client = marketplace_http_client()?;
+    let verifier = SigstoreVerifier::production()?;
+    let catalog = download_verified_marketplace_catalog(&client, &verifier)?;
+    let entry = catalog
+        .plan_updates(&releases)
+        .into_iter()
+        .find(|entry| entry.package_id == id)
+        .context("authenticated catalog produced no update decision")?;
+    if entry.status != UpdateStatus::Available {
+        bail!("{}", marketplace_update_blocker(entry.status, id));
+    }
+    let package = catalog.installable_package(id)?;
+    if package.provenance.trust != ReleaseTrust::SigstoreBundle
+        || entry.available_version.as_deref() != Some(package.version.as_str())
+    {
+        bail!("authenticated update plan does not match the installable release");
+    }
+    ensure_marketplace_components_disabled(&current, scope, &project_root, cwd)?;
+    let publisher = catalog
+        .publishers
+        .iter()
+        .find(|publisher| publisher.id == package.publisher)
+        .context("remote package publisher is unavailable")?;
+    let downloads = download_marketplace_artifacts(&client, package)?;
+    let installed = Installer::new(store.packages_root())
+        .install_sigstore(package, publisher, &downloads, &verifier)?;
+    let activated = store.record(&installed)?;
+    if let Err(error) =
+        replace_marketplace_components(&current, &activated, scope, &project_root, cwd)
+    {
+        store
+            .activate(id, &current.package.version)
+            .context("update configuration failed and prior activation could not be restored")?;
+        return Err(error).context("update configuration failed; prior activation was restored");
+    }
+    writeln!(
+        writer,
+        "◆ Updated {} {} → {} · {} scope",
+        id,
+        current.package.version,
+        activated.package.version,
+        install_scope_name(scope)
+    )?;
+    writeln!(
+        writer,
+        "  Catalog and {} artifact signatures verified; prior release retained for rollback.",
+        package.artifacts.len()
+    )?;
+    writeln!(writer, "  Updated components remain disabled.")?;
+    Ok(())
+}
+
+fn marketplace_update_blocker(status: UpdateStatus, id: &str) -> String {
+    match status {
+        UpdateStatus::Current => format!("package `{id}` is already current"),
+        UpdateStatus::Pinned => {
+            format!("package `{id}` is pinned; run `/marketplace unpin {id}` first")
+        }
+        UpdateStatus::Revoked => format!(
+            "package `{id}` has a revoked active release; inspect the authenticated update plan before recovery"
+        ),
+        UpdateStatus::Removed => format!("package `{id}` is no longer present in the catalog"),
+        UpdateStatus::Unavailable => {
+            format!("package `{id}` has no compatible trusted update")
+        }
+        UpdateStatus::CatalogOlder => {
+            format!("catalog release for `{id}` is older; downgrade refused")
+        }
+        UpdateStatus::Available => "update is available".to_owned(),
+    }
 }
 
 fn set_marketplace_pin(
@@ -6976,17 +7075,18 @@ mod tests {
     use crumb_agent::{
         AgentConfig, CredentialReference, ProviderHeader, ProviderProtocol, RiskClass,
     };
+    use crumb_marketplace::UpdateStatus;
     use crumb_memory::{MemoryScope, MemorySet, MemoryStore};
     use crumb_profile::{ProfileSelectionStore, ProfileStore};
 
     use super::{
         ExitGesture, MarketplaceContent, SessionCommandContext, agent_config_location,
         configure_plugin, effort_display_name, effort_wire_name, failed_command_recovery,
-        initial_agent_activity, openrouter_preset, parse_credential_reference,
-        parse_provider_header, parse_resume_session_argument, read_agent_config,
-        read_bounded_response, resolve_memory_keep, show_graph, show_marketplace, show_memory,
-        show_profile_with_stores, suggestion_width, validate_marketplace_path,
-        validate_marketplace_response, workspace_read_host,
+        initial_agent_activity, marketplace_update_blocker, openrouter_preset,
+        parse_credential_reference, parse_provider_header, parse_resume_session_argument,
+        read_agent_config, read_bounded_response, resolve_memory_keep, show_graph,
+        show_marketplace, show_memory, show_profile_with_stores, suggestion_width,
+        validate_marketplace_path, validate_marketplace_response, workspace_read_host,
     };
 
     #[test]
@@ -7268,6 +7368,19 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn marketplace_update_blockers_are_actionable_and_fail_closed() {
+        let id = "crumb/review";
+        assert!(marketplace_update_blocker(UpdateStatus::Current, id).contains("current"));
+        assert!(marketplace_update_blocker(UpdateStatus::Pinned, id).contains("unpin"));
+        assert!(marketplace_update_blocker(UpdateStatus::Revoked, id).contains("revoked"));
+        assert!(marketplace_update_blocker(UpdateStatus::Removed, id).contains("no longer"));
+        assert!(
+            marketplace_update_blocker(UpdateStatus::Unavailable, id).contains("no compatible")
+        );
+        assert!(marketplace_update_blocker(UpdateStatus::CatalogOlder, id).contains("refused"));
     }
 
     #[test]
