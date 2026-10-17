@@ -1511,6 +1511,7 @@ fn load_effective_agent_config(cwd: &Path, writer: &mut dyn Write) -> Result<Age
 fn read_agent_config(cwd: &Path) -> Result<AgentConfig> {
     let (path, config_root) = agent_config_location(cwd);
     let mut config = LiveConfig::new(path).load_or_default()?;
+    bundled_skills::apply_defaults(&mut config);
     if let Some(HarnessConfig::Process {
         command, cordis, ..
     }) = &mut config.harness
@@ -4361,7 +4362,10 @@ fn update_agent_config<F>(cwd: &Path, mutate: F) -> Result<AgentConfig>
 where
     F: FnOnce(&mut AgentConfig) -> Result<()>,
 {
-    raw_agent_config(cwd).update(mutate)
+    raw_agent_config(cwd).update(|config| {
+        bundled_skills::apply_defaults(config);
+        mutate(config)
+    })
 }
 
 fn show_jobs(
@@ -8457,12 +8461,13 @@ mod tests {
         register_local_skill("/skills add review external skill", &workspace, &mut output)
             .expect("skill registers");
         let config = read_agent_config(&workspace).expect("config loads");
-        assert_eq!(config.skills.len(), 1);
-        assert!(!config.skills[0].enabled);
-        assert_eq!(
-            config.skills[0].path,
-            skill_path.canonicalize().expect("path")
-        );
+        let review = config
+            .skills
+            .iter()
+            .find(|skill| skill.id == "review")
+            .expect("local skill is registered");
+        assert!(!review.enabled);
+        assert_eq!(review.path, skill_path.canonicalize().expect("path"));
 
         set_skill_enabled("/skills load review", &workspace, true, &mut output)
             .expect("skill loads");
@@ -8471,12 +8476,12 @@ mod tests {
             .expect("skill unloads");
         unregister_local_skill("/skills remove review", &workspace, &mut output)
             .expect("skill registration is removed");
-        assert_eq!(
+        assert!(
             read_agent_config(&workspace)
                 .expect("config loads")
                 .skills
-                .len(),
-            0
+                .iter()
+                .all(|skill| skill.id != "review")
         );
         assert!(skill_path.is_file());
         std::fs::remove_dir_all(workspace).expect("workspace removed");
@@ -8500,11 +8505,13 @@ mod tests {
         )
         .expect("bundled skill loads");
         let config = read_agent_config(&workspace).expect("config loads");
-        assert!(config.skills[0].enabled);
-        assert_eq!(
-            config.skills[0].path,
-            crate::bundled_skills::path("failure-autopsy")
-        );
+        let skill = config
+            .skills
+            .iter()
+            .find(|skill| skill.id == "failure-autopsy")
+            .expect("bundled skill is configured");
+        assert!(skill.enabled);
+        assert_eq!(skill.path, crate::bundled_skills::path("failure-autopsy"));
 
         std::fs::remove_dir_all(workspace).expect("workspace removed");
     }
