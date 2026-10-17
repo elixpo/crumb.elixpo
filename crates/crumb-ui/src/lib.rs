@@ -290,9 +290,9 @@ impl Renderer {
     #[must_use]
     pub fn composer_hotkeys(&self, terminal_width: u16) -> String {
         let guide = if terminal_width < 80 {
-            "Enter send · Tab complete · / commands · ? help"
+            "Enter send · Tab complete · PgUp/PgDn chat · / commands · ? help"
         } else {
-            "Enter send/steer · Ctrl+Enter queue · Tab complete · @ context · / commands · ? help · Ctrl+C cancel"
+            "Enter send/steer · Ctrl+Enter queue · PgUp/PgDn chat · Tab complete · @ context · / commands · ? help · Ctrl+C cancel"
         };
         self.paint(&format!("  {guide}"), "2")
     }
@@ -364,9 +364,9 @@ impl Renderer {
         let card_width = usize::from(terminal_width.saturating_sub(4));
         let content_width = card_width.saturating_sub(2);
         let timestamp = timestamp.unwrap_or_default();
-        let mut body = Vec::new();
+        let mut body = vec![String::new()];
         for line in input.lines().take(TRANSCRIPT_INPUT_MAX_ROWS) {
-            let first = body.is_empty();
+            let first = body.len() == 1;
             let marker = if first { "◆ >" } else { "  │" };
             let timestamp_width = if first && !timestamp.is_empty() {
                 timestamp.chars().count().saturating_add(1)
@@ -548,15 +548,21 @@ impl Renderer {
         }
         let details = [runtime, session, resume];
         let art = trim_art(PANDA_CLOSING);
+        let art_lines = art.lines().collect::<Vec<_>>();
+        let detail_start = art_lines.len().saturating_sub(details.len()) / 2;
         let art_width = art
             .lines()
             .map(|line| line.chars().count())
             .max()
             .unwrap_or_default();
-        art.lines()
+        art_lines
+            .into_iter()
             .enumerate()
             .map(|(index, line)| {
-                let detail = details.get(index).map_or("", String::as_str);
+                let detail = index
+                    .checked_sub(detail_start)
+                    .and_then(|detail_index| details.get(detail_index))
+                    .map_or("", String::as_str);
                 format!(
                     "  {}   {}",
                     self.paint(&format!("{line:<art_width$}"), "38;2;128;128;128"),
@@ -1103,7 +1109,7 @@ mod tests {
         );
         assert_eq!(
             renderer.transcript_input("elixpo", "fix this"),
-            "  ◆ > fix this\n  "
+            "  \n  ◆ > fix this\n  "
         );
         assert_eq!(renderer.native_output_prefix(), "  ╰──▶ ");
         let handoff =
@@ -1121,9 +1127,9 @@ mod tests {
                 .chars()
                 .count()
         };
-        let runtime_column = detail_column(lines[0], "Runtime");
-        assert_eq!(detail_column(lines[1], "Session"), runtime_column);
-        assert_eq!(detail_column(lines[2], "Resume"), runtime_column);
+        let runtime_column = detail_column(lines[2], "Runtime");
+        assert_eq!(detail_column(lines[3], "Session"), runtime_column);
+        assert_eq!(detail_column(lines[4], "Resume"), runtime_column);
         assert!(runtime_column <= 20);
     }
 

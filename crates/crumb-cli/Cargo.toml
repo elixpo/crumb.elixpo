@@ -38,10 +38,14 @@ reedline.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 url.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix.workspace = true

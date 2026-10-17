@@ -82,6 +82,7 @@ The live terminal mutation surface includes:
 - `/config provider modality add|remove`
 - `/config provider thinking-budget set|remove`
 - `/config provider model add|remove`
+- `/config provider discover <provider>`
 - `/config provider model set|modality|effort|compatibility|compatibility-field`
 - `/model use <provider>/<model>`
 - `/effort use <level|default>`
@@ -99,6 +100,12 @@ reference, and public Crumb attribution headers. The Pollinations preset uses
 `https://gen.pollinations.ai/v1` and a `POLLINATIONS_API_KEY` environment
 reference. Presets intentionally contain no models: users add an exact model
 and select it explicitly.
+
+Model discovery is lazy and user-triggered. `/config provider discover <provider>` reads the
+provider's bounded `/models` response, resolves credentials only for that request, blocks
+redirects, and merges newly discovered identifiers without replacing explicit local metadata.
+`/doctor` performs local route, modality, model, and effort compatibility checks without making a
+network request.
 
 The typed `set` surface covers protocol and endpoint changes, display names,
 SSE/WebSocket transport, cache retention, optimizer selection, reasoning,

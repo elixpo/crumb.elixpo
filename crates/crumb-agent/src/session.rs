@@ -196,11 +196,33 @@ pub struct SessionExport {
     pub events: Vec<SessionEvent>,
 }
 
+/// A user-selected context reference persisted with one agent session.
+///
+/// Only the typed reference is stored. File contents are resolved, bounded,
+/// and redacted again immediately before each turn.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", content = "path", rename_all = "snake_case")]
+pub enum SessionAttachment {
+    File(PathBuf),
+    Folder(PathBuf),
+}
+
+impl SessionAttachment {
+    #[must_use]
+    pub fn display_reference(&self) -> String {
+        match self {
+            Self::File(path) => format!("@file:{}", path.display()),
+            Self::Folder(path) => format!("@folder:{}", path.display()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 struct SessionMetadata {
     label: Option<String>,
     archived: bool,
+    attachments: Vec<SessionAttachment>,
 }
 
 /// Lists valid session journals newest-first without loading prompt content.
@@ -275,6 +297,58 @@ pub fn set_session_archived(root: &Path, id: &str, archived: bool) -> Result<()>
     let mut metadata = read_metadata(root, &id)?;
     metadata.archived = archived;
     write_metadata(root, &id, &metadata)
+}
+
+/// Returns the persistent context references selected for a session.
+///
+/// # Errors
+///
+/// Returns an error when the session is missing or its metadata is invalid.
+pub fn session_attachments(root: &Path, id: &str) -> Result<Vec<SessionAttachment>> {
+    let id = SessionId::new(id)?;
+    Ok(read_metadata(root, &id)?.attachments)
+}
+
+/// Atomically appends a persistent context reference when it is not present.
+///
+/// # Errors
+///
+/// Returns an error when the session is missing or metadata cannot be written.
+pub fn attach_session_context(
+    root: &Path,
+    id: &str,
+    attachment: SessionAttachment,
+) -> Result<bool> {
+    let id = SessionId::new(id)?;
+    let mut metadata = read_metadata(root, &id)?;
+    if metadata.attachments.contains(&attachment) {
+        return Ok(false);
+    }
+    metadata.attachments.push(attachment);
+    metadata.attachments.sort();
+    write_metadata(root, &id, &metadata)?;
+    Ok(true)
+}
+
+/// Removes one persistent context reference from a session.
+///
+/// # Errors
+///
+/// Returns an error when the session is missing or metadata cannot be written.
+pub fn detach_session_context(
+    root: &Path,
+    id: &str,
+    attachment: &SessionAttachment,
+) -> Result<bool> {
+    let id = SessionId::new(id)?;
+    let mut metadata = read_metadata(root, &id)?;
+    let previous = metadata.attachments.len();
+    metadata.attachments.retain(|item| item != attachment);
+    if previous == metadata.attachments.len() {
+        return Ok(false);
+    }
+    write_metadata(root, &id, &metadata)?;
+    Ok(true)
 }
 
 /// Loads a portable export containing only redacted session events.
@@ -740,8 +814,10 @@ mod tests {
     use crate::{AgentMode, TurnStatus};
 
     use super::{
-        AgentSession, CancellationToken, SessionEvent, SessionId, SessionJournal, export_session,
-        search_sessions, session_summary, set_session_archived, set_session_label, trash_session,
+        AgentSession, CancellationToken, SessionAttachment, SessionEvent, SessionId,
+        SessionJournal, attach_session_context, detach_session_context, export_session,
+        search_sessions, session_attachments, session_summary, set_session_archived,
+        set_session_label, trash_session,
     };
 
     #[test]
@@ -813,6 +889,35 @@ mod tests {
         let trashed = trash_session(&root, id.as_str()).expect("session moves to trash");
         assert!(trashed.is_dir());
         assert!(session_summary(&root, id.as_str()).is_err());
+        fs::remove_dir_all(root).expect("fixture is removed");
+    }
+
+    #[test]
+    fn session_context_persists_typed_references_without_contents() {
+        let root = temporary_root();
+        let id = SessionId::new("attachment-session").expect("valid session id");
+        let journal = SessionJournal::open(&root, &id).expect("journal opens");
+        drop(
+            AgentSession::start(id.clone(), AgentMode::Auto, root.clone(), journal)
+                .expect("session starts"),
+        );
+        let attachment = SessionAttachment::File("README.md".into());
+        assert!(
+            attach_session_context(&root, id.as_str(), attachment.clone()).expect("attachment")
+        );
+        assert!(!attach_session_context(&root, id.as_str(), attachment.clone()).expect("dedupe"));
+        assert_eq!(
+            session_attachments(&root, id.as_str()).expect("attachments"),
+            vec![attachment.clone()]
+        );
+        assert!(detach_session_context(&root, id.as_str(), &attachment).expect("detach"));
+        assert_eq!(
+            session_attachments(&root, id.as_str()).expect("attachments"),
+            Vec::new()
+        );
+        let metadata =
+            fs::read_to_string(root.join(id.as_str()).join("metadata.jsonl")).expect("metadata");
+        assert!(!metadata.contains("file contents"));
         fs::remove_dir_all(root).expect("fixture is removed");
     }
 

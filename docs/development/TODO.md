@@ -64,9 +64,9 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Add Tab suggestions for slash commands and typed inline references.
 - [x] Load enabled skill and configured MCP/plugin identifiers into suggestions.
 - [x] Bound file and folder suggestions to the active workspace.
-- [ ] Resolve selected `@` references into bounded, redacted agent context.
-- [ ] Implement `/attach`, `/detach`, and persistent session context.
-- [ ] Implement live `/mode`, `/model`, `/effort`, and `/config` changes.
+- [x] Resolve selected `@file` and `@folder` references into bounded, redacted agent context.
+- [x] Implement `/attach`, `/detach`, and persistent session context.
+- [x] Implement live `/mode`, `/model`, `/effort`, and `/config` changes.
 - [ ] Add the installable terminal UI and binary packaging pass.
 
 ## Active terminal UX pass
@@ -79,6 +79,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Add read-only `/mode`, `/model`, `/effort`, `/config`, and `/plugins` surfaces.
 - [x] Stream real Harness notifications into the renderer instead of projecting them after completion.
 - [x] Expose bounded Pollinations web search through MCP with an explicit network-tool grant.
+- [x] Add provider-neutral, public-HTTPS page fetching with DNS, redirect, byte, and time bounds.
 - [x] Add bounded Enter-to-steer and Ctrl+Enter FIFO follow-ups with queue replacement.
 - [x] Add queued steering and richer tool-specific event projection to the Harness stream.
 - [ ] Add interactive approval, tool-call, patch, error, and completion components.
@@ -100,7 +101,7 @@ This is the local source of truth for implementation order. GitHub issues provid
   - [x] Add OpenRouter/Pollinations presets and typed credential/header references.
   - [x] Add advanced provider, compatibility, pricing, retry, and model mutations.
   - [x] Project selected providers into the replaceable Harness adapter.
-  - [ ] Add lazy model discovery and local compatibility diagnostics.
+  - [x] Add lazy model discovery and local compatibility diagnostics.
 
 ## Proposed roadmap: context, ecosystem, and release readiness
 

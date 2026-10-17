@@ -63,6 +63,12 @@ and a process-scoped credential are available. The tool is always classified as
 add or widen that grant. Requests, response bytes, and execution time are
 bounded, and Ctrl+C cancels the in-flight HTTP future.
 
+The provider-neutral `web_fetch` tool is registered independently of Pollinations. It accepts
+public HTTPS pages only, DNS-pins each request hop to a public address, rejects URL credentials and
+automatic redirects, permits text/HTML/JSON responses, and enforces byte, time, and cancellation
+limits. Users grant either tool explicitly with `/permissions allow-network web_fetch` or
+`/permissions allow-network web_search`. Models cannot add these grants.
+
 ## Failure and cancellation
 
 Requests and shutdown are time-bounded. Ctrl+C first sets Crumb's shared

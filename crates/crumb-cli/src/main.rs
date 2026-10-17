@@ -5,8 +5,8 @@ use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -62,8 +62,9 @@ use crumb_profile::{ProfileDocument, ProfileSelectionStore, ProfileStore};
 use crumb_pty::{PtyInput, PtyResizer, SystemPty, TerminalSize};
 use crumb_repl::{ReplOutcome, read_classified_line};
 use crumb_tools::{
-    CheckpointDecision, CheckpointStatus, CheckpointStore, WorkspaceToolLimits,
-    WorkspaceWriteLimits, register_workspace_read_tools, register_workspace_write_tool,
+    CheckpointDecision, CheckpointStatus, CheckpointStore, WebFetchLimits, WorkspaceToolLimits,
+    WorkspaceWriteLimits, register_web_fetch_tool, register_workspace_read_tools,
+    register_workspace_write_tool,
 };
 use crumb_ui::{GitSegment, PromptContext, Renderer, StartupContext, UiSettings};
 use directories::BaseDirs;
@@ -77,12 +78,16 @@ use reedline::{
 
 mod agent_runtime;
 mod completion;
+mod context;
 mod device_auth;
+mod provider_discovery;
 mod provider_projection;
 mod shell_completion;
 
 use agent_runtime::{AgentRuntime, apply_selected_profile, validate_skill_path};
 use completion::{COMPLETION_PALETTE_ROWS, CompletionWorkspace, CrumbCompleter};
+use context::{parse_attachment, resolve_request_context};
+use provider_discovery::{compatibility_diagnostics, discover_models};
 use shell_completion::{CompletionShell, write_completion};
 
 const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
@@ -320,7 +325,7 @@ fn serve_mcp() -> Result<()> {
     let workspace = current_process_dir()?;
     let mut config = read_agent_config(&workspace)?;
     enforce_graphify_pin(&workspace, &mut config);
-    let search_api_key = pollinations_environment_key();
+    let search_api_key = pollinations_runtime_key();
     let mut host = workspace_read_host(&workspace, &config, search_api_key)?;
     let mut diagnostics = register_stdio_servers(
         &mut host,
@@ -399,6 +404,13 @@ fn workspace_read_host(
             max_file_bytes: max_file_write_bytes,
         },
     )?;
+    register_web_fetch_tool(
+        &mut host,
+        WebFetchLimits {
+            timeout: Duration::from_secs(config.limits.max_wall_time_seconds.min(60)),
+            max_output_bytes,
+        },
+    )?;
     if let Some(route) = config
         .models
         .get(&Modality::WebSearch)
@@ -441,14 +453,17 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
         fullscreen,
         &mut stdout.lock(),
     )?;
+    let transcript_state = Arc::new(Mutex::new(TranscriptState::default()));
     let mut line_editor = optional_line_editor(
         interactive,
         history.as_ref(),
         completion_workspace,
         renderer,
         header_rows,
+        Arc::clone(&transcript_state),
     )?;
-    let mut transcript = FullscreenTranscript::new(fullscreen, renderer, header_rows);
+    let mut transcript =
+        FullscreenTranscript::new(fullscreen, renderer, header_rows, transcript_state);
     let mut exit_gesture = ExitGesture::default();
 
     loop {
@@ -466,21 +481,14 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
             &prompt,
             &status,
         )?;
-        let (event, submitted_input) = match submission {
-            ReplSubmission::Input(event, input) => {
-                exit_gesture.reset();
-                (event, input)
-            }
-            ReplSubmission::Interrupt if exit_gesture.register_interrupt() => {
-                shutdown_session(session.take())?;
-                return finish_managed_repl(screen, renderer, started_at, agent_runtime.as_ref());
-            }
-            ReplSubmission::Interrupt => continue,
-            ReplSubmission::Retry => {
-                exit_gesture.reset();
+        let (event, submitted_input) = match next_repl_action(submission, &mut exit_gesture) {
+            ReplLoopAction::Input(event, input) => (event, input),
+            ReplLoopAction::Scroll(direction) => {
+                transcript.scroll(direction)?;
                 continue;
             }
-            ReplSubmission::Exit => {
+            ReplLoopAction::Continue => continue,
+            ReplLoopAction::Exit => {
                 shutdown_session(session.take())?;
                 return finish_managed_repl(screen, renderer, started_at, agent_runtime.as_ref());
             }
@@ -490,31 +498,50 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
             &status,
             submitted_input.as_deref().unwrap_or_default(),
         )?;
-        let mut writer = stdout.lock();
-        let mut context = InputContext {
-            command_catalog: &command_catalog,
-            agent_runtime: &mut agent_runtime,
-            session: &mut session,
-            history: history.as_ref(),
-            cwd: &cwd,
-            platform,
-            interactive,
-            fullscreen,
-            renderer,
-            writer: &mut writer,
-            last_exit_code: &mut last_exit_code,
-            command_context: &mut command_context,
+        let mut writer = TranscriptCapture::new(stdout.lock());
+        let outcome = {
+            let mut context = InputContext {
+                command_catalog: &command_catalog,
+                agent_runtime: &mut agent_runtime,
+                session: &mut session,
+                history: history.as_ref(),
+                cwd: &cwd,
+                platform,
+                interactive,
+                fullscreen,
+                renderer,
+                writer: &mut writer,
+                last_exit_code: &mut last_exit_code,
+                command_context: &mut command_context,
+            };
+            dispatch_repl_event(event, &mut context)?
         };
-        let outcome = handle_repl_event(event, &mut context);
+        writer.flush()?;
+        transcript.record_output(&writer.into_capture());
         match outcome {
-            Ok(Some(ReplOutcome::Exit)) => {
+            Some(ReplOutcome::Exit) => {
                 return finish_managed_repl(screen, renderer, started_at, agent_runtime.as_ref());
             }
-            Ok(Some(outcome)) => return Ok(outcome),
-            Ok(None) => {}
-            Err(error) => writeln!(writer, "{}", renderer.command_error(&error.to_string()))?,
+            Some(outcome) => return Ok(outcome),
+            None => {}
         }
-        writer.flush()?;
+    }
+}
+
+fn dispatch_repl_event(
+    event: InputEvent,
+    context: &mut InputContext<'_>,
+) -> Result<Option<ReplOutcome>> {
+    match handle_repl_event(event, context) {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            writeln!(
+                context.writer,
+                "{}",
+                context.renderer.command_error(&error.to_string())
+            )?;
+            Ok(None)
+        }
     }
 }
 
@@ -574,9 +601,40 @@ fn handle_repl_event(
 
 enum ReplSubmission {
     Input(InputEvent, Option<String>),
+    Scroll(TranscriptScroll),
     Interrupt,
     Retry,
     Exit,
+}
+
+enum ReplLoopAction {
+    Input(InputEvent, Option<String>),
+    Scroll(TranscriptScroll),
+    Continue,
+    Exit,
+}
+
+fn next_repl_action(submission: ReplSubmission, exit_gesture: &mut ExitGesture) -> ReplLoopAction {
+    match submission {
+        ReplSubmission::Input(event, input) => {
+            exit_gesture.reset();
+            ReplLoopAction::Input(event, input)
+        }
+        ReplSubmission::Scroll(direction) => ReplLoopAction::Scroll(direction),
+        ReplSubmission::Interrupt if exit_gesture.register_interrupt() => ReplLoopAction::Exit,
+        ReplSubmission::Interrupt => ReplLoopAction::Continue,
+        ReplSubmission::Retry => {
+            exit_gesture.reset();
+            ReplLoopAction::Continue
+        }
+        ReplSubmission::Exit => ReplLoopAction::Exit,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TranscriptScroll {
+    Up,
+    Down,
 }
 
 #[derive(Default)]
@@ -609,16 +667,23 @@ struct FullscreenTranscript {
     header_rows: u16,
     started: bool,
     cursor: Option<(u16, u16)>,
+    state: Arc<Mutex<TranscriptState>>,
 }
 
 impl FullscreenTranscript {
-    const fn new(enabled: bool, renderer: Renderer, header_rows: u16) -> Self {
+    fn new(
+        enabled: bool,
+        renderer: Renderer,
+        header_rows: u16,
+        state: Arc<Mutex<TranscriptState>>,
+    ) -> Self {
         Self {
             enabled,
             renderer,
             header_rows,
             started: false,
             cursor: None,
+            state,
         }
     }
 
@@ -637,7 +702,7 @@ impl FullscreenTranscript {
 
     fn submit(&mut self, prompt: &str, status: &str, input: &str) -> io::Result<()> {
         if self.enabled {
-            prepare_fullscreen_submission(
+            let rendered = prepare_fullscreen_submission(
                 self.renderer,
                 self.header_rows,
                 prompt,
@@ -646,9 +711,107 @@ impl FullscreenTranscript {
                 self.cursor,
                 self.started,
             )?;
+            if let Some(rendered) = rendered {
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .append(&rendered);
+            }
             self.started = true;
         }
         Ok(())
+    }
+
+    fn record_output(&mut self, output: &[u8]) {
+        if self.enabled && !output.is_empty() {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .append(&String::from_utf8_lossy(output));
+        }
+    }
+
+    fn scroll(&mut self, direction: TranscriptScroll) -> io::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.scroll(direction, self.header_rows);
+        render_transcript_view(&state, self.header_rows)
+    }
+}
+
+#[derive(Default)]
+struct TranscriptState {
+    lines: VecDeque<String>,
+    scroll_offset: usize,
+}
+
+impl TranscriptState {
+    const MAX_LINES: usize = 4_096;
+    const SCROLL_STEP: usize = 3;
+
+    fn append(&mut self, output: &str) {
+        self.scroll_offset = 0;
+        self.lines.extend(
+            sanitize_transcript_output(output)
+                .split('\n')
+                .map(str::to_owned),
+        );
+        while self.lines.len() > Self::MAX_LINES {
+            self.lines.pop_front();
+        }
+    }
+
+    fn scroll(&mut self, direction: TranscriptScroll, header_rows: u16) {
+        let viewport_rows = fullscreen_rows(header_rows).map_or(1, |(top, bottom, _, _)| {
+            bottom.saturating_sub(top) as usize + 1
+        });
+        let maximum = self.lines.len().saturating_sub(viewport_rows);
+        self.scroll_offset = match direction {
+            TranscriptScroll::Up => self
+                .scroll_offset
+                .saturating_add(Self::SCROLL_STEP)
+                .min(maximum),
+            TranscriptScroll::Down => self.scroll_offset.saturating_sub(Self::SCROLL_STEP),
+        };
+    }
+}
+
+struct TranscriptCapture<W> {
+    writer: W,
+    captured: Vec<u8>,
+}
+
+impl<W> TranscriptCapture<W> {
+    const MAX_CAPTURE_BYTES: usize = 1_048_576;
+
+    const fn new(writer: W) -> Self {
+        Self {
+            writer,
+            captured: Vec::new(),
+        }
+    }
+
+    fn into_capture(self) -> Vec<u8> {
+        self.captured
+    }
+}
+
+impl<W: Write> Write for TranscriptCapture<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.writer.write(buffer)?;
+        let remaining = Self::MAX_CAPTURE_BYTES.saturating_sub(self.captured.len());
+        self.captured
+            .extend_from_slice(&buffer[..written.min(remaining)]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
     }
 }
 
@@ -679,6 +842,12 @@ fn read_repl_submission(
         }
         Signal::CtrlC => ReplSubmission::Interrupt,
         Signal::CtrlD => ReplSubmission::Exit,
+        Signal::HostCommand(command) if command == "crumb:transcript-up" => {
+            ReplSubmission::Scroll(TranscriptScroll::Up)
+        }
+        Signal::HostCommand(command) if command == "crumb:transcript-down" => {
+            ReplSubmission::Scroll(TranscriptScroll::Down)
+        }
         _ => ReplSubmission::Retry,
     })
 }
@@ -1065,10 +1234,11 @@ struct AgentTerminal {
 
 fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<ReplOutcome>> {
     let agent_config = load_effective_agent_config(context.cwd, context.writer)?;
-    let decision = context
+    let mut decision = context
         .command_catalog
         .route(command, &agent_config.routing);
     if !matches!(decision.route, InputRoute::Native) {
+        prepare_agent_context(&mut decision, context, &agent_config)?;
         let decision = context.command_context.attach_to(decision, &agent_config);
         handle_agent_boundary(
             &decision,
@@ -1161,6 +1331,27 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
             Ok(Some(ReplOutcome::Exit))
         }
     }
+}
+
+fn prepare_agent_context(
+    decision: &mut RouteDecision,
+    context: &InputContext<'_>,
+    config: &AgentConfig,
+) -> Result<()> {
+    let persistent = context
+        .agent_runtime
+        .as_ref()
+        .map(AgentRuntime::attached_context)
+        .transpose()?
+        .unwrap_or_default();
+    decision.payload = resolve_request_context(
+        &decision.payload,
+        &persistent,
+        context.cwd,
+        config,
+        &configured_optimization_pipeline(config),
+    )?;
+    Ok(())
 }
 
 fn ensure_shell_session(
@@ -1983,7 +2174,7 @@ fn handle_builtin(
     match command {
         BuiltInCommand::Auth(action) => handle_auth(action, writer)?,
         BuiltInCommand::Connectors => handle_auth(AuthAction::Status, writer)?,
-        BuiltInCommand::Context => show_reference_help(writer)?,
+        BuiltInCommand::Context => show_context(agent_runtime.as_ref(), writer)?,
         BuiltInCommand::Exit => {
             shutdown_session(session.take())?;
             return Ok(Some(ReplOutcome::Exit));
@@ -2124,6 +2315,23 @@ fn show_reference_help(writer: &mut dyn Write) -> Result<()> {
     Ok(())
 }
 
+fn show_context(runtime: Option<&AgentRuntime>, writer: &mut dyn Write) -> Result<()> {
+    show_reference_help(writer)?;
+    let attachments = runtime
+        .map(AgentRuntime::attached_context)
+        .transpose()?
+        .unwrap_or_default();
+    writeln!(writer, "\nPersistent session context:")?;
+    if attachments.is_empty() {
+        writeln!(writer, "  none")?;
+    } else {
+        for attachment in attachments {
+            writeln!(writer, "  {}", attachment.display_reference())?;
+        }
+    }
+    Ok(())
+}
+
 fn show_skills(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     let config = read_agent_config(cwd)?;
     if config.skills.is_empty() {
@@ -2194,6 +2402,16 @@ fn show_reserved(
         command if command.starts_with("/effort use ") => {
             set_reasoning_effort(command, cwd, writer)?;
         }
+        command if command == "/attach" || command.starts_with("/attach ") => {
+            configure_session_attachment(command, cwd, runtime, true, writer)?;
+        }
+        command if command == "/detach" || command.starts_with("/detach ") => {
+            configure_session_attachment(command, cwd, runtime, false, writer)?;
+        }
+        "/tools" => show_agent_tools(cwd, writer)?,
+        command if command == "/permissions" || command.starts_with("/permissions ") => {
+            configure_permissions(command, cwd, writer)?;
+        }
         command if command == "/skills load" || command.starts_with("/skills load ") => {
             set_skill_enabled(command, cwd, true, writer)?;
         }
@@ -2239,6 +2457,148 @@ fn show_reserved(
             writeln!(writer, "◇ {command}")?;
             writeln!(writer, "  Reserved by Crumb; not available in this build.")?;
         }
+    }
+    Ok(())
+}
+
+fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    writeln!(writer, "◆ Agent tools")?;
+    for (name, risk, available) in [
+        ("read_file", "workspace read", true),
+        ("list_directory", "workspace read", true),
+        ("write_file", "workspace write", true),
+        ("web_fetch", "network", true),
+        (
+            "web_search",
+            "network",
+            config
+                .models
+                .get(&Modality::WebSearch)
+                .is_some_and(|routes| !routes.is_empty()),
+        ),
+    ] {
+        let granted = config.permissions.allow_network_tools.contains(name)
+            || config.permissions.allow_workspace_tools.contains(name);
+        writeln!(
+            writer,
+            "  {} {name:<18} {risk}{}",
+            if granted { "●" } else { "○" },
+            if available { "" } else { " · unavailable" }
+        )?;
+    }
+    writeln!(writer, "  ● granted · ○ approval required/denied")?;
+    Ok(())
+}
+
+fn configure_permissions(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let arguments = command.split_whitespace().skip(1).collect::<Vec<_>>();
+    if arguments.is_empty() {
+        let config = read_agent_config(cwd)?;
+        writeln!(writer, "◆ Agent permissions")?;
+        writeln!(
+            writer,
+            "  network    {}",
+            joined_or_none(&config.permissions.allow_network_tools)
+        )?;
+        writeln!(
+            writer,
+            "  workspace  {}",
+            joined_or_none(&config.permissions.allow_workspace_tools)
+        )?;
+        writeln!(
+            writer,
+            "  MCP        {}",
+            joined_or_none(&config.permissions.allow_mcp_tools)
+        )?;
+        writeln!(
+            writer,
+            "  Grants are user-owned; models cannot add or widen them."
+        )?;
+        return Ok(());
+    }
+    let [action, tool] = arguments.as_slice() else {
+        bail!("usage: /permissions [allow-network|deny-network <tool>]");
+    };
+    if !matches!(*tool, "web_fetch" | "web_search") {
+        bail!("network permission tool must be web_fetch or web_search");
+    }
+    let allow = match *action {
+        "allow-network" => true,
+        "deny-network" => false,
+        _ => bail!("usage: /permissions [allow-network|deny-network <tool>]"),
+    };
+    update_agent_config(cwd, |config| {
+        if allow {
+            config
+                .permissions
+                .allow_network_tools
+                .insert((*tool).to_owned());
+        } else {
+            config.permissions.allow_network_tools.remove(*tool);
+        }
+        Ok(())
+    })?;
+    writeln!(
+        writer,
+        "◆ Network permission · {tool} {}",
+        if allow { "allowed" } else { "denied" }
+    )?;
+    Ok(())
+}
+
+fn joined_or_none(values: &std::collections::BTreeSet<String>) -> String {
+    if values.is_empty() {
+        "none".to_owned()
+    } else {
+        values.iter().cloned().collect::<Vec<_>>().join(" · ")
+    }
+}
+
+fn configure_session_attachment(
+    command: &str,
+    cwd: &Path,
+    runtime: &mut Option<AgentRuntime>,
+    attach: bool,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let action = if attach { "/attach" } else { "/detach" };
+    let reference = command
+        .strip_prefix(action)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("usage: {action} <@file:path|@folder:path>"))?;
+    let attachment = parse_attachment(reference, cwd)?;
+    let runtime = if let Some(runtime) = runtime.as_mut() {
+        runtime
+    } else if attach {
+        runtime.insert(AgentRuntime::new()?)
+    } else {
+        bail!("no active agent session");
+    };
+    let changed = if attach {
+        let config = read_agent_config(cwd)?;
+        runtime.attach_context(cwd, config.mode, attachment.clone())?
+    } else {
+        runtime.detach_context(cwd, &attachment)?
+    };
+    writeln!(
+        writer,
+        "{} {} · {}",
+        if changed { "◆" } else { "◇" },
+        if attach { "Attached" } else { "Detached" },
+        attachment.display_reference()
+    )?;
+    if !changed {
+        writeln!(
+            writer,
+            "  {}",
+            if attach {
+                "already attached"
+            } else {
+                "was not attached"
+            }
+        )?;
     }
     Ok(())
 }
@@ -2448,6 +2808,7 @@ fn configure_provider(command: &str, cwd: &Path, writer: &mut dyn Write) -> Resu
     match arguments.as_slice() {
         [] | ["list"] => show_providers(cwd, writer),
         ["show", id] => show_provider(cwd, id, writer),
+        ["discover", id] => discover_provider_models(cwd, id, writer),
         ["remove", id] => remove_provider(cwd, id, writer),
         ["preset", preset] => add_provider_preset(cwd, preset, preset, writer),
         ["preset", preset, id] => add_provider_preset(cwd, preset, id, writer),
@@ -2493,9 +2854,40 @@ fn configure_provider(command: &str, cwd: &Path, writer: &mut dyn Write) -> Resu
             add_provider(cwd, id, protocol, base_url, Some(credential), writer)
         }
         _ => Err(anyhow!(
-            "usage: /config provider <list|show|add|remove|preset|set|retry|pricing|compatibility|credential|header|model ...>"
+            "usage: /config provider <list|show|discover|add|remove|preset|set|retry|pricing|compatibility|credential|header|model ...>"
         )),
     }
+}
+
+fn discover_provider_models(cwd: &Path, provider_id: &str, writer: &mut dyn Write) -> Result<()> {
+    let config = raw_agent_config(cwd).load_or_default()?;
+    let provider = config
+        .providers
+        .get(provider_id)
+        .with_context(|| format!("provider `{provider_id}` is not configured"))?;
+    let discovered = discover_models(provider)?;
+    let discovered_count = discovered.len();
+    let mut added = 0_usize;
+    update_agent_config(cwd, |config| {
+        let models = &mut config
+            .providers
+            .get_mut(provider_id)
+            .with_context(|| format!("provider `{provider_id}` is not configured"))?
+            .models;
+        for model in &discovered {
+            if !models.iter().any(|existing| existing.id == model.id) {
+                models.push(model.clone());
+                added = added.saturating_add(1);
+            }
+        }
+        models.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(())
+    })?;
+    writeln!(
+        writer,
+        "◆ Provider discovery · {provider_id} · {discovered_count} reported · {added} added"
+    )?;
+    Ok(())
 }
 
 fn configure_provider_model(arguments: &[&str], cwd: &Path, writer: &mut dyn Write) -> Result<()> {
@@ -3532,6 +3924,15 @@ fn show_doctor(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         Some(HarnessConfig::Native) => writeln!(writer, "  native Harness  unavailable")?,
         None => writeln!(writer, "  none configured · native shell remains available")?,
     }
+    writeln!(writer, "◆ Provider compatibility")?;
+    let diagnostics = compatibility_diagnostics(&config);
+    if diagnostics.is_empty() {
+        writeln!(writer, "  selected routes are locally compatible")?;
+    } else {
+        for diagnostic in diagnostics {
+            writeln!(writer, "  warning · {diagnostic}")?;
+        }
+    }
     writeln!(writer, "◆ Token optimizers")?;
     if config.optimizers.is_empty() {
         writeln!(
@@ -3835,27 +4236,40 @@ fn show_models(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     writeln!(writer, "◆ Model routes")?;
     if config.models.values().all(Vec::is_empty) {
         writeln!(writer, "  No model routes configured in .crumb/agent.json")?;
-        return Ok(());
-    }
-    for (modality, routes) in &config.models {
-        for (index, route) in routes.iter().enumerate() {
-            let marker = if index == 0 { "●" } else { "○" };
-            let effort = route
-                .reasoning_effort
-                .as_deref()
-                .or(config.reasoning_effort.as_deref())
-                .map_or(String::new(), |effort| format!(" · effort {effort}"));
-            writeln!(
-                writer,
-                "  {marker} {:<13} {}/{}{}",
-                modality_name(*modality),
-                route.provider,
-                route.model,
-                effort
-            )?;
+    } else {
+        for (modality, routes) in &config.models {
+            for (index, route) in routes.iter().enumerate() {
+                let marker = if index == 0 { "●" } else { "○" };
+                let effort = route
+                    .reasoning_effort
+                    .as_deref()
+                    .or(config.reasoning_effort.as_deref())
+                    .map_or(String::new(), |effort| format!(" · effort {effort}"));
+                writeln!(
+                    writer,
+                    "  {marker} {:<13} {}/{}{}",
+                    modality_name(*modality),
+                    route.provider,
+                    route.model,
+                    effort
+                )?;
+            }
         }
+        writeln!(writer, "  ● active route · ○ fallback")?;
     }
-    writeln!(writer, "  ● active route · ○ fallback")?;
+    writeln!(writer, "◆ Discovered provider catalogs")?;
+    for (provider_id, provider) in &config.providers {
+        writeln!(
+            writer,
+            "  {provider_id:<18} {} models{}",
+            provider.models.len(),
+            if provider.models.is_empty() {
+                format!(" · run `/config provider discover {provider_id}`")
+            } else {
+                String::new()
+            }
+        )?;
+    }
     Ok(())
 }
 
@@ -6314,6 +6728,17 @@ fn pollinations_environment_key() -> Option<String> {
         })
 }
 
+fn pollinations_runtime_key() -> Option<String> {
+    pollinations_environment_key().or_else(|| {
+        OsCredentialStore::new()
+            .ok()?
+            .get()
+            .ok()?
+            .map(|secret| secret.expose().to_owned())
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
 fn execute_and_capture(
     shell: &mut ShellSession,
     command: &str,
@@ -6412,14 +6837,21 @@ struct CompletionOverlay {
     menu: IdeMenu,
     renderer: Renderer,
     header_rows: u16,
+    transcript: Arc<Mutex<TranscriptState>>,
 }
 
 impl CompletionOverlay {
-    const fn new(menu: IdeMenu, renderer: Renderer, header_rows: u16) -> Self {
+    fn new(
+        menu: IdeMenu,
+        renderer: Renderer,
+        header_rows: u16,
+        transcript: Arc<Mutex<TranscriptState>>,
+    ) -> Self {
         Self {
             menu,
             renderer,
             header_rows,
+            transcript,
         }
     }
 
@@ -6458,10 +6890,37 @@ impl CompletionOverlay {
     }
 
     fn clear_overlay(&self) {
-        let mut output = io::stdout();
-        let frame = self.paint_overlay("");
-        let _ = write!(output, "\x1b7{frame}\x1b8");
-        let _ = output.flush();
+        let transcript = self
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = render_transcript_view(&transcript, self.header_rows);
+    }
+
+    fn restore_overlay_frame(&self) -> String {
+        let (_, top, composer_row) = self.overlay_rows();
+        let transcript = self
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transcript_top = self.header_rows.min(composer_row.saturating_sub(1));
+        let viewport_height = composer_row.saturating_sub(transcript_top) as usize;
+        let end = transcript
+            .lines
+            .len()
+            .saturating_sub(transcript.scroll_offset);
+        let start = end.saturating_sub(viewport_height);
+        let mut frame = String::new();
+        for row in top..composer_row {
+            let _ = write!(frame, "\x1b[{};1H\x1b[2K", row.saturating_add(1));
+            let index = start.saturating_add(row.saturating_sub(transcript_top) as usize);
+            if index < end
+                && let Some(line) = transcript.lines.get(index)
+            {
+                frame.push_str(line);
+            }
+        }
+        frame
     }
 }
 
@@ -6543,6 +7002,9 @@ impl Menu for CompletionOverlay {
     }
 
     fn menu_string(&self, _available_lines: u16, use_ansi_coloring: bool) -> String {
+        if self.menu.get_values().is_empty() {
+            return self.restore_overlay_frame();
+        }
         self.paint_overlay(
             &self
                 .menu
@@ -6577,9 +7039,10 @@ fn optional_line_editor(
     workspace: CompletionWorkspace,
     renderer: Renderer,
     header_rows: u16,
+    transcript: Arc<Mutex<TranscriptState>>,
 ) -> Result<Option<InteractiveLineEditor>> {
     interactive
-        .then(|| create_line_editor(history, workspace, renderer, header_rows))
+        .then(|| create_line_editor(history, workspace, renderer, header_rows, transcript))
         .transpose()
 }
 
@@ -6588,6 +7051,7 @@ fn create_line_editor(
     workspace: CompletionWorkspace,
     renderer: Renderer,
     header_rows: u16,
+    transcript: Arc<Mutex<TranscriptState>>,
 ) -> Result<InteractiveLineEditor> {
     let mut interactive_history = FileBackedHistory::new(INTERACTIVE_HISTORY_CAPACITY)?;
     if let Some(history) = history {
@@ -6638,6 +7102,16 @@ fn create_line_editor(
         KeyCode::Char('o'),
         ReedlineEvent::OpenEditor,
     );
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::PageUp,
+        ReedlineEvent::ExecuteHostCommand("crumb:transcript-up".to_owned()),
+    );
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::PageDown,
+        ReedlineEvent::ExecuteHostCommand("crumb:transcript-down".to_owned()),
+    );
     let terminal_width = suggestion_width(size()?.0);
     let menu_width = u16::try_from(terminal_width).unwrap_or(1);
     let menu = IdeMenu::default()
@@ -6664,7 +7138,7 @@ fn create_line_editor(
         .with_padding(0)
         .with_cursor_offset(i16::try_from(FULLSCREEN_SIDE_GUTTER).unwrap_or(2))
         .with_correct_cursor_pos(true);
-    let menu = CompletionOverlay::new(menu, renderer, header_rows);
+    let menu = CompletionOverlay::new(menu, renderer, header_rows, transcript);
     let editor = Reedline::create()
         .with_history(Box::new(interactive_history))
         .with_hinter(Box::new(CrumbHinter::default()))
@@ -6845,10 +7319,7 @@ const FULLSCREEN_COMPOSER_ROWS: u16 = 5;
 fn fullscreen_rows(header_rows: u16) -> io::Result<(u16, u16, u16, u16)> {
     let (_, rows) = size()?;
     let composer_row = rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
-    let palette_top = composer_row
-        .saturating_sub(COMPLETION_PALETTE_ROWS)
-        .max(header_rows.min(composer_row));
-    let transcript_bottom = palette_top.saturating_sub(1);
+    let transcript_bottom = composer_row.saturating_sub(1);
     let transcript_top = header_rows.min(transcript_bottom);
     Ok((
         transcript_top,
@@ -6931,7 +7402,7 @@ fn prepare_fullscreen_submission(
     input: &str,
     transcript_cursor: Option<(u16, u16)>,
     separate_from_previous: bool,
-) -> io::Result<()> {
+) -> io::Result<Option<String>> {
     render_idle_composer(renderer, header_rows, prompt, status)?;
     position_transcript(header_rows, transcript_cursor)?;
     if !input.trim().is_empty() {
@@ -6940,18 +7411,61 @@ fn prepare_fullscreen_submission(
         }
         let timestamp = Local::now().format("%H:%M").to_string();
         let terminal_width = size().map_or(80, |(columns, _)| columns);
-        writeln!(
-            io::stdout(),
-            "{}",
-            renderer.transcript_input_at(
-                &terminal_username(),
-                input,
-                Some(&timestamp),
-                terminal_width,
-            )
-        )?;
+        let command_card = renderer.transcript_input_at(
+            &terminal_username(),
+            input,
+            Some(&timestamp),
+            terminal_width,
+        );
+        writeln!(io::stdout(), "{command_card}")?;
+        return Ok(Some(command_card));
     }
-    Ok(())
+    Ok(None)
+}
+
+fn render_transcript_view(state: &TranscriptState, header_rows: u16) -> io::Result<()> {
+    let (top, bottom, _, _) = fullscreen_rows(header_rows)?;
+    let height = bottom.saturating_sub(top) as usize + 1;
+    let end = state.lines.len().saturating_sub(state.scroll_offset);
+    let start = end.saturating_sub(height);
+    let visible = state.lines.range(start..end);
+    let mut writer = io::stdout();
+    write!(writer, "\x1b7\x1b[r")?;
+    for row in top..=bottom {
+        crossterm::execute!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    }
+    for (row, line) in (top..=bottom).zip(visible) {
+        crossterm::execute!(writer, MoveTo(0, row))?;
+        write!(writer, "{line}")?;
+    }
+    write!(writer, "\x1b8")?;
+    writer.flush()
+}
+
+fn sanitize_transcript_output(output: &str) -> String {
+    let mut sanitized = String::with_capacity(output.len());
+    let mut characters = output.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\x1b' {
+            if characters.next_if_eq(&'[').is_some() {
+                let mut sequence = String::from("\x1b[");
+                for sequence_character in characters.by_ref() {
+                    sequence.push(sequence_character);
+                    if ('@'..='~').contains(&sequence_character) {
+                        if sequence_character == 'm' {
+                            sanitized.push_str(&sequence);
+                        }
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if character == '\n' || character == '\t' || !character.is_control() {
+            sanitized.push(character);
+        }
+    }
+    sanitized
 }
 
 fn terminal_username() -> String {
@@ -7208,9 +7722,9 @@ mod tests {
         initial_agent_activity, marketplace_update_blocker, openrouter_preset,
         parse_credential_reference, parse_provider_header, parse_resume_session_argument,
         read_agent_config, read_bounded_response, register_local_skill, resolve_memory_keep,
-        set_skill_enabled, show_graph, show_marketplace, show_memory, show_profile_with_stores,
-        suggestion_width, unregister_local_skill, validate_marketplace_path,
-        validate_marketplace_response, workspace_read_host,
+        sanitize_transcript_output, set_skill_enabled, show_graph, show_marketplace, show_memory,
+        show_profile_with_stores, suggestion_width, unregister_local_skill,
+        validate_marketplace_path, validate_marketplace_response, workspace_read_host,
     };
 
     #[test]
@@ -7231,6 +7745,14 @@ mod tests {
 
         assert!(!gesture.register_interrupt_at(started));
         assert!(gesture.register_interrupt_at(started + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn transcript_history_keeps_color_but_drops_cursor_controls() {
+        let output = "\x1b[31mred\x1b[0m\x1b[2J\r\nnext";
+        let sanitized = sanitize_transcript_output(output);
+
+        assert_eq!(sanitized, "\x1b[31mred\x1b[0m\nnext");
     }
 
     #[test]
@@ -7373,13 +7895,21 @@ mod tests {
         let host = workspace_read_host(&workspace, &AgentConfig::default(), None)
             .expect("workspace tools are registered");
         let tools = host.tools().collect::<Vec<_>>();
-        assert_eq!(tools.len(), 3);
-        assert_eq!(tools[0].name, "list_directory");
-        assert_eq!(tools[0].risk, RiskClass::ReadOnly);
-        assert_eq!(tools[1].name, "read_file");
-        assert_eq!(tools[1].risk, RiskClass::ReadOnly);
-        assert_eq!(tools[2].name, "write_file");
-        assert_eq!(tools[2].risk, RiskClass::WriteWorkspace);
+        assert_eq!(tools.len(), 4);
+        for (name, risk) in [
+            ("list_directory", RiskClass::ReadOnly),
+            ("read_file", RiskClass::ReadOnly),
+            ("web_fetch", RiskClass::NetworkAccess),
+            ("write_file", RiskClass::WriteWorkspace),
+        ] {
+            assert_eq!(
+                tools
+                    .iter()
+                    .find(|tool| tool.name == name)
+                    .map(|tool| tool.risk),
+                Some(risk)
+            );
+        }
     }
 
     #[test]
