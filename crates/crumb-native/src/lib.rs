@@ -86,8 +86,6 @@ impl WindowsPowerShell {
             .arg("-NoLogo")
             .arg("-NonInteractive")
             .arg("-NoExit")
-            .arg("-Command")
-            .arg("-")
     }
 }
 
@@ -101,8 +99,6 @@ impl NativeShell for WindowsPowerShell {
             .arg("-NoLogo")
             .arg("-NonInteractive")
             .arg("-NoExit")
-            .arg("-Command")
-            .arg("-")
     }
 
     fn builtin_commands(&self) -> &'static [&'static str] {
@@ -178,9 +174,6 @@ mod tests {
 
         assert_eq!(shell.kind(), ShellKind::PowerShell);
         assert_eq!(command.program(), "pwsh");
-        assert_eq!(
-            command.args(),
-            ["-NoLogo", "-NonInteractive", "-NoExit", "-Command", "-"]
-        );
+        assert_eq!(command.args(), ["-NoLogo", "-NonInteractive", "-NoExit"]);
     }
 }
