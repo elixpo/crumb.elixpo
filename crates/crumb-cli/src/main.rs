@@ -41,9 +41,10 @@ use crumb_graph::{
 use crumb_harness_dsh::HarnessActivity;
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_marketplace::{
-    Catalog, InstallScope, Installer, MAX_CATALOG_BYTES, MAX_SIGSTORE_BUNDLE_BYTES,
-    McpTransport as MarketplaceMcpTransport, Package, PublisherIdentity, ReleaseTrust,
-    RemoteCatalogCache, SignedArtifact, SigstoreVerifier, bundled_catalog, verify_package_files,
+    Catalog, InstallScope, InstallationStore, InstalledRelease, Installer, MAX_CATALOG_BYTES,
+    MAX_SIGSTORE_BUNDLE_BYTES, McpTransport as MarketplaceMcpTransport, Package, PublisherIdentity,
+    ReleaseTrust, RemoteCatalogCache, SignedArtifact, SigstoreVerifier, bundled_catalog,
+    verify_package_files,
 };
 use crumb_mcp::{
     McpDispatcher, StdioMcpLimits, StreamableHttpLimits, register_stdio_servers,
@@ -4956,6 +4957,9 @@ const fn memory_scope_name(scope: MemoryScope) -> &'static str {
 }
 
 fn show_marketplace(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    if handle_marketplace_lifecycle(command, cwd, writer)? {
+        return Ok(());
+    }
     if let Some(path) = command.strip_prefix("/marketplace validate ") {
         return validate_marketplace_path(path.trim(), cwd, writer);
     }
@@ -4976,6 +4980,36 @@ fn show_marketplace(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result
         )?;
         return Ok(());
     }
+    show_marketplace_catalog(command, cwd, writer)
+}
+
+fn handle_marketplace_lifecycle(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<bool> {
+    if let Some(arguments) = command.strip_prefix("/marketplace installed") {
+        let scope = parse_marketplace_scope_argument(arguments, "installed")?;
+        show_installed_marketplace_packages(scope, cwd, writer)?;
+        return Ok(true);
+    }
+    if let Some(arguments) = command.strip_prefix("/marketplace pin ") {
+        set_marketplace_pin(arguments, true, cwd, writer)?;
+        return Ok(true);
+    }
+    if let Some(arguments) = command.strip_prefix("/marketplace unpin ") {
+        set_marketplace_pin(arguments, false, cwd, writer)?;
+        return Ok(true);
+    }
+    if let Some(arguments) = command.strip_prefix("/marketplace doctor") {
+        let scope = parse_marketplace_scope_argument(arguments, "doctor")?;
+        doctor_marketplace(scope, cwd, writer)?;
+        return Ok(true);
+    }
+    if let Some(arguments) = command.strip_prefix("/marketplace uninstall ") {
+        uninstall_marketplace_package(arguments, cwd, writer)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn show_marketplace_catalog(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     if command == "/marketplace remote" {
         let catalog = cached_remote_catalog()?;
         writeln!(
@@ -5037,6 +5071,10 @@ fn show_marketplace(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result
         )?;
         writeln!(
             writer,
+            "  `/marketplace installed [--scope project|user]` · `pin` · `unpin` · `doctor` · `uninstall`"
+        )?;
+        writeln!(
+            writer,
             "  Installation verifies files; enabling capabilities is separate."
         )?;
         return Ok(());
@@ -5051,7 +5089,7 @@ fn show_marketplace(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result
         return install_marketplace_package(&catalog, arguments, cwd, writer);
     }
     Err(anyhow!(
-        "usage: /marketplace [sync | remote [inspect <publisher/name>] | inspect <publisher/name> | install <publisher/name> [--scope project|user] | install-remote <publisher/name> [--scope project|user] | validate <catalog.json>]"
+        "usage: /marketplace [sync | remote [inspect <publisher/name>] | inspect <publisher/name> | install <publisher/name> [--scope project|user] | install-remote <publisher/name> [--scope project|user] | installed [--scope project|user] | pin|unpin|uninstall <publisher/name> [--scope project|user] | doctor [--scope project|user] | validate <catalog.json>]"
     ))
 }
 
@@ -5226,9 +5264,10 @@ fn install_remote_marketplace_package(
         downloads.insert(artifact.path.clone(), SignedArtifact { bytes, bundle });
     }
     let (_, project_root) = agent_config_location(cwd);
-    let destination = marketplace_install_destination(scope, &project_root)?;
-    let installed =
-        Installer::new(destination).install_sigstore(package, publisher, &downloads, &verifier)?;
+    let store = marketplace_install_store(scope, &project_root)?;
+    let installed = Installer::new(store.packages_root())
+        .install_sigstore(package, publisher, &downloads, &verifier)?;
+    store.record(&installed)?;
     register_installed_package(&installed, scope, &project_root, cwd)?;
     writeln!(
         writer,
@@ -5375,8 +5414,9 @@ fn install_marketplace_package(
     let (id, scope) = parse_marketplace_install_arguments(arguments, "install")?;
     let package = catalog.installable_package(id)?;
     let (_, project_root) = agent_config_location(cwd);
-    let destination = marketplace_install_destination(scope, &project_root)?;
-    let installed = Installer::new(destination).install_bundled(package)?;
+    let store = marketplace_install_store(scope, &project_root)?;
+    let installed = Installer::new(store.packages_root()).install_bundled(package)?;
+    store.record(&installed)?;
     register_installed_package(&installed, scope, &project_root, cwd)?;
     writeln!(
         writer,
@@ -5421,14 +5461,130 @@ fn parse_marketplace_install_arguments<'a>(
     Ok((id, scope))
 }
 
-fn marketplace_install_destination(scope: InstallScope, project_root: &Path) -> Result<PathBuf> {
-    Ok(match scope {
-        InstallScope::Project => project_root.join(".crumb/marketplace/packages"),
+fn parse_marketplace_scope_argument(arguments: &str, command: &str) -> Result<InstallScope> {
+    match arguments.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [] | ["--scope", "project"] => Ok(InstallScope::Project),
+        ["--scope", "user"] => Ok(InstallScope::User),
+        _ => Err(anyhow!(
+            "usage: /marketplace {command} [--scope project|user]"
+        )),
+    }
+}
+
+fn marketplace_install_store(
+    scope: InstallScope,
+    project_root: &Path,
+) -> Result<InstallationStore> {
+    let root = match scope {
+        InstallScope::Project => project_root.join(".crumb/marketplace"),
         InstallScope::User => BaseDirs::new()
             .context("home directory is unavailable")?
             .home_dir()
-            .join(".crumb/marketplace/packages"),
-    })
+            .join(".crumb/marketplace"),
+    };
+    Ok(InstallationStore::new(root))
+}
+
+fn show_installed_marketplace_packages(
+    scope: InstallScope,
+    cwd: &Path,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let (_, project_root) = agent_config_location(cwd);
+    let releases = marketplace_install_store(scope, &project_root)?.list()?;
+    writeln!(
+        writer,
+        "◆ Installed marketplace releases · {} scope",
+        install_scope_name(scope)
+    )?;
+    if releases.is_empty() {
+        writeln!(writer, "  No recorded releases.")?;
+        return Ok(());
+    }
+    for release in releases {
+        writeln!(
+            writer,
+            "  {} {:<28} {:<12}{}",
+            if release.active { "●" } else { "○" },
+            release.package.id,
+            release.package.version,
+            if release.pinned { " pinned" } else { "" }
+        )?;
+    }
+    Ok(())
+}
+
+fn set_marketplace_pin(
+    arguments: &str,
+    pinned: bool,
+    cwd: &Path,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let command = if pinned { "pin" } else { "unpin" };
+    let (id, scope) = parse_marketplace_install_arguments(arguments, command)?;
+    let (_, project_root) = agent_config_location(cwd);
+    let release = marketplace_install_store(scope, &project_root)?.set_pinned(id, pinned)?;
+    writeln!(
+        writer,
+        "◆ {} {} {} · {} scope",
+        if pinned { "Pinned" } else { "Unpinned" },
+        release.package.id,
+        release.package.version,
+        install_scope_name(scope)
+    )?;
+    Ok(())
+}
+
+fn doctor_marketplace(scope: InstallScope, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let (_, project_root) = agent_config_location(cwd);
+    let diagnostics = marketplace_install_store(scope, &project_root)?.doctor()?;
+    writeln!(
+        writer,
+        "◆ Marketplace doctor · {} scope",
+        install_scope_name(scope)
+    )?;
+    if diagnostics.is_empty() {
+        writeln!(writer, "  No recorded releases.")?;
+        return Ok(());
+    }
+    for diagnostic in diagnostics {
+        writeln!(
+            writer,
+            "  {} {} {}{} · {}",
+            if diagnostic.healthy { "✓" } else { "!" },
+            diagnostic.package_id,
+            diagnostic.version,
+            if diagnostic.active { " active" } else { "" },
+            diagnostic.detail
+        )?;
+    }
+    Ok(())
+}
+
+fn uninstall_marketplace_package(
+    arguments: &str,
+    cwd: &Path,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let (id, scope) = parse_marketplace_install_arguments(arguments, "uninstall")?;
+    let (_, project_root) = agent_config_location(cwd);
+    let store = marketplace_install_store(scope, &project_root)?;
+    let release = store
+        .list()?
+        .into_iter()
+        .find(|release| release.package.id == id && release.active)
+        .with_context(|| format!("marketplace package `{id}` is not installed"))?;
+    ensure_marketplace_components_disabled(&release, scope, &project_root, cwd)?;
+    store.uninstall(id)?;
+    unregister_marketplace_components(&release, scope, &project_root, cwd)?;
+    writeln!(
+        writer,
+        "◆ Uninstalled {} {} · {} scope",
+        release.package.id,
+        release.package.version,
+        install_scope_name(scope)
+    )?;
+    Ok(())
 }
 
 fn register_installed_package(
@@ -5498,6 +5654,118 @@ fn register_installed_package(
         Ok(())
     })?;
     Ok(())
+}
+
+fn ensure_marketplace_components_disabled(
+    release: &InstalledRelease,
+    scope: InstallScope,
+    project_root: &Path,
+    cwd: &Path,
+) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    let package_root = marketplace_release_root(release, scope, project_root)?;
+    for entry in &release.package.skills {
+        let path = marketplace_component_path(&package_root, &entry.path, scope, project_root);
+        if config
+            .skills
+            .iter()
+            .any(|skill| skill.id == entry.id && skill.path == path && skill.enabled)
+        {
+            bail!(
+                "skill `{}` is enabled; unload it before uninstalling the package",
+                entry.id
+            );
+        }
+    }
+    for entry in &release.package.mcp_servers {
+        if config
+            .mcp_servers
+            .iter()
+            .any(|server| server.id == entry.id && server.enabled)
+        {
+            bail!(
+                "MCP server `{}` is enabled; disable it before uninstalling the package",
+                entry.id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn unregister_marketplace_components(
+    release: &InstalledRelease,
+    scope: InstallScope,
+    project_root: &Path,
+    cwd: &Path,
+) -> Result<()> {
+    let package_root = marketplace_release_root(release, scope, project_root)?;
+    let current_executable = std::env::current_exe().context("Crumb executable is unavailable")?;
+    update_agent_config(cwd, |config| {
+        config.skills.retain(|skill| {
+            !release.package.skills.iter().any(|entry| {
+                skill.id == entry.id
+                    && !skill.enabled
+                    && skill.path
+                        == marketplace_component_path(
+                            &package_root,
+                            &entry.path,
+                            scope,
+                            project_root,
+                        )
+            })
+        });
+        config.mcp_servers.retain(|server| {
+            !release.package.mcp_servers.iter().any(|entry| {
+                let transport = match entry.transport {
+                    MarketplaceMcpTransport::Stdio => crumb_agent::McpTransport::Stdio,
+                    MarketplaceMcpTransport::StreamableHttp => {
+                        crumb_agent::McpTransport::StreamableHttp
+                    }
+                };
+                let command = match entry.command.as_deref() {
+                    Some("crumb") => current_executable.clone(),
+                    Some(command) => PathBuf::from(command),
+                    None => PathBuf::new(),
+                };
+                server.id == entry.id
+                    && !server.enabled
+                    && server.transport == transport
+                    && server.command == command
+                    && server.arguments == entry.arguments
+                    && server.url == entry.url
+                    && server.credential.is_none()
+            })
+        });
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn marketplace_release_root(
+    release: &InstalledRelease,
+    scope: InstallScope,
+    project_root: &Path,
+) -> Result<PathBuf> {
+    Ok(marketplace_install_store(scope, project_root)?
+        .packages_root()
+        .join(release.package.id.replace('/', "--"))
+        .join(&release.package.version))
+}
+
+fn marketplace_component_path(
+    package_root: &Path,
+    path: &Path,
+    scope: InstallScope,
+    project_root: &Path,
+) -> PathBuf {
+    let absolute = package_root.join(path);
+    if scope == InstallScope::Project {
+        absolute
+            .strip_prefix(project_root)
+            .map_or(absolute.clone(), Path::to_path_buf)
+    } else {
+        absolute
+    }
 }
 
 const fn package_kind_name(package: &Package) -> &'static str {
@@ -6706,6 +6974,37 @@ mod tests {
         assert!(!skill.enabled);
         assert!(skill.path.ends_with("skills/code-review/SKILL.md"));
         assert!(workspace.join(&skill.path).is_file());
+
+        output.clear();
+        show_marketplace(
+            "/marketplace installed --scope project",
+            &workspace,
+            &mut output,
+        )
+        .expect("installed release should be listed");
+        assert!(String::from_utf8_lossy(&output).contains("crumb/code-review"));
+        show_marketplace(
+            "/marketplace pin crumb/code-review --scope project",
+            &workspace,
+            &mut output,
+        )
+        .expect("installed release should pin");
+        show_marketplace(
+            "/marketplace doctor --scope project",
+            &workspace,
+            &mut output,
+        )
+        .expect("installed release should verify");
+        assert!(String::from_utf8_lossy(&output).contains("verified"));
+        show_marketplace(
+            "/marketplace uninstall crumb/code-review --scope project",
+            &workspace,
+            &mut output,
+        )
+        .expect("disabled package should uninstall");
+        let config = read_agent_config(&workspace).expect("agent config should reload");
+        assert!(config.skills.iter().all(|skill| skill.id != "code-review"));
+        assert!(!workspace.join(&skill.path).exists());
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
     }
 
