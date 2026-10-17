@@ -722,7 +722,11 @@ impl Renderer {
         if self.settings.output == OutputMode::ScreenReader {
             format!("Activity: {label}")
         } else {
-            format!("  {}  ↳ {label}", self.paint("│", "35"))
+            format!(
+                "  {}  ↳ {}",
+                self.paint("│", "35"),
+                self.paint(label, "38;5;245")
+            )
         }
     }
 
@@ -756,13 +760,13 @@ impl Renderer {
                 format!("Tool {name} {state}")
             };
         }
-        let color = if success { "32;1" } else { "31;1" };
+        let color = if success { "38;5;245" } else { "31;1" };
         format!(
             "  {}  {} {} {}",
             self.paint(CRUMB_BADGE, "38;2;255;255;204;48;5;53;1"),
             self.paint(title, color),
             self.paint("·", "2"),
-            self.paint(detail, "1")
+            self.paint(detail, if success { "38;5;245" } else { "1" })
         )
     }
 
@@ -1791,6 +1795,23 @@ mod tests {
             renderer.agent_approval_required("spawn_agents"),
             "  [ CRUMB ]  Allow a parallel agent team?\n  ╰──▶ Koi · Nyx · Rune · Echo · user permission required"
         );
+    }
+
+    #[test]
+    fn successful_tool_status_uses_subdued_grey() {
+        let renderer = Renderer::new(UiSettings {
+            color: true,
+            output: OutputMode::Rich,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+
+        let searching = renderer.agent_activity("Searching web · weather Kolkata tomorrow");
+        let completed = renderer.agent_tool_result("web_search", true);
+
+        assert!(searching.contains("\x1b[38;5;245mSearching web"));
+        assert!(completed.contains("\x1b[38;5;245mTool completed"));
+        assert!(!completed.contains("\x1b[32;1m"));
     }
 
     #[test]

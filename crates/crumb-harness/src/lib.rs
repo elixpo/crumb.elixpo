@@ -720,23 +720,65 @@ fn preserve_web_search_terms(call: &mut ToolCall, user_message: &str) {
     else {
         return;
     };
-    let query_terms = search_terms(query);
+    let query = compact_search_query(query);
+    let query_terms = search_terms(&query);
     let missing = search_terms(user_message)
         .into_iter()
-        .filter(|term| !query_terms.contains(term))
+        .filter(|term| !query_terms.contains(term) && !search_term_is_redundant(term, &query_terms))
+        .take(8)
         .collect::<Vec<_>>();
-    if missing.is_empty() {
-        return;
+    let optimized = if missing.is_empty() {
+        query
+    } else if query.is_empty() {
+        missing.join(" ")
+    } else {
+        format!("{query} {}", missing.join(" "))
+    };
+    call.arguments["query"] = serde_json::Value::String(optimized);
+}
+
+fn compact_search_query(query: &str) -> String {
+    const MAX_TERMS: usize = 16;
+    const MAX_BYTES: usize = 192;
+    let mut compact = String::new();
+    for term in query
+        .split_whitespace()
+        .filter(|term| !search_query_noise(term))
+        .take(MAX_TERMS)
+    {
+        if !compact.is_empty() {
+            compact.push(' ');
+        }
+        if compact.len().saturating_add(term.len()) > MAX_BYTES {
+            break;
+        }
+        compact.push_str(term);
     }
-    call.arguments["query"] = serde_json::Value::String(format!("{query} {}", missing.join(" ")));
+    compact
+}
+
+fn search_query_noise(term: &str) -> bool {
+    let normalized = term
+        .trim_matches(|character: char| !character.is_alphanumeric())
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "please" | "search" | "find" | "tell" | "me" | "thinking" | "need"
+    )
+}
+
+fn search_term_is_redundant(term: &str, query_terms: &std::collections::BTreeSet<String>) -> bool {
+    let weather_query = query_terms.contains("weather") || query_terms.contains("forecast");
+    weather_query && matches!(term, "umbrella" | "raincoat" | "jacket" | "sunscreen")
 }
 
 fn search_terms(input: &str) -> std::collections::BTreeSet<String> {
     const STOP_WORDS: &[&str] = &[
-        "a", "about", "an", "and", "are", "at", "be", "did", "do", "does", "find", "for", "from",
-        "give", "how", "i", "in", "is", "it", "know", "look", "me", "of", "on", "please", "search",
-        "short", "tell", "the", "to", "up", "web", "what", "when", "where", "which", "who", "why",
-        "you",
+        "a", "about", "am", "an", "and", "are", "at", "be", "been", "being", "can", "could", "did",
+        "do", "does", "find", "for", "from", "give", "had", "has", "have", "how", "i", "in", "is",
+        "it", "know", "look", "me", "might", "need", "of", "on", "please", "search", "should",
+        "short", "tell", "the", "thinking", "to", "up", "was", "web", "were", "what", "when",
+        "where", "which", "who", "why", "will", "would", "you",
     ];
     input
         .split(|character: char| {
@@ -1628,6 +1670,47 @@ mod tests {
         assert_eq!(
             call.arguments["query"].as_str(),
             Some("Ayushman Bhattachaya Elixpo public information")
+        );
+    }
+
+    #[test]
+    fn weather_query_does_not_inherit_conversational_decision_words() {
+        let mut call = ToolCall {
+            id: "search_3".to_owned(),
+            name: "web_search".to_owned(),
+            arguments: json!({"query": "please search weather forecast for Kolkata tomorrow"}),
+        };
+
+        super::preserve_web_search_terms(
+            &mut call,
+            "I was thinking, do I need an umbrella in Kolkata tomorrow?",
+        );
+
+        assert_eq!(
+            call.arguments["query"].as_str(),
+            Some("weather forecast for Kolkata tomorrow")
+        );
+    }
+
+    #[test]
+    fn web_search_query_has_a_bounded_term_budget() {
+        let mut call = ToolCall {
+            id: "search_4".to_owned(),
+            name: "web_search".to_owned(),
+            arguments: json!({
+                "query": "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen"
+            }),
+        };
+
+        super::preserve_web_search_terms(&mut call, "");
+
+        assert_eq!(
+            call.arguments["query"]
+                .as_str()
+                .expect("query remains text")
+                .split_whitespace()
+                .count(),
+            16
         );
     }
 
