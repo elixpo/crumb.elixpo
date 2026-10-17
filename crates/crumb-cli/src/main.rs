@@ -2259,7 +2259,20 @@ fn render_observed_activity(
     live_context_tokens: &mut u64,
 ) -> Result<()> {
     input.clear_line(writer)?;
-    if let HarnessActivity::Usage {
+    if terminal.fullscreen
+        && let HarnessActivity::ToolOutput {
+            content: Some(content),
+            ..
+        } = event
+    {
+        render_fullscreen_tool_output(
+            content,
+            activity,
+            renderer,
+            &terminal.transcript,
+            terminal.header_rows,
+        )?;
+    } else if let HarnessActivity::Usage {
         input_tokens,
         output_tokens,
     } = event
@@ -2293,6 +2306,29 @@ fn render_observed_activity(
     // The guide owns the final terminal row. Paint it after every composer
     // redraw so wrapped steering input and resize recovery cannot cover it.
     refresh_active_footer(renderer, terminal.fullscreen)?;
+    Ok(())
+}
+
+fn render_fullscreen_tool_output(
+    content: &str,
+    activity: &mut Option<crumb_ui::ActivityIndicator>,
+    renderer: Renderer,
+    transcript: &Arc<Mutex<TranscriptState>>,
+    header_rows: u16,
+) -> io::Result<()> {
+    if let Some(indicator) = activity.take() {
+        indicator.finish();
+    }
+    let output_block = terminal_tool_output(renderer, content);
+    let mut state = transcript
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.append(&output_block);
+    render_transcript_view(&state, renderer, header_rows)?;
+    if state.scroll_offset == 0 {
+        position_after_transcript(&state, header_rows)?;
+        *activity = Some(start_activity(renderer, "Thinking", true));
+    }
     Ok(())
 }
 

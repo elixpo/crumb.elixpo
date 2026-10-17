@@ -153,6 +153,9 @@ impl TokenOptimizer for RtkOptimizer {
     }
 
     fn optimize(&self, kind: OutputKind, input: &[u8], budget: usize) -> Result<Vec<u8>> {
+        if kind == OutputKind::Generic {
+            bail!("RTK has no lossless filter for generic command output");
+        }
         let executable = resolve_executable(&self.command).context("RTK is unavailable")?;
         let mut process = Command::new(executable);
         process
@@ -455,6 +458,18 @@ mod tests {
 
         assert!(String::from_utf8_lossy(&result.bytes).contains("error: compilation failed"));
         assert_eq!(result.optimizer, None);
+    }
+
+    #[test]
+    fn rtk_does_not_treat_generic_command_output_as_logs() {
+        let optimizer = RtkOptimizer::new(PathBuf::from("rtk"), Vec::new(), Duration::from_secs(1))
+            .expect("optimizer config is valid");
+
+        assert!(
+            optimizer
+                .optimize(OutputKind::Generic, b"folder-a\nfolder-b\n", 128)
+                .is_err()
+        );
     }
 
     #[test]
