@@ -1044,12 +1044,14 @@ impl Drop for ActivityIndicator {
 
 fn animate_activity(label: &str, color: bool, running: &AtomicBool, row: Option<u16>) {
     let mut frame = 0_usize;
+    let started = Instant::now();
     while running.load(Ordering::Acquire) {
         let cookie = COOKIE_SPINNER[frame];
+        let elapsed = started.elapsed().as_secs_f32();
         let line = if color {
-            format!("\x1b[35;1m{cookie}\x1b[0m \x1b[90m{label}\x1b[0m")
+            format!("\x1b[35;1m{cookie}\x1b[0m \x1b[90m{label} · {elapsed:.1}s\x1b[0m")
         } else {
-            format!("{cookie} {label}")
+            format!("{cookie} {label} · {elapsed:.1}s")
         };
         write_activity_line(&line, row);
         let _ = io::stderr().flush();

@@ -15,9 +15,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
 use crossterm::cursor::{MoveTo, Show, position as cursor_position};
 use crossterm::event::{
-    Event as TerminalEvent, KeyCode as TerminalKeyCode, KeyEventKind,
-    KeyModifiers as TerminalModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags, poll as poll_terminal_event, read as read_terminal_event,
+    DisableMouseCapture, EnableMouseCapture, Event as TerminalEvent, KeyCode as TerminalKeyCode,
+    KeyEventKind, KeyModifiers as TerminalModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags, poll as poll_terminal_event,
+    read as read_terminal_event,
 };
 use crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
@@ -73,10 +74,11 @@ use crumb_ui::{GitSegment, PromptContext, Renderer, StartupContext, UiSettings};
 use directories::BaseDirs;
 use nu_ansi_term::{Color, Style};
 use reedline::{
-    Completer, DefaultHinter, EditCommand, Editor, Emacs, FileBackedHistory, Hinter, History,
-    HistoryItem, IdeMenu, KeyCode, KeyModifiers, Menu, MenuBuilder, MenuEvent, MenuSettings,
-    Painter, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
-    ReedlineEvent, ReedlineMenu, Signal, Suggestion, default_emacs_keybindings,
+    Completer, DefaultHinter, EditCommand, EditMode, Editor, Emacs, FileBackedHistory, Hinter,
+    History, HistoryItem, IdeMenu, KeyCode, KeyModifiers, Menu, MenuBuilder, MenuEvent,
+    MenuSettings, Painter, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus,
+    Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent, Signal, Suggestion,
+    default_emacs_keybindings,
 };
 
 mod agent_runtime;
@@ -329,7 +331,7 @@ fn serve_mcp() -> Result<()> {
     let workspace = current_process_dir()?;
     let mut config = read_agent_config(&workspace)?;
     enforce_graphify_pin(&workspace, &mut config);
-    let search_api_key = pollinations_runtime_key();
+    let search_api_key = configured_pollinations_runtime_key(&config);
     let mut host = workspace_read_host(&workspace, &config, search_api_key)?;
     let mut diagnostics = register_stdio_servers(
         &mut host,
@@ -433,18 +435,15 @@ fn workspace_read_host(
             max_output_bytes,
         },
     )?;
-    if let Some(route) = config
+    let search_route = config
         .models
         .get(&Modality::WebSearch)
         .and_then(|routes| routes.first())
-        && route.provider == "pollinations"
-        && let Some(api_key) = search_api_key
-        && !api_key.trim().is_empty()
-    {
-        register_web_search_tool(
-            &mut host,
-            PollinationsSearchConfig::new(api_key, max_output_bytes)?.with_model(&route.model),
-        )?;
+        .filter(|route| route.provider == "pollinations");
+    if let Some(api_key) = search_api_key.filter(|key| !key.trim().is_empty()) {
+        let search = PollinationsSearchConfig::new(api_key, max_output_bytes)?;
+        let search = search_route.map_or(search.clone(), |route| search.with_model(&route.model));
+        register_web_search_tool(&mut host, search)?;
     }
     Ok(host)
 }
@@ -1673,7 +1672,7 @@ fn execute_agent_sequence(
             workspace.to_path_buf(),
             activity_capacity,
         )?;
-        let (returned_runtime, result, interruption) = loop {
+        let (returned_runtime, result, interruption, streamed_response) = loop {
             match observe_agent_turn(
                 task,
                 &mut steering,
@@ -1683,8 +1682,8 @@ fn execute_agent_sequence(
                 terminal,
                 &initial_activity,
             )? {
-                TurnObservation::Finished(runtime, result, interruption) => {
-                    break (*runtime, result, interruption);
+                TurnObservation::Finished(runtime, result, interruption, streamed_response) => {
+                    break (*runtime, result, interruption, streamed_response);
                 }
                 TurnObservation::Backgrounded(returned_task) => {
                     match promote_agent_turn(
@@ -1714,6 +1713,7 @@ fn execute_agent_sequence(
         match finish_agent_turn(
             &result,
             interruption,
+            streamed_response,
             &persisted_request,
             &mut AgentTurnUi {
                 steering: &mut steering,
@@ -1764,6 +1764,7 @@ struct AgentTurnUi<'a> {
 fn finish_agent_turn(
     result: &Result<crumb_harness_dsh::RunResult>,
     interruption: TurnInterruption,
+    streamed_response: bool,
     persisted_request: &str,
     ui: &mut AgentTurnUi<'_>,
 ) -> Result<AgentSequenceStep> {
@@ -1791,7 +1792,11 @@ fn finish_agent_turn(
             PausedTurnAction::Cancel => Ok(AgentSequenceStep::Stop),
         },
         TurnInterruption::None | TurnInterruption::Paused => {
-            render_agent_result(result, ui.renderer, ui.writer)?;
+            if streamed_response && result.is_ok() {
+                writeln!(ui.writer)?;
+            } else {
+                render_agent_result(result, ui.renderer, ui.writer)?;
+            }
             Ok(if result.is_ok() {
                 AgentSequenceStep::RunFollowUps
             } else {
@@ -1806,6 +1811,7 @@ enum TurnObservation {
         Box<AgentRuntime>,
         Result<crumb_harness_dsh::RunResult>,
         TurnInterruption,
+        bool,
     ),
     Backgrounded(agent_runtime::AgentTurnTask),
 }
@@ -1877,6 +1883,7 @@ fn observe_agent_turn(
         initial_activity,
         terminal.fullscreen,
     ));
+    let mut streamed_response = false;
     let mut input = SteeringInput::new(renderer, steering_bytes);
     let raw_mode = terminal
         .interactive
@@ -1902,6 +1909,7 @@ fn observe_agent_turn(
                 render_harness_activity(
                     &event,
                     &mut activity,
+                    &mut streamed_response,
                     renderer,
                     writer,
                     terminal.fullscreen,
@@ -1935,7 +1943,14 @@ fn observe_agent_turn(
     }
     while let Ok(event) = task.recv_timeout(Duration::ZERO) {
         input.clear_line(writer)?;
-        render_harness_activity(&event, &mut activity, renderer, writer, terminal.fullscreen)?;
+        render_harness_activity(
+            &event,
+            &mut activity,
+            &mut streamed_response,
+            renderer,
+            writer,
+            terminal.fullscreen,
+        )?;
         input.redraw(writer)?;
     }
     let interruption = input.interruption;
@@ -1950,6 +1965,7 @@ fn observe_agent_turn(
         Box::new(runtime),
         result,
         interruption,
+        streamed_response,
     ))
 }
 
@@ -2486,6 +2502,7 @@ impl SteeringInput {
 fn harness_activity_label(activity: &HarnessActivity) -> String {
     match activity {
         HarnessActivity::RequestAccepted => "request accepted".to_owned(),
+        HarnessActivity::ResponseDelta { .. } => "responding".to_owned(),
         HarnessActivity::Status { state } => format!("session {state}"),
         HarnessActivity::ToolStarted { name } if name == "spawn_agents" => {
             "coordinating parallel agent team".to_owned()
@@ -2513,11 +2530,21 @@ fn harness_activity_label(activity: &HarnessActivity) -> String {
 fn render_harness_activity(
     activity: &HarnessActivity,
     indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    streamed_response: &mut bool,
     renderer: Renderer,
     writer: &mut dyn Write,
     fullscreen: bool,
 ) -> Result<()> {
     match activity {
+        HarnessActivity::ResponseDelta { text } => {
+            finish_activity_line(indicator, writer)?;
+            if !*streamed_response {
+                write!(writer, "{} ", renderer.agent_response(""))?;
+                *streamed_response = true;
+            }
+            write!(writer, "{text}")?;
+            writer.flush()?;
+        }
         HarnessActivity::ToolStarted { name } if name == "spawn_agents" => {
             replace_activity(
                 indicator,
@@ -2567,7 +2594,9 @@ fn render_harness_activity(
             writer.flush()?;
         }
         HarnessActivity::Completed { .. } => {
-            replace_activity(indicator, renderer, "Thinking", fullscreen);
+            if !*streamed_response {
+                replace_activity(indicator, renderer, "Thinking", fullscreen);
+            }
         }
         HarnessActivity::Progress { label } => {
             replace_activity(indicator, renderer, label, fullscreen);
@@ -7392,6 +7421,17 @@ fn pollinations_runtime_key() -> Option<String> {
     })
 }
 
+fn configured_pollinations_runtime_key(config: &AgentConfig) -> Option<String> {
+    config
+        .providers
+        .get("pollinations")
+        .and_then(|provider| provider.credential.as_ref())
+        .and_then(|reference| provider_projection::resolve_credential_secret(reference).ok())
+        .map(|secret| secret.expose().to_owned())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(pollinations_runtime_key)
+}
+
 fn execute_and_capture(
     shell: &mut ShellSession,
     command: &str,
@@ -7798,8 +7838,40 @@ fn create_line_editor(
         .with_completer(Box::new(CrumbCompleter::new(workspace.clone())))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
         .with_persistent_menus(true)
-        .with_edit_mode(Box::new(Emacs::new(keybindings)));
+        .with_edit_mode(Box::new(CrumbEditMode::new(keybindings)));
     Ok(InteractiveLineEditor { editor, workspace })
+}
+
+struct CrumbEditMode {
+    emacs: Emacs,
+}
+
+impl CrumbEditMode {
+    const fn new(keybindings: reedline::Keybindings) -> Self {
+        Self {
+            emacs: Emacs::new(keybindings),
+        }
+    }
+}
+
+impl EditMode for CrumbEditMode {
+    fn parse_event(&mut self, event: ReedlineRawEvent) -> ReedlineEvent {
+        let event = TerminalEvent::from(event);
+        match event {
+            TerminalEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
+                ReedlineEvent::ExecuteHostCommand("crumb:transcript-up".to_owned())
+            }
+            TerminalEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => {
+                ReedlineEvent::ExecuteHostCommand("crumb:transcript-down".to_owned())
+            }
+            event => ReedlineRawEvent::try_from(event)
+                .map_or(ReedlineEvent::None, |event| self.emacs.parse_event(event)),
+        }
+    }
+
+    fn edit_mode(&self) -> PromptEditMode {
+        self.emacs.edit_mode()
+    }
 }
 
 fn suggestion_width(terminal_columns: u16) -> usize {
@@ -8305,6 +8377,7 @@ impl AlternateScreenGuard {
             crossterm::execute!(
                 io::stdout(),
                 EnterAlternateScreen,
+                EnableMouseCapture,
                 Clear(ClearType::All),
                 MoveTo(0, 0),
                 Show
@@ -8319,7 +8392,7 @@ impl Drop for AlternateScreenGuard {
         if self.active {
             let mut writer = io::stdout();
             let _ = write!(writer, "\x1b[r");
-            let _ = crossterm::execute!(writer, Show, LeaveAlternateScreen);
+            let _ = crossterm::execute!(writer, DisableMouseCapture, Show, LeaveAlternateScreen);
         }
     }
 }
@@ -8362,6 +8435,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use crossterm::event::{Event as TerminalEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use crumb_agent::{
         AgentConfig, CredentialReference, HarnessConfig, ProviderHeader, ProviderProtocol,
         RiskClass, SkillConfig,
@@ -8371,16 +8445,16 @@ mod tests {
     use crumb_profile::{ProfileSelectionStore, ProfileStore};
 
     use super::{
-        ExitGesture, MarketplaceContent, PausedSubmission, SessionCommandContext, SteeringAction,
-        TerminalModeTracker, TranscriptCapture, agent_config_location, configure_permissions,
-        configure_plugin, effort_display_name, effort_wire_name, failed_command_recovery,
-        initial_agent_activity, marketplace_update_blocker, openrouter_preset,
-        parse_credential_reference, parse_paused_submission, parse_provider_header,
-        parse_resume_session_argument, read_agent_config, read_bounded_response,
-        register_local_skill, resolve_memory_keep, sanitize_transcript_output, set_skill_enabled,
-        show_graph, show_marketplace, show_memory, show_profile_with_stores, suggestion_width,
-        unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
-        workspace_read_host,
+        CrumbEditMode, ExitGesture, MarketplaceContent, PausedSubmission, SessionCommandContext,
+        SteeringAction, TerminalModeTracker, TranscriptCapture, agent_config_location,
+        configure_permissions, configure_plugin, effort_display_name, effort_wire_name,
+        failed_command_recovery, initial_agent_activity, marketplace_update_blocker,
+        openrouter_preset, parse_credential_reference, parse_paused_submission,
+        parse_provider_header, parse_resume_session_argument, read_agent_config,
+        read_bounded_response, register_local_skill, resolve_memory_keep,
+        sanitize_transcript_output, set_skill_enabled, show_graph, show_marketplace, show_memory,
+        show_profile_with_stores, suggestion_width, unregister_local_skill,
+        validate_marketplace_path, validate_marketplace_response, workspace_read_host,
     };
 
     #[test]
@@ -8684,6 +8758,40 @@ mod tests {
                     .find(|tool| tool.name == name)
                     .map(|tool| tool.risk),
                 Some(risk)
+            );
+        }
+    }
+
+    #[test]
+    fn pollinations_key_registers_web_search_without_an_explicit_search_route() {
+        let workspace = std::env::current_dir().expect("current directory is available");
+        let host = workspace_read_host(
+            &workspace,
+            &AgentConfig::default(),
+            Some("fixture-key".to_owned()),
+        )
+        .expect("workspace tools are registered");
+
+        assert!(host.tools().any(|tool| tool.name == "web_search"));
+    }
+
+    #[test]
+    fn mouse_wheel_is_reserved_for_transcript_scrolling() {
+        let mut mode = CrumbEditMode::new(reedline::default_emacs_keybindings());
+        for (kind, expected) in [
+            (MouseEventKind::ScrollUp, "crumb:transcript-up"),
+            (MouseEventKind::ScrollDown, "crumb:transcript-down"),
+        ] {
+            let raw = reedline::ReedlineRawEvent::try_from(TerminalEvent::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .expect("mouse event is accepted");
+            assert_eq!(
+                reedline::EditMode::parse_event(&mut mode, raw),
+                reedline::ReedlineEvent::ExecuteHostCommand(expected.to_owned())
             );
         }
     }

@@ -161,6 +161,7 @@ impl EventSink for NativeEventBridge<'_> {
         }
         let activity = match event {
             HarnessEvent::TurnStarted => Some(HarnessActivity::RequestAccepted),
+            HarnessEvent::TextDelta(text) => Some(HarnessActivity::ResponseDelta { text }),
             HarnessEvent::ToolRequested { name, .. } => Some(HarnessActivity::ToolStarted { name }),
             HarnessEvent::ToolProgress { label, .. } => Some(HarnessActivity::Progress { label }),
             HarnessEvent::ToolFinished { name, success, .. } => {
@@ -169,7 +170,7 @@ impl EventSink for NativeEventBridge<'_> {
             HarnessEvent::TurnFinished => Some(HarnessActivity::Completed {
                 reason: "stop".to_owned(),
             }),
-            HarnessEvent::TextDelta(_) | HarnessEvent::Usage(_) => None,
+            HarnessEvent::Usage(_) => None,
         };
         if let Some(activity) = activity
             && let Err(error) = (self.on_activity)(activity)
@@ -676,8 +677,11 @@ impl AgentRuntime {
             .context("selected persona profile could not be applied")?;
         let config = &application.config;
         config.validate()?;
-        let tools =
-            crate::workspace_read_host(&workspace, config, crate::pollinations_runtime_key())?;
+        let tools = crate::workspace_read_host(
+            &workspace,
+            config,
+            crate::configured_pollinations_runtime_key(config),
+        )?;
         let configured = configured_approvals(config);
         let approvals: Arc<dyn ApprovalBroker> = match interaction.interactive {
             Some(interactive) => Arc::new(TurnApprovals {

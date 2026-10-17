@@ -5,7 +5,15 @@ use std::path::{Path, PathBuf};
 use crumb_agent::{AgentConfig, SkillConfig};
 
 pub(crate) const PREFIX: &str = "builtin:";
-pub(crate) const DEFAULT_IDS: &[&str] = &["codebase-map", "failure-autopsy", "plan-execute"];
+pub(crate) const DEFAULT_IDS: &[&str] = &[
+    "codebase-map",
+    "failure-autopsy",
+    "test-repair",
+    "safe-refactor",
+    "security-review",
+    "plan-execute",
+    "web-research",
+];
 
 pub(crate) struct BundledSkill {
     pub id: &'static str,
@@ -59,6 +67,10 @@ pub(crate) static ALL: &[BundledSkill] = &[
     skill!(
         "plan-execute",
         "split broad work into bounded verified packages"
+    ),
+    skill!(
+        "web-research",
+        "research current facts with bounded searches and source verification"
     ),
 ];
 

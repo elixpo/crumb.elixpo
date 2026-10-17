@@ -193,6 +193,7 @@ struct TurnMetrics {
 
 struct ModelRound {
     text: String,
+    text_chunks: Vec<String>,
     calls: Vec<ToolCall>,
     finish: Option<FinishReason>,
     usage: TokenUsage,
@@ -351,9 +352,18 @@ impl NativeHarness {
             if round.calls.is_empty() {
                 match round.finish {
                     Some(FinishReason::Stop | FinishReason::Other(_)) => {
-                        conversation.commit(turn.user_message, round.text.clone());
+                        let final_text = sanitize_agent_response(&round.text);
+                        let chunks = if final_text == round.text {
+                            round.text_chunks
+                        } else {
+                            vec![final_text.clone()]
+                        };
+                        for chunk in chunks {
+                            sink.emit(HarnessEvent::TextDelta(chunk));
+                        }
+                        conversation.commit(turn.user_message, final_text.clone());
                         return Ok(HarnessOutcome {
-                            text: round.text,
+                            text: final_text,
                             usage,
                             model_rounds: metrics.model_rounds,
                             tool_calls: metrics.tool_calls,
@@ -408,6 +418,7 @@ impl NativeHarness {
             .map_err(provider_error)?;
         let mut round = ModelRound {
             text: String::new(),
+            text_chunks: Vec::new(),
             calls: Vec::new(),
             finish: None,
             usage: TokenUsage::default(),
@@ -421,7 +432,7 @@ impl NativeHarness {
                 ChatEvent::TextDelta(delta) => {
                     add_output_bytes(output_bytes, delta.len(), self.limits)?;
                     round.text.push_str(&delta);
-                    sink.emit(HarnessEvent::TextDelta(delta));
+                    round.text_chunks.push(delta);
                 }
                 ChatEvent::ToolCall(call) => round.calls.push(call),
                 ChatEvent::Usage(usage) => {
@@ -505,7 +516,7 @@ impl NativeHarness {
 
 fn system_messages(turn: &HarnessTurn) -> Vec<ChatMessage> {
     let mut system = String::from(
-        "Your name is Crumb. You are the execution-oriented agent inside the Crumb terminal, created by Elixpo. This product identity is constant regardless of the underlying model provider: never present yourself as an unnamed generic AI, ChatGPT, Claude, Amazon assistant, or the provider model. If asked who or what you are, answer plainly that you are Crumb by Elixpo. When operating as a named child agent, the child name is a temporary call sign and Crumb remains the product identity. Be a calm, capable terminal collaborator: direct, technically precise, naturally conversational, and free of generic customer-support closings. Complete the user's latest request yourself using the available tools when action or verification is needed. Treat prior turns only as context; do not continue or explain an older command failure unless the latest request asks about it. Do not tell the user to run a command that you can run with a tool. Use workspace tools for project work, process tools for commands and locally available system facts, and web tools for current external information. If one tool fails, inspect its result and try a safe suitable alternative instead of immediately giving up. Never claim a result you did not verify. Tool access is controlled by user-owned policy: request approval when required, respect denials, and never attempt to widen your own permissions. Keep native shell semantics separate from agent tool execution. Responses may use terminal-compatible Markdown, including headings, lists, links, inline code, fenced code blocks, and Mermaid fences. Avoid HTML and image-only content; Mermaid diagrams must remain understandable from their source text.",
+        "Your name is Crumb. You are the execution-oriented agent inside the Crumb terminal, created by Elixpo. This product identity is constant regardless of the underlying model provider: never present yourself as an unnamed generic AI, ChatGPT, Claude, Amazon assistant, or the provider model. If asked who or what you are, answer plainly that you are Crumb by Elixpo. When operating as a named child agent, the child name is a temporary call sign and Crumb remains the product identity. Be a calm, capable terminal collaborator: direct, technically precise, naturally conversational, and free of generic customer-support closings. Complete the user's latest request yourself using the available tools when action or verification is needed. Treat prior turns only as context; do not continue or explain an older command failure unless the latest request asks about it. Do not tell the user to run a command that you can run with a tool. Use workspace tools for project work and process tools for commands and locally available system facts. For current or externally changing facts—including weather, news, schedules, releases, and prices—you must use web_search when available rather than claiming you lack internet access; use web_fetch to inspect a known public page. If one tool fails, inspect its result and try a safe suitable alternative instead of immediately giving up. Never claim a result you did not verify. Tool access is controlled by user-owned policy: request approval when required, respect denials, and never attempt to widen your own permissions. Keep native shell semantics separate from agent tool execution. Responses may use terminal-compatible Markdown, including headings, lists, links, inline code, fenced code blocks, and Mermaid fences. Avoid HTML and image-only content; Mermaid diagrams must remain understandable from their source text.",
     );
     if let Some(persona) = turn
         .persona
@@ -520,6 +531,65 @@ fn system_messages(turn: &HarnessTurn) -> Vec<ChatMessage> {
         system.push_str(&turn.trusted_context.join("\n\n"));
     }
     vec![ChatMessage::text(ChatRole::System, system)]
+}
+
+fn sanitize_agent_response(text: &str) -> String {
+    let text = strip_private_reasoning(text);
+    [
+        "I am an AI system",
+        "I'm an AI system",
+        "built by a team of inventors at Amazon",
+        "created by a team of inventors at Amazon",
+        "built by Amazon",
+        "created by Amazon",
+    ]
+    .into_iter()
+    .enumerate()
+    .fold(text, |output, (index, claim)| {
+        let replacement = if index < 2 {
+            "I am Crumb, an AI agent"
+        } else {
+            "built by Elixpo"
+        };
+        replace_ascii_case_insensitive(&output, claim, replacement)
+    })
+    .trim()
+    .to_owned()
+}
+
+fn strip_private_reasoning(text: &str) -> String {
+    let mut output = text.to_owned();
+    for (opening, closing) in [("<thinking>", "</thinking>"), ("<analysis>", "</analysis>")] {
+        loop {
+            let lowercase = output.to_ascii_lowercase();
+            let Some(start) = lowercase.find(opening) else {
+                break;
+            };
+            let Some(relative_end) = lowercase[start + opening.len()..].find(closing) else {
+                output.truncate(start);
+                break;
+            };
+            let end = start + opening.len() + relative_end + closing.len();
+            output.replace_range(start..end, "");
+        }
+    }
+    output
+}
+
+fn replace_ascii_case_insensitive(text: &str, needle: &str, replacement: &str) -> String {
+    let lowercase = text.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let mut output = String::with_capacity(text.len());
+    let mut start = 0;
+    while let Some(offset) = lowercase[start..].find(&needle) {
+        let match_start = start + offset;
+        let match_end = match_start + needle.len();
+        output.push_str(&text[start..match_start]);
+        output.push_str(replacement);
+        start = match_end;
+    }
+    output.push_str(&text[start..]);
+    output
 }
 
 fn add_output_bytes(
@@ -827,6 +897,15 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, HarnessEvent::ToolFinished { success: true, .. }))
         );
+        let streamed = events
+            .iter()
+            .filter_map(|event| match event {
+                HarnessEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(streamed, "It is 24 C.");
+        assert!(!streamed.contains("placeholder"));
         let requests = provider.requests.lock().expect("request lock");
         assert_eq!(requests[0].messages[0].role, crumb_llm::ChatRole::System);
         assert_eq!(
@@ -855,6 +934,26 @@ mod tests {
         for secret in ["weather in Pune", "Pune", "24 C", "Be warm and brief"] {
             assert!(!persisted.contains(secret));
         }
+    }
+
+    #[test]
+    fn provider_identity_claims_are_corrected_at_the_product_boundary() {
+        assert_eq!(
+            super::sanitize_agent_response(
+                "I am Crumb, an AI system built by a team of inventors at Amazon."
+            ),
+            "I am Crumb, an AI system built by Elixpo."
+        );
+        assert_eq!(
+            super::sanitize_agent_response("Amazon Web Services is a cloud platform."),
+            "Amazon Web Services is a cloud platform."
+        );
+        assert_eq!(
+            super::sanitize_agent_response(
+                "<thinking>private chain of thought</thinking>\n\nI am an AI system built by Elixpo."
+            ),
+            "I am Crumb, an AI agent built by Elixpo."
+        );
     }
 
     #[tokio::test]

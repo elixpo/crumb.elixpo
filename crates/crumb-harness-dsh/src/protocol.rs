@@ -69,6 +69,7 @@ pub struct Notification {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HarnessActivity {
     RequestAccepted,
+    ResponseDelta { text: String },
     Status { state: String },
     ToolStarted { name: String },
     ApprovalRequired { name: String },
