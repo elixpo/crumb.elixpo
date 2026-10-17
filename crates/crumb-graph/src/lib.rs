@@ -165,6 +165,9 @@ impl ProjectGraph {
             bail!("project graph exceeds the byte limit");
         }
         let encoded = fs::read(graph_path).context("project graph could not be read")?;
+        if encoded.len() > limits.max_bytes {
+            bail!("project graph exceeds the byte limit");
+        }
         let raw: RawGraph =
             serde_json::from_slice(&encoded).context("project graph is malformed")?;
         if raw.graph.schema_version != GRAPHIFY_SCHEMA_VERSION {
@@ -399,19 +402,24 @@ impl ProjectGraph {
         self.evidence(&selected, truncated)
     }
 
-    fn evidence(&self, selected: &BTreeSet<String>, truncated: bool) -> GraphEvidence {
+    fn evidence(&self, selected: &BTreeSet<String>, mut truncated: bool) -> GraphEvidence {
         let nodes = selected
             .iter()
             .filter_map(|id| self.nodes.get(id))
             .map(|node| self.project_node(node))
             .collect();
-        let edges = self
+        let edge_limit = self.limits.max_results.saturating_mul(4);
+        let mut matching_edges = self
             .edges
             .iter()
             .filter(|edge| selected.contains(&edge.source) && selected.contains(&edge.target))
-            .take(self.limits.max_results.saturating_mul(4))
+            .peekable();
+        let edges = matching_edges
+            .by_ref()
+            .take(edge_limit)
             .map(|edge| self.project_edge(edge))
-            .collect();
+            .collect::<Vec<_>>();
+        truncated |= matching_edges.next().is_some();
         GraphEvidence {
             nodes,
             edges,
