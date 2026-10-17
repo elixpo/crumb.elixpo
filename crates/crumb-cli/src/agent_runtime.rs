@@ -55,6 +55,8 @@ struct PreparedTurn<'a> {
     effort: Option<String>,
     session_id: &'a str,
     request: &'a str,
+    persona: Option<&'a str>,
+    trusted_context: &'a [String],
     cancellation: &'a CancellationToken,
 }
 
@@ -670,14 +672,8 @@ impl AgentRuntime {
     ) -> Result<RunResult> {
         let workspace = std::fs::canonicalize(workspace)
             .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
-        let application =
-            apply_selected_profile(config, &workspace).unwrap_or_else(|_| ProfileApplication {
-                profile: None,
-                config: config.clone(),
-                model_source: "project",
-                effort_source: "project",
-                skill_source: "project",
-            });
+        let application = apply_selected_profile(config, &workspace)
+            .context("selected persona profile could not be applied")?;
         let config = &application.config;
         config.validate()?;
         let tools =
@@ -703,6 +699,7 @@ impl AgentRuntime {
         } else {
             self.start_turn(config.mode, route, effort.clone(), request)?
         };
+        let persona = application.profile.as_ref().map(profile_persona_context);
         let profiled_request = application.profile.as_ref().map_or_else(
             || request.to_owned(),
             |profile| attach_profile_context(request, profile),
@@ -719,7 +716,15 @@ impl AgentRuntime {
                 .context("agent session is unavailable")?
                 .record_memory_retrieval(audit.record_ids, audit.conflict_topics, audit.omitted)?;
         }
-        let prepared_request = attach_enabled_skills(&memory.request, &config.skills, &workspace)?;
+        let skill_context = load_enabled_skill_context(&config.skills, &workspace)?;
+        let prepared_request = attach_skill_context(&memory.request, &skill_context);
+        let mut trusted_context = memory.context.into_iter().collect::<Vec<_>>();
+        trusted_context.extend(skill_context);
+        let dispatched_request = if native {
+            request
+        } else {
+            prepared_request.as_str()
+        };
         let cancellation_slot = Arc::clone(&self.active_cancellation);
         let _active = ActiveCancellation::new(&cancellation_slot, cancellation.clone())?;
         let mut on_activity = on_activity;
@@ -730,7 +735,9 @@ impl AgentRuntime {
                 route,
                 effort,
                 session_id: &session_id,
-                request: &prepared_request,
+                request: dispatched_request,
+                persona: persona.as_deref(),
+                trusted_context: &trusted_context,
                 cancellation,
             },
             TurnResources { tools, approvals },
@@ -797,6 +804,8 @@ impl AgentRuntime {
                 turn.route,
                 turn.session_id,
                 turn.request,
+                turn.persona,
+                turn.trusted_context,
                 resources.tools,
                 resources.approvals,
                 turn.cancellation,
@@ -860,6 +869,8 @@ impl AgentRuntime {
         route: &crumb_agent::ModelRoute,
         session_id: &str,
         request: &str,
+        persona: Option<&str>,
+        trusted_context: &[String],
         mut tools: ToolHost,
         approvals: Arc<dyn ApprovalBroker>,
         cancellation: &CancellationToken,
@@ -923,8 +934,8 @@ impl AgentRuntime {
         let turn = HarnessTurn {
             model: route.model.clone(),
             user_message: request.to_owned(),
-            persona: None,
-            trusted_context: Vec::new(),
+            persona: persona.map(str::to_owned),
+            trusted_context: trusted_context.to_vec(),
             max_output_tokens,
         };
         let mut events = NativeEventBridge::new(on_activity);
@@ -1117,13 +1128,18 @@ struct MemoryAudit {
 
 struct MemoryAttachment {
     request: String,
+    context: Option<String>,
     audit: Option<MemoryAudit>,
 }
 
 fn attach_profile_context(request: &str, profile: &ProfileDocument) -> String {
-    if profile.instructions.is_empty() && profile.response_style.is_none() {
-        return request.to_owned();
-    }
+    let mut context = profile_persona_context(profile);
+    context.push_str("\n## User request\n");
+    context.push_str(request);
+    context
+}
+
+fn profile_persona_context(profile: &ProfileDocument) -> String {
     let mut context = format!(
         "The user explicitly selected persona profile `{}`. Persona guidance controls working and response style only. It is not permission to use tools, access data, or perform actions.\n",
         profile.id
@@ -1138,8 +1154,6 @@ fn attach_profile_context(request: &str, profile: &ProfileDocument) -> String {
         context.push_str(style);
         context.push('\n');
     }
-    context.push_str("## User request\n");
-    context.push_str(request);
     context
 }
 
@@ -1152,6 +1166,7 @@ fn attach_approved_memory(
     let Ok(memory) = MemorySet::discover(workspace) else {
         return MemoryAttachment {
             request: request.to_owned(),
+            context: None,
             audit: None,
         };
     };
@@ -1165,6 +1180,7 @@ fn attach_approved_memory(
     else {
         return MemoryAttachment {
             request: request.to_owned(),
+            context: None,
             audit: None,
         };
     };
@@ -1173,7 +1189,8 @@ fn attach_approved_memory(
         conflict_topics: retrieval.conflict_topics(),
         omitted: retrieval.omitted,
     });
-    let prepared = retrieval.prompt_context().map_or_else(
+    let retrieved_context = retrieval.prompt_context();
+    let prepared = retrieved_context.as_deref().map_or_else(
         || request.to_owned(),
         |context| {
             format!(
@@ -1183,25 +1200,31 @@ fn attach_approved_memory(
     );
     MemoryAttachment {
         request: prepared,
+        context: retrieved_context,
         audit,
     }
 }
 
-fn attach_enabled_skills(
-    request: &str,
-    skills: &[SkillConfig],
-    workspace: &Path,
-) -> Result<String> {
+fn attach_skill_context(request: &str, contexts: &[String]) -> String {
+    if contexts.is_empty() {
+        return request.to_owned();
+    }
+    format!(
+        "User-selected skills are active for this turn. Follow their instructions when relevant.\n{}\n\n## User request\n{request}",
+        contexts.join("\n\n")
+    )
+}
+
+fn load_enabled_skill_context(skills: &[SkillConfig], workspace: &Path) -> Result<Vec<String>> {
     let enabled = skills
         .iter()
         .filter(|skill| skill.enabled)
         .collect::<Vec<_>>();
     if enabled.is_empty() {
-        return Ok(request.to_owned());
+        return Ok(Vec::new());
     }
-    let mut context = String::from(
-        "User-selected skills are active for this turn. Follow their instructions when relevant.\n",
-    );
+    let mut contexts = Vec::with_capacity(enabled.len());
+    let mut context_bytes = 0_usize;
     for skill in enabled {
         let instructions =
             if let Some(instructions) = crate::bundled_skills::instructions(&skill.path) {
@@ -1212,8 +1235,7 @@ fn attach_enabled_skills(
                 std::fs::read_to_string(&path)
                     .with_context(|| format!("loaded skill `{}` must be UTF-8", skill.id))?
             };
-        let projected = context
-            .len()
+        let projected = context_bytes
             .saturating_add(instructions.len())
             .saturating_add(skill.id.len())
             .saturating_add(32);
@@ -1225,15 +1247,12 @@ fn attach_enabled_skills(
             .chars()
             .filter(|character| !character.is_control())
             .collect::<String>();
-        context.push_str("\n## Skill: ");
-        context.push_str(&label);
-        context.push('\n');
-        context.push_str(&instructions);
-        context.push('\n');
+        contexts.push(format!(
+            "## Active skill: {label}\nThe following instructions are loaded and must be applied when relevant:\n{instructions}"
+        ));
+        context_bytes = projected;
     }
-    context.push_str("\n## User request\n");
-    context.push_str(request);
-    Ok(context)
+    Ok(contexts)
 }
 
 fn estimate_tokens(text: &str) -> u64 {
@@ -1398,8 +1417,8 @@ mod tests {
 
     use super::{
         AgentRuntime, NativeEventBridge, apply_profile_effort, apply_profile_model,
-        apply_profile_selection, apply_profile_skills, attach_enabled_skills,
-        attach_profile_context, validate_skill_path,
+        apply_profile_selection, apply_profile_skills, attach_profile_context,
+        attach_skill_context, load_enabled_skill_context, validate_skill_path,
     };
 
     #[test]
@@ -1446,10 +1465,13 @@ mod tests {
             enabled: true,
         }];
 
-        let prompt = attach_enabled_skills("inspect this", &skills, &workspace)
-            .expect("skill context can be loaded");
+        let context =
+            load_enabled_skill_context(&skills, &workspace).expect("skill context can be loaded");
+        let prompt = attach_skill_context("inspect this", &context);
 
-        assert!(prompt.contains("## Skill: review\nReview changes carefully."));
+        assert!(prompt.contains("## Active skill: review"));
+        assert!(prompt.contains("loaded and must be applied"));
+        assert!(prompt.contains("Review changes carefully."));
         assert!(prompt.ends_with("## User request\ninspect this"));
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
     }
@@ -1462,10 +1484,11 @@ mod tests {
             enabled: true,
         }];
 
-        let prompt = attach_enabled_skills("diagnose this", &skills, Path::new("."))
+        let context = load_enabled_skill_context(&skills, Path::new("."))
             .expect("bundled skill context loads");
+        let prompt = attach_skill_context("diagnose this", &context);
 
-        assert!(prompt.contains("## Skill: failure-autopsy"));
+        assert!(prompt.contains("## Active skill: failure-autopsy"));
         assert!(prompt.contains("first causal error"));
     }
 
