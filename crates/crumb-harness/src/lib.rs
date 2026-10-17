@@ -13,8 +13,8 @@ use crumb_agent::{
     TurnStatus,
 };
 use crumb_llm::{
-    ChatEvent, ChatMessage, ChatRequest, ChatRole, FinishReason, LlmProvider, ProviderError,
-    TokenUsage, ToolCall, ToolChoice, ToolDefinition,
+    ChatEvent, ChatMessage, ChatRequest, ChatRole, FinishReason, ImageInput, LlmProvider,
+    ProviderError, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
 };
 use tokio::time::Instant;
 
@@ -49,10 +49,17 @@ impl Default for HarnessLimits {
 pub struct HarnessTurn {
     pub model: String,
     pub user_message: String,
+    pub images: Vec<ImageInput>,
     pub persona: Option<String>,
     pub static_context: Vec<String>,
     pub trusted_context: Vec<String>,
     pub max_output_tokens: Option<u32>,
+}
+
+impl HarnessTurn {
+    fn user_chat_message(&self) -> ChatMessage {
+        ChatMessage::user_with_images(self.user_message.clone(), self.images.clone())
+    }
 }
 
 /// Transient event vocabulary emitted to a trusted caller.
@@ -339,7 +346,7 @@ impl NativeHarness {
         let deadline = Instant::now() + self.limits.turn_timeout;
         let mut messages = system_messages(&turn);
         messages.extend(conversation.messages());
-        messages.push(ChatMessage::text(ChatRole::User, turn.user_message.clone()));
+        messages.push(turn.user_chat_message());
         let definitions = tool_definitions_for_turn(&self.tools, &turn.user_message);
         let mut usage = TokenUsage::default();
         let mut output_bytes = 0_usize;
@@ -404,6 +411,7 @@ impl NativeHarness {
             messages.push(ChatMessage {
                 role: ChatRole::Assistant,
                 content: round.text,
+                images: Vec::new(),
                 tool_call_id: None,
                 tool_calls: round.calls.clone(),
             });
@@ -1487,6 +1495,7 @@ mod tests {
         HarnessTurn {
             model: "fixture".to_owned(),
             user_message: "weather in Pune".to_owned(),
+            images: Vec::new(),
             persona: Some("Be warm and brief.".to_owned()),
             static_context: vec!["Skill: web research".to_owned()],
             trusted_context: vec!["Locale: en-IN".to_owned()],

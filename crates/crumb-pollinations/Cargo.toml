@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 bytes.workspace = true
 crumb-agent = { path = "../crumb-agent" }
 crumb-llm = { path = "../crumb-llm" }

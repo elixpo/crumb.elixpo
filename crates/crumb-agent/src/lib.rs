@@ -18,7 +18,7 @@ pub use approvals::{ApprovalInbox, InteractiveApprovalBroker, PendingApproval, a
 pub use backend::{BackendDiscovery, CodingBackend};
 pub use config::{
     AgentConfig, AgentLimits, AgentMode, ApprovalMode, CacheRetention, CompatibilityFlag,
-    CredentialReference, HarnessConfig, LiveConfig, MistakePolicy, Modality, ModelRoute,
+    CredentialReference, HarnessConfig, LiveConfig, MistakePolicy, Modality, ModelPack, ModelRoute,
     OptimizerConfig, ProviderCompatibility, ProviderConfig, ProviderHeader, ProviderModel,
     ProviderProtocol, ProviderRetryPolicy, ProviderTransport, SkillConfig, StructuredEncoding,
     ToolPermissions,

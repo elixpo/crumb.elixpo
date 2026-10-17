@@ -28,7 +28,7 @@ use crumb_agent::{
     AgentConfig, AgentMode, ApprovalMode, BackendDiscovery, CacheRetention, CancellationToken,
     CommandCatalog, CompatibilityFlag, ConfiguredApprovals, CredentialReference, HarnessConfig,
     InputRoute, JobId, JobSchedule, JobState, JobStore, LiveConfig, McpServer, McpTransport,
-    MistakePolicy, Modality, ModelRoute, NewJob, OutputKind, PendingApproval,
+    MistakePolicy, Modality, ModelPack, ModelRoute, NewJob, OutputKind, PendingApproval,
     ProviderCompatibility, ProviderConfig, ProviderHeader, ProviderModel, ProviderProtocol,
     ProviderTransport, RiskClass, RouteDecision, RouteReason, SkillConfig, SteeringAction,
     SteeringQueue, TokenOptimizer, ToolHost, TurnStatus, UnknownInputPolicy, export_session,
@@ -1226,7 +1226,11 @@ fn render_startup(
         platform,
         model: model.as_deref(),
         mode: agent_mode_name(config.mode),
-        effort: text_route.and_then(|route| config.reasoning_effort_for(route)),
+        effort: Some(
+            text_route
+                .and_then(|route| config.reasoning_effort_for(route))
+                .map_or("default", effort_display_name),
+        ),
         session_budget_tokens: context_token_budget(&config, text_route),
         context_tokens,
         auto_compaction: matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
@@ -1352,7 +1356,11 @@ fn context_footer_status(
         platform,
         model: model.as_deref(),
         mode: agent_mode_name(config.mode),
-        effort: text_route.and_then(|route| config.reasoning_effort_for(route)),
+        effort: Some(
+            text_route
+                .and_then(|route| config.reasoning_effort_for(route))
+                .map_or("default", effort_display_name),
+        ),
         session_budget_tokens: context_token_budget(&config, text_route),
         context_tokens,
         auto_compaction: matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
@@ -1853,6 +1861,7 @@ fn read_agent_config(cwd: &Path) -> Result<AgentConfig> {
     let (path, config_root) = agent_config_location(cwd);
     let mut config = LiveConfig::new(path).load_or_default()?;
     bundled_skills::apply_defaults(&mut config);
+    apply_builtin_model_packs(&mut config);
     if let Some(HarnessConfig::Process {
         command, cordis, ..
     }) = &mut config.harness
@@ -1903,7 +1912,11 @@ fn handle_agent_boundary(
     let model = route.map_or("not configured".to_owned(), |route| {
         format!("{}/{}", route.provider, route.model)
     });
-    let effort = route.and_then(|route| config.reasoning_effort_for(route));
+    let effort = Some(
+        route
+            .and_then(|route| config.reasoning_effort_for(route))
+            .map_or("default", effort_display_name),
+    );
     write!(writer, "\r\x1b[2K")?;
     writeln!(
         writer,
@@ -3832,6 +3845,7 @@ fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
             &[
                 "/mode",
                 "/model",
+                "/pack",
                 "/effort",
                 "/session",
                 "/review",
@@ -3963,6 +3977,7 @@ fn show_reserved(
             )?;
         }
         "/model" => show_models(cwd, writer)?,
+        "/pack" => show_model_packs(cwd, writer)?,
         "/effort" => {
             let config = read_agent_config(cwd)?;
             let text_route = config
@@ -3982,6 +3997,9 @@ fn show_reserved(
         }
         command if command.starts_with("/model use ") => {
             set_text_model(command, cwd, writer)?;
+        }
+        command if command.starts_with("/pack use ") => {
+            set_model_pack(command, cwd, writer)?;
         }
         command if command.starts_with("/effort use ") => {
             set_reasoning_effort(command, cwd, writer)?;
@@ -4040,11 +4058,41 @@ fn show_reserved(
         command if command == "/session" || command.starts_with("/session ") => {
             show_sessions(command, cwd, runtime, writer)?;
         }
+        "/cost" => show_provider_usage(cwd, runtime.as_ref(), writer)?,
         _ => {
             writeln!(writer, "◇ {command}")?;
             writeln!(writer, "  Reserved by Crumb; not available in this build.")?;
         }
     }
+    Ok(())
+}
+
+fn show_provider_usage(
+    cwd: &Path,
+    runtime: Option<&AgentRuntime>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    let provider = config
+        .models
+        .get(&Modality::Text)
+        .and_then(|routes| routes.first())
+        .map_or("provider", |route| route.provider.as_str());
+    let (input, output) = runtime.map_or((0, 0), AgentRuntime::provider_token_usage);
+    let (_, estimated, _) = runtime.map_or((0, 0, 0), AgentRuntime::token_usage);
+    writeln!(writer, "◆ Session usage · {provider}")?;
+    writeln!(
+        writer,
+        "  reported  {} input · {} output · {} total tokens",
+        compact_token_count(input),
+        compact_token_count(output),
+        compact_token_count(input.saturating_add(output))
+    )?;
+    writeln!(
+        writer,
+        "  estimated {} session tokens (used only when provider usage is absent)",
+        compact_token_count(estimated)
+    )?;
     Ok(())
 }
 
@@ -4482,6 +4530,76 @@ fn set_text_model(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<(
     Ok(())
 }
 
+fn show_model_packs(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    writeln!(writer, "◆ Model packs")?;
+    if config.model_packs.is_empty() {
+        writeln!(writer, "  No packs configured")?;
+        return Ok(());
+    }
+    for (id, pack) in &config.model_packs {
+        let marker = if config.active_model_pack.as_deref() == Some(id) {
+            "●"
+        } else {
+            "○"
+        };
+        writeln!(writer, "  {marker} {} ({id})", pack.label)?;
+        writeln!(
+            writer,
+            "    router {} · vision {} · image {} · coder {}",
+            pack.router.model, pack.vision.model, pack.image_generation.model, pack.coder.model
+        )?;
+    }
+    writeln!(writer, "  Switch with `/pack use <id>`")?;
+    Ok(())
+}
+
+fn set_model_pack(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let id = command
+        .strip_prefix("/pack use ")
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .context("usage: /pack use <id>")?;
+    let selected = update_agent_config(cwd, |config| {
+        let pack = config
+            .model_packs
+            .get(id)
+            .cloned()
+            .with_context(|| format!("model pack `{id}` is not configured"))?;
+        promote_model_route(&mut config.models, Modality::Text, pack.coder.clone());
+        promote_model_route(&mut config.models, Modality::Text, pack.router.clone());
+        promote_model_route(
+            &mut config.models,
+            Modality::Image,
+            pack.image_generation.clone(),
+        );
+        config.active_model_pack = Some(id.to_owned());
+        Ok(())
+    })?;
+    let pack = selected
+        .model_packs
+        .get(id)
+        .context("selected model pack disappeared")?;
+    writeln!(writer, "◆ Model pack · {}", pack.label)?;
+    writeln!(
+        writer,
+        "  router {} · vision {} · image {} · coder {}",
+        pack.router.model, pack.vision.model, pack.image_generation.model, pack.coder.model
+    )?;
+    Ok(())
+}
+
+fn promote_model_route(
+    routes: &mut BTreeMap<Modality, Vec<ModelRoute>>,
+    modality: Modality,
+    route: ModelRoute,
+) {
+    let candidates = routes.entry(modality).or_default();
+    candidates
+        .retain(|candidate| candidate.provider != route.provider || candidate.model != route.model);
+    candidates.insert(0, route);
+}
+
 fn set_reasoning_effort(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     let value = command
         .strip_prefix("/effort use ")
@@ -4493,12 +4611,13 @@ fn set_reasoning_effort(command: &str, cwd: &Path, writer: &mut dyn Write) -> Re
     let selected = effort_wire_name(value)?;
     let display = selected.as_deref().map_or("default", effort_display_name);
     update_agent_config(cwd, |config| {
-        let route = config
-            .models
-            .get_mut(&Modality::Text)
-            .and_then(|routes| routes.first_mut())
-            .context("select a text model before setting reasoning effort")?;
-        route.reasoning_effort.clone_from(&selected);
+        if !config.models.contains_key(&Modality::Text) {
+            bail!("select a text model before setting reasoning effort");
+        }
+        config.reasoning_effort.clone_from(&selected);
+        for route in config.models.values_mut().flatten() {
+            route.reasoning_effort = None;
+        }
         Ok(())
     })?;
     writeln!(writer, "◆ Reasoning effort · {display}")?;
@@ -4516,7 +4635,7 @@ fn effort_wire_name(value: &str) -> Result<Option<String>> {
         ["ultra" | "max"] => "max",
         _ => {
             return Err(anyhow!(
-                "effort must be light, medium, high, extra high, ultra, or default"
+                "effort must be light, medium, high, extra high, or default"
             ));
         }
     };
@@ -5453,8 +5572,62 @@ where
 {
     raw_agent_config(cwd).update(|config| {
         bundled_skills::apply_defaults(config);
+        apply_builtin_model_packs(config);
         mutate(config)
     })
+}
+
+fn apply_builtin_model_packs(config: &mut AgentConfig) {
+    let has_model = |model: &str| {
+        config
+            .providers
+            .get("pollinations")
+            .is_some_and(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .any(|candidate| candidate.id == model)
+            })
+    };
+    if ![
+        "nova-fast",
+        "qwen-coder",
+        "Circuit-Overtime/OreoLook",
+        "flux",
+        "klein",
+    ]
+    .into_iter()
+    .all(has_model)
+    {
+        return;
+    }
+    let route = |model: &str| ModelRoute {
+        provider: "pollinations".to_owned(),
+        model: model.to_owned(),
+        reasoning_effort: None,
+    };
+    for (id, label, router, image) in [
+        ("quick", "Quick Crumb", "nova-fast", "flux"),
+        ("balanced", "Balanced Crumb", "nova-fast", "klein"),
+        ("deep", "Deep Crumb", "Circuit-Overtime/OreoLook", "klein"),
+    ] {
+        config
+            .model_packs
+            .entry(id.to_owned())
+            .or_insert_with(|| ModelPack {
+                label: label.to_owned(),
+                router: route(router),
+                vision: route("Circuit-Overtime/OreoLook"),
+                image_generation: route(image),
+                coder: route("qwen-coder"),
+                voice: None,
+                transcription: has_model("whisper").then(|| route("whisper")),
+                text_to_speech: has_model("elevenflash").then(|| route("elevenflash")),
+            });
+    }
+    if config.active_model_pack.is_none() {
+        config.active_model_pack = Some("quick".to_owned());
+    }
 }
 
 fn show_jobs(

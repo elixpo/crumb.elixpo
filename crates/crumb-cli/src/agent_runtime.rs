@@ -25,6 +25,7 @@ use crumb_harness_dsh::{
     HarnessActivity, HarnessEnvironment, HarnessIdentity, HarnessLaunch, HarnessSupervisor,
     Notification, RunResult, SupervisorLimits,
 };
+use crumb_llm::ImageInput;
 use crumb_memory::{MemorySet, RetrievalPolicy};
 use crumb_pollinations::{PollinationsConfig, PollinationsProvider};
 use crumb_profile::{ProfileDocument, ProfileSelectionStore, ProfileStore};
@@ -271,6 +272,8 @@ pub struct AgentRuntime {
     environment_revision: u64,
     context_tokens_estimate: u64,
     session_tokens_estimate: u64,
+    provider_input_tokens: u64,
+    provider_output_tokens: u64,
     compactions: u32,
     review_notes: Vec<ReviewNote>,
     review_note_bytes: usize,
@@ -438,6 +441,8 @@ impl AgentRuntime {
             environment_revision: 1,
             context_tokens_estimate: 0,
             session_tokens_estimate: 0,
+            provider_input_tokens: 0,
+            provider_output_tokens: 0,
             compactions: 0,
             review_notes: Vec::new(),
             review_note_bytes: 0,
@@ -565,6 +570,12 @@ impl AgentRuntime {
             self.session_tokens_estimate,
             self.compactions,
         )
+    }
+
+    /// Returns provider-reported input and output tokens for this process.
+    #[must_use]
+    pub const fn provider_token_usage(&self) -> (u64, u64) {
+        (self.provider_input_tokens, self.provider_output_tokens)
     }
 
     /// Runs a turn off the terminal input thread and emits only bounded,
@@ -703,10 +714,7 @@ impl AgentRuntime {
             None => Arc::new(configured),
         };
         self.ensure_session(&workspace, config.mode)?;
-        let route = config
-            .models
-            .get(&Modality::Text)
-            .and_then(|routes| routes.first())
+        let route = select_request_route(config, request)
             .context("agent config has no text model route")?;
         let effort = config.reasoning_effort_for(route).map(str::to_owned);
         let native = matches!(config.harness, Some(HarnessConfig::Native));
@@ -849,6 +857,14 @@ impl AgentRuntime {
         let reported = result.map_or(0, |result| {
             result.input_tokens.saturating_add(result.output_tokens)
         });
+        if let Some(result) = result {
+            self.provider_input_tokens = self
+                .provider_input_tokens
+                .saturating_add(result.input_tokens);
+            self.provider_output_tokens = self
+                .provider_output_tokens
+                .saturating_add(result.output_tokens);
+        }
         let turn_tokens = estimated.max(reported);
         self.session_tokens_estimate = self.session_tokens_estimate.saturating_add(turn_tokens);
         let reported_context = result.map_or(0, |result| result.context_tokens);
@@ -915,11 +931,11 @@ impl AgentRuntime {
                 route.provider
             );
         }
-        let provider = config
+        let provider_config = config
             .providers
             .get(&route.provider)
             .context("native Harness provider is not configured")?;
-        let credential = provider
+        let credential = provider_config
             .credential
             .as_ref()
             .map(crate::provider_projection::resolve_credential_secret)
@@ -928,11 +944,11 @@ impl AgentRuntime {
                 Some(secret.expose().to_owned())
             })
             .context("Pollinations credential is unavailable")?;
-        let base_url = provider
+        let base_url = provider_config
             .base_url
             .trim_end_matches('/')
             .strip_suffix("/v1")
-            .unwrap_or(provider.base_url.trim_end_matches('/'));
+            .unwrap_or(provider_config.base_url.trim_end_matches('/'));
         let provider: Arc<dyn crumb_llm::LlmProvider> = Arc::new(PollinationsProvider::new(
             PollinationsConfig::new(credential)?.with_base_url(base_url)?,
         )?);
@@ -953,7 +969,7 @@ impl AgentRuntime {
             Arc::clone(&provider),
             ParallelAgentConfig {
                 journal_root: session_root(&workspace).join("agents"),
-                workspace,
+                workspace: workspace.clone(),
                 model: route.model.clone(),
                 max_output_tokens: child_output_tokens,
                 harness_limits: parallel_harness_limits(harness_limits),
@@ -967,6 +983,11 @@ impl AgentRuntime {
         let turn = HarnessTurn {
             model: route.model.clone(),
             user_message: request.to_owned(),
+            images: load_request_images(
+                &workspace,
+                request,
+                provider_config.max_request_image_bytes,
+            )?,
             persona: persona.map(str::to_owned),
             static_context: static_context.to_vec(),
             trusted_context: trusted_context.to_vec(),
@@ -1121,6 +1142,128 @@ impl AgentRuntime {
         }
         self.supervisor_limits = None;
         Ok(())
+    }
+}
+
+fn select_request_route<'a>(
+    config: &'a AgentConfig,
+    request: &str,
+) -> Option<&'a crumb_agent::ModelRoute> {
+    if matches!(config.harness, Some(HarnessConfig::Native))
+        && request_has_image_reference(request)
+        && let Some(pack) = config
+            .active_model_pack
+            .as_ref()
+            .and_then(|id| config.model_packs.get(id))
+    {
+        return Some(&pack.vision);
+    }
+    if let Some(pack) = config
+        .active_model_pack
+        .as_ref()
+        .and_then(|id| config.model_packs.get(id))
+        && request_needs_coder(request)
+    {
+        return Some(&pack.coder);
+    }
+    config
+        .models
+        .get(&Modality::Text)
+        .and_then(|routes| routes.first())
+}
+
+fn request_needs_coder(request: &str) -> bool {
+    let request = request.to_ascii_lowercase();
+    [
+        "code",
+        "implement",
+        "refactor",
+        "debug",
+        "fix the test",
+        "fix this test",
+        "compile",
+        "cargo ",
+        "npm ",
+        "python",
+        ".rs",
+        ".ts",
+        ".tsx",
+        ".py",
+    ]
+    .iter()
+    .any(|term| request.contains(term))
+}
+
+fn request_has_image_reference(request: &str) -> bool {
+    request.split_whitespace().any(|token| {
+        token
+            .strip_prefix("@file:")
+            .map(|path| path.trim_matches(['\'', '"', ',', ';']))
+            .and_then(|path| Path::new(path).extension())
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "webp" | "gif"
+                )
+            })
+    })
+}
+
+fn load_request_images(
+    workspace: &Path,
+    request: &str,
+    configured_limit: Option<u64>,
+) -> Result<Vec<ImageInput>> {
+    let canonical_workspace = std::fs::canonicalize(workspace)
+        .with_context(|| format!("workspace `{}` is unavailable", workspace.display()))?;
+    let limit = usize::try_from(configured_limit.unwrap_or(10 * 1024 * 1024)).unwrap_or(usize::MAX);
+    let mut images = Vec::new();
+    let mut total = 0_usize;
+    let mut seen = BTreeSet::new();
+    for token in request.split_whitespace() {
+        let Some(path) = token.strip_prefix("@file:") else {
+            continue;
+        };
+        let path = path.trim_matches(['\'', '"', ',', ';']);
+        let Some((media_type, _)) = image_media_type(Path::new(path)) else {
+            continue;
+        };
+        let candidate = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            canonical_workspace.join(path)
+        };
+        let canonical = std::fs::canonicalize(&candidate).with_context(|| {
+            format!("image attachment `{}` is unavailable", candidate.display())
+        })?;
+        if !canonical.starts_with(&canonical_workspace) {
+            bail!("image attachments must stay inside the trusted workspace");
+        }
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        let data = std::fs::read(&canonical)
+            .with_context(|| format!("failed to read image attachment `{path}`"))?;
+        total = total.saturating_add(data.len());
+        if total > limit {
+            bail!("image attachments exceed the configured {limit}-byte request limit");
+        }
+        images.push(ImageInput {
+            media_type: media_type.to_owned(),
+            data,
+        });
+    }
+    Ok(images)
+}
+
+fn image_media_type(path: &Path) -> Option<(&'static str, &'static str)> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => Some(("image/png", "png")),
+        "jpg" | "jpeg" => Some(("image/jpeg", "jpeg")),
+        "webp" => Some(("image/webp", "webp")),
+        "gif" => Some(("image/gif", "gif")),
+        _ => None,
     }
 }
 
@@ -1583,7 +1726,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crumb_agent::{AgentConfig, Modality, ModelRoute, SkillConfig};
+    use crumb_agent::{AgentConfig, Modality, ModelPack, ModelRoute, SkillConfig};
     use crumb_harness::{EventSink, HarnessEvent};
     use crumb_harness_dsh::HarnessActivity;
     use crumb_llm::TokenUsage;
@@ -1592,8 +1735,73 @@ mod tests {
     use super::{
         AgentRuntime, NativeEventBridge, apply_profile_effort, apply_profile_model,
         apply_profile_selection, apply_profile_skills, attach_profile_context,
-        attach_skill_context, load_enabled_skill_context, validate_skill_path,
+        attach_skill_context, load_enabled_skill_context, load_request_images, request_needs_coder,
+        select_request_route, validate_skill_path,
     };
+
+    fn route(model: &str) -> ModelRoute {
+        ModelRoute {
+            provider: "pollinations".to_owned(),
+            model: model.to_owned(),
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn active_pack_routes_code_and_images_to_specialists() {
+        let mut config = AgentConfig {
+            harness: Some(crumb_agent::HarnessConfig::Native),
+            active_model_pack: Some("balanced".to_owned()),
+            ..AgentConfig::default()
+        };
+        config.models.insert(Modality::Text, vec![route("router")]);
+        config.model_packs.insert(
+            "balanced".to_owned(),
+            ModelPack {
+                label: "Balanced".to_owned(),
+                router: route("router"),
+                vision: route("vision"),
+                image_generation: route("image"),
+                coder: route("coder"),
+                voice: None,
+                transcription: None,
+                text_to_speech: None,
+            },
+        );
+
+        assert_eq!(
+            select_request_route(&config, "hello")
+                .expect("router")
+                .model,
+            "router"
+        );
+        assert_eq!(
+            select_request_route(&config, "fix this Rust code")
+                .expect("coder")
+                .model,
+            "coder"
+        );
+        assert_eq!(
+            select_request_route(&config, "describe @file:screenshot.png")
+                .expect("vision")
+                .model,
+            "vision"
+        );
+        assert!(request_needs_coder("implement the parser"));
+    }
+
+    #[test]
+    fn image_attachments_are_loaded_as_bounded_binary_inputs() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("screen.png"), [0, 1, 2]).expect("image fixture");
+
+        let images = load_request_images(workspace.path(), "inspect @file:screen.png", Some(16))
+            .expect("image loads");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].media_type, "image/png");
+        assert_eq!(images[0].data, [0, 1, 2]);
+    }
 
     #[test]
     fn native_bridge_forwards_safe_tool_progress() {

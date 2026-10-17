@@ -84,12 +84,20 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "select an exact provider/model",
     },
     SlashCommand {
+        usage: "/pack",
+        description: "inspect model capability packs",
+    },
+    SlashCommand {
+        usage: "/pack use ",
+        description: "switch router, vision, image, and coder models together",
+    },
+    SlashCommand {
         usage: "/effort",
         description: "inspect or set reasoning effort",
     },
     SlashCommand {
         usage: "/effort use ",
-        description: "set light, medium, high, extra high, ultra, or default",
+        description: "set light, medium, high, extra high, or default",
     },
     SlashCommand {
         usage: "/session",

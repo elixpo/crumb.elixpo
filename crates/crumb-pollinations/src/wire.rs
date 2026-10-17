@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use crumb_llm::{
     ChatEvent, ChatRequest, ChatRole, EmbeddingRequest, EmbeddingResponse, FinishReason,
     ModelCapability, ModelInfo, ProviderError, ProviderErrorKind, ProviderResult, TokenUsage,
@@ -76,7 +77,26 @@ impl<'a> ChatCompletionMessage<'a> {
     fn new(message: &'a crumb_llm::ChatMessage, cacheable: bool) -> Self {
         Self {
             role: role_name(message.role),
-            content: if cacheable {
+            content: if !message.images.is_empty() {
+                let mut parts = vec![ChatContentBlock::Text {
+                    text: &message.content,
+                }];
+                parts.extend(
+                    message
+                        .images
+                        .iter()
+                        .map(|image| ChatContentBlock::ImageUrl {
+                            image_url: ImageUrl {
+                                url: format!(
+                                    "data:{};base64,{}",
+                                    image.media_type,
+                                    base64::engine::general_purpose::STANDARD.encode(&image.data)
+                                ),
+                            },
+                        }),
+                );
+                ChatCompletionContent::Parts(parts)
+            } else if cacheable {
                 ChatCompletionContent::Cached([CachedTextBlock {
                     kind: "text",
                     text: &message.content,
@@ -100,6 +120,19 @@ impl<'a> ChatCompletionMessage<'a> {
 enum ChatCompletionContent<'a> {
     Text(&'a str),
     Cached([CachedTextBlock<'a>; 1]),
+    Parts(Vec<ChatContentBlock<'a>>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ChatContentBlock<'a> {
+    Text { text: &'a str },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Serialize)]
+struct ImageUrl {
+    url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -507,8 +540,8 @@ fn protocol_error(message: &'static str) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use crumb_llm::{
-        ChatEvent, ChatMessage, ChatRequest, ChatRole, FinishReason, ProviderErrorKind, TokenUsage,
-        ToolChoice, ToolDefinition,
+        ChatEvent, ChatMessage, ChatRequest, ChatRole, FinishReason, ImageInput, ProviderErrorKind,
+        TokenUsage, ToolChoice, ToolDefinition,
     };
 
     use super::{ChatCompletionRequest, SseDecoder};
@@ -581,6 +614,34 @@ mod tests {
             .expect("request should serialize");
 
         assert_eq!(json["messages"][0]["content"], "stable");
+    }
+
+    #[test]
+    fn vision_request_serializes_text_and_data_url_parts() {
+        let request = ChatRequest {
+            model: "vision".to_owned(),
+            messages: vec![ChatMessage::user_with_images(
+                "describe this",
+                vec![ImageInput {
+                    media_type: "image/png".to_owned(),
+                    data: vec![0, 1, 2],
+                }],
+            )],
+            tools: Vec::new(),
+            tool_choice: ToolChoice::None,
+            max_output_tokens: None,
+        };
+
+        let json = serde_json::to_value(ChatCompletionRequest::from(&request))
+            .expect("vision request should serialize");
+
+        assert_eq!(json["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(json["messages"][0]["content"][0]["text"], "describe this");
+        assert_eq!(json["messages"][0]["content"][1]["type"], "image_url");
+        assert_eq!(
+            json["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AAEC"
+        );
     }
 
     #[test]

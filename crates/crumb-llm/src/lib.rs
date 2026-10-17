@@ -45,6 +45,7 @@ pub enum ChatRole {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    pub images: Vec<ImageInput>,
     pub tool_call_id: Option<String>,
     pub tool_calls: Vec<ToolCall>,
 }
@@ -55,6 +56,7 @@ impl ChatMessage {
         Self {
             role,
             content: content.into(),
+            images: Vec::new(),
             tool_call_id: None,
             tool_calls: Vec::new(),
         }
@@ -65,6 +67,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::Assistant,
             content: String::new(),
+            images: Vec::new(),
             tool_call_id: None,
             tool_calls: calls,
         }
@@ -75,7 +78,28 @@ impl ChatMessage {
         Self {
             role: ChatRole::Tool,
             content: content.into(),
+            images: Vec::new(),
             tool_call_id: Some(call_id.into()),
+            tool_calls: Vec::new(),
+        }
+    }
+}
+
+/// One trusted, bounded image supplied to a vision-capable chat model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageInput {
+    pub media_type: String,
+    pub data: Vec<u8>,
+}
+
+impl ChatMessage {
+    #[must_use]
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImageInput>) -> Self {
+        Self {
+            role: ChatRole::User,
+            content: content.into(),
+            images,
+            tool_call_id: None,
             tool_calls: Vec::new(),
         }
     }
