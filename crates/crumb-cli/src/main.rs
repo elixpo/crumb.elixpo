@@ -3153,19 +3153,27 @@ fn render_finished_tool(
     writer: &mut dyn Write,
     fullscreen: bool,
 ) -> Result<()> {
+    let elapsed = indicator
+        .as_ref()
+        .map_or(Duration::ZERO, crumb_ui::ActivityIndicator::elapsed);
     finish_activity_line(indicator, writer)?;
     let detail = state
         .active_tool
         .take()
         .filter(|(active_name, _)| active_name == name)
         .and_then(|(_, detail)| detail);
-    if name == "spawn_agents" || detail.is_none() {
+    if name == "spawn_agents" {
         writeln!(writer, "{}", renderer.agent_tool_result(name, success))?;
     } else {
         writeln!(
             writer,
             "{}",
-            renderer.agent_activity(&finished_tool_activity(name, detail.as_deref(), success))
+            renderer.agent_activity(&finished_tool_activity(
+                name,
+                detail.as_deref(),
+                success,
+                elapsed,
+            ))
         )?;
     }
     writer.flush()?;
@@ -3185,7 +3193,12 @@ fn visible_tool_activity(name: &str, detail: Option<&str>) -> String {
     }
 }
 
-fn finished_tool_activity(name: &str, detail: Option<&str>, success: bool) -> String {
+fn finished_tool_activity(
+    name: &str,
+    detail: Option<&str>,
+    success: bool,
+    elapsed: Duration,
+) -> String {
     let verb = match (name, success) {
         ("run_shell", true) => "Ran command",
         ("run_shell", false) => "Command failed",
@@ -3196,10 +3209,20 @@ fn finished_tool_activity(name: &str, detail: Option<&str>, success: bool) -> St
         (_, true) => "Tool completed",
         (_, false) => "Tool failed",
     };
+    let elapsed = format_activity_elapsed(elapsed);
     match (name, detail) {
-        ("run_shell", Some(command)) => format!("{verb} · $ {command}"),
-        (_, Some(detail)) => format!("{verb} · {detail}"),
-        (_, None) => format!("{verb} · {name}"),
+        ("run_shell", Some(command)) => format!("{verb} · {elapsed} · $ {command}"),
+        (_, Some(detail)) => format!("{verb} · {elapsed} · {detail}"),
+        (_, None) => format!("{verb} · {elapsed} · {name}"),
+    }
+}
+
+fn format_activity_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs_f32();
+    if seconds < 10.0 {
+        format!("{seconds:.1}s")
+    } else {
+        format!("{seconds:.0}s")
     }
 }
 
@@ -10198,12 +10221,22 @@ mod tests {
             "Running command · $ command -v g++ && g++ --version"
         );
         assert_eq!(
-            finished_tool_activity("run_shell", Some("command -v g++ && g++ --version"), true,),
-            "Ran command · $ command -v g++ && g++ --version"
+            finished_tool_activity(
+                "run_shell",
+                Some("command -v g++ && g++ --version"),
+                true,
+                Duration::from_millis(30_120),
+            ),
+            "Ran command · 30s · $ command -v g++ && g++ --version"
         );
         assert_eq!(
-            finished_tool_activity("web_search", Some("Crumb terminal agent"), true),
-            "Searched the web · Crumb terminal agent"
+            finished_tool_activity(
+                "web_search",
+                Some("Crumb terminal agent"),
+                true,
+                Duration::from_millis(850),
+            ),
+            "Searched the web · 0.9s · Crumb terminal agent"
         );
     }
 

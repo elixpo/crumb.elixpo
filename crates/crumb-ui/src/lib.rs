@@ -1143,6 +1143,12 @@ impl ActivityIndicator {
         &self.label
     }
 
+    /// Returns how long the current activity phase has been running.
+    #[must_use]
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
     /// Stops and clears the activity line before another message is rendered.
     pub fn finish(mut self) {
         self.stop();
