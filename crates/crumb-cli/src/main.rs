@@ -325,7 +325,7 @@ fn serve_mcp() -> Result<()> {
     let workspace = current_process_dir()?;
     let mut config = read_agent_config(&workspace)?;
     enforce_graphify_pin(&workspace, &mut config);
-    let search_api_key = pollinations_environment_key();
+    let search_api_key = pollinations_runtime_key();
     let mut host = workspace_read_host(&workspace, &config, search_api_key)?;
     let mut diagnostics = register_stdio_servers(
         &mut host,
@@ -6569,6 +6569,17 @@ fn pollinations_environment_key() -> Option<String> {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
         })
+}
+
+fn pollinations_runtime_key() -> Option<String> {
+    pollinations_environment_key().or_else(|| {
+        OsCredentialStore::new()
+            .ok()?
+            .get()
+            .ok()?
+            .map(|secret| secret.expose().to_owned())
+            .filter(|value| !value.trim().is_empty())
+    })
 }
 
 fn execute_and_capture(
