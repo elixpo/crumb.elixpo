@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Read, Write};
@@ -41,8 +41,9 @@ use crumb_graph::{
 use crumb_harness_dsh::HarnessActivity;
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_marketplace::{
-    Catalog, InstallScope, Installer, MAX_CATALOG_BYTES, McpTransport as MarketplaceMcpTransport,
-    Package, ReleaseTrust, RemoteCatalogCache, bundled_catalog, verify_package_files,
+    Catalog, InstallScope, Installer, MAX_CATALOG_BYTES, MAX_SIGSTORE_BUNDLE_BYTES,
+    McpTransport as MarketplaceMcpTransport, Package, PublisherIdentity, ReleaseTrust,
+    RemoteCatalogCache, SignedArtifact, SigstoreVerifier, bundled_catalog, verify_package_files,
 };
 use crumb_mcp::{
     McpDispatcher, StdioMcpLimits, StreamableHttpLimits, register_stdio_servers,
@@ -87,6 +88,11 @@ const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
 const FULLSCREEN_SIDE_GUTTER: u16 = 2;
 const FULLSCREEN_TOP_GUTTER: u16 = 1;
 const MARKETPLACE_CATALOG_URL: &str = "https://crumb.elixpo.com/marketplace/catalog.json";
+const MARKETPLACE_CATALOG_BUNDLE_URL: &str =
+    "https://crumb.elixpo.com/marketplace/catalog.sigstore.json";
+const MARKETPLACE_CATALOG_SIGNER: &str =
+    "https://github.com/elixpo/crumb.elixpo/.github/workflows/deploy.yml@refs/heads/main";
+const SIGSTORE_GITHUB_ACTIONS_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
 fn main() -> Result<()> {
     let resume_session = resume_session_argument()?;
@@ -4953,6 +4959,9 @@ fn show_marketplace(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result
     if let Some(path) = command.strip_prefix("/marketplace validate ") {
         return validate_marketplace_path(path.trim(), cwd, writer);
     }
+    if let Some(arguments) = command.strip_prefix("/marketplace install-remote ") {
+        return install_remote_marketplace_package(arguments, cwd, writer);
+    }
     if command == "/marketplace sync" {
         let bytes = download_marketplace_catalog()?;
         let catalog = remote_marketplace_cache()?.store(&bytes)?;
@@ -5024,6 +5033,10 @@ fn show_marketplace(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result
         writeln!(writer, "  `/marketplace sync` · `/marketplace remote`")?;
         writeln!(
             writer,
+            "  `/marketplace install-remote <publisher/name> [--scope project|user]`"
+        )?;
+        writeln!(
+            writer,
             "  Installation verifies files; enabling capabilities is separate."
         )?;
         return Ok(());
@@ -5038,7 +5051,7 @@ fn show_marketplace(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result
         return install_marketplace_package(&catalog, arguments, cwd, writer);
     }
     Err(anyhow!(
-        "usage: /marketplace [sync | remote [inspect <publisher/name>] | inspect <publisher/name> | install <publisher/name> [--scope project|user] | validate <catalog.json>]"
+        "usage: /marketplace [sync | remote [inspect <publisher/name>] | inspect <publisher/name> | install <publisher/name> [--scope project|user] | install-remote <publisher/name> [--scope project|user] | validate <catalog.json>]"
     ))
 }
 
@@ -5057,53 +5070,179 @@ fn cached_remote_catalog() -> Result<Catalog> {
 }
 
 fn download_marketplace_catalog() -> Result<Vec<u8>> {
-    let client = reqwest::blocking::Client::builder()
+    let client = marketplace_http_client()?;
+    download_marketplace_url(
+        &client,
+        MARKETPLACE_CATALOG_URL,
+        MAX_CATALOG_BYTES,
+        MarketplaceContent::Json,
+    )
+}
+
+fn marketplace_http_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .context("failed to prepare marketplace connection")?;
+        .context("failed to prepare marketplace connection")
+}
+
+#[derive(Clone, Copy)]
+enum MarketplaceContent {
+    Json,
+    Artifact,
+}
+
+fn download_marketplace_url(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    maximum_bytes: usize,
+    content: MarketplaceContent,
+) -> Result<Vec<u8>> {
     let response = client
-        .get(MARKETPLACE_CATALOG_URL)
-        .header(reqwest::header::ACCEPT, "application/json")
+        .get(url)
+        .header(
+            reqwest::header::ACCEPT,
+            match content {
+                MarketplaceContent::Json => "application/json, application/*+json",
+                MarketplaceContent::Artifact => "application/octet-stream, text/plain, */*",
+            },
+        )
         .send()
-        .context("marketplace catalog is unavailable")?
+        .context("marketplace download is unavailable")?
         .error_for_status()
-        .context("marketplace catalog request failed")?;
+        .context("marketplace download failed")?;
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
-    validate_marketplace_response(content_type, response.content_length())?;
-    read_bounded_catalog(response)
+    validate_marketplace_response(
+        content_type,
+        response.content_length(),
+        maximum_bytes,
+        content,
+    )?;
+    read_bounded_response(response, maximum_bytes)
 }
 
 fn validate_marketplace_response(
     content_type: Option<&str>,
     content_length: Option<u64>,
+    maximum_bytes: usize,
+    content: MarketplaceContent,
 ) -> Result<()> {
     let media_type = content_type
         .and_then(|value| value.split(';').next())
         .map(str::trim);
-    if !media_type.is_some_and(|value| value == "application/json" || value.ends_with("+json")) {
-        bail!("marketplace returned a non-JSON response");
+    match content {
+        MarketplaceContent::Json
+            if !media_type
+                .is_some_and(|value| value == "application/json" || value.ends_with("+json")) =>
+        {
+            bail!("marketplace returned a non-JSON response");
+        }
+        MarketplaceContent::Artifact if media_type.is_some_and(|value| value == "text/html") => {
+            bail!("marketplace returned an HTML response for an artifact");
+        }
+        _ => {}
     }
-    if content_length.is_some_and(|length| length > MAX_CATALOG_BYTES as u64) {
-        bail!("remote marketplace catalog exceeds the size limit");
+    if content_length.is_some_and(|length| length > maximum_bytes as u64) {
+        bail!("marketplace response exceeds the size limit");
     }
     Ok(())
 }
 
-fn read_bounded_catalog(reader: impl Read) -> Result<Vec<u8>> {
-    let limit = u64::try_from(MAX_CATALOG_BYTES).unwrap_or(u64::MAX);
+fn read_bounded_response(reader: impl Read, maximum_bytes: usize) -> Result<Vec<u8>> {
+    let limit = u64::try_from(maximum_bytes).unwrap_or(u64::MAX);
     let mut bytes = Vec::new();
     reader
         .take(limit.saturating_add(1))
         .read_to_end(&mut bytes)?;
-    if bytes.is_empty() || bytes.len() > MAX_CATALOG_BYTES {
-        bail!("remote marketplace catalog exceeds the size limit");
+    if bytes.is_empty() || bytes.len() > maximum_bytes {
+        bail!("marketplace response exceeds the size limit");
     }
     Ok(bytes)
+}
+
+fn install_remote_marketplace_package(
+    arguments: &str,
+    cwd: &Path,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let (id, scope) = parse_marketplace_install_arguments(arguments, "install-remote")?;
+    let client = marketplace_http_client()?;
+    let catalog_bytes = download_marketplace_url(
+        &client,
+        MARKETPLACE_CATALOG_URL,
+        MAX_CATALOG_BYTES,
+        MarketplaceContent::Json,
+    )?;
+    let catalog_bundle = download_marketplace_url(
+        &client,
+        MARKETPLACE_CATALOG_BUNDLE_URL,
+        MAX_SIGSTORE_BUNDLE_BYTES,
+        MarketplaceContent::Json,
+    )?;
+    let verifier = SigstoreVerifier::production()?;
+    verifier.verify(
+        &catalog_bytes,
+        &catalog_bundle,
+        &PublisherIdentity {
+            issuer: SIGSTORE_GITHUB_ACTIONS_ISSUER.to_owned(),
+            subject: MARKETPLACE_CATALOG_SIGNER.to_owned(),
+        },
+    )?;
+    let catalog = Catalog::parse(&catalog_bytes)?;
+    let package = catalog.installable_package(id)?;
+    if package.provenance.trust != ReleaseTrust::SigstoreBundle {
+        bail!("remote package `{id}` does not declare Sigstore release trust");
+    }
+    let publisher = catalog
+        .publishers
+        .iter()
+        .find(|publisher| publisher.id == package.publisher)
+        .context("remote package publisher is unavailable")?;
+    let mut downloads = BTreeMap::new();
+    for artifact in &package.artifacts {
+        let url = artifact
+            .url
+            .as_deref()
+            .context("remote artifact URL is unavailable")?;
+        let bundle_url = artifact
+            .bundle_url
+            .as_deref()
+            .context("remote artifact Sigstore bundle URL is unavailable")?;
+        let maximum_bytes =
+            usize::try_from(artifact.size_bytes).context("remote artifact size is unsupported")?;
+        let bytes =
+            download_marketplace_url(&client, url, maximum_bytes, MarketplaceContent::Artifact)?;
+        let bundle = download_marketplace_url(
+            &client,
+            bundle_url,
+            MAX_SIGSTORE_BUNDLE_BYTES,
+            MarketplaceContent::Json,
+        )?;
+        downloads.insert(artifact.path.clone(), SignedArtifact { bytes, bundle });
+    }
+    let (_, project_root) = agent_config_location(cwd);
+    let destination = marketplace_install_destination(scope, &project_root)?;
+    let installed =
+        Installer::new(destination).install_sigstore(package, publisher, &downloads, &verifier)?;
+    register_installed_package(&installed, scope, &project_root, cwd)?;
+    writeln!(
+        writer,
+        "◆ Installed verified remote {} {} · {} scope",
+        package_kind_name(package),
+        package.id,
+        install_scope_name(scope)
+    )?;
+    writeln!(
+        writer,
+        "  Catalog identity and {} artifact signatures verified; components remain disabled.",
+        package.artifacts.len()
+    )?;
+    Ok(())
 }
 
 fn validate_marketplace_path(path: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
@@ -5175,7 +5314,7 @@ fn show_marketplace_package(
         publisher.display_name,
         match package.provenance.trust {
             ReleaseTrust::Bundled => "bundled",
-            ReleaseTrust::SigstoreBundle { .. } => "Sigstore bundle metadata",
+            ReleaseTrust::SigstoreBundle => "Sigstore bundle metadata",
         },
         &package.provenance.revision[..12]
     )?;
@@ -5233,25 +5372,10 @@ fn install_marketplace_package(
     cwd: &Path,
     writer: &mut dyn Write,
 ) -> Result<()> {
-    let parts = arguments.split_whitespace().collect::<Vec<_>>();
-    let (id, scope) = match parts.as_slice() {
-        [id] | [id, "--scope", "project"] => (*id, InstallScope::Project),
-        [id, "--scope", "user"] => (*id, InstallScope::User),
-        _ => {
-            return Err(anyhow!(
-                "usage: /marketplace install <publisher/name> [--scope project|user]"
-            ));
-        }
-    };
+    let (id, scope) = parse_marketplace_install_arguments(arguments, "install")?;
     let package = catalog.installable_package(id)?;
     let (_, project_root) = agent_config_location(cwd);
-    let destination = match scope {
-        InstallScope::Project => project_root.join(".crumb/marketplace/packages"),
-        InstallScope::User => BaseDirs::new()
-            .context("home directory is unavailable")?
-            .home_dir()
-            .join(".crumb/marketplace/packages"),
-    };
+    let destination = marketplace_install_destination(scope, &project_root)?;
     let installed = Installer::new(destination).install_bundled(package)?;
     register_installed_package(&installed, scope, &project_root, cwd)?;
     writeln!(
@@ -5278,6 +5402,33 @@ fn install_marketplace_package(
         )?;
     }
     Ok(())
+}
+
+fn parse_marketplace_install_arguments<'a>(
+    arguments: &'a str,
+    command: &str,
+) -> Result<(&'a str, InstallScope)> {
+    let parts = arguments.split_whitespace().collect::<Vec<_>>();
+    let (id, scope) = match parts.as_slice() {
+        [id] | [id, "--scope", "project"] => (*id, InstallScope::Project),
+        [id, "--scope", "user"] => (*id, InstallScope::User),
+        _ => {
+            return Err(anyhow!(
+                "usage: /marketplace {command} <publisher/name> [--scope project|user]"
+            ));
+        }
+    };
+    Ok((id, scope))
+}
+
+fn marketplace_install_destination(scope: InstallScope, project_root: &Path) -> Result<PathBuf> {
+    Ok(match scope {
+        InstallScope::Project => project_root.join(".crumb/marketplace/packages"),
+        InstallScope::User => BaseDirs::new()
+            .context("home directory is unavailable")?
+            .home_dir()
+            .join(".crumb/marketplace/packages"),
+    })
 }
 
 fn register_installed_package(
@@ -6342,13 +6493,13 @@ mod tests {
     use crumb_profile::{ProfileSelectionStore, ProfileStore};
 
     use super::{
-        ExitGesture, SessionCommandContext, agent_config_location, configure_plugin,
-        effort_display_name, effort_wire_name, failed_command_recovery, initial_agent_activity,
-        openrouter_preset, parse_credential_reference, parse_provider_header,
-        parse_resume_session_argument, read_agent_config, read_bounded_catalog,
-        resolve_memory_keep, show_graph, show_marketplace, show_memory, show_profile_with_stores,
-        suggestion_width, validate_marketplace_path, validate_marketplace_response,
-        workspace_read_host,
+        ExitGesture, MarketplaceContent, SessionCommandContext, agent_config_location,
+        configure_plugin, effort_display_name, effort_wire_name, failed_command_recovery,
+        initial_agent_activity, openrouter_preset, parse_credential_reference,
+        parse_provider_header, parse_resume_session_argument, read_agent_config,
+        read_bounded_response, resolve_memory_keep, show_graph, show_marketplace, show_memory,
+        show_profile_with_stores, suggestion_width, validate_marketplace_path,
+        validate_marketplace_response, workspace_read_host,
     };
 
     #[test]
@@ -6561,26 +6712,42 @@ mod tests {
     #[test]
     fn marketplace_download_requires_bounded_json() {
         assert!(
-            validate_marketplace_response(Some("application/json; charset=utf-8"), Some(42))
-                .is_ok()
+            validate_marketplace_response(
+                Some("application/json; charset=utf-8"),
+                Some(42),
+                crumb_marketplace::MAX_CATALOG_BYTES,
+                MarketplaceContent::Json,
+            )
+            .is_ok()
         );
-        assert!(validate_marketplace_response(Some("text/html"), Some(42)).is_err());
+        assert!(
+            validate_marketplace_response(
+                Some("text/html"),
+                Some(42),
+                crumb_marketplace::MAX_CATALOG_BYTES,
+                MarketplaceContent::Json,
+            )
+            .is_err()
+        );
         assert!(
             validate_marketplace_response(
                 Some("application/json"),
                 Some((crumb_marketplace::MAX_CATALOG_BYTES + 1) as u64),
+                crumb_marketplace::MAX_CATALOG_BYTES,
+                MarketplaceContent::Json,
             )
             .is_err()
         );
         assert_eq!(
-            read_bounded_catalog(Cursor::new(b"{}")).expect("small response should be accepted"),
+            read_bounded_response(Cursor::new(b"{}"), crumb_marketplace::MAX_CATALOG_BYTES)
+                .expect("small response should be accepted"),
             b"{}"
         );
         assert!(
-            read_bounded_catalog(Cursor::new(vec![
-                b'x';
-                crumb_marketplace::MAX_CATALOG_BYTES + 1
-            ]))
+            read_bounded_response(
+                Cursor::new(vec![b'x'; crumb_marketplace::MAX_CATALOG_BYTES + 1]),
+                crumb_marketplace::MAX_CATALOG_BYTES,
+            )
             .is_err()
         );
     }

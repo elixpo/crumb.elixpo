@@ -24,10 +24,14 @@ names only. Secret values do not belong in manifests, logs, or memory.
 
 The schema deliberately excludes arbitrary lifecycle scripts and secret values. `/marketplace
 sync` can refresh the fixed public HTTPS catalog into a bounded, content-addressed cache. Cached
-remote metadata is labeled unverified and remains inspection-only; installs still come exclusively
-from the bundled catalog. Cryptographic Sigstore verification, remote artifact installation,
-updates, and rollback are separate explicit lifecycle steps. Installation alone never enables a
-component.
+remote metadata is labeled unverified and remains inspection-only.
+
+`/marketplace install-remote <publisher/name>` uses a separate authenticated path. Crumb verifies
+the catalog bundle against the pinned Crumb deployment-workflow identity, then verifies every
+artifact bundle against the publisher identity from that signed catalog. Size and SHA-256 checks
+run before signature verification, all downloads are bounded, and nothing is published until the
+complete set passes. Installed components remain disabled. Updates and rollback remain separate
+explicit lifecycle steps.
 
 Validate catalog structure against `schema/catalog.schema.json`. Crumb's Rust validator remains
 authoritative and additionally enforces publisher namespaces, unique immutable releases,
