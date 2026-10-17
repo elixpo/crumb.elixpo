@@ -2821,7 +2821,7 @@ fn offer_ai_recovery(
 fn prompt_for_ai_recovery(exit_code: i32, writer: &mut dyn Write) -> Result<bool> {
     write!(
         writer,
-        "help: command exited {exit_code} · [A] Ask AI  [Enter] Continue"
+        "help: command exited {exit_code} · [A] Ask AI  [Enter] Continue  [^C] Cancel"
     )?;
     writer.flush()?;
     let _raw_mode = RawModeGuard::enable()?;
