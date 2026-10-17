@@ -2194,8 +2194,11 @@ fn render_observed_activity(
             terminal.fullscreen,
         )?;
     }
+    restore_steering_input(input, activity, writer)?;
+    // The guide owns the final terminal row. Paint it after every composer
+    // redraw so wrapped steering input and resize recovery cannot cover it.
     refresh_active_footer(renderer, terminal.fullscreen)?;
-    restore_steering_input(input, activity, writer)
+    Ok(())
 }
 
 fn restore_steering_input(
@@ -2234,8 +2237,8 @@ fn handle_active_terminal_event(
         }
         TerminalEvent::Resize(_, _) => {
             input.clear_line(writer)?;
-            refresh_active_footer(input.renderer, terminal.fullscreen)?;
             input.redraw(writer)?;
+            refresh_active_footer(input.renderer, terminal.fullscreen)?;
             Ok(false)
         }
         _ => Ok(false),
@@ -2247,14 +2250,14 @@ fn refresh_active_footer(renderer: Renderer, fullscreen: bool) -> io::Result<()>
         return Ok(());
     }
     let (columns, rows) = size()?;
-    let frame = format!(
-        "\x1b7\x1b[{};1H\x1b[2K{}\x1b8",
-        rows,
-        renderer.composer_active_hotkeys(columns)
-    );
+    let frame = fixed_footer_frame(rows, &renderer.composer_active_hotkeys(columns));
     let mut terminal = io::stderr();
     terminal.write_all(frame.as_bytes())?;
     terminal.flush()
+}
+
+fn fixed_footer_frame(row: u16, content: &str) -> String {
+    format!("\x1b7\x1b[{row};1H\x1b[2K{content}\x1b8")
 }
 
 fn resolve_tool_approval(
@@ -2674,8 +2677,8 @@ fn wait_for_paused_turn(
         let event = read_terminal_event()?;
         if matches!(event, TerminalEvent::Resize(_, _)) {
             input.clear_line(writer)?;
-            refresh_active_footer(renderer, terminal.fullscreen)?;
             input.redraw(writer)?;
+            refresh_active_footer(renderer, terminal.fullscreen)?;
             continue;
         }
         let TerminalEvent::Key(key) = event else {
@@ -8970,7 +8973,7 @@ mod tests {
         CrumbEditMode, ExitGesture, MarketplaceContent, PausedSubmission, SessionCommandContext,
         SteeringAction, TerminalModeTracker, TranscriptCapture, TranscriptScroll, TranscriptState,
         agent_config_location, configure_permissions, configure_plugin, effort_display_name,
-        effort_wire_name, failed_command_recovery, initial_agent_activity,
+        effort_wire_name, failed_command_recovery, fixed_footer_frame, initial_agent_activity,
         marketplace_update_blocker, openrouter_preset, parse_credential_reference,
         parse_paused_submission, parse_provider_header, parse_resume_session_argument,
         read_agent_config, read_bounded_response, register_local_skill, resolve_memory_keep,
@@ -9778,5 +9781,18 @@ mod tests {
             assert!(width >= 1);
             assert!(width <= usize::from(columns.max(1)));
         }
+    }
+
+    #[test]
+    fn active_help_is_pinned_to_the_last_terminal_row() {
+        let frame = fixed_footer_frame(
+            40,
+            "  Type a follow-up · Enter steer · Ctrl+Enter queue · /pause · Ctrl+C cancel",
+        );
+
+        assert_eq!(
+            frame,
+            "\x1b7\x1b[40;1H\x1b[2K  Type a follow-up · Enter steer · Ctrl+Enter queue · /pause · Ctrl+C cancel\x1b8"
+        );
     }
 }
