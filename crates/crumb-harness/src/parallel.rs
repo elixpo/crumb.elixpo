@@ -117,16 +117,23 @@ fn run_team(
     cancellation: &CancellationToken,
 ) -> Result<ToolOutput> {
     ensure_active(cancellation)?;
-    let tasks = parse_tasks(arguments, tool.config.team_limits)?;
+    let request = parse_request(arguments, tool.config.team_limits)?;
     let team = team_id();
-    let mut workers = Vec::with_capacity(tasks.len());
-    for (index, task) in tasks.into_iter().enumerate() {
-        let name = NAMES[index].to_owned();
+    let assignments = request
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| (NAMES[index].to_owned(), task.clone()))
+        .collect::<Vec<_>>();
+    let mut workers = Vec::with_capacity(assignments.len());
+    for (index, (name, task)) in assignments.iter().cloned().enumerate() {
         let provider = Arc::clone(&tool.provider);
         let child_tools = tool.child_tools.clone();
         let config = tool.config.clone();
         let worker = WorkerSpec {
             team: team.clone(),
+            objective: request.objective.clone(),
+            assignments: assignments.clone(),
             index,
             name,
             task,
@@ -152,18 +159,35 @@ fn run_team(
         );
     }
     ensure_active(cancellation)?;
-    let text = findings
+    let reports = findings
         .iter()
-        .map(|finding| format!("{}:\n{}", finding.name, finding.text))
+        .map(|finding| {
+            format!(
+                "{} [{}]:\n{}",
+                finding.name,
+                if finding.failed { "failed" } else { "complete" },
+                finding.text
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n\n");
-    let text = bounded_text(text, tool.config.harness_limits.max_output_bytes.get());
+    let text = bounded_text(
+        format!(
+            "Team {team} report\nObjective: {}\n\n{reports}\n\nParent action: reconcile agreements, conflicts, and evidence into one final response.",
+            request.objective
+        ),
+        tool.config.harness_limits.max_output_bytes.get(),
+    );
     Ok(ToolOutput {
         text,
         structured: Some(json!({
+            "team_id": team,
+            "objective": request.objective,
+            "status": if findings.iter().any(|finding| finding.failed) { "partial" } else { "complete" },
             "agents": findings.iter().map(|finding| json!({
                 "name": finding.name,
                 "session_id": finding.session_id,
+                "status": if finding.failed { "failed" } else { "complete" },
                 "finding": finding.text,
             })).collect::<Vec<_>>()
         })),
@@ -180,6 +204,8 @@ struct Finding {
 
 struct WorkerSpec {
     team: String,
+    objective: String,
+    assignments: Vec<(String, String)>,
     index: usize,
     name: String,
     task: String,
@@ -192,6 +218,8 @@ struct WorkerSpec {
 fn run_worker(worker: WorkerSpec) -> Result<Finding> {
     let WorkerSpec {
         team,
+        objective,
+        assignments,
         index,
         name,
         task,
@@ -220,10 +248,15 @@ fn run_worker(worker: WorkerSpec) -> Result<Finding> {
     );
     let mut conversation = harness.conversation();
     let mut events = NoopEvents;
+    let roster = assignments
+        .iter()
+        .map(|(agent, assignment)| format!("- {agent}: {assignment}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let turn = HarnessTurn {
         model: config.model,
         user_message: format!(
-            "You are {name}, a read-only Crumb analysis agent. Investigate independently, cite concrete paths or evidence, and return concise findings for the parent agent. Do not request mutations.\n\nAssigned task:\n{task}"
+            "You are {name}, one read-only member of a Crumb agent team supervised by the parent Harness. Work only on your assignment, avoid duplicating sibling scopes, cite concrete paths or evidence, and flag dependencies, disagreements, or uncertainty for parent synthesis. Do not request mutations or claim to be the final answer.\n\nShared objective:\n{objective}\n\nTeam assignments:\n{roster}\n\nYour assignment:\n{task}"
         ),
         persona: None,
         trusted_context: Vec::new(),
@@ -263,7 +296,20 @@ fn team_id() -> String {
     format!("{}-{timestamp}-{sequence}", std::process::id())
 }
 
-fn parse_tasks(arguments: &Value, limits: ParallelAgentLimits) -> Result<Vec<String>> {
+struct TeamRequest {
+    objective: String,
+    tasks: Vec<String>,
+}
+
+fn parse_request(arguments: &Value, limits: ParallelAgentLimits) -> Result<TeamRequest> {
+    let objective = arguments
+        .get("objective")
+        .and_then(Value::as_str)
+        .unwrap_or("Parallel investigation requested by the parent Harness")
+        .trim();
+    if objective.is_empty() || objective.len() > limits.max_task_bytes.get() {
+        bail!("parallel agent objective is empty or exceeds the byte limit");
+    }
     let tasks = arguments
         .get("tasks")
         .and_then(Value::as_array)
@@ -274,7 +320,7 @@ fn parse_tasks(arguments: &Value, limits: ParallelAgentLimits) -> Result<Vec<Str
     if tasks.len() > limits.max_agents.get() {
         bail!("parallel analysis exceeds the configured agent limit");
     }
-    tasks
+    let tasks = tasks
         .iter()
         .map(|task| {
             let task = task.as_str().context("each task must be a string")?.trim();
@@ -283,7 +329,11 @@ fn parse_tasks(arguments: &Value, limits: ParallelAgentLimits) -> Result<Vec<Str
             }
             Ok(task.to_owned())
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(TeamRequest {
+        objective: objective.to_owned(),
+        tasks,
+    })
 }
 
 fn bounded_text(mut text: String, limit: usize) -> String {
@@ -314,10 +364,16 @@ impl EventSink for NoopEvents {
 fn descriptor(limits: ParallelAgentLimits) -> ToolDescriptor {
     ToolDescriptor {
         name: SPAWN_AGENTS.to_owned(),
-        description: "Run two or more independent read-only analysis agents in parallel and return their bounded findings to the parent agent.".to_owned(),
+        description: "Supervise two or more named read-only agents working concurrently toward one shared objective, then return a bounded team report for parent synthesis.".to_owned(),
         input_schema: json!({
             "type": "object",
             "properties": {
+                "objective": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": limits.max_task_bytes.get(),
+                    "description": "Shared outcome the parent Harness wants the team to achieve"
+                },
                 "tasks": {
                     "type": "array",
                     "minItems": 2,
@@ -346,7 +402,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        NAMES, ParallelAgentConfig, ParallelAgentLimits, parse_tasks, register_parallel_agent_tool,
+        NAMES, ParallelAgentConfig, ParallelAgentLimits, parse_request,
+        register_parallel_agent_tool,
     };
     use crate::HarnessLimits;
 
@@ -364,10 +421,15 @@ mod tests {
             max_task_bytes: NonZeroUsize::new(8).unwrap(),
             max_result_bytes: NonZeroUsize::new(32).unwrap(),
         };
-        assert!(parse_tasks(&json!({"tasks":["one", "two"]}), limits).is_ok());
-        assert!(parse_tasks(&json!({"tasks":["one"]}), limits).is_err());
-        assert!(parse_tasks(&json!({"tasks":["one", "two", "three"]}), limits).is_err());
-        assert!(parse_tasks(&json!({"tasks":["too long!", "two"]}), limits).is_err());
+        let request = parse_request(
+            &json!({"objective":"ship it", "tasks":["one", "two"]}),
+            limits,
+        )
+        .expect("bounded team request");
+        assert_eq!(request.objective, "ship it");
+        assert!(parse_request(&json!({"tasks":["one"]}), limits).is_err());
+        assert!(parse_request(&json!({"tasks":["one", "two", "three"]}), limits).is_err());
+        assert!(parse_request(&json!({"tasks":["too long!", "two"]}), limits).is_err());
     }
 
     #[test]
@@ -407,7 +469,10 @@ mod tests {
         let output = host
             .call(
                 "spawn_agents",
-                &json!({"tasks":["inspect one", "inspect two"]}),
+                &json!({
+                    "objective":"map both surfaces",
+                    "tasks":["inspect one", "inspect two"]
+                }),
                 AgentMode::Auto,
                 &approvals,
                 &CancellationToken::default(),
@@ -415,8 +480,18 @@ mod tests {
             .expect("parallel analysis succeeds");
 
         assert!(!output.is_error);
-        assert!(output.text.contains("Koi:\nevidence"));
-        assert!(output.text.contains("Nyx:\nevidence"));
+        assert!(output.text.contains("Objective: map both surfaces"));
+        assert!(output.text.contains("Koi [complete]:\nevidence"));
+        assert!(output.text.contains("Nyx [complete]:\nevidence"));
+        assert!(output.text.contains("Parent action: reconcile"));
+        assert_eq!(
+            output
+                .structured
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(serde_json::Value::as_str),
+            Some("complete")
+        );
         assert_eq!(
             std::fs::read_dir(journal_root)
                 .expect("journals exist")
