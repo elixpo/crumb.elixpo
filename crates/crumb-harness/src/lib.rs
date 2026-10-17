@@ -201,6 +201,11 @@ struct ModelRound {
     usage: TokenUsage,
 }
 
+struct ExecutedTool {
+    content: String,
+    success: bool,
+}
+
 /// Provider-neutral harness with Rust-owned tools and approval policy.
 #[derive(Clone)]
 pub struct NativeHarness {
@@ -313,15 +318,7 @@ impl NativeHarness {
         let mut messages = system_messages(&turn);
         messages.extend(conversation.messages());
         messages.push(ChatMessage::text(ChatRole::User, turn.user_message.clone()));
-        let definitions = self
-            .tools
-            .tools()
-            .map(|tool| ToolDefinition {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                input_schema: tool.input_schema.clone(),
-            })
-            .collect::<Vec<_>>();
+        let definitions = tool_definitions_for_turn(&self.tools, &turn.user_message);
         let mut usage = TokenUsage::default();
         let mut output_bytes = 0_usize;
         let mut retries = RequiredToolRetries::new(&definitions);
@@ -390,6 +387,7 @@ impl NativeHarness {
                 tool_call_id: None,
                 tool_calls: round.calls.clone(),
             });
+            let mut failed_tools = Vec::new();
             for call in round.calls {
                 if metrics.tool_calls == self.limits.max_tool_calls.get() {
                     return Err(HarnessError::new(
@@ -399,8 +397,14 @@ impl NativeHarness {
                 }
                 metrics.tool_calls += 1;
                 let result = self.execute_tool(session, &call, cancellation, deadline, sink)?;
-                add_output_bytes(&mut output_bytes, result.len(), self.limits)?;
-                messages.push(ChatMessage::tool_result(call.id, result));
+                add_output_bytes(&mut output_bytes, result.content.len(), self.limits)?;
+                if !result.success {
+                    failed_tools.push(call.name.clone());
+                }
+                messages.push(ChatMessage::tool_result(call.id, result.content));
+            }
+            if retries.prepare_failed_execution(&mut messages, &turn.user_message, &failed_tools) {
+                require_tool = true;
             }
         }
     }
@@ -457,7 +461,7 @@ impl NativeHarness {
         cancellation: &CancellationToken,
         deadline: Instant,
         sink: &mut dyn EventSink,
-    ) -> Result<String, HarnessError> {
+    ) -> Result<ExecutedTool, HarnessError> {
         ensure_active(cancellation, deadline)?;
         let risk = self
             .tools
@@ -511,8 +515,25 @@ impl NativeHarness {
             name: call.name.clone(),
             success,
         });
-        Ok(content)
+        Ok(ExecutedTool { content, success })
     }
+}
+
+fn tool_definitions_for_turn(tools: &ToolHost, user_message: &str) -> Vec<ToolDefinition> {
+    let mut definitions = tools
+        .tools()
+        .map(|tool| ToolDefinition {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            input_schema: tool.input_schema.clone(),
+        })
+        .collect::<Vec<_>>();
+    if user_requires_host_shell(user_message)
+        && definitions.iter().any(|tool| tool.name == "run_shell")
+    {
+        definitions.retain(|tool| tool.name == "run_shell");
+    }
+    definitions
 }
 
 struct RequiredToolRetries {
@@ -554,6 +575,26 @@ impl RequiredToolRetries {
             return true;
         }
         false
+    }
+
+    fn prepare_failed_execution(
+        &mut self,
+        messages: &mut Vec<ChatMessage>,
+        user_message: &str,
+        failed_tools: &[String],
+    ) -> bool {
+        if self.execution != RetryStatus::Ready
+            || failed_tools.is_empty()
+            || !user_requires_execution(user_message)
+        {
+            return false;
+        }
+        self.execution = RetryStatus::Used;
+        messages.push(ChatMessage::text(
+            ChatRole::System,
+            "The previous inspection tool failed, so it is not evidence that the requested file, directory, program, or state is absent. Call run_shell now and perform a direct host inspection. If execution also fails, report that failure accurately instead of inventing a negative result.",
+        ));
+        true
     }
 }
 
@@ -674,6 +715,24 @@ fn user_requires_execution(user_message: &str) -> bool {
         "execute ",
         "build ",
         "test ",
+    ]
+    .iter()
+    .any(|phrase| user_message.contains(phrase))
+}
+
+fn user_requires_host_shell(user_message: &str) -> bool {
+    let user_message = user_message.to_ascii_lowercase();
+    [
+        "home directory",
+        "my home",
+        "on my laptop",
+        "on my computer",
+        "on my system",
+        "local filesystem",
+        "outside the workspace",
+        "outside this workspace",
+        "outside the repo",
+        "outside this repo",
     ]
     .iter()
     .any(|phrase| user_message.contains(phrase))
@@ -1557,6 +1616,14 @@ mod tests {
         assert_eq!(streamed, "g++ is installed and available.");
         let requests = provider.requests.lock().expect("request lock");
         assert_eq!(requests[0].tool_choice, ToolChoice::Required);
+        assert_eq!(
+            requests[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["run_shell"]
+        );
         assert_eq!(requests[1].tool_choice, ToolChoice::Required);
         assert_eq!(requests[2].tool_choice, ToolChoice::Auto);
         assert!(requests[1].messages.iter().any(|message| {
@@ -1586,6 +1653,12 @@ mod tests {
         assert!(super::should_retry_with_execution(
             "is there a file named Cargo.toml in this project?",
             "I do not have access to your local filesystem."
+        ));
+        assert!(super::user_requires_host_shell(
+            "Can you see a folder named elixpo_projects in my home directory?"
+        ));
+        assert!(!super::user_requires_host_shell(
+            "Can you see a folder named src in this project?"
         ));
     }
 
