@@ -252,6 +252,50 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "deduplicate approved memory",
     },
     SlashCommand {
+        usage: "/profile",
+        description: "show the active persona profile",
+    },
+    SlashCommand {
+        usage: "/profile list",
+        description: "list persona profiles",
+    },
+    SlashCommand {
+        usage: "/profile show ",
+        description: "inspect a persona profile",
+    },
+    SlashCommand {
+        usage: "/profile create ",
+        description: "create a persona profile",
+    },
+    SlashCommand {
+        usage: "/profile clone ",
+        description: "clone a persona profile",
+    },
+    SlashCommand {
+        usage: "/profile select ",
+        description: "select a profile for this project",
+    },
+    SlashCommand {
+        usage: "/profile clear",
+        description: "clear this project's profile",
+    },
+    SlashCommand {
+        usage: "/profile rename ",
+        description: "rename a persona profile",
+    },
+    SlashCommand {
+        usage: "/profile export ",
+        description: "export a profile as safe JSON",
+    },
+    SlashCommand {
+        usage: "/profile import ",
+        description: "import a bounded profile file",
+    },
+    SlashCommand {
+        usage: "/profile delete ",
+        description: "delete an inactive profile",
+    },
+    SlashCommand {
         usage: "/config",
         description: "inspect live configuration",
     },

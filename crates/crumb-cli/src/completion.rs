@@ -160,6 +160,7 @@ fn is_setting_command(usage: &str) -> bool {
         "/tools",
         "/permissions",
         "/memory",
+        "/profile",
         "/config",
         "/doctor",
         "/cost",
