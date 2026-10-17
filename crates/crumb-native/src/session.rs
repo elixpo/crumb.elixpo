@@ -174,6 +174,11 @@ impl ShellSession {
         let mut buffer = [0_u8; 8192];
         loop {
             let bytes_read = self.reader.read(&mut buffer)?;
+            #[cfg(target_os = "windows")]
+            eprintln!(
+                "native shell output: {:?}",
+                String::from_utf8_lossy(&buffer[..bytes_read])
+            );
             if bytes_read == 0 {
                 self.process.wait()?;
                 return Ok(None);
