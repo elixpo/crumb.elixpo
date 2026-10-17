@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -17,6 +17,8 @@ use url::{Host, Url};
 
 const MAX_ARTIFACT_BYTES: usize = 256 * 1024;
 const MAX_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_INSTALLATION_STATE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_INSTALLED_RELEASES: usize = 512;
 /// Maximum accepted size for a downloaded marketplace catalog.
 pub const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum accepted size for one Sigstore bundle.
@@ -807,6 +809,346 @@ pub struct InstalledPackage {
     pub package: Package,
 }
 
+/// One immutable package release recorded in a scope-local installation ledger.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledRelease {
+    pub package: Package,
+    pub installed_at: String,
+    pub active: bool,
+    pub pinned: bool,
+}
+
+/// Result of checking one recorded release without executing package code.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstallationDiagnostic {
+    pub package_id: String,
+    pub version: String,
+    pub active: bool,
+    pub healthy: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InstallationState {
+    schema_version: u32,
+    releases: Vec<InstalledRelease>,
+}
+
+impl Default for InstallationState {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            releases: Vec::new(),
+        }
+    }
+}
+
+/// Durable lifecycle state for one project or user marketplace scope.
+pub struct InstallationStore {
+    root: PathBuf,
+}
+
+impl InstallationStore {
+    #[must_use]
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    #[must_use]
+    pub fn packages_root(&self) -> PathBuf {
+        self.root.join("packages")
+    }
+
+    /// Lists all recorded releases in stable package/version order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when state is malformed, oversized, linked, or unavailable.
+    pub fn list(&self) -> Result<Vec<InstalledRelease>> {
+        let mut releases = self.load()?.releases;
+        releases.sort_by(|left, right| {
+            (&left.package.id, &left.package.version)
+                .cmp(&(&right.package.id, &right.package.version))
+        });
+        Ok(releases)
+    }
+
+    /// Atomically records an installed release and makes it active.
+    ///
+    /// A pinned active release cannot be replaced by a different version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid or conflicting state and filesystem failures.
+    pub fn record(&self, installed: &InstalledPackage) -> Result<InstalledRelease> {
+        installed.package.validate()?;
+        let expected_root = self.package_root(&installed.package);
+        if installed.root != expected_root {
+            bail!("installed package is outside the marketplace scope");
+        }
+        verify_package_files(&installed.package, &installed.root)?;
+        let mut state = self.load()?;
+        if state.releases.iter().any(|release| {
+            release.package.id == installed.package.id
+                && release.active
+                && release.pinned
+                && release.package.version != installed.package.version
+        }) {
+            bail!("package is pinned; unpin it before changing versions");
+        }
+        if let Some(existing) = state.releases.iter().find(|release| {
+            release.package.id == installed.package.id
+                && release.package.version == installed.package.version
+        }) && existing.package != installed.package
+        {
+            bail!("installed release metadata conflicts with the immutable ledger");
+        }
+        for release in &mut state.releases {
+            if release.package.id == installed.package.id {
+                release.active = false;
+            }
+        }
+        let installed_at = Utc::now().to_rfc3339();
+        let position = state.releases.iter().position(|release| {
+            release.package.id == installed.package.id
+                && release.package.version == installed.package.version
+        });
+        let recorded = if let Some(position) = position {
+            state.releases[position].active = true;
+            state.releases[position].installed_at = installed_at;
+            state.releases[position].clone()
+        } else {
+            let release = InstalledRelease {
+                package: installed.package.clone(),
+                installed_at,
+                active: true,
+                pinned: false,
+            };
+            state.releases.push(release.clone());
+            release
+        };
+        self.save(&state)?;
+        Ok(recorded)
+    }
+
+    /// Pins or unpins the active release for a package.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no active release exists or state cannot be saved.
+    pub fn set_pinned(&self, package_id: &str, pinned: bool) -> Result<InstalledRelease> {
+        if !valid_package_id(package_id) {
+            bail!("marketplace package id is invalid");
+        }
+        let mut state = self.load()?;
+        let release = state
+            .releases
+            .iter_mut()
+            .find(|release| release.package.id == package_id && release.active)
+            .with_context(|| format!("marketplace package `{package_id}` is not installed"))?;
+        release.pinned = pinned;
+        let release = release.clone();
+        self.save(&state)?;
+        Ok(release)
+    }
+
+    /// Checks every recorded release against its immutable artifact metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the ledger itself cannot be read safely.
+    pub fn doctor(&self) -> Result<Vec<InstallationDiagnostic>> {
+        let releases = self.list()?;
+        let known_roots = releases
+            .iter()
+            .map(|release| self.package_root(&release.package))
+            .collect::<BTreeSet<_>>();
+        let mut diagnostics = releases
+            .into_iter()
+            .map(|release| {
+                let result =
+                    verify_package_files(&release.package, &self.package_root(&release.package));
+                InstallationDiagnostic {
+                    package_id: release.package.id,
+                    version: release.package.version,
+                    active: release.active,
+                    healthy: result.is_ok(),
+                    detail: result
+                        .map_or_else(|error| error.to_string(), |()| "verified".to_owned()),
+                }
+            })
+            .collect::<Vec<_>>();
+        diagnostics.extend(self.orphan_diagnostics(&known_roots)?);
+        Ok(diagnostics)
+    }
+
+    /// Removes the active release through a scope-confined rename and ledger update.
+    ///
+    /// Callers must remove only matching disabled runtime registrations before invoking this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no active release exists or the removal cannot be completed safely.
+    pub fn uninstall(&self, package_id: &str) -> Result<InstalledRelease> {
+        if !valid_package_id(package_id) {
+            bail!("marketplace package id is invalid");
+        }
+        let mut state = self.load()?;
+        let position = state
+            .releases
+            .iter()
+            .position(|release| release.package.id == package_id && release.active)
+            .with_context(|| format!("marketplace package `{package_id}` is not installed"))?;
+        let release = state.releases[position].clone();
+        let package_root = self.package_root(&release.package);
+        let parent = package_root
+            .parent()
+            .context("package installation has no parent")?;
+        let tombstone = parent.join(format!(
+            ".remove-{}-{}",
+            release.package.version,
+            std::process::id()
+        ));
+        if tombstone.exists() {
+            bail!("a previous package removal is incomplete");
+        }
+        fs::rename(&package_root, &tombstone).with_context(|| {
+            format!("failed to isolate installed package `{package_id}` for removal")
+        })?;
+        state.releases.remove(position);
+        if let Err(error) = self.save(&state) {
+            let _ = fs::rename(&tombstone, &package_root);
+            return Err(error);
+        }
+        fs::remove_dir_all(&tombstone).with_context(|| {
+            format!("installed package `{package_id}` was removed but cleanup is incomplete")
+        })?;
+        Ok(release)
+    }
+
+    fn package_root(&self, package: &Package) -> PathBuf {
+        self.packages_root()
+            .join(package.id.replace('/', "--"))
+            .join(&package.version)
+    }
+
+    fn orphan_diagnostics(
+        &self,
+        known_roots: &BTreeSet<PathBuf>,
+    ) -> Result<Vec<InstallationDiagnostic>> {
+        let packages_root = self.packages_root();
+        let metadata = match fs::symlink_metadata(&packages_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.file_type().is_dir() {
+            bail!("marketplace package root is not a directory");
+        }
+        let mut diagnostics = Vec::new();
+        let mut inspected = 0_usize;
+        for package_entry in fs::read_dir(&packages_root)? {
+            let package_entry = package_entry?;
+            inspected = inspected.saturating_add(1);
+            if inspected > MAX_INSTALLED_RELEASES.saturating_mul(2) {
+                bail!("marketplace package directory exceeds the inspection limit");
+            }
+            let package_path = package_entry.path();
+            let package_name = package_entry.file_name().to_string_lossy().into_owned();
+            let package_metadata = fs::symlink_metadata(&package_path)?;
+            if !package_metadata.file_type().is_dir() {
+                diagnostics.push(orphan_diagnostic(package_name, "unknown"));
+                continue;
+            }
+            for version_entry in fs::read_dir(package_path)? {
+                let version_entry = version_entry?;
+                inspected = inspected.saturating_add(1);
+                if inspected > MAX_INSTALLED_RELEASES.saturating_mul(2) {
+                    bail!("marketplace package directory exceeds the inspection limit");
+                }
+                if !known_roots.contains(&version_entry.path()) {
+                    diagnostics.push(orphan_diagnostic(
+                        package_name.clone(),
+                        &version_entry.file_name().to_string_lossy(),
+                    ));
+                }
+            }
+        }
+        Ok(diagnostics)
+    }
+
+    fn load(&self) -> Result<InstallationState> {
+        let path = self.root.join("installed.json");
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(InstallationState::default());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.file_type().is_file() || metadata.len() > MAX_INSTALLATION_STATE_BYTES as u64 {
+            bail!("marketplace installation state is not a bounded regular file");
+        }
+        let state: InstallationState = serde_json::from_slice(&fs::read(path)?)
+            .context("marketplace installation state is invalid")?;
+        Self::validate_state(&state)?;
+        Ok(state)
+    }
+
+    fn save(&self, state: &InstallationState) -> Result<()> {
+        Self::validate_state(state)?;
+        fs::create_dir_all(&self.root)?;
+        let bytes = serde_json::to_vec_pretty(state)?;
+        if bytes.len() > MAX_INSTALLATION_STATE_BYTES {
+            bail!("marketplace installation state exceeds the size limit");
+        }
+        let destination = self.root.join("installed.json");
+        let mut temporary = NamedTempFile::new_in(&self.root)?;
+        set_private_permissions(temporary.path())?;
+        std::io::Write::write_all(&mut temporary, &bytes)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(&destination)
+            .map_err(|error| error.error)?;
+        Ok(())
+    }
+
+    fn validate_state(state: &InstallationState) -> Result<()> {
+        if state.schema_version != 1 || state.releases.len() > MAX_INSTALLED_RELEASES {
+            bail!("marketplace installation state schema or size is unsupported");
+        }
+        let mut identities = BTreeSet::new();
+        let mut active = BTreeSet::new();
+        for release in &state.releases {
+            release.package.validate()?;
+            DateTime::parse_from_rfc3339(&release.installed_at)
+                .context("installed release timestamp is invalid")?;
+            if !identities.insert((release.package.id.clone(), release.package.version.clone())) {
+                bail!("marketplace installation state contains a duplicate release");
+            }
+            if release.active && !active.insert(release.package.id.clone()) {
+                bail!("marketplace installation state contains multiple active releases");
+            }
+            if release.pinned && !release.active {
+                bail!("only an active marketplace release can be pinned");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn orphan_diagnostic(package_id: String, version: &str) -> InstallationDiagnostic {
+    InstallationDiagnostic {
+        package_id,
+        version: version.to_owned(),
+        active: false,
+        healthy: false,
+        detail: "orphaned package path is not present in the installation ledger".to_owned(),
+    }
+}
+
 /// Downloaded bytes and the Sigstore bundle authenticating exactly those bytes.
 pub struct SignedArtifact {
     pub bytes: Vec<u8>,
@@ -1109,8 +1451,8 @@ fn current_platform() -> MarketplacePlatform {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTRIBUTOR_SCHEMA, Catalog, Installer, MAX_CATALOG_BYTES, PUBLIC_CATALOG, PUBLIC_SCHEMA,
-        RemoteCatalogCache, Revocation, bundled_catalog,
+        CONTRIBUTOR_SCHEMA, Catalog, InstallationStore, Installer, MAX_CATALOG_BYTES,
+        PUBLIC_CATALOG, PUBLIC_SCHEMA, RemoteCatalogCache, Revocation, bundled_catalog,
     };
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -1144,6 +1486,98 @@ mod tests {
             fs::read_to_string(installed.root.join("skills/SKILL.md")).expect("installed skill"),
             "# Review\n"
         );
+    }
+
+    #[test]
+    fn installation_state_records_pins_and_diagnoses_releases() {
+        let source = tempdir().expect("source tempdir");
+        fs::write(source.path().join("SKILL.md"), "# Review\n").expect("skill fixture");
+        let hash = format!("{:x}", Sha256::digest(b"# Review\n"));
+        let package = catalog(&hash, "SKILL.md").packages.remove(0);
+        let scope = tempdir().expect("scope tempdir");
+        let store = InstallationStore::new(scope.path());
+        let installed = Installer::new(store.packages_root())
+            .install(&package, source.path())
+            .expect("package should install");
+
+        store
+            .record(&installed)
+            .expect("release should be recorded");
+        let pinned = store
+            .set_pinned("crumb/review", true)
+            .expect("release should pin");
+        assert!(pinned.active);
+        assert!(pinned.pinned);
+        assert_eq!(store.list().expect("installation state").len(), 1);
+        assert!(
+            store
+                .doctor()
+                .expect("diagnostics")
+                .into_iter()
+                .all(|diagnostic| diagnostic.healthy)
+        );
+
+        fs::write(installed.root.join("SKILL.md"), "tampered").expect("tamper fixture");
+        let diagnostics = store.doctor().expect("tamper diagnostics");
+        assert!(!diagnostics[0].healthy);
+        assert!(diagnostics[0].detail.contains("integrity verification"));
+    }
+
+    #[test]
+    fn installation_state_uninstalls_only_the_recorded_release() {
+        let source = tempdir().expect("source tempdir");
+        fs::write(source.path().join("SKILL.md"), "# Review\n").expect("skill fixture");
+        let hash = format!("{:x}", Sha256::digest(b"# Review\n"));
+        let package = catalog(&hash, "SKILL.md").packages.remove(0);
+        let scope = tempdir().expect("scope tempdir");
+        let store = InstallationStore::new(scope.path());
+        let installed = Installer::new(store.packages_root())
+            .install(&package, source.path())
+            .expect("package should install");
+        store
+            .record(&installed)
+            .expect("release should be recorded");
+        fs::write(scope.path().join("keep.txt"), "keep").expect("unrelated fixture");
+
+        let removed = store
+            .uninstall("crumb/review")
+            .expect("release should uninstall");
+        assert_eq!(removed.package, package);
+        assert!(!installed.root.exists());
+        assert!(scope.path().join("keep.txt").exists());
+        assert_eq!(store.list().expect("empty state"), Vec::new());
+
+        let orphan = store.packages_root().join("unknown--package/9.9.9");
+        fs::create_dir_all(orphan).expect("orphan fixture");
+        let diagnostics = store.doctor().expect("orphan diagnostics");
+        assert_eq!(diagnostics.len(), 1);
+        assert!(!diagnostics[0].healthy);
+        assert!(diagnostics[0].detail.contains("orphaned"));
+    }
+
+    #[test]
+    fn installation_state_rejects_malformed_or_linked_state() {
+        let scope = tempdir().expect("scope tempdir");
+        fs::write(scope.path().join("installed.json"), "not json").expect("invalid state");
+        assert!(InstallationStore::new(scope.path()).list().is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            fs::remove_file(scope.path().join("installed.json")).expect("remove invalid state");
+            fs::write(
+                scope.path().join("target.json"),
+                r#"{"schema_version":1,"releases":[]}"#,
+            )
+            .expect("target state");
+            symlink(
+                scope.path().join("target.json"),
+                scope.path().join("installed.json"),
+            )
+            .expect("state symlink");
+            assert!(InstallationStore::new(scope.path()).list().is_err());
+        }
     }
 
     #[test]
