@@ -803,9 +803,8 @@ impl FullscreenTranscript {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.append(&rendered) {
-                    render_transcript_view(&state, self.renderer, self.header_rows)?;
-                }
+                state.append(&rendered);
+                render_transcript_view(&state, self.renderer, self.header_rows)?;
             }
             self.started = true;
         }
@@ -818,9 +817,8 @@ impl FullscreenTranscript {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.append(&String::from_utf8_lossy(output)) {
-                render_transcript_view(&state, self.renderer, self.header_rows)?;
-            }
+            state.append(&String::from_utf8_lossy(output));
+            render_transcript_view(&state, self.renderer, self.header_rows)?;
         }
         Ok(())
     }
@@ -1168,6 +1166,7 @@ fn initialize_transcript(
     };
     if let Some(startup) = startup_transcript {
         state.append(startup.trim_end_matches('\n'));
+        render_transcript_view(&state, renderer, header_rows)?;
     }
     Ok((header_rows, Arc::new(Mutex::new(state))))
 }
