@@ -1994,23 +1994,37 @@ fn render_harness_activity(
         HarnessActivity::ToolStarted { name } => {
             replace_activity(indicator, renderer, &format!("Using {name}"), fullscreen);
         }
-        HarnessActivity::ToolFinished { success: true, .. } => {
-            replace_activity(indicator, renderer, "Thinking", fullscreen);
+        HarnessActivity::ToolOutput { name, bytes } => {
+            let label = bytes.map_or_else(
+                || format!("Using {name}"),
+                |bytes| format!("Using {name} · {bytes} bytes"),
+            );
+            replace_activity(indicator, renderer, &label, fullscreen);
         }
-        HarnessActivity::ApprovalRequired { .. }
-        | HarnessActivity::ToolFinished { success: false, .. }
-        | HarnessActivity::Failed { .. }
-        | HarnessActivity::Cancelled => {
-            if let Some(active) = indicator.take() {
-                active.finish();
+        HarnessActivity::ToolFinished { name, success } => {
+            finish_activity_line(indicator, writer)?;
+            writeln!(writer, "{}", renderer.agent_tool_result(name, *success))?;
+            writer.flush()?;
+            if *success {
+                replace_activity(indicator, renderer, "Thinking", fullscreen);
             }
-            write!(writer, "\r\x1b[2K")?;
+        }
+        HarnessActivity::ApprovalRequired { name } => {
+            finish_activity_line(indicator, writer)?;
+            writeln!(writer, "{}", renderer.agent_approval_required(name))?;
+            writer.flush()?;
+        }
+        HarnessActivity::Failed { .. } | HarnessActivity::Cancelled => {
+            finish_activity_line(indicator, writer)?;
             writeln!(
                 writer,
                 "{}",
                 renderer.agent_activity(&harness_activity_label(activity))
             )?;
             writer.flush()?;
+        }
+        HarnessActivity::Completed { .. } => {
+            replace_activity(indicator, renderer, "Thinking", fullscreen);
         }
         HarnessActivity::Progress { label } => {
             replace_activity(indicator, renderer, label, fullscreen);
@@ -2021,8 +2035,18 @@ fn render_harness_activity(
         HarnessActivity::RequestAccepted => {
             replace_activity(indicator, renderer, "Request accepted", fullscreen);
         }
-        HarnessActivity::ToolOutput { .. } | HarnessActivity::Completed { .. } => {}
     }
+    Ok(())
+}
+
+fn finish_activity_line(
+    indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    if let Some(active) = indicator.take() {
+        active.finish();
+    }
+    write!(writer, "\r\x1b[2K")?;
     Ok(())
 }
 
