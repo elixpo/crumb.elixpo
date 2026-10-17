@@ -39,7 +39,7 @@ use crumb_marketplace::{
     Catalog, InstallScope, Installer, Package, bundled_catalog, verify_package_files,
 };
 use crumb_mcp::{McpDispatcher, serve_stdio};
-use crumb_memory::{MemoryScope, MemorySet, MemoryStore};
+use crumb_memory::{MemoryProvenance, MemoryRecord, MemoryScope, MemorySet, MemoryStore};
 use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::shell_for;
 use crumb_optimize::{OptimizationPipeline, RtkOptimizer};
@@ -3829,6 +3829,13 @@ fn show_memory(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> 
             let store = select_memory_store(&memory, command.trim_start_matches("/memory show "))?;
             show_memory_store(store, writer)
         }
+        command if command.starts_with("/memory inspect ") => {
+            inspect_memory(&memory, command, writer)
+        }
+        command if command.starts_with("/memory search ") => {
+            search_memory(&memory, command, writer)
+        }
+        "/memory conflicts" => show_memory_conflicts(&memory, writer),
         command if command.starts_with("/memory remember ") => {
             let (store, entry) = parse_memory_entry(&memory, command, "/memory remember ")?;
             let added = store.remember_approved(entry)?;
@@ -3849,18 +3856,16 @@ fn show_memory(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> 
             Ok(())
         }
         command if command.starts_with("/memory forget ") => {
-            let (scope, index) = parse_memory_arguments(command, "/memory forget ")?;
-            let store = select_memory_store(&memory, scope)?;
-            let index = index
-                .parse::<usize>()
-                .context("memory index must be a positive integer")?;
-            store.forget_approved(index)?;
-            writeln!(
-                writer,
-                "◆ {} memory · forgot entry {index}",
-                memory_scope_name(store.scope())
-            )?;
-            Ok(())
+            forget_memory(&memory, command, writer)
+        }
+        command if command.starts_with("/memory tag ") => {
+            update_memory_tag(&memory, command, false, writer)
+        }
+        command if command.starts_with("/memory untag ") => {
+            update_memory_tag(&memory, command, true, writer)
+        }
+        command if command.starts_with("/memory replace ") => {
+            replace_memory(&memory, command, writer)
         }
         command if command.starts_with("/memory compact ") => {
             let scope = command.trim_start_matches("/memory compact ").trim();
@@ -3874,9 +3879,99 @@ fn show_memory(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> 
             Ok(())
         }
         _ => Err(anyhow!(
-            "usage: /memory [status | show [project|user] | remember <project|user> <text> | forget <project|user> <index> | compact <project|user>]"
+            "usage: /memory [status | show [project|user] | inspect <scope> <id> | search <query> | conflicts | remember <scope> <text> | tag|untag <scope> <id> <tag> | replace <scope> <id> <text> | forget <scope> <id|index> | compact <scope>]"
         )),
     }
+}
+
+fn inspect_memory(memory: &MemorySet, command: &str, writer: &mut dyn Write) -> Result<()> {
+    let (scope, id) = parse_memory_arguments(command, "/memory inspect ")?;
+    let record = select_memory_store(memory, scope)?
+        .record(id)?
+        .with_context(|| format!("memory record `{id}` was not found"))?;
+    show_memory_record(&record, writer)
+}
+
+fn search_memory(memory: &MemorySet, command: &str, writer: &mut dyn Write) -> Result<()> {
+    let query = command.trim_start_matches("/memory search ").trim();
+    let matches = memory.search(query, 20)?;
+    writeln!(writer, "◆ Memory search · {query}")?;
+    if matches.is_empty() {
+        writeln!(writer, "  No matching approved memory")?;
+    }
+    for candidate in matches {
+        writeln!(
+            writer,
+            "  {} [{}] · {} hit(s) · {}",
+            candidate.record.id,
+            memory_scope_name(candidate.record.scope),
+            candidate.lexical_hits,
+            candidate.record.content
+        )?;
+    }
+    Ok(())
+}
+
+fn forget_memory(memory: &MemorySet, command: &str, writer: &mut dyn Write) -> Result<()> {
+    let (scope, target) = parse_memory_arguments(command, "/memory forget ")?;
+    let store = select_memory_store(memory, scope)?;
+    if target.starts_with("mem_") {
+        store.forget_approved_id(target)?;
+    } else {
+        let index = target
+            .parse::<usize>()
+            .context("memory target must be a stable ID or positive display index")?;
+        store.forget_approved(index)?;
+    }
+    writeln!(
+        writer,
+        "◆ {} memory · forgot {target}",
+        memory_scope_name(store.scope()),
+    )?;
+    Ok(())
+}
+
+fn update_memory_tag(
+    memory: &MemorySet,
+    command: &str,
+    remove: bool,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let prefix = if remove {
+        "/memory untag "
+    } else {
+        "/memory tag "
+    };
+    let (store, id, tag) = parse_memory_record_value(memory, command, prefix)?;
+    let changed = if remove {
+        store.untag_approved(id, tag)?
+    } else {
+        store.tag_approved(id, tag)?
+    };
+    let status = match (remove, changed) {
+        (true, true) => "removed",
+        (true, false) => "was not present",
+        (false, true) => "added",
+        (false, false) => "already present",
+    };
+    writeln!(
+        writer,
+        "◆ {} memory · tag `{tag}` {status}",
+        memory_scope_name(store.scope())
+    )?;
+    Ok(())
+}
+
+fn replace_memory(memory: &MemorySet, command: &str, writer: &mut dyn Write) -> Result<()> {
+    let (store, id, entry) = parse_memory_record_value(memory, command, "/memory replace ")?;
+    let replacement = store.replace_approved(id, entry)?;
+    writeln!(
+        writer,
+        "◆ {} memory · {} replaces {id}",
+        memory_scope_name(store.scope()),
+        replacement.id
+    )?;
+    Ok(())
 }
 
 fn show_memory_status(memory: &MemorySet, writer: &mut dyn Write) -> Result<()> {
@@ -3901,13 +3996,77 @@ fn show_memory_status(memory: &MemorySet, writer: &mut dyn Write) -> Result<()> 
 
 fn show_memory_store(store: &MemoryStore, writer: &mut dyn Write) -> Result<()> {
     writeln!(writer, "◆ {} memory", memory_scope_name(store.scope()))?;
-    let entries = store.entries()?;
-    if entries.is_empty() {
+    let records = store.records()?;
+    if records.is_empty() {
         writeln!(writer, "  No approved entries")?;
     }
-    for (index, entry) in entries.iter().enumerate() {
-        writeln!(writer, "  {}. {entry}", index + 1)?;
+    for (index, record) in records.iter().enumerate() {
+        let state = record
+            .supersedes
+            .as_deref()
+            .map_or(String::new(), |id| format!(" · replaces {id}"));
+        writeln!(
+            writer,
+            "  {}. {} · {}{state}",
+            index + 1,
+            record.id,
+            record.content
+        )?;
+        if !record.tags.is_empty() {
+            writeln!(writer, "     tags: {}", record.tags.join(", "))?;
+        }
     }
+    Ok(())
+}
+
+fn show_memory_record(record: &MemoryRecord, writer: &mut dyn Write) -> Result<()> {
+    let provenance = match &record.provenance {
+        MemoryProvenance::Manual => "manual".to_owned(),
+        MemoryProvenance::LegacyMigration { source, index } => {
+            format!("legacy migration · {source} entry {index}")
+        }
+    };
+    writeln!(writer, "◆ Memory record · {}", record.id)?;
+    writeln!(writer, "  scope       {}", memory_scope_name(record.scope))?;
+    writeln!(writer, "  source      {provenance}")?;
+    writeln!(writer, "  created     {} ms", record.created_at_unix_ms)?;
+    writeln!(writer, "  updated     {} ms", record.updated_at_unix_ms)?;
+    writeln!(
+        writer,
+        "  tags        {}",
+        if record.tags.is_empty() {
+            "none".to_owned()
+        } else {
+            record.tags.join(", ")
+        }
+    )?;
+    writeln!(
+        writer,
+        "  supersedes  {}",
+        record.supersedes.as_deref().unwrap_or("none")
+    )?;
+    writeln!(writer, "  content     {}", record.content)?;
+    Ok(())
+}
+
+fn show_memory_conflicts(memory: &MemorySet, writer: &mut dyn Write) -> Result<()> {
+    let conflicts = memory.conflicts()?;
+    writeln!(writer, "◆ Memory conflicts")?;
+    if conflicts.is_empty() {
+        writeln!(writer, "  No unresolved conflicts")?;
+    }
+    for conflict in conflicts {
+        writeln!(
+            writer,
+            "  {} · {}",
+            conflict.topic,
+            conflict.record_ids.join(", ")
+        )?;
+    }
+    writeln!(
+        writer,
+        "  Inspect IDs, then use replace, tag, untag, or forget explicitly."
+    )?;
     Ok(())
 }
 
@@ -3918,6 +4077,23 @@ fn parse_memory_entry<'a>(
 ) -> Result<(&'a MemoryStore, &'a str)> {
     let (scope, entry) = parse_memory_arguments(command, prefix)?;
     Ok((select_memory_store(memory, scope)?, entry))
+}
+
+fn parse_memory_record_value<'a>(
+    memory: &'a MemorySet,
+    command: &'a str,
+    prefix: &str,
+) -> Result<(&'a MemoryStore, &'a str, &'a str)> {
+    let (scope, remaining) = parse_memory_arguments(command, prefix)?;
+    let boundary = remaining
+        .find(char::is_whitespace)
+        .context("memory command requires a stable ID and value")?;
+    let (id, value) = remaining.split_at(boundary);
+    let value = value.trim();
+    if !id.starts_with("mem_") || value.is_empty() {
+        bail!("memory command requires a stable ID and value");
+    }
+    Ok((select_memory_store(memory, scope)?, id, value))
 }
 
 fn parse_memory_arguments<'a>(command: &'a str, prefix: &str) -> Result<(&'a str, &'a str)> {
@@ -5164,6 +5340,7 @@ mod tests {
     use crumb_agent::{
         AgentConfig, CredentialReference, ProviderHeader, ProviderProtocol, RiskClass,
     };
+    use crumb_memory::{MemoryScope, MemoryStore};
 
     use super::{
         ExitGesture, SessionCommandContext, agent_config_location, effort_display_name,
@@ -5383,6 +5560,45 @@ mod tests {
         let output = String::from_utf8(output).expect("memory output is UTF-8");
         assert!(output.contains("Run the workspace merge gate"));
         assert!(workspace.join(".crumb/MEMORY.md").is_file());
+        std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
+    }
+
+    #[test]
+    fn memory_commands_inspect_tag_and_replace_by_stable_id() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-memory-manage-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace can be created");
+        let mut output = Vec::new();
+        show_memory(
+            "/memory remember project Use tabs for indentation",
+            &workspace,
+            &mut output,
+        )
+        .expect("memory is stored");
+        let store = MemoryStore::new(workspace.join(".crumb/MEMORY.md"), MemoryScope::Project);
+        let id = store.records().expect("records")[0].id.clone();
+
+        for command in [
+            format!("/memory tag project {id} conflict:indentation"),
+            format!("/memory inspect project {id}"),
+            format!("/memory replace project {id} Use four spaces for indentation"),
+        ] {
+            show_memory(&command, &workspace, &mut output).expect("memory command succeeds");
+        }
+
+        let output = String::from_utf8(output).expect("memory output is UTF-8");
+        assert!(output.contains(&id));
+        assert!(output.contains("conflict:indentation"));
+        let records = store.records().expect("replacement records");
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .any(|record| record.content == "Use four spaces for indentation")
+        );
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
     }
 
