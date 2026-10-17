@@ -460,7 +460,7 @@ pub(crate) fn redacted_error(error: &anyhow::Error) -> String {
 mod tests {
     use std::io::Cursor;
     #[cfg(unix)]
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[cfg(unix)]
     use crumb_agent::{
@@ -470,7 +470,7 @@ mod tests {
     use serde_json::json;
 
     #[cfg(unix)]
-    use super::{StdioMcpLimits, register_stdio_servers};
+    use super::{StdioMcpClient, StdioMcpLimits, register_stdio_servers};
     use super::{parse_tool, parse_tool_output, read_frame, redacted_error};
 
     #[test]
@@ -568,6 +568,157 @@ mod tests {
         assert!(marker.exists());
 
         drop(host);
+        std::fs::remove_dir_all(workspace).expect("temporary workspace removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_failures_are_isolated_and_child_environment_is_cleared() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-mcp-adversarial-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+
+        let environment_script = workspace.join("environment.sh");
+        std::fs::write(
+            &environment_script,
+            concat!(
+                "while IFS= read -r line; do\n",
+                "case \"$line\" in\n",
+                "  *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\"}}' ;;\n",
+                "  *'\"method\":\"tools/list\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"environment\",\"description\":\"%s\",\"inputSchema\":{\"type\":\"object\"}}]}}\\n' \"${HOME:-cleared}\" ;;\n",
+                "esac\n",
+                "done\n"
+            ),
+        )
+        .expect("environment fixture");
+        let server = McpServer {
+            id: "environment".to_owned(),
+            transport: crumb_agent::McpTransport::Stdio,
+            command: "/bin/sh".into(),
+            arguments: vec![environment_script.to_string_lossy().into_owned()],
+            url: None,
+            credential: None,
+            enabled: true,
+        };
+        let mut host = ToolHost::default();
+        assert_eq!(
+            register_stdio_servers(
+                &mut host,
+                std::slice::from_ref(&server),
+                &workspace,
+                StdioMcpLimits::default(),
+            ),
+            []
+        );
+        assert_eq!(
+            host.descriptor("mcp__environment__environment")
+                .expect("environment tool")
+                .description,
+            "cleared"
+        );
+        drop(host);
+
+        let malformed_script = workspace.join("malformed.sh");
+        std::fs::write(
+            &malformed_script,
+            "IFS= read -r line\nprintf '%s\\n' 'secret-child-payload'\n",
+        )
+        .expect("malformed fixture");
+        let malformed = McpServer {
+            id: "malformed".to_owned(),
+            arguments: vec![malformed_script.to_string_lossy().into_owned()],
+            ..server.clone()
+        };
+        let diagnostics = register_stdio_servers(
+            &mut ToolHost::default(),
+            &[malformed],
+            &workspace,
+            StdioMcpLimits::default(),
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "external MCP malformed");
+        assert!(!diagnostics[0].message.contains("secret-child-payload"));
+
+        let hanging_script = workspace.join("hanging.sh");
+        std::fs::write(&hanging_script, "IFS= read -r line\nsleep 5\n").expect("hanging fixture");
+        let hanging = McpServer {
+            id: "hanging".to_owned(),
+            arguments: vec![hanging_script.to_string_lossy().into_owned()],
+            ..server
+        };
+        let diagnostics = register_stdio_servers(
+            &mut ToolHost::default(),
+            &[hanging],
+            &workspace,
+            StdioMcpLimits {
+                startup_timeout: Duration::from_millis(20),
+                ..StdioMcpLimits::default()
+            },
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "external MCP timed out");
+        std::fs::remove_dir_all(workspace).expect("temporary workspace removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_an_active_stdio_call_terminates_the_child() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-mcp-cancel-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let script = workspace.join("fixture.sh");
+        std::fs::write(
+            &script,
+            concat!(
+                "while IFS= read -r line; do\n",
+                "case \"$line\" in\n",
+                "  *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\"}}' ;;\n",
+                "  *'\"method\":\"tools/list\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"hang\",\"inputSchema\":{\"type\":\"object\"}}]}}' ;;\n",
+                "  *'\"method\":\"tools/call\"'*) sleep 5 ;;\n",
+                "esac\n",
+                "done\n"
+            ),
+        )
+        .expect("fixture script");
+        let server = McpServer {
+            id: "fixture".to_owned(),
+            transport: crumb_agent::McpTransport::Stdio,
+            command: "/bin/sh".into(),
+            arguments: vec![script.to_string_lossy().into_owned()],
+            url: None,
+            credential: None,
+            enabled: true,
+        };
+        let client = StdioMcpClient::start(&server, &workspace, StdioMcpLimits::default())
+            .expect("client starts");
+        client.discover().expect("tools discovered");
+        let cancellation = CancellationToken::default();
+        let trigger = cancellation.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            trigger.cancel();
+        });
+        let error = client
+            .call("hang", &json!({}), &cancellation)
+            .expect_err("call is cancelled");
+        worker.join().expect("cancellation worker");
+        assert!(error.to_string().contains("cancelled"));
+        assert!(
+            client
+                .child
+                .lock()
+                .expect("child lock")
+                .try_wait()
+                .expect("child status")
+                .is_some()
+        );
+        drop(client);
         std::fs::remove_dir_all(workspace).expect("temporary workspace removed");
     }
 }
