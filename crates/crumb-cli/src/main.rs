@@ -1569,13 +1569,6 @@ fn handle_agent_boundary(
         format!("{}/{}", route.provider, route.model)
     });
     let effort = route.and_then(|route| config.reasoning_effort_for(route));
-    let loaded_skills = config
-        .skills
-        .iter()
-        .filter(|skill| skill.enabled)
-        .map(|skill| skill.id.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
     write!(writer, "\r\x1b[2K")?;
     writeln!(
         writer,
@@ -1584,7 +1577,7 @@ fn handle_agent_boundary(
             &model,
             effort,
             agent_mode_name(config.mode),
-            (!loaded_skills.is_empty()).then_some(loaded_skills.as_str()),
+            None,
             size().map_or(80, |(columns, _)| columns),
         )
     )?;
@@ -2100,25 +2093,12 @@ const fn approval_risk_label(risk: RiskClass) -> &'static str {
 }
 
 fn initial_agent_activity(request: &str, config: &AgentConfig) -> String {
-    let enabled_skills = config
-        .skills
-        .iter()
-        .filter(|skill| skill.enabled)
-        .map(|skill| skill.id.as_str())
-        .collect::<Vec<_>>();
-    if !enabled_skills.is_empty() {
-        let visible = enabled_skills
-            .iter()
-            .take(3)
-            .copied()
-            .collect::<Vec<_>>()
-            .join(" · ");
-        let overflow = enabled_skills.len().saturating_sub(3);
-        if overflow == 0 {
-            format!("Loading skills · {visible}")
-        } else {
-            format!("Loading skills · {visible} · +{overflow}")
-        }
+    let enabled_skills = config.skills.iter().filter(|skill| skill.enabled).count();
+    if enabled_skills > 0 {
+        format!(
+            "Loading {enabled_skills} skill{}",
+            if enabled_skills == 1 { "" } else { "s" }
+        )
     } else if request
         .split_whitespace()
         .any(|token| token.starts_with('@') && token.len() > 1)
@@ -8733,7 +8713,7 @@ mod tests {
         });
         assert_eq!(
             initial_agent_activity("review the project", &config),
-            "Loading skills · code-review"
+            "Loading 1 skill"
         );
     }
 

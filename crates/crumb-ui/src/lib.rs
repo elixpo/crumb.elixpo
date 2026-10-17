@@ -717,10 +717,10 @@ impl Renderer {
         }
         let color = if success { "32;1" } else { "31;1" };
         format!(
-            "  {}  {}\n  {} {}",
+            "  {}  {} {} {}",
             self.paint(CRUMB_BADGE, "38;2;255;255;204;48;5;53;1"),
             self.paint(title, color),
-            self.paint("╰──▶", color),
+            self.paint("·", "2"),
             self.paint(detail, "1")
         )
     }
@@ -1658,11 +1658,11 @@ mod tests {
 
         assert_eq!(
             renderer.agent_tool_result("web_fetch", true),
-            "  [ CRUMB ]  Tool completed\n  ╰──▶ web_fetch"
+            "  [ CRUMB ]  Tool completed · web_fetch"
         );
         assert_eq!(
             renderer.agent_tool_result("write_file", false),
-            "  [ CRUMB ]  Tool failed\n  ╰──▶ write_file"
+            "  [ CRUMB ]  Tool failed · write_file"
         );
         assert_eq!(
             renderer.agent_approval_required("write_file"),
@@ -1674,7 +1674,7 @@ mod tests {
         );
         assert_eq!(
             renderer.agent_tool_result("spawn_agents", true),
-            "  [ CRUMB ]  Agent team reported\n  ╰──▶ parallel findings returned to the parent Harness"
+            "  [ CRUMB ]  Agent team reported · parallel findings returned to the parent Harness"
         );
         assert_eq!(
             renderer.agent_approval_required("spawn_agents"),
