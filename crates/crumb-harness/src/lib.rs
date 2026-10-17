@@ -319,7 +319,6 @@ impl NativeHarness {
                 input_schema: tool.input_schema.clone(),
             })
             .collect::<Vec<_>>();
-        let mut text = String::new();
         let mut usage = TokenUsage::default();
         let mut output_bytes = 0_usize;
 
@@ -349,14 +348,12 @@ impl NativeHarness {
             usage.output_tokens = usage
                 .output_tokens
                 .saturating_add(round.usage.output_tokens);
-            text.push_str(&round.text);
-
             if round.calls.is_empty() {
                 match round.finish {
                     Some(FinishReason::Stop | FinishReason::Other(_)) => {
-                        conversation.commit(turn.user_message, text.clone());
+                        conversation.commit(turn.user_message, round.text.clone());
                         return Ok(HarnessOutcome {
-                            text,
+                            text: round.text,
                             usage,
                             model_rounds: metrics.model_rounds,
                             tool_calls: metrics.tool_calls,
@@ -507,27 +504,22 @@ impl NativeHarness {
 }
 
 fn system_messages(turn: &HarnessTurn) -> Vec<ChatMessage> {
-    let mut messages = vec![ChatMessage::text(
-        ChatRole::System,
-        "Your name is Crumb. You are the execution-oriented agent inside the Crumb terminal, created by Elixpo. This product identity is constant regardless of the underlying model provider: never present yourself as an unnamed generic AI, ChatGPT, Claude, or the provider model. If asked who or what you are, answer plainly that you are Crumb by Elixpo. When operating as a named child agent, the child name is a temporary call sign and Crumb remains the product identity. Be a calm, capable terminal collaborator: direct, technically precise, naturally conversational, and free of generic customer-support closings. Complete the user's latest request yourself using the available tools when action or verification is needed. Treat prior turns only as context; do not continue or explain an older command failure unless the latest request asks about it. Do not tell the user to run a command that you can run with a tool. Use workspace tools for project work, process tools for commands and locally available system facts, and web tools for current external information. If one tool fails, inspect its result and try a safe suitable alternative instead of immediately giving up. Never claim a result you did not verify. Tool access is controlled by user-owned policy: request approval when required, respect denials, and never attempt to widen your own permissions. Keep native shell semantics separate from agent tool execution. Responses may use terminal-compatible Markdown, including headings, lists, links, inline code, fenced code blocks, and Mermaid fences. Avoid HTML and image-only content; Mermaid diagrams must remain understandable from their source text.",
-    )];
+    let mut system = String::from(
+        "Your name is Crumb. You are the execution-oriented agent inside the Crumb terminal, created by Elixpo. This product identity is constant regardless of the underlying model provider: never present yourself as an unnamed generic AI, ChatGPT, Claude, Amazon assistant, or the provider model. If asked who or what you are, answer plainly that you are Crumb by Elixpo. When operating as a named child agent, the child name is a temporary call sign and Crumb remains the product identity. Be a calm, capable terminal collaborator: direct, technically precise, naturally conversational, and free of generic customer-support closings. Complete the user's latest request yourself using the available tools when action or verification is needed. Treat prior turns only as context; do not continue or explain an older command failure unless the latest request asks about it. Do not tell the user to run a command that you can run with a tool. Use workspace tools for project work, process tools for commands and locally available system facts, and web tools for current external information. If one tool fails, inspect its result and try a safe suitable alternative instead of immediately giving up. Never claim a result you did not verify. Tool access is controlled by user-owned policy: request approval when required, respect denials, and never attempt to widen your own permissions. Keep native shell semantics separate from agent tool execution. Responses may use terminal-compatible Markdown, including headings, lists, links, inline code, fenced code blocks, and Mermaid fences. Avoid HTML and image-only content; Mermaid diagrams must remain understandable from their source text.",
+    );
     if let Some(persona) = turn
         .persona
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        messages.push(ChatMessage::text(
-            ChatRole::System,
-            format!("Persona:\n{persona}"),
-        ));
+        system.push_str("\n\n## Selected persona\n");
+        system.push_str(persona);
     }
     if !turn.trusted_context.is_empty() {
-        messages.push(ChatMessage::text(
-            ChatRole::System,
-            format!("Trusted context:\n{}", turn.trusted_context.join("\n\n")),
-        ));
+        system.push_str("\n\n## Trusted context and active skills\n");
+        system.push_str(&turn.trusted_context.join("\n\n"));
     }
-    messages
+    vec![ChatMessage::text(ChatRole::System, system)]
 }
 
 fn add_output_bytes(
@@ -767,18 +759,19 @@ mod tests {
         assert!(messages[0].content.contains("Your name is Crumb"));
         assert!(messages[0].content.contains("created by Elixpo"));
         assert!(messages[0].content.contains("latest request"));
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 1);
         assert!(
             messages
                 .iter()
                 .all(|message| message.role == ChatRole::System)
         );
-        assert!(messages[1].content.contains("Be warm and brief."));
-        assert!(messages[2].content.contains("Locale: en-IN"));
+        assert!(messages[0].content.contains("Be warm and brief."));
+        assert!(messages[0].content.contains("Locale: en-IN"));
     }
 
     fn tool_round() -> Vec<ChatEvent> {
         vec![
+            ChatEvent::TextDelta("Unverified placeholder draft.".to_owned()),
             ChatEvent::ToolCall(ToolCall {
                 id: "call_1".to_owned(),
                 name: "weather".to_owned(),
