@@ -39,5 +39,9 @@ jobs:
       - name: Test Rust workspace
         run: cargo test --workspace --all-targets
 
+      - name: Audit website dependencies
+        working-directory: crumb.elixpo
+        run: npm audit --audit-level=low
+
       - name: Build Crumb website
         run: ./deploy.sh --worker build
