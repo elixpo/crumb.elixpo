@@ -216,6 +216,7 @@ fn is_public_ip(ip: IpAddr) -> bool {
 }
 
 fn html_to_text(html: &str) -> String {
+    let html = remove_tagged_blocks(html, &["script", "style", "noscript", "svg"]);
     let mut text = String::with_capacity(html.len());
     let mut in_tag = false;
     let mut previous_space = false;
@@ -251,6 +252,29 @@ fn html_to_text(html: &str) -> String {
         .to_owned()
 }
 
+fn remove_tagged_blocks(html: &str, tags: &[&str]) -> String {
+    let mut output = html.to_owned();
+    for tag in tags {
+        loop {
+            let lowered = output.to_ascii_lowercase();
+            let opening = format!("<{tag}");
+            let closing = format!("</{tag}>");
+            let Some(start) = lowered.find(&opening) else {
+                break;
+            };
+            let Some(relative_end) = lowered[start..].find(&closing) else {
+                output.truncate(start);
+                break;
+            };
+            let end = start
+                .saturating_add(relative_end)
+                .saturating_add(closing.len());
+            output.replace_range(start..end, " ");
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -268,7 +292,7 @@ mod tests {
     #[test]
     fn html_is_reduced_to_bounded_plain_text() {
         assert_eq!(
-            html_to_text("<h1>Crumb</h1><p>A &amp; B</p>"),
+            html_to_text("<style>body{display:none}</style><h1>Crumb</h1><p>A &amp; B</p>"),
             "Crumb A & B"
         );
     }

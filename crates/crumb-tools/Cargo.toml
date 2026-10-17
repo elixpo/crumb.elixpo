@@ -12,7 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
 url.workspace = true
 
 [target.'cfg(unix)'.dependencies]
