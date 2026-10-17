@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use crumb_agent::LiveConfig;
+use crumb_agent::{AgentConfig, AgentMode, LiveConfig, Modality};
 use reedline::{Completer, CompletionResult, Span, Suggestion};
 
 pub const COMPLETION_PALETTE_ROWS: u16 = 9;
@@ -80,6 +80,7 @@ fn help_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Suggestion>
     if !token.starts_with('?') {
         return Vec::new();
     }
+    let query = token.trim_start_matches('?');
     let mut settings = vec![
         (
             "? help".to_owned(),
@@ -104,6 +105,7 @@ fn help_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Suggestion>
                 )
             }),
     );
+    settings.extend(configured_runtime_actions(workspace));
     settings.extend(configured_skill_actions(workspace).into_iter().map(
         |(command, description)| {
             (
@@ -115,11 +117,129 @@ fn help_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Suggestion>
     ));
     settings
         .into_iter()
-        .filter(|(display, _, _)| display.starts_with(token))
+        .filter(|(display, _, _)| {
+            query.is_empty()
+                || display
+                    .strip_prefix("? ")
+                    .is_some_and(|label| label.starts_with(query))
+        })
         .map(|(display, value, description)| {
             routed_suggestion(&display, &value, &description, Span::new(start, pos))
         })
         .collect()
+}
+
+fn configured_runtime_actions(workspace: &Path) -> Vec<(String, String, String)> {
+    let Some(path) = config_path(workspace) else {
+        return Vec::new();
+    };
+    let Ok(config) = LiveConfig::new(path).load() else {
+        return Vec::new();
+    };
+    let mut actions = mode_actions(config.mode);
+    actions.extend(model_actions(&config));
+    actions.extend(effort_actions(&config));
+    actions
+}
+
+fn mode_actions(selected: AgentMode) -> Vec<(String, String, String)> {
+    [
+        ("auto", AgentMode::Auto, "execute approved read-only tools"),
+        (
+            "negotiate",
+            AgentMode::Negotiate,
+            "request approval before tool execution",
+        ),
+        ("plan", AgentMode::Plan, "reason without executing tools"),
+    ]
+    .into_iter()
+    .map(|(name, mode, description)| {
+        (
+            format!("? mode {name}"),
+            format!("/mode use {name}"),
+            selection_description(description, mode == selected),
+        )
+    })
+    .collect()
+}
+
+fn model_actions(config: &AgentConfig) -> Vec<(String, String, String)> {
+    let selected = config
+        .models
+        .get(&Modality::Text)
+        .and_then(|routes| routes.first());
+    config
+        .providers
+        .iter()
+        .flat_map(|(provider_id, provider)| {
+            provider.models.iter().map(move |model| {
+                let selection = format!("{provider_id}/{}", model.id);
+                let is_selected = selected
+                    .is_some_and(|route| route.provider == *provider_id && route.model == model.id);
+                let description = model
+                    .display_name
+                    .as_deref()
+                    .unwrap_or(provider.display_name.as_str());
+                (
+                    format!("? model {selection}"),
+                    format!("/model use {selection}"),
+                    selection_description(description, is_selected),
+                )
+            })
+        })
+        .collect()
+}
+
+fn effort_actions(config: &AgentConfig) -> Vec<(String, String, String)> {
+    let Some(route) = config
+        .models
+        .get(&Modality::Text)
+        .and_then(|routes| routes.first())
+    else {
+        return Vec::new();
+    };
+    let selected = config.reasoning_effort_for(route);
+    let mut efforts = vec![("default".to_owned(), None)];
+    if let Some(model) = config
+        .providers
+        .get(&route.provider)
+        .and_then(|provider| provider.models.iter().find(|model| model.id == route.model))
+    {
+        efforts.extend(model.reasoning_efforts.keys().map(|effort| {
+            (
+                effort_display_name(effort).to_owned(),
+                Some(effort.as_str()),
+            )
+        }));
+    }
+    efforts
+        .into_iter()
+        .map(|(display, wire)| {
+            let is_selected = wire == selected;
+            (
+                format!("? effort {display}"),
+                format!("/effort use {display}"),
+                selection_description("reasoning effort", is_selected),
+            )
+        })
+        .collect()
+}
+
+fn selection_description(description: &str, selected: bool) -> String {
+    if selected {
+        format!("selected · {description}")
+    } else {
+        description.to_owned()
+    }
+}
+
+fn effort_display_name(effort: &str) -> &str {
+    match effort {
+        "low" => "light",
+        "xhigh" => "extra high",
+        "max" => "ultra",
+        value => value,
+    }
 }
 
 fn current_token(line: &str) -> (usize, &str) {
@@ -450,6 +570,85 @@ mod tests {
                 .display_override
                 .as_deref()
                 .is_some_and(|display| display.starts_with("? skills load review"))
+        );
+        std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
+    }
+
+    #[test]
+    fn settings_palette_exposes_live_mode_model_and_effort_choices() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-runtime-menu-{suffix}"));
+        std::fs::create_dir_all(workspace.join(".crumb")).expect("config directory can be created");
+        std::fs::write(
+            workspace.join(".crumb/agent.json"),
+            br#"{
+              "mode":"auto",
+              "providers":{
+                "fixture":{
+                  "display_name":"Fixture Gateway",
+                  "protocol":"open_ai_responses",
+                  "base_url":"https://example.com/v1",
+                  "models":[{
+                    "id":"coding-model",
+                    "display_name":"Coding Model",
+                    "input":["text"],
+                    "reasoning_efforts":{"low":"low","high":"high"}
+                  }]
+                }
+              },
+              "models":{
+                "text":[{"provider":"fixture","model":"coding-model","effort":"high"}]
+              }
+            }"#,
+        )
+        .expect("agent config can be written");
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(workspace.clone()));
+
+        let settings = completer.complete("?", 1);
+        assert!(
+            settings
+                .suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "/mode use plan")
+        );
+        let model = settings
+            .suggestions()
+            .iter()
+            .find(|candidate| candidate.value == "/model use fixture/coding-model")
+            .expect("configured model is selectable");
+        assert!(
+            model
+                .display_override
+                .as_deref()
+                .is_some_and(|display| display.contains("selected · Coding Model"))
+        );
+        assert!(
+            settings
+                .suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "/effort use light")
+        );
+        assert!(
+            settings
+                .suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "/effort use high")
+        );
+        assert!(
+            settings
+                .suggestions()
+                .iter()
+                .all(|candidate| candidate.value != "/effort use ultra")
+        );
+        let filtered = completer.complete("?mod", 4);
+        assert!(
+            filtered
+                .suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "/model use fixture/coding-model")
         );
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
     }
