@@ -70,7 +70,7 @@ pub(crate) static ALL: &[BundledSkill] = &[
     ),
     skill!(
         "web-research",
-        "research current facts with bounded searches and source verification"
+        "automatically research current or uncertain facts with source verification"
     ),
 ];
 

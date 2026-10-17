@@ -324,9 +324,8 @@ impl NativeHarness {
             .collect::<Vec<_>>();
         let mut usage = TokenUsage::default();
         let mut output_bytes = 0_usize;
-        let shell_available = definitions.iter().any(|tool| tool.name == "run_shell");
+        let mut retries = RequiredToolRetries::new(&definitions);
         let mut require_tool = false;
-        let mut execution_retry_used = false;
 
         loop {
             if metrics.model_rounds == self.limits.max_model_rounds.get() {
@@ -360,13 +359,7 @@ impl NativeHarness {
             if round.calls.is_empty() {
                 match round.finish {
                     Some(FinishReason::Stop | FinishReason::Other(_)) => {
-                        if prepare_execution_retry(
-                            &mut messages,
-                            &turn.user_message,
-                            &round.text,
-                            shell_available,
-                            &mut execution_retry_used,
-                        ) {
+                        if retries.prepare(&mut messages, &turn.user_message, &round.text) {
                             require_tool = true;
                             continue;
                         }
@@ -521,6 +514,56 @@ impl NativeHarness {
     }
 }
 
+struct RequiredToolRetries {
+    execution: RetryStatus,
+    research: RetryStatus,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RetryStatus {
+    Unavailable,
+    Ready,
+    Used,
+}
+
+impl RequiredToolRetries {
+    fn new(definitions: &[ToolDefinition]) -> Self {
+        Self {
+            execution: retry_status(definitions, "run_shell"),
+            research: retry_status(definitions, "web_search"),
+        }
+    }
+
+    fn prepare(
+        &mut self,
+        messages: &mut Vec<ChatMessage>,
+        user_message: &str,
+        response: &str,
+    ) -> bool {
+        if self.execution == RetryStatus::Ready
+            && prepare_execution_retry(messages, user_message, response)
+        {
+            self.execution = RetryStatus::Used;
+            return true;
+        }
+        if self.research == RetryStatus::Ready
+            && prepare_research_retry(messages, user_message, response)
+        {
+            self.research = RetryStatus::Used;
+            return true;
+        }
+        false
+    }
+}
+
+fn retry_status(definitions: &[ToolDefinition], name: &str) -> RetryStatus {
+    if definitions.iter().any(|tool| tool.name == name) {
+        RetryStatus::Ready
+    } else {
+        RetryStatus::Unavailable
+    }
+}
+
 fn finish_turn(
     round: ModelRound,
     turn: HarnessTurn,
@@ -551,13 +594,10 @@ fn prepare_execution_retry(
     messages: &mut Vec<ChatMessage>,
     user_message: &str,
     response: &str,
-    shell_available: bool,
-    retry_used: &mut bool,
 ) -> bool {
-    if *retry_used || !shell_available || !should_retry_with_execution(user_message, response) {
+    if !should_retry_with_execution(user_message, response) {
         return false;
     }
-    *retry_used = true;
     messages.push(ChatMessage::text(ChatRole::Assistant, response));
     messages.push(ChatMessage::text(
         ChatRole::System,
@@ -615,6 +655,58 @@ fn should_retry_with_execution(user_message: &str, response: &str) -> bool {
     .iter()
     .any(|phrase| response.contains(phrase));
     asks_for_action && deferred_to_user
+}
+
+fn prepare_research_retry(
+    messages: &mut Vec<ChatMessage>,
+    user_message: &str,
+    response: &str,
+) -> bool {
+    if !should_retry_with_research(user_message, response) {
+        return false;
+    }
+    messages.push(ChatMessage::text(ChatRole::Assistant, response));
+    messages.push(ChatMessage::text(
+        ChatRole::System,
+        "The response exposed uncertainty or deferred web research to the user. Call web_search now using the specific subjects, location, date or time period, and qualifiers from the user's request. Inspect the returned evidence as needed, then answer with verified findings. Do not repeat the uncertainty disclaimer or tell the user to search.",
+    ));
+    true
+}
+
+fn should_retry_with_research(user_message: &str, response: &str) -> bool {
+    let user_message = user_message.to_ascii_lowercase();
+    if [
+        "without searching",
+        "without web search",
+        "don't search",
+        "do not search",
+        "offline only",
+    ]
+    .iter()
+    .any(|phrase| user_message.contains(phrase))
+    {
+        return false;
+    }
+    let response = response.to_ascii_lowercase();
+    [
+        "i don't know",
+        "i do not know",
+        "i'm not sure",
+        "i am not sure",
+        "i can't verify",
+        "i cannot verify",
+        "i don't have real-time access",
+        "i do not have real-time access",
+        "i can't access the internet",
+        "i cannot access the internet",
+        "knowledge cutoff",
+        "use a search engine",
+        "check a search engine",
+        "check online",
+        "check local tourism",
+    ]
+    .iter()
+    .any(|phrase| response.contains(phrase))
 }
 
 fn preserve_web_search_terms(call: &mut ToolCall, user_message: &str) {
@@ -1091,6 +1183,23 @@ mod tests {
         tools
     }
 
+    fn web_tools(calls: Arc<AtomicUsize>) -> ToolHost {
+        let mut tools = ToolHost::default();
+        tools
+            .register(
+                ToolDescriptor {
+                    name: "web_search".to_owned(),
+                    description: "Search the public web".to_owned(),
+                    input_schema: json!({"type":"object","required":["query"]}),
+                    risk: RiskClass::ReadOnly,
+                    transport: ToolTransport::Native,
+                },
+                Arc::new(CountingTool(calls)),
+            )
+            .expect("tool registers");
+        tools
+    }
+
     fn session(mode: AgentMode) -> (tempfile::TempDir, AgentSession) {
         let root = tempfile::tempdir().expect("session root");
         let id = SessionId::new("harness-test").expect("session id");
@@ -1177,6 +1286,17 @@ mod tests {
         ]
     }
 
+    fn web_search_round() -> Vec<ChatEvent> {
+        vec![
+            ChatEvent::ToolCall(ToolCall {
+                id: "search_1".to_owned(),
+                name: "web_search".to_owned(),
+                arguments: json!({"query":"current festival Kolkata"}),
+            }),
+            ChatEvent::Finished(FinishReason::ToolCall),
+        ]
+    }
+
     #[tokio::test]
     async fn approved_tool_runs_once_in_a_multi_round_turn() {
         let provider = Arc::new(ScriptedProvider::new(vec![tool_round(), answer_round()]));
@@ -1249,6 +1369,70 @@ mod tests {
         for secret in ["weather in Pune", "Pune", "24 C", "Be warm and brief"] {
             assert!(!persisted.contains(secret));
         }
+    }
+
+    #[tokio::test]
+    async fn uncertainty_about_current_facts_retries_with_web_search() {
+        let refusal = vec![
+            ChatEvent::TextDelta(
+                "I don't have real-time access. Check a search engine for Kolkata festivals."
+                    .to_owned(),
+            ),
+            ChatEvent::Finished(FinishReason::Stop),
+        ];
+        let answer = vec![
+            ChatEvent::TextDelta("Kolkata is celebrating Durga Puja.".to_owned()),
+            ChatEvent::Finished(FinishReason::Stop),
+        ];
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            refusal,
+            web_search_round(),
+            answer,
+        ]));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let harness = NativeHarness::new(
+            provider.clone(),
+            web_tools(calls.clone()),
+            Arc::new(DenyAllApprovals),
+            HarnessLimits::default(),
+        );
+        let (root, mut session) = session(AgentMode::Auto);
+        let mut conversation = harness.conversation();
+        let mut events = Vec::new();
+        let mut research_turn = turn();
+        research_turn.user_message = "What festival is in Kolkata now?".to_owned();
+
+        let outcome = harness
+            .run_turn(
+                &mut session,
+                &mut conversation,
+                research_turn,
+                &CancellationToken::default(),
+                &mut events,
+            )
+            .await
+            .expect("turn succeeds");
+
+        assert_eq!(outcome.text, "Kolkata is celebrating Durga Puja.");
+        assert_eq!(outcome.model_rounds, 3);
+        assert_eq!(outcome.tool_calls, 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let requests = provider.requests.lock().expect("request lock");
+        assert_eq!(requests[1].tool_choice, ToolChoice::Required);
+        assert!(requests[1].messages.iter().any(|message| {
+            message.role == ChatRole::System && message.content.contains("Call web_search now")
+        }));
+        assert!(!outcome.text.contains("search engine"));
+        drop(requests);
+        drop(root);
+    }
+
+    #[test]
+    fn explicit_offline_request_does_not_force_research() {
+        assert!(!super::should_retry_with_research(
+            "Answer from memory without searching",
+            "I'm not sure; check online."
+        ));
     }
 
     #[tokio::test]
