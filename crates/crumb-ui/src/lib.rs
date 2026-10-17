@@ -503,6 +503,7 @@ impl Renderer {
     #[must_use]
     pub fn agent_response(&self, response: &str) -> String {
         let response = visible_agent_text(response);
+        let response = render_terminal_markdown(*self, &response);
         if self.settings.output == OutputMode::ScreenReader {
             return response;
         }
@@ -1094,6 +1095,144 @@ pub fn visible_agent_text(response: &str) -> String {
         .map_or_else(|| visible.to_owned(), |body| body.trim().to_owned())
 }
 
+fn render_terminal_markdown(ui: Renderer, markdown: &str) -> String {
+    let mut output_lines = Vec::new();
+    let mut fence: Option<String> = None;
+
+    for line in markdown.lines() {
+        let trimmed = line.trim_start();
+        if let Some(info) = trimmed.strip_prefix("```") {
+            if fence.is_some() {
+                output_lines.push(ui.paint("└─", "2"));
+                fence = None;
+            } else {
+                let language = info.trim();
+                let label = if language.eq_ignore_ascii_case("mermaid") {
+                    "mermaid diagram · source".to_owned()
+                } else if language.is_empty() {
+                    "code".to_owned()
+                } else {
+                    format!("code · {language}")
+                };
+                output_lines.push(format!(
+                    "{} {}",
+                    ui.paint("┌─", "2"),
+                    ui.paint(&label, "35;1")
+                ));
+                fence = Some(language.to_owned());
+            }
+            continue;
+        }
+
+        if fence.is_some() {
+            output_lines.push(format!("{} {line}", ui.paint("│", "2")));
+            continue;
+        }
+
+        output_lines.push(render_markdown_line(ui, line));
+    }
+
+    if fence.is_some() {
+        output_lines.push(ui.paint("└─", "2"));
+    }
+    output_lines.join("\n")
+}
+
+fn render_markdown_line(renderer: Renderer, line: &str) -> String {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+
+    if let Some((level, heading)) = markdown_heading(trimmed) {
+        let color = if level <= 2 {
+            "38;2;255;255;204;1"
+        } else {
+            "1"
+        };
+        return format!("{indent}{}", renderer.paint(heading, color));
+    }
+    if let Some(quote) = trimmed.strip_prefix("> ") {
+        return format!(
+            "{indent}{} {}",
+            renderer.paint("│", "2"),
+            render_inline_markdown(renderer, quote)
+        );
+    }
+    if let Some(item) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+    {
+        return format!(
+            "{indent}{} {}",
+            renderer.paint("•", "35;1"),
+            render_inline_markdown(renderer, item)
+        );
+    }
+    if matches!(trimmed, "---" | "***" | "___") {
+        return format!("{indent}{}", renderer.paint("────────────────", "2"));
+    }
+    format!("{indent}{}", render_inline_markdown(renderer, trimmed))
+}
+
+fn markdown_heading(line: &str) -> Option<(usize, &str)> {
+    let hashes = line.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    line.get(hashes..)?
+        .strip_prefix(' ')
+        .map(|text| (hashes, text))
+}
+
+fn render_inline_markdown(renderer: Renderer, text: &str) -> String {
+    let mut output = String::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(code) = rest.strip_prefix('`')
+            && let Some(end) = code.find('`')
+        {
+            output.push_str(&renderer.paint(&code[..end], "36"));
+            rest = &code[end + 1..];
+            continue;
+        }
+        if let Some(bold) = rest.strip_prefix("**")
+            && let Some(end) = bold.find("**")
+        {
+            output.push_str(&renderer.paint(&bold[..end], "1"));
+            rest = &bold[end + 2..];
+            continue;
+        }
+        if let Some(label) = rest.strip_prefix('[')
+            && let Some(label_end) = label.find("](")
+            && let Some(url_end) = label[label_end + 2..].find(')')
+        {
+            let url_start = label_end + 2;
+            let url_end = url_start + url_end;
+            output.push_str(&renderer.paint(&label[..label_end], "36;4"));
+            output.push_str(" (");
+            output.push_str(&label[url_start..url_end]);
+            output.push(')');
+            rest = &label[url_end + 1..];
+            continue;
+        }
+
+        let next = rest
+            .char_indices()
+            .find_map(|(index, character)| matches!(character, '`' | '*' | '[').then_some(index))
+            .filter(|index| *index > 0)
+            .unwrap_or(rest.len());
+        if next == 0 {
+            let character = rest.chars().next().expect("non-empty markdown text");
+            output.push(character);
+            rest = &rest[character.len_utf8()..];
+        } else {
+            output.push_str(&rest[..next]);
+            rest = &rest[next..];
+        }
+    }
+    output
+}
+
 fn append_optional_segments(segments: &mut Vec<String>, context: &PromptContext<'_>) {
     if let Some(git) = context.git {
         let dirty = if git.dirty { " *" } else { "" };
@@ -1276,6 +1415,27 @@ mod tests {
         assert_eq!(detail_column(lines[3], "Session"), runtime_column);
         assert_eq!(detail_column(lines[4], "Resume"), runtime_column);
         assert!(runtime_column <= 20);
+    }
+
+    #[test]
+    fn agent_output_renders_terminal_markdown_and_mermaid_source() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let response = "# Result\n**Ready** after `cargo test`.\n- checks passed\n```rust\nfn main() {}\n```\n```mermaid\ngraph TD\n  A --> B\n```";
+        let output = renderer.agent_response(response);
+
+        assert!(output.contains("╰──▶ Result"));
+        assert!(output.contains("Ready after cargo test."));
+        assert!(output.contains("• checks passed"));
+        assert!(output.contains("┌─ code · rust"));
+        assert!(output.contains("│ fn main() {}"));
+        assert!(output.contains("┌─ mermaid diagram · source"));
+        assert!(output.contains("│ graph TD"));
+        assert!(!output.contains("```"));
     }
 
     #[test]
