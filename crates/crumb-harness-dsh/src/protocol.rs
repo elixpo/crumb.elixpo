@@ -72,6 +72,10 @@ pub enum HarnessActivity {
     ResponseDelta {
         text: String,
     },
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
     Status {
         state: String,
     },

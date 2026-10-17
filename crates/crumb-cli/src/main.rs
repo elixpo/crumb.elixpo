@@ -508,6 +508,7 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
         platform,
         interactive,
         fullscreen,
+        runtime_context_tokens(agent_runtime.as_ref()),
         &mut stdout.lock(),
     )?;
     let transcript_state = Arc::new(Mutex::new(TranscriptState::default()));
@@ -575,6 +576,7 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
         };
         writer.flush()?;
         transcript.record_output(&writer.into_capture())?;
+        transcript.refresh_context_header(platform, &cwd, agent_runtime.as_ref())?;
         match outcome {
             Some(ReplOutcome::Exit) => {
                 return finish_managed_repl(screen, renderer, started_at, agent_runtime.as_ref());
@@ -818,6 +820,21 @@ impl FullscreenTranscript {
         state.scroll(direction, self.header_rows);
         render_transcript_view(&state, self.renderer, self.header_rows)
     }
+
+    fn refresh_context_header(
+        &self,
+        platform: Platform,
+        cwd: &Path,
+        runtime: Option<&AgentRuntime>,
+    ) -> Result<()> {
+        refresh_context_header(
+            self.renderer,
+            platform,
+            cwd,
+            runtime_context_tokens(runtime),
+            self.enabled,
+        )
+    }
 }
 
 #[derive(Default)]
@@ -1027,6 +1044,7 @@ fn render_startup(
     platform: Platform,
     interactive: bool,
     fullscreen: bool,
+    context_tokens: u64,
     writer: &mut dyn Write,
 ) -> Result<u16> {
     let cwd = current_process_dir()?;
@@ -1047,7 +1065,7 @@ fn render_startup(
         mode: agent_mode_name(config.mode),
         effort: text_route.and_then(|route| config.reasoning_effort_for(route)),
         session_budget_tokens: context_token_budget(&config, text_route),
-        context_tokens: 0,
+        context_tokens,
         auto_compaction: matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
         agent_configured: config.harness.is_some() && model.is_some(),
     };
@@ -1086,6 +1104,64 @@ fn render_startup(
         )?;
     }
     Ok(0)
+}
+
+fn refresh_context_header(
+    renderer: Renderer,
+    platform: Platform,
+    cwd: &Path,
+    context_tokens: u64,
+    fullscreen: bool,
+) -> Result<()> {
+    if !fullscreen {
+        return Ok(());
+    }
+    let config = read_agent_config(cwd).unwrap_or_default();
+    let text_route = config
+        .models
+        .get(&Modality::Text)
+        .and_then(|routes| routes.first());
+    let model = text_route.map(|route| format!("{}/{}", route.provider, route.model));
+    let startup = StartupContext {
+        version: env!("CARGO_PKG_VERSION"),
+        platform,
+        model: model.as_deref(),
+        mode: agent_mode_name(config.mode),
+        effort: text_route.and_then(|route| config.reasoning_effort_for(route)),
+        session_budget_tokens: context_token_budget(&config, text_route),
+        context_tokens,
+        auto_compaction: matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
+        agent_configured: config.harness.is_some() && model.is_some(),
+    };
+    let terminal_width = size().map_or(100, |(columns, _)| columns);
+    let content_width = terminal_width.saturating_sub(FULLSCREEN_SIDE_GUTTER * 2);
+    let welcome = indent_terminal_block(
+        &renderer.welcome(&startup, content_width),
+        FULLSCREEN_SIDE_GUTTER,
+    );
+    let mut lines = vec![String::new(); usize::from(FULLSCREEN_TOP_GUTTER)];
+    lines.extend(welcome.lines().map(str::to_owned));
+    lines.push(format!(
+        "{}{}",
+        " ".repeat(usize::from(FULLSCREEN_SIDE_GUTTER)),
+        renderer.transcript_divider(content_width)
+    ));
+    let mut frame = Vec::new();
+    write!(frame, "\x1b7")?;
+    for (row, line) in lines.iter().enumerate() {
+        let row = u16::try_from(row).unwrap_or(u16::MAX);
+        crossterm::execute!(frame, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+        write!(frame, "{line}")?;
+    }
+    write!(frame, "\x1b8")?;
+    let mut terminal = io::stdout();
+    terminal.write_all(&frame)?;
+    terminal.flush()?;
+    Ok(())
+}
+
+fn runtime_context_tokens(runtime: Option<&AgentRuntime>) -> u64 {
+    runtime.map_or(0, |runtime| runtime.token_usage().0)
 }
 
 fn confirm_folder_trust(renderer: Renderer, workspace: &Path, fullscreen: bool) -> Result<bool> {
@@ -1745,6 +1821,7 @@ fn execute_agent_sequence(
     let mut steering = SteeringQueue::new(steering_messages, steering_bytes)?;
     let mut request = initial_request;
     let mut active_runtime = runtime.take().context("agent runtime is unavailable")?;
+    let mut live_context_tokens = active_runtime.token_usage().0;
     loop {
         let session_id = active_runtime.prepare_local_job(config.mode, workspace)?;
         let persisted_request = request.clone();
@@ -1756,14 +1833,19 @@ fn execute_agent_sequence(
             activity_capacity,
         )?;
         let (returned_runtime, result, interruption, streamed_response) = loop {
+            let mut active_context = ActiveTurnContext {
+                terminal,
+                workspace,
+                live_context_tokens: &mut live_context_tokens,
+            };
             match observe_agent_turn(
                 task,
                 &mut steering,
                 steering_bytes,
                 renderer,
                 writer,
-                terminal,
                 &initial_activity,
+                &mut active_context,
             )? {
                 TurnObservation::Finished(runtime, result, interruption, streamed_response) => {
                     break (*runtime, result, interruption, streamed_response);
@@ -1793,6 +1875,7 @@ fn execute_agent_sequence(
             }
         };
         active_runtime = returned_runtime;
+        live_context_tokens = active_runtime.token_usage().0;
         match finish_agent_turn(
             &result,
             interruption,
@@ -1898,6 +1981,12 @@ enum TurnObservation {
     Backgrounded(agent_runtime::AgentTurnTask),
 }
 
+struct ActiveTurnContext<'a> {
+    terminal: AgentTerminal,
+    workspace: &'a Path,
+    live_context_tokens: &'a mut u64,
+}
+
 fn promote_agent_turn(
     task: agent_runtime::AgentTurnTask,
     request: &str,
@@ -1957,9 +2046,10 @@ fn observe_agent_turn(
     steering_bytes: usize,
     renderer: Renderer,
     writer: &mut dyn Write,
-    terminal: AgentTerminal,
     initial_activity: &str,
+    context: &mut ActiveTurnContext<'_>,
 ) -> Result<TurnObservation> {
+    let terminal = context.terminal;
     refresh_active_footer(renderer, terminal.fullscreen)?;
     let mut activity = Some(start_activity(
         renderer,
@@ -1996,18 +2086,18 @@ fn observe_agent_turn(
         }
         match task.recv_timeout(Duration::from_millis(15)) {
             Ok(event) => {
-                input.clear_line(writer)?;
-                render_harness_activity(
+                render_observed_activity(
                     &event,
+                    &mut input,
                     &mut activity,
                     &mut streamed_response,
                     &mut streamed_column,
                     renderer,
                     writer,
-                    terminal.fullscreen,
+                    terminal,
+                    context.workspace,
+                    context.live_context_tokens,
                 )?;
-                refresh_active_footer(renderer, terminal.fullscreen)?;
-                restore_steering_input(&mut input, &mut activity, writer)?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2032,18 +2122,18 @@ fn observe_agent_turn(
         }
     }
     while let Ok(event) = task.recv_timeout(Duration::ZERO) {
-        input.clear_line(writer)?;
-        render_harness_activity(
+        render_observed_activity(
             &event,
+            &mut input,
             &mut activity,
             &mut streamed_response,
             &mut streamed_column,
             renderer,
             writer,
-            terminal.fullscreen,
+            terminal,
+            context.workspace,
+            context.live_context_tokens,
         )?;
-        refresh_active_footer(renderer, terminal.fullscreen)?;
-        restore_steering_input(&mut input, &mut activity, writer)?;
     }
     let interruption = input.interruption;
     input.clear_line(writer)?;
@@ -2059,6 +2149,53 @@ fn observe_agent_turn(
         interruption,
         streamed_response,
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_observed_activity(
+    event: &HarnessActivity,
+    input: &mut SteeringInput,
+    activity: &mut Option<crumb_ui::ActivityIndicator>,
+    streamed_response: &mut bool,
+    streamed_column: &mut usize,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    terminal: AgentTerminal,
+    workspace: &Path,
+    live_context_tokens: &mut u64,
+) -> Result<()> {
+    input.clear_line(writer)?;
+    if let HarnessActivity::Usage {
+        input_tokens,
+        output_tokens,
+    } = event
+    {
+        if let Some(indicator) = activity.take() {
+            indicator.finish();
+        }
+        *live_context_tokens =
+            (*live_context_tokens).max(input_tokens.saturating_add(*output_tokens));
+        refresh_context_header(
+            renderer,
+            Platform::current(),
+            workspace,
+            *live_context_tokens,
+            terminal.fullscreen,
+        )?;
+        *activity = Some(start_activity(renderer, "Thinking", terminal.fullscreen));
+    } else {
+        render_harness_activity(
+            event,
+            activity,
+            streamed_response,
+            streamed_column,
+            renderer,
+            writer,
+            terminal.fullscreen,
+        )?;
+    }
+    refresh_active_footer(renderer, terminal.fullscreen)?;
+    restore_steering_input(input, activity, writer)
 }
 
 fn restore_steering_input(
@@ -2713,6 +2850,7 @@ fn harness_activity_label(activity: &HarnessActivity) -> String {
     match activity {
         HarnessActivity::RequestAccepted => "request accepted".to_owned(),
         HarnessActivity::ResponseDelta { .. } => "responding".to_owned(),
+        HarnessActivity::Usage { .. } => "updating context".to_owned(),
         HarnessActivity::Status { state } => format!("session {state}"),
         HarnessActivity::ToolStarted { name, .. } if name == "spawn_agents" => {
             "coordinating parallel agent team".to_owned()
@@ -2839,6 +2977,7 @@ fn render_harness_activity(
         HarnessActivity::RequestAccepted => {
             replace_activity(indicator, renderer, "Request accepted", fullscreen);
         }
+        HarnessActivity::Usage { .. } => {}
     }
     Ok(())
 }

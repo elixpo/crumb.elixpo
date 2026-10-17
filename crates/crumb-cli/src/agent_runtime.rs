@@ -173,7 +173,10 @@ impl EventSink for NativeEventBridge<'_> {
             HarnessEvent::TurnFinished => Some(HarnessActivity::Completed {
                 reason: "stop".to_owned(),
             }),
-            HarnessEvent::Usage(_) => None,
+            HarnessEvent::Usage(usage) => Some(HarnessActivity::Usage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            }),
         };
         if let Some(activity) = activity
             && let Err(error) = (self.on_activity)(activity)
@@ -833,9 +836,16 @@ impl AgentRuntime {
         auto_compaction: bool,
     ) {
         let response = result.map_or("", |result| result.final_response.as_str());
-        let tokens = estimate_tokens(request).saturating_add(estimate_tokens(response));
-        self.session_tokens_estimate = self.session_tokens_estimate.saturating_add(tokens);
-        self.context_tokens_estimate = self.context_tokens_estimate.saturating_add(tokens);
+        let estimated = estimate_tokens(request).saturating_add(estimate_tokens(response));
+        let reported = result.map_or(0, |result| {
+            result.input_tokens.saturating_add(result.output_tokens)
+        });
+        let turn_tokens = estimated.max(reported);
+        self.session_tokens_estimate = self.session_tokens_estimate.saturating_add(turn_tokens);
+        self.context_tokens_estimate = self
+            .context_tokens_estimate
+            .saturating_add(estimated)
+            .max(reported);
         let threshold = limit.saturating_mul(4) / 5;
         if auto_compaction && threshold > 0 && self.context_tokens_estimate >= threshold {
             self.context_tokens_estimate = limit.saturating_mul(16) / 100;
@@ -971,6 +981,8 @@ impl AgentRuntime {
             session_id: session_id.to_owned(),
             final_response: outcome.text,
             finish_reason: Some("stop".to_owned()),
+            input_tokens: outcome.usage.input_tokens,
+            output_tokens: outcome.usage.output_tokens,
             events: Vec::new(),
             notifications: Vec::new(),
         })
@@ -1433,6 +1445,7 @@ mod tests {
     use crumb_agent::{AgentConfig, Modality, ModelRoute, SkillConfig};
     use crumb_harness::{EventSink, HarnessEvent};
     use crumb_harness_dsh::HarnessActivity;
+    use crumb_llm::TokenUsage;
     use crumb_profile::{ProfileDocument, ProfileReference, ProfileSelectionStore, ProfileStore};
 
     use super::{
@@ -1461,6 +1474,30 @@ mod tests {
             activities,
             vec![HarnessActivity::Progress {
                 label: "Koi · Reading · read_file".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn native_bridge_forwards_usage_for_the_live_context_meter() {
+        let mut activities = Vec::new();
+        let mut capture = |activity| {
+            activities.push(activity);
+            Ok(())
+        };
+        let mut bridge = NativeEventBridge::new(&mut capture);
+
+        bridge.emit(HarnessEvent::Usage(TokenUsage {
+            input_tokens: 1_200,
+            output_tokens: 80,
+        }));
+        bridge.finish().expect("activity callback succeeds");
+
+        assert_eq!(
+            activities,
+            vec![HarnessActivity::Usage {
+                input_tokens: 1_200,
+                output_tokens: 80,
             }]
         );
     }

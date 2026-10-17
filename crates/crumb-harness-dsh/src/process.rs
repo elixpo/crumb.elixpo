@@ -72,6 +72,8 @@ pub struct RunResult {
     pub session_id: String,
     pub final_response: String,
     pub finish_reason: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
     pub events: Vec<serde_json::Value>,
     pub notifications: Vec<Notification>,
 }
@@ -584,6 +586,8 @@ impl<'a> RunProjection<'a> {
             session_id: self.session_id.to_owned(),
             final_response: final_response(&self.events),
             finish_reason: finish_reason(&self.events)?,
+            input_tokens: 0,
+            output_tokens: 0,
             events: self.events,
             notifications: self.notifications,
         })

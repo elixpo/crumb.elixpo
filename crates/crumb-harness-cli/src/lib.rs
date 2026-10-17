@@ -141,6 +141,8 @@ fn run_child(
         session_id: launch.session_id.to_owned(),
         final_response,
         finish_reason: Some("completed".to_owned()),
+        input_tokens: 0,
+        output_tokens: 0,
         events: Vec::new(),
         notifications: vec![Notification {
             method: "session.status".to_owned(),
