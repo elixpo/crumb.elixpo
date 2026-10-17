@@ -16,9 +16,9 @@ use chrono::Local;
 use crossterm::cursor::{MoveTo, Show, position as cursor_position};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as TerminalEvent, KeyCode as TerminalKeyCode,
-    KeyEventKind, KeyModifiers as TerminalModifiers, KeyboardEnhancementFlags, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags, poll as poll_terminal_event,
-    read as read_terminal_event,
+    KeyEventKind, KeyModifiers as TerminalModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    poll as poll_terminal_event, read as read_terminal_event,
 };
 use crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
@@ -542,8 +542,8 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
         )?;
         let (event, submitted_input) = match next_repl_action(submission, &mut exit_gesture) {
             ReplLoopAction::Input(event, input) => (event, input),
-            ReplLoopAction::Scroll(direction) => {
-                transcript.scroll(direction)?;
+            ReplLoopAction::Transcript(action) => {
+                transcript.apply(action)?;
                 continue;
             }
             ReplLoopAction::Continue => continue,
@@ -686,6 +686,7 @@ fn handle_repl_event(
 enum ReplSubmission {
     Input(InputEvent, Option<String>),
     Scroll(TranscriptScroll),
+    ToggleToolOutput(u16),
     Interrupt,
     Retry,
     Exit,
@@ -693,7 +694,7 @@ enum ReplSubmission {
 
 enum ReplLoopAction {
     Input(InputEvent, Option<String>),
-    Scroll(TranscriptScroll),
+    Transcript(TranscriptAction),
     Continue,
     Exit,
 }
@@ -704,7 +705,12 @@ fn next_repl_action(submission: ReplSubmission, exit_gesture: &mut ExitGesture) 
             exit_gesture.reset();
             ReplLoopAction::Input(event, input)
         }
-        ReplSubmission::Scroll(direction) => ReplLoopAction::Scroll(direction),
+        ReplSubmission::Scroll(direction) => {
+            ReplLoopAction::Transcript(TranscriptAction::Scroll(direction))
+        }
+        ReplSubmission::ToggleToolOutput(row) => {
+            ReplLoopAction::Transcript(TranscriptAction::ToggleToolOutput(row))
+        }
         ReplSubmission::Interrupt if exit_gesture.register_interrupt() => ReplLoopAction::Exit,
         ReplSubmission::Interrupt => ReplLoopAction::Continue,
         ReplSubmission::Retry => {
@@ -719,6 +725,12 @@ fn next_repl_action(submission: ReplSubmission, exit_gesture: &mut ExitGesture) 
 enum TranscriptScroll {
     Up,
     Down,
+}
+
+#[derive(Clone, Copy)]
+enum TranscriptAction {
+    Scroll(TranscriptScroll),
+    ToggleToolOutput(u16),
 }
 
 #[derive(Default)]
@@ -774,6 +786,13 @@ impl FullscreenTranscript {
     fn capture_cursor(&mut self) {
         if self.enabled && self.started {
             self.cursor = cursor_position().ok().or(self.cursor);
+        }
+    }
+
+    fn apply(&mut self, action: TranscriptAction) -> io::Result<()> {
+        match action {
+            TranscriptAction::Scroll(direction) => self.scroll(direction),
+            TranscriptAction::ToggleToolOutput(row) => self.toggle_tool_output(row),
         }
     }
 
@@ -838,6 +857,21 @@ impl FullscreenTranscript {
         render_transcript_view(&state, self.renderer, self.header_rows)
     }
 
+    fn toggle_tool_output(&mut self, row: u16) -> io::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let (top, bottom, _, _) = fullscreen_rows(self.header_rows)?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.toggle_tool_output_at(row, top, bottom) {
+            render_transcript_view(&state, self.renderer, self.header_rows)?;
+        }
+        Ok(())
+    }
+
     fn refresh_context_header(
         &self,
         platform: Platform,
@@ -858,10 +892,39 @@ impl FullscreenTranscript {
 
 #[derive(Default)]
 struct TranscriptState {
-    lines: VecDeque<String>,
+    lines: VecDeque<TranscriptLine>,
+    tool_outputs: BTreeMap<u64, CollapsibleToolOutput>,
+    next_tool_output_id: u64,
     scroll_offset: usize,
     unseen_lines: usize,
     footer_context: String,
+}
+
+struct TranscriptLine {
+    text: String,
+    tool_output: Option<ToolOutputLine>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ToolOutputLine {
+    Header(u64),
+    Body(u64),
+}
+
+struct CollapsibleToolOutput {
+    collapsed_header: String,
+    expanded_header: String,
+    body: Vec<String>,
+    expanded: bool,
+}
+
+impl TranscriptLine {
+    fn plain(text: String) -> Self {
+        Self {
+            text,
+            tool_output: None,
+        }
+    }
 }
 
 impl TranscriptState {
@@ -871,8 +934,35 @@ impl TranscriptState {
     fn append(&mut self, output: &str) -> bool {
         let appended = sanitize_transcript_output(output)
             .split('\n')
-            .map(str::to_owned)
+            .map(|line| TranscriptLine::plain(line.to_owned()))
             .collect::<Vec<_>>();
+        self.append_lines(appended)
+    }
+
+    fn append_tool_output(
+        &mut self,
+        collapsed_header: String,
+        expanded_header: String,
+        body: Vec<String>,
+    ) -> bool {
+        let id = self.next_tool_output_id;
+        self.next_tool_output_id = self.next_tool_output_id.saturating_add(1);
+        self.tool_outputs.insert(
+            id,
+            CollapsibleToolOutput {
+                collapsed_header: collapsed_header.clone(),
+                expanded_header,
+                body,
+                expanded: false,
+            },
+        );
+        self.append_lines(vec![TranscriptLine {
+            text: collapsed_header,
+            tool_output: Some(ToolOutputLine::Header(id)),
+        }])
+    }
+
+    fn append_lines(&mut self, appended: Vec<TranscriptLine>) -> bool {
         let appended_lines = appended.len();
         let preserve_viewport = self.scroll_offset > 0;
         if preserve_viewport {
@@ -887,6 +977,51 @@ impl TranscriptState {
         }
         self.scroll_offset = self.scroll_offset.min(self.lines.len().saturating_sub(1));
         preserve_viewport
+    }
+
+    fn toggle_tool_output_at(&mut self, row: u16, top: u16, bottom: u16) -> bool {
+        if row < top || row > bottom {
+            return false;
+        }
+        let height = bottom.saturating_sub(top) as usize + 1;
+        let end = self.lines.len().saturating_sub(self.scroll_offset);
+        let start = end.saturating_sub(height);
+        let index = start.saturating_add(usize::from(row.saturating_sub(top)));
+        let Some(ToolOutputLine::Header(id)) =
+            self.lines.get(index).and_then(|line| line.tool_output)
+        else {
+            return false;
+        };
+        let Some(block) = self.tool_outputs.get_mut(&id) else {
+            return false;
+        };
+        block.expanded = !block.expanded;
+        self.lines[index].text = if block.expanded {
+            block.expanded_header.clone()
+        } else {
+            block.collapsed_header.clone()
+        };
+        if block.expanded {
+            for (offset, text) in block.body.iter().cloned().enumerate() {
+                self.lines.insert(
+                    index.saturating_add(offset).saturating_add(1),
+                    TranscriptLine {
+                        text,
+                        tool_output: Some(ToolOutputLine::Body(id)),
+                    },
+                );
+            }
+        } else {
+            while self
+                .lines
+                .get(index + 1)
+                .is_some_and(|line| line.tool_output == Some(ToolOutputLine::Body(id)))
+            {
+                self.lines.remove(index + 1);
+            }
+        }
+        self.scroll_offset = self.scroll_offset.min(self.lines.len().saturating_sub(1));
+        true
     }
 
     fn scroll(&mut self, direction: TranscriptScroll, header_rows: u16) {
@@ -1021,6 +1156,11 @@ fn read_repl_submission(
         Signal::HostCommand(command) if command == "crumb:transcript-down" => {
             ReplSubmission::Scroll(TranscriptScroll::Down)
         }
+        Signal::HostCommand(command) if command.starts_with("crumb:toggle-tool-output:") => command
+            .rsplit(':')
+            .next()
+            .and_then(|row| row.parse::<u16>().ok())
+            .map_or(ReplSubmission::Retry, ReplSubmission::ToggleToolOutput),
         _ => ReplSubmission::Retry,
     })
 }
@@ -2272,6 +2412,17 @@ fn render_observed_activity(
             &terminal.transcript,
             terminal.header_rows,
         )?;
+    } else if terminal.fullscreen
+        && let HarnessActivity::ToolFinished { name, success } = event
+    {
+        render_fullscreen_finished_tool(
+            (name, *success),
+            activity,
+            render_state,
+            renderer,
+            &terminal.transcript,
+            terminal.header_rows,
+        )?;
     } else if let HarnessActivity::Usage {
         input_tokens,
         output_tokens,
@@ -2319,15 +2470,63 @@ fn render_fullscreen_tool_output(
     if let Some(indicator) = activity.take() {
         indicator.finish();
     }
-    let output_block = terminal_tool_output(renderer, content);
+    let terminal_width = size().map_or(80, |(columns, _)| columns);
+    let line_count = content.trim_end().lines().count();
+    let collapsed = renderer.agent_tool_output_toggle(false, line_count, content.len());
+    let expanded = renderer.agent_tool_output_toggle(true, line_count, content.len());
+    let body = renderer.agent_tool_output_body_for_width(content, terminal_width);
     let mut state = transcript
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    state.append(&output_block);
+    state.append_tool_output(collapsed, expanded, body);
     render_transcript_view(&state, renderer, header_rows)?;
     if state.scroll_offset == 0 {
         position_after_transcript(&state, header_rows)?;
         *activity = Some(start_activity(renderer, "Thinking", true));
+    }
+    Ok(())
+}
+
+fn render_fullscreen_finished_tool(
+    tool: (&str, bool),
+    indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    render_state: &mut HarnessRenderState,
+    renderer: Renderer,
+    transcript: &Arc<Mutex<TranscriptState>>,
+    header_rows: u16,
+) -> io::Result<()> {
+    let (name, success) = tool;
+    let elapsed = indicator
+        .as_ref()
+        .map_or(Duration::ZERO, crumb_ui::ActivityIndicator::elapsed);
+    if let Some(indicator) = indicator.take() {
+        indicator.finish();
+    }
+    let detail = render_state
+        .active_tool
+        .take()
+        .filter(|(active_name, _)| active_name == name)
+        .and_then(|(_, detail)| detail);
+    let line = if name == "spawn_agents" {
+        renderer.agent_tool_result(name, success)
+    } else {
+        renderer.agent_activity(&finished_tool_activity(
+            name,
+            detail.as_deref(),
+            success,
+            elapsed,
+        ))
+    };
+    let mut state = transcript
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.append(&line);
+    render_transcript_view(&state, renderer, header_rows)?;
+    if state.scroll_offset == 0 {
+        position_after_transcript(&state, header_rows)?;
+        if success {
+            *indicator = Some(start_activity(renderer, "Thinking", true));
+        }
     }
     Ok(())
 }
@@ -2354,6 +2553,31 @@ fn handle_active_terminal_event(
     writer: &mut dyn Write,
     terminal: &AgentTerminal,
 ) -> Result<bool> {
+    if let TerminalEvent::Mouse(mouse) = event
+        && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+        && terminal.fullscreen
+    {
+        let activity_label = activity.as_ref().map(|active| active.label().to_owned());
+        if let Some(active) = activity.take() {
+            active.finish();
+        }
+        let (top, bottom, _, _) = fullscreen_rows(terminal.header_rows)?;
+        let mut state = terminal
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.toggle_tool_output_at(mouse.row, top, bottom) {
+            render_transcript_view(&state, input.renderer, terminal.header_rows)?;
+        }
+        if state.scroll_offset == 0
+            && let Some(label) = activity_label
+        {
+            position_after_transcript(&state, terminal.header_rows)?;
+            *activity = Some(start_activity(input.renderer, &label, true));
+        }
+        refresh_active_footer(input.renderer, true)?;
+        return Ok(false);
+    }
     if let Some(direction) = active_scroll_direction(event) {
         if terminal.fullscreen {
             let activity_label = activity.as_ref().map(|active| active.label().to_owned());
@@ -8453,7 +8677,7 @@ impl CompletionOverlay {
             if index < end
                 && let Some(line) = transcript.lines.get(index)
             {
-                frame.push_str(line);
+                frame.push_str(&line.text);
             }
         }
         frame.push_str(&completion_footer_frame(
@@ -8729,6 +8953,7 @@ fn create_line_editor(
         .with_cursor_offset(i16::try_from(FULLSCREEN_SIDE_GUTTER).unwrap_or(2))
         .with_correct_cursor_pos(true);
     let menu = CompletionOverlay::new(menu, renderer, header_rows, Arc::clone(&transcript));
+    let edit_mode = CrumbEditMode::new(keybindings, fullscreen.then_some(header_rows));
     let editor = Reedline::create()
         .with_history(Box::new(interactive_history))
         .with_hinter(Box::new(CrumbHinter::new(fullscreen.then_some(
@@ -8740,19 +8965,27 @@ fn create_line_editor(
         .with_completer(Box::new(CrumbCompleter::new(workspace.clone())))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
         .with_persistent_menus(true)
-        .with_edit_mode(Box::new(CrumbEditMode::new(keybindings)));
+        .with_edit_mode(Box::new(edit_mode));
     Ok(InteractiveLineEditor { editor, workspace })
 }
 
 struct CrumbEditMode {
     emacs: Emacs,
+    transcript_header_rows: Option<u16>,
 }
 
 impl CrumbEditMode {
-    const fn new(keybindings: reedline::Keybindings) -> Self {
+    const fn new(keybindings: reedline::Keybindings, transcript_header_rows: Option<u16>) -> Self {
         Self {
             emacs: Emacs::new(keybindings),
+            transcript_header_rows,
         }
+    }
+
+    fn is_transcript_row(&self, row: u16) -> bool {
+        self.transcript_header_rows
+            .and_then(|header_rows| fullscreen_rows(header_rows).ok())
+            .is_some_and(|(top, bottom, _, _)| row >= top && row <= bottom)
     }
 }
 
@@ -8765,6 +8998,12 @@ impl EditMode for CrumbEditMode {
             }
             TerminalEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => {
                 ReedlineEvent::ExecuteHostCommand("crumb:transcript-down".to_owned())
+            }
+            TerminalEvent::Mouse(mouse)
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                    && self.is_transcript_row(mouse.row) =>
+            {
+                ReedlineEvent::ExecuteHostCommand(format!("crumb:toggle-tool-output:{}", mouse.row))
             }
             event => ReedlineRawEvent::try_from(event)
                 .map_or(ReedlineEvent::None, |event| self.emacs.parse_event(event)),
@@ -9113,7 +9352,7 @@ fn render_transcript_view(
     }
     for (row, line) in (top..=bottom).zip(visible) {
         crossterm::execute!(frame, MoveTo(0, row))?;
-        write!(frame, "{line}")?;
+        write!(frame, "{}", line.text)?;
     }
     render_transcript_footer_with_writer(&mut frame, state, renderer, header_rows)?;
     write!(frame, "\x1b8")?;
@@ -9462,7 +9701,8 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use crossterm::event::{
-        Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+        Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     };
     use crumb_agent::{
         AgentConfig, ApprovalMode, CredentialReference, HarnessConfig, OptimizerConfig,
@@ -9855,7 +10095,7 @@ mod tests {
 
     #[test]
     fn mouse_wheel_is_reserved_for_transcript_scrolling() {
-        let mut mode = CrumbEditMode::new(reedline::default_emacs_keybindings());
+        let mut mode = CrumbEditMode::new(reedline::default_emacs_keybindings(), Some(0));
         for (kind, expected) in [
             (MouseEventKind::ScrollUp, "crumb:transcript-up"),
             (MouseEventKind::ScrollDown, "crumb:transcript-down"),
@@ -9872,6 +10112,17 @@ mod tests {
                 reedline::ReedlineEvent::ExecuteHostCommand(expected.to_owned())
             );
         }
+        let raw = reedline::ReedlineRawEvent::try_from(TerminalEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 8,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .expect("mouse event is accepted");
+        assert_eq!(
+            reedline::EditMode::parse_event(&mut mode, raw),
+            reedline::ReedlineEvent::ExecuteHostCommand("crumb:toggle-tool-output:12".to_owned())
+        );
     }
 
     #[test]
@@ -9920,6 +10171,27 @@ mod tests {
         }
         assert_eq!(transcript.scroll_offset, 0);
         assert_eq!(transcript.unseen_lines, 0);
+    }
+
+    #[test]
+    fn tool_output_is_collapsed_by_default_and_toggles_in_place() {
+        let mut transcript = TranscriptState::default();
+        transcript.append_tool_output(
+            "▶ Tool output · 2 lines".to_owned(),
+            "▼ Tool output · 2 lines".to_owned(),
+            vec!["folder-a".to_owned(), "folder-b".to_owned()],
+        );
+
+        assert_eq!(transcript.lines.len(), 1);
+        assert_eq!(transcript.lines[0].text, "▶ Tool output · 2 lines");
+        assert!(transcript.toggle_tool_output_at(0, 0, 5));
+        assert_eq!(transcript.lines.len(), 3);
+        assert_eq!(transcript.lines[0].text, "▼ Tool output · 2 lines");
+        assert_eq!(transcript.lines[1].text, "folder-a");
+        assert_eq!(transcript.lines[2].text, "folder-b");
+        assert!(transcript.toggle_tool_output_at(0, 0, 5));
+        assert_eq!(transcript.lines.len(), 1);
+        assert_eq!(transcript.lines[0].text, "▶ Tool output · 2 lines");
     }
 
     #[test]

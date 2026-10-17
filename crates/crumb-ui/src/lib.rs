@@ -756,6 +756,43 @@ impl Renderer {
         output
     }
 
+    /// Renders the clickable summary row for captured tool output.
+    #[must_use]
+    pub fn agent_tool_output_toggle(&self, expanded: bool, lines: usize, bytes: usize) -> String {
+        let marker = if expanded { "▼" } else { "▶" };
+        let label = format!("{marker} Tool output · {lines} lines · {bytes} B");
+        if self.settings.output == OutputMode::ScreenReader {
+            return label;
+        }
+        format!(
+            "  {}    {}",
+            self.paint("│", "35"),
+            self.paint(&label, "38;5;245")
+        )
+    }
+
+    /// Renders only the body of an expanded tool-output block.
+    #[must_use]
+    pub fn agent_tool_output_body_for_width(
+        &self,
+        content: &str,
+        terminal_width: u16,
+    ) -> Vec<String> {
+        let content_width = usize::from(terminal_width.saturating_sub(10)).max(1);
+        content
+            .trim_end()
+            .lines()
+            .flat_map(|source_line| wrap_terminal_line(source_line, content_width))
+            .map(|line| {
+                if self.settings.output == OutputMode::ScreenReader {
+                    line
+                } else {
+                    format!("  {}    {}", self.paint("│", "35"), self.paint(&line, "2"))
+                }
+            })
+            .collect()
+    }
+
     /// Renders a durable tool outcome in the scrolling transcript.
     #[must_use]
     pub fn agent_tool_result(&self, name: &str, success: bool) -> String {
@@ -1812,6 +1849,14 @@ mod tests {
         assert_eq!(
             renderer.agent_tool_output_for_width("folder-a\nfolder-b", 80),
             "  │    tool output\n  │    folder-a\n  │    folder-b"
+        );
+        assert_eq!(
+            renderer.agent_tool_output_toggle(false, 2, 17),
+            "  │    ▶ Tool output · 2 lines · 17 B"
+        );
+        assert_eq!(
+            renderer.agent_tool_output_toggle(true, 2, 17),
+            "  │    ▼ Tool output · 2 lines · 17 B"
         );
         assert_eq!(
             renderer.agent_approval_required("write_file"),
