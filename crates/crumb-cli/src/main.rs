@@ -43,8 +43,8 @@ use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_marketplace::{
     Catalog, InstallScope, InstallationStore, InstalledRelease, Installer, MAX_CATALOG_BYTES,
     MAX_SIGSTORE_BUNDLE_BYTES, McpTransport as MarketplaceMcpTransport, Package, PublisherIdentity,
-    ReleaseTrust, RemoteCatalogCache, SignedArtifact, SigstoreVerifier, bundled_catalog,
-    verify_package_files,
+    ReleaseTrust, RemoteCatalogCache, SignedArtifact, SigstoreVerifier, UpdateStatus,
+    bundled_catalog, verify_package_files,
 };
 use crumb_mcp::{
     McpDispatcher, StdioMcpLimits, StreamableHttpLimits, register_stdio_servers,
@@ -4984,6 +4984,11 @@ fn show_marketplace(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result
 }
 
 fn handle_marketplace_lifecycle(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<bool> {
+    if let Some(arguments) = command.strip_prefix("/marketplace updates") {
+        let scope = parse_marketplace_scope_argument(arguments, "updates")?;
+        show_marketplace_updates(scope, cwd, writer)?;
+        return Ok(true);
+    }
     if let Some(arguments) = command.strip_prefix("/marketplace installed") {
         let scope = parse_marketplace_scope_argument(arguments, "installed")?;
         show_installed_marketplace_packages(scope, cwd, writer)?;
@@ -5071,7 +5076,7 @@ fn show_marketplace_catalog(command: &str, cwd: &Path, writer: &mut dyn Write) -
         )?;
         writeln!(
             writer,
-            "  `/marketplace installed [--scope project|user]` · `pin` · `unpin` · `doctor` · `uninstall`"
+            "  `/marketplace updates|installed [--scope project|user]` · `pin` · `unpin` · `doctor` · `uninstall`"
         )?;
         writeln!(
             writer,
@@ -5089,7 +5094,7 @@ fn show_marketplace_catalog(command: &str, cwd: &Path, writer: &mut dyn Write) -
         return install_marketplace_package(&catalog, arguments, cwd, writer);
     }
     Err(anyhow!(
-        "usage: /marketplace [sync | remote [inspect <publisher/name>] | inspect <publisher/name> | install <publisher/name> [--scope project|user] | install-remote <publisher/name> [--scope project|user] | installed [--scope project|user] | pin|unpin|uninstall <publisher/name> [--scope project|user] | doctor [--scope project|user] | validate <catalog.json>]"
+        "usage: /marketplace [sync | remote [inspect <publisher/name>] | inspect <publisher/name> | install <publisher/name> [--scope project|user] | install-remote <publisher/name> [--scope project|user] | updates|installed [--scope project|user] | pin|unpin|uninstall <publisher/name> [--scope project|user] | doctor [--scope project|user] | validate <catalog.json>]"
     ))
 }
 
@@ -5210,28 +5215,8 @@ fn install_remote_marketplace_package(
 ) -> Result<()> {
     let (id, scope) = parse_marketplace_install_arguments(arguments, "install-remote")?;
     let client = marketplace_http_client()?;
-    let catalog_bytes = download_marketplace_url(
-        &client,
-        MARKETPLACE_CATALOG_URL,
-        MAX_CATALOG_BYTES,
-        MarketplaceContent::Json,
-    )?;
-    let catalog_bundle = download_marketplace_url(
-        &client,
-        MARKETPLACE_CATALOG_BUNDLE_URL,
-        MAX_SIGSTORE_BUNDLE_BYTES,
-        MarketplaceContent::Json,
-    )?;
     let verifier = SigstoreVerifier::production()?;
-    verifier.verify(
-        &catalog_bytes,
-        &catalog_bundle,
-        &PublisherIdentity {
-            issuer: SIGSTORE_GITHUB_ACTIONS_ISSUER.to_owned(),
-            subject: MARKETPLACE_CATALOG_SIGNER.to_owned(),
-        },
-    )?;
-    let catalog = Catalog::parse(&catalog_bytes)?;
+    let catalog = download_verified_marketplace_catalog(&client, &verifier)?;
     let package = catalog.installable_package(id)?;
     if package.provenance.trust != ReleaseTrust::SigstoreBundle {
         bail!("remote package `{id}` does not declare Sigstore release trust");
@@ -5282,6 +5267,33 @@ fn install_remote_marketplace_package(
         package.artifacts.len()
     )?;
     Ok(())
+}
+
+fn download_verified_marketplace_catalog(
+    client: &reqwest::blocking::Client,
+    verifier: &SigstoreVerifier,
+) -> Result<Catalog> {
+    let catalog_bytes = download_marketplace_url(
+        client,
+        MARKETPLACE_CATALOG_URL,
+        MAX_CATALOG_BYTES,
+        MarketplaceContent::Json,
+    )?;
+    let catalog_bundle = download_marketplace_url(
+        client,
+        MARKETPLACE_CATALOG_BUNDLE_URL,
+        MAX_SIGSTORE_BUNDLE_BYTES,
+        MarketplaceContent::Json,
+    )?;
+    verifier.verify(
+        &catalog_bytes,
+        &catalog_bundle,
+        &PublisherIdentity {
+            issuer: SIGSTORE_GITHUB_ACTIONS_ISSUER.to_owned(),
+            subject: MARKETPLACE_CATALOG_SIGNER.to_owned(),
+        },
+    )?;
+    Catalog::parse(&catalog_bytes)
 }
 
 fn validate_marketplace_path(path: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
@@ -5511,6 +5523,49 @@ fn show_installed_marketplace_packages(
             if release.pinned { " pinned" } else { "" }
         )?;
     }
+    Ok(())
+}
+
+fn show_marketplace_updates(scope: InstallScope, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let (_, project_root) = agent_config_location(cwd);
+    let installed = marketplace_install_store(scope, &project_root)?.list()?;
+    let client = marketplace_http_client()?;
+    let verifier = SigstoreVerifier::production()?;
+    let catalog = download_verified_marketplace_catalog(&client, &verifier)?;
+    let plan = catalog.plan_updates(&installed);
+    writeln!(
+        writer,
+        "◆ Authenticated marketplace update plan · {} scope",
+        install_scope_name(scope)
+    )?;
+    if plan.is_empty() {
+        writeln!(writer, "  No active marketplace releases.")?;
+        return Ok(());
+    }
+    for entry in plan {
+        let available = entry
+            .available_version
+            .as_deref()
+            .map_or_else(String::new, |version| format!(" → {version}"));
+        let status = match entry.status {
+            UpdateStatus::Current => "current",
+            UpdateStatus::Available => "update available",
+            UpdateStatus::Pinned => "pinned; update blocked",
+            UpdateStatus::Revoked => "active release revoked",
+            UpdateStatus::Removed => "not present in catalog",
+            UpdateStatus::Unavailable => "no compatible trusted release",
+            UpdateStatus::CatalogOlder => "catalog release is older; no downgrade",
+        };
+        writeln!(
+            writer,
+            "  {} {}{} · {status}",
+            entry.package_id, entry.installed_version, available
+        )?;
+    }
+    writeln!(
+        writer,
+        "  Read-only plan; no artifacts were downloaded or changed."
+    )?;
     Ok(())
 }
 

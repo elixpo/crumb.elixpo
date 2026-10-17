@@ -330,6 +330,77 @@ impl Catalog {
         }
         Ok(package)
     }
+
+    /// Compares active installed releases with this already-authenticated catalog.
+    ///
+    /// Revoked active releases are always reported, including when pinned. Only newer,
+    /// compatible, non-revoked releases can be proposed as updates.
+    #[must_use]
+    pub fn plan_updates(&self, installed: &[InstalledRelease]) -> Vec<UpdatePlanEntry> {
+        let mut plan = installed
+            .iter()
+            .filter(|release| release.active)
+            .filter_map(|release| {
+                let installed_version = Version::parse(&release.package.version).ok()?;
+                let available = self
+                    .packages
+                    .iter()
+                    .filter(|package| package.id == release.package.id)
+                    .filter(|package| {
+                        package.provenance.trust == ReleaseTrust::SigstoreBundle
+                            && package.compatibility.supports_current()
+                            && !self.is_revoked(package)
+                    })
+                    .filter_map(|package| {
+                        Version::parse(&package.version)
+                            .ok()
+                            .map(|version| (version, package))
+                    })
+                    .max_by(|left, right| left.0.cmp(&right.0));
+                let active_revoked = self.is_revoked(&release.package);
+                let active_listed = self.packages.iter().any(|package| {
+                    package.id == release.package.id
+                        && package.version == release.package.version
+                        && package.compatibility.supports_current()
+                        && !self.is_revoked(package)
+                });
+                let package_listed = self
+                    .packages
+                    .iter()
+                    .any(|package| package.id == release.package.id);
+                let (available_version, status) = match available {
+                    Some((_, package)) if active_revoked => {
+                        (Some(package.version.clone()), UpdateStatus::Revoked)
+                    }
+                    None if active_revoked => (None, UpdateStatus::Revoked),
+                    Some((version, package)) if version > installed_version => (
+                        Some(package.version.clone()),
+                        if release.pinned {
+                            UpdateStatus::Pinned
+                        } else {
+                            UpdateStatus::Available
+                        },
+                    ),
+                    _ if active_listed => {
+                        (Some(release.package.version.clone()), UpdateStatus::Current)
+                    }
+                    Some((_, package)) => {
+                        (Some(package.version.clone()), UpdateStatus::CatalogOlder)
+                    }
+                    None if package_listed => (None, UpdateStatus::Unavailable),
+                    None => (None, UpdateStatus::Removed),
+                };
+                Some(UpdatePlanEntry {
+                    package_id: release.package.id.clone(),
+                    installed_version: release.package.version.clone(),
+                    available_version,
+                    status,
+                })
+            })
+            .collect::<Vec<_>>();
+        plan.sort_by(|left, right| left.package_id.cmp(&right.package_id));
+        plan
+    }
 }
 
 /// Returns the public catalog shipped with this Crumb build.
@@ -827,6 +898,27 @@ pub struct InstallationDiagnostic {
     pub active: bool,
     pub healthy: bool,
     pub detail: String,
+}
+
+/// Read-only result of comparing one active release with an authenticated catalog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateStatus {
+    Current,
+    Available,
+    Pinned,
+    Revoked,
+    Removed,
+    Unavailable,
+    CatalogOlder,
+}
+
+/// One deterministic marketplace update decision. Planning never downloads artifacts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdatePlanEntry {
+    pub package_id: String,
+    pub installed_version: String,
+    pub available_version: Option<String>,
+    pub status: UpdateStatus,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1451,8 +1543,9 @@ fn current_platform() -> MarketplacePlatform {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTRIBUTOR_SCHEMA, Catalog, InstallationStore, Installer, MAX_CATALOG_BYTES,
-        PUBLIC_CATALOG, PUBLIC_SCHEMA, RemoteCatalogCache, Revocation, bundled_catalog,
+        CONTRIBUTOR_SCHEMA, Catalog, InstallationStore, InstalledRelease, Installer,
+        MAX_CATALOG_BYTES, PUBLIC_CATALOG, PUBLIC_SCHEMA, RemoteCatalogCache, Revocation,
+        UpdateStatus, bundled_catalog,
     };
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -1468,6 +1561,15 @@ mod tests {
 
     fn catalog(hash: &str, path: &str) -> Catalog {
         Catalog::parse(catalog_json(hash, path).as_bytes()).expect("catalog should be valid")
+    }
+
+    fn installed_release(package: &super::Package, pinned: bool) -> InstalledRelease {
+        InstalledRelease {
+            package: package.clone(),
+            installed_at: "2026-10-17T00:00:00Z".to_owned(),
+            active: true,
+            pinned,
+        }
     }
 
     #[test]
@@ -1578,6 +1680,59 @@ mod tests {
             .expect("state symlink");
             assert!(InstallationStore::new(scope.path()).list().is_err());
         }
+    }
+
+    #[test]
+    fn update_planning_handles_versions_pins_revocations_and_removals() {
+        let mut catalog = catalog(&"a".repeat(64), "SKILL.md");
+        let installed_package = catalog.packages[0].clone();
+        let mut newer = installed_package.clone();
+        newer.version = "2.0.0".to_owned();
+        newer.provenance.trust = super::ReleaseTrust::SigstoreBundle;
+        catalog.packages.push(newer);
+
+        let available = catalog.plan_updates(&[installed_release(&installed_package, false)]);
+        assert_eq!(available[0].status, UpdateStatus::Available);
+        assert_eq!(available[0].available_version.as_deref(), Some("2.0.0"));
+
+        let pinned = catalog.plan_updates(&[installed_release(&installed_package, true)]);
+        assert_eq!(pinned[0].status, UpdateStatus::Pinned);
+
+        catalog.revocations.push(Revocation {
+            package: installed_package.id.clone(),
+            version: installed_package.version.clone(),
+            reason: "compromised".to_owned(),
+            revoked_at: "2026-10-17T00:00:00Z".to_owned(),
+        });
+        let revoked = catalog.plan_updates(&[installed_release(&installed_package, true)]);
+        assert_eq!(revoked[0].status, UpdateStatus::Revoked);
+        assert_eq!(revoked[0].available_version.as_deref(), Some("2.0.0"));
+
+        let mut removed_package = installed_package.clone();
+        removed_package.id = "crumb/removed".to_owned();
+        let removed = catalog.plan_updates(&[installed_release(&removed_package, false)]);
+        assert_eq!(removed[0].status, UpdateStatus::Removed);
+
+        let mut future_package = installed_package.clone();
+        future_package.version = "3.0.0".to_owned();
+        let older = catalog.plan_updates(&[installed_release(&future_package, false)]);
+        assert_eq!(older[0].status, UpdateStatus::CatalogOlder);
+    }
+
+    #[test]
+    fn update_planning_ignores_incompatible_newer_releases() {
+        let mut catalog = catalog(&"a".repeat(64), "SKILL.md");
+        let installed_package = catalog.packages[0].clone();
+        let mut incompatible = installed_package.clone();
+        incompatible.version = "2.0.0".to_owned();
+        incompatible.provenance.trust = super::ReleaseTrust::SigstoreBundle;
+        incompatible.compatibility.minimum_crumb_version = "9.0.0".to_owned();
+        incompatible.compatibility.maximum_crumb_version_exclusive = None;
+        catalog.packages.push(incompatible);
+
+        let plan = catalog.plan_updates(&[installed_release(&installed_package, false)]);
+        assert_eq!(plan[0].status, UpdateStatus::Current);
+        assert_eq!(plan[0].available_version.as_deref(), Some("1.0.0"));
     }
 
     #[test]
