@@ -138,18 +138,23 @@ fn rewrite_arguments(
     arguments: &Value,
     cancellation: &CancellationToken,
 ) -> Value {
-    let Some(rewriter) = config.command_rewriter.as_ref() else {
-        return arguments.clone();
-    };
     let Some(command) = arguments.get("command").and_then(Value::as_str) else {
         return arguments.clone();
     };
+    let normalized = normalize_shell_command(command);
+    let mut prepared = arguments.clone();
+    if normalized != command {
+        prepared["command"] = Value::String(normalized.clone());
+    }
+    let Some(rewriter) = config.command_rewriter.as_ref() else {
+        return prepared;
+    };
     if cancellation.is_cancelled() {
-        return arguments.clone();
+        return prepared;
     }
     let mut process = Command::new(rewriter);
     process
-        .args(["rewrite", command])
+        .args(["rewrite", &normalized])
         .current_dir(workspace)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -161,14 +166,21 @@ fn rewrite_arguments(
         process.env("PATH", path);
     }
     let Ok(output) = process.output() else {
-        return arguments.clone();
+        return prepared;
     };
-    let Some(rewritten) = accepted_rewrite(command, &output.stdout) else {
-        return arguments.clone();
+    let Some(rewritten) = accepted_rewrite(&normalized, &output.stdout) else {
+        return prepared;
     };
-    let mut prepared = arguments.clone();
     prepared["command"] = Value::String(rewritten);
     prepared
+}
+
+fn normalize_shell_command(command: &str) -> String {
+    let trimmed = command.trim();
+    if let Some(expression) = trimmed.strip_prefix("find -") {
+        return format!("find . -{expression}");
+    }
+    command.to_owned()
 }
 
 fn accepted_rewrite(original: &str, output: &[u8]) -> Option<String> {
@@ -508,7 +520,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AgentShellConfig, accepted_rewrite, register_shell_tool, register_shell_tool_with_optimizer,
+        AgentShellConfig, accepted_rewrite, normalize_shell_command, register_shell_tool,
+        register_shell_tool_with_optimizer,
     };
 
     struct AllowOnce;
@@ -621,6 +634,18 @@ mod tests {
         assert_eq!(
             accepted_rewrite("rtk git status", b"rtk git status\n"),
             None
+        );
+    }
+
+    #[test]
+    fn rootless_find_gets_an_explicit_search_root() {
+        assert_eq!(
+            normalize_shell_command("find -path 'elixpo_projects' -type d"),
+            "find . -path 'elixpo_projects' -type d"
+        );
+        assert_eq!(
+            normalize_shell_command("find /home/user -type d -name projects"),
+            "find /home/user -type d -name projects"
         );
     }
 

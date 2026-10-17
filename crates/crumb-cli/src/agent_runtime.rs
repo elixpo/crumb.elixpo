@@ -734,6 +734,7 @@ impl AgentRuntime {
             self.token_usage(),
             context_token_budget(config, route),
         ));
+        trusted_context.push(runtime_workspace_context(&workspace));
         let dispatched_request = if native {
             request
         } else {
@@ -1120,6 +1121,13 @@ fn runtime_session_context(
 ) -> String {
     format!(
         "## Runtime session state (authoritative)\nThe active Crumb process retains prior completed user and assistant turns in its model conversation. Current estimated context: ~{context_tokens}/{context_limit} tokens. Total estimated session usage: ~{session_tokens} tokens. Automatic compactions: {compactions}. Persistent attachments and approved memory are separate from the live conversation. Never claim that every interaction starts fresh."
+    )
+}
+
+fn runtime_workspace_context(workspace: &Path) -> String {
+    format!(
+        "## Runtime workspace (authoritative)\nThe current working directory is `{}`. run_shell starts in this directory but may inspect parent directories, the user's home directory, absolute paths, and installed programs when policy permits. Workspace read/write tools are intentionally limited to this directory. When asked to locate a named file or folder without an explicit workspace-only constraint, do not assume it is nested below the current directory: inspect the current path, its ancestors, and then the home directory with one valid bounded command. Prefer RTK-compatible commands and never invent paths from a failed or empty search.",
+        workspace.display()
     )
 }
 
@@ -1604,6 +1612,16 @@ mod tests {
         assert!(context.contains("Automatic compactions: 2"));
         assert!(context.contains("retains prior completed user and assistant turns"));
         assert!(context.contains("Never claim that every interaction starts fresh"));
+    }
+
+    #[test]
+    fn runtime_context_identifies_the_shell_starting_directory() {
+        let context = super::runtime_workspace_context(Path::new("/home/user/projects/crumb"));
+
+        assert!(context.contains("`/home/user/projects/crumb`"));
+        assert!(context.contains("inspect parent directories"));
+        assert!(context.contains("then the home directory"));
+        assert!(context.contains("never invent paths"));
     }
 
     #[test]
