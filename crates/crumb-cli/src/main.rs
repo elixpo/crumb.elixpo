@@ -62,8 +62,9 @@ use crumb_profile::{ProfileDocument, ProfileSelectionStore, ProfileStore};
 use crumb_pty::{PtyInput, PtyResizer, SystemPty, TerminalSize};
 use crumb_repl::{ReplOutcome, read_classified_line};
 use crumb_tools::{
-    CheckpointDecision, CheckpointStatus, CheckpointStore, WorkspaceToolLimits,
-    WorkspaceWriteLimits, register_workspace_read_tools, register_workspace_write_tool,
+    CheckpointDecision, CheckpointStatus, CheckpointStore, WebFetchLimits, WorkspaceToolLimits,
+    WorkspaceWriteLimits, register_web_fetch_tool, register_workspace_read_tools,
+    register_workspace_write_tool,
 };
 use crumb_ui::{GitSegment, PromptContext, Renderer, StartupContext, UiSettings};
 use directories::BaseDirs;
@@ -399,6 +400,13 @@ fn workspace_read_host(
         workspace,
         WorkspaceWriteLimits {
             max_file_bytes: max_file_write_bytes,
+        },
+    )?;
+    register_web_fetch_tool(
+        &mut host,
+        WebFetchLimits {
+            timeout: Duration::from_secs(config.limits.max_wall_time_seconds.min(60)),
+            max_output_bytes,
         },
     )?;
     if let Some(route) = config
@@ -1071,19 +1079,7 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
         .command_catalog
         .route(command, &agent_config.routing);
     if !matches!(decision.route, InputRoute::Native) {
-        let persistent = context
-            .agent_runtime
-            .as_ref()
-            .map(AgentRuntime::attached_context)
-            .transpose()?
-            .unwrap_or_default();
-        decision.payload = resolve_request_context(
-            &decision.payload,
-            &persistent,
-            context.cwd,
-            &agent_config,
-            &configured_optimization_pipeline(&agent_config),
-        )?;
+        prepare_agent_context(&mut decision, context, &agent_config)?;
         let decision = context.command_context.attach_to(decision, &agent_config);
         handle_agent_boundary(
             &decision,
@@ -1176,6 +1172,27 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
             Ok(Some(ReplOutcome::Exit))
         }
     }
+}
+
+fn prepare_agent_context(
+    decision: &mut RouteDecision,
+    context: &InputContext<'_>,
+    config: &AgentConfig,
+) -> Result<()> {
+    let persistent = context
+        .agent_runtime
+        .as_ref()
+        .map(AgentRuntime::attached_context)
+        .transpose()?
+        .unwrap_or_default();
+    decision.payload = resolve_request_context(
+        &decision.payload,
+        &persistent,
+        context.cwd,
+        config,
+        &configured_optimization_pipeline(config),
+    )?;
+    Ok(())
 }
 
 fn ensure_shell_session(
@@ -2232,6 +2249,10 @@ fn show_reserved(
         command if command == "/detach" || command.starts_with("/detach ") => {
             configure_session_attachment(command, cwd, runtime, false, writer)?;
         }
+        "/tools" => show_agent_tools(cwd, writer)?,
+        command if command == "/permissions" || command.starts_with("/permissions ") => {
+            configure_permissions(command, cwd, writer)?;
+        }
         command if command == "/skills load" || command.starts_with("/skills load ") => {
             set_skill_enabled(command, cwd, true, writer)?;
         }
@@ -2279,6 +2300,100 @@ fn show_reserved(
         }
     }
     Ok(())
+}
+
+fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    writeln!(writer, "◆ Agent tools")?;
+    for (name, risk, available) in [
+        ("read_file", "workspace read", true),
+        ("list_directory", "workspace read", true),
+        ("write_file", "workspace write", true),
+        ("web_fetch", "network", true),
+        (
+            "web_search",
+            "network",
+            config
+                .models
+                .get(&Modality::WebSearch)
+                .is_some_and(|routes| !routes.is_empty()),
+        ),
+    ] {
+        let granted = config.permissions.allow_network_tools.contains(name)
+            || config.permissions.allow_workspace_tools.contains(name);
+        writeln!(
+            writer,
+            "  {} {name:<18} {risk}{}",
+            if granted { "●" } else { "○" },
+            if available { "" } else { " · unavailable" }
+        )?;
+    }
+    writeln!(writer, "  ● granted · ○ approval required/denied")?;
+    Ok(())
+}
+
+fn configure_permissions(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let arguments = command.split_whitespace().skip(1).collect::<Vec<_>>();
+    if arguments.is_empty() {
+        let config = read_agent_config(cwd)?;
+        writeln!(writer, "◆ Agent permissions")?;
+        writeln!(
+            writer,
+            "  network    {}",
+            joined_or_none(&config.permissions.allow_network_tools)
+        )?;
+        writeln!(
+            writer,
+            "  workspace  {}",
+            joined_or_none(&config.permissions.allow_workspace_tools)
+        )?;
+        writeln!(
+            writer,
+            "  MCP        {}",
+            joined_or_none(&config.permissions.allow_mcp_tools)
+        )?;
+        writeln!(
+            writer,
+            "  Grants are user-owned; models cannot add or widen them."
+        )?;
+        return Ok(());
+    }
+    let [action, tool] = arguments.as_slice() else {
+        bail!("usage: /permissions [allow-network|deny-network <tool>]");
+    };
+    if !matches!(*tool, "web_fetch" | "web_search") {
+        bail!("network permission tool must be web_fetch or web_search");
+    }
+    let allow = match *action {
+        "allow-network" => true,
+        "deny-network" => false,
+        _ => bail!("usage: /permissions [allow-network|deny-network <tool>]"),
+    };
+    update_agent_config(cwd, |config| {
+        if allow {
+            config
+                .permissions
+                .allow_network_tools
+                .insert((*tool).to_owned());
+        } else {
+            config.permissions.allow_network_tools.remove(*tool);
+        }
+        Ok(())
+    })?;
+    writeln!(
+        writer,
+        "◆ Network permission · {tool} {}",
+        if allow { "allowed" } else { "denied" }
+    )?;
+    Ok(())
+}
+
+fn joined_or_none(values: &std::collections::BTreeSet<String>) -> String {
+    if values.is_empty() {
+        "none".to_owned()
+    } else {
+        values.iter().cloned().collect::<Vec<_>>().join(" · ")
+    }
 }
 
 fn configure_session_attachment(
@@ -7459,13 +7574,21 @@ mod tests {
         let host = workspace_read_host(&workspace, &AgentConfig::default(), None)
             .expect("workspace tools are registered");
         let tools = host.tools().collect::<Vec<_>>();
-        assert_eq!(tools.len(), 3);
-        assert_eq!(tools[0].name, "list_directory");
-        assert_eq!(tools[0].risk, RiskClass::ReadOnly);
-        assert_eq!(tools[1].name, "read_file");
-        assert_eq!(tools[1].risk, RiskClass::ReadOnly);
-        assert_eq!(tools[2].name, "write_file");
-        assert_eq!(tools[2].risk, RiskClass::WriteWorkspace);
+        assert_eq!(tools.len(), 4);
+        for (name, risk) in [
+            ("list_directory", RiskClass::ReadOnly),
+            ("read_file", RiskClass::ReadOnly),
+            ("web_fetch", RiskClass::NetworkAccess),
+            ("write_file", RiskClass::WriteWorkspace),
+        ] {
+            assert_eq!(
+                tools
+                    .iter()
+                    .find(|tool| tool.name == name)
+                    .map(|tool| tool.risk),
+                Some(risk)
+            );
+        }
     }
 
     #[test]

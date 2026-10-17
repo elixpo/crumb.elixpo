@@ -264,6 +264,14 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "inspect agent permissions",
     },
     SlashCommand {
+        usage: "/permissions allow-network ",
+        description: "allow web_fetch or web_search",
+    },
+    SlashCommand {
+        usage: "/permissions deny-network ",
+        description: "remove a network-tool grant",
+    },
+    SlashCommand {
         usage: "/memory",
         description: "manage approved memory",
     },

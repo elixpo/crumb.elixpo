@@ -567,6 +567,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "url",
 ]
 
@@ -745,10 +746,13 @@ dependencies = [
  "anyhow",
  "crumb-agent",
  "crumb-optimize",
+ "reqwest",
  "rustix",
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
+ "url",
 ]
 
 [[package]]

@@ -79,7 +79,7 @@
     }
   ],
   "permissions": {
-    "allow_network_tools": ["web_search"],
+    "allow_network_tools": ["web_fetch", "web_search"],
     "allow_workspace_tools": ["write_file"],
     "allow_mcp_tools": []
   },

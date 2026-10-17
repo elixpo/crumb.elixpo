@@ -11,6 +11,9 @@ crumb-optimize = { path = "../crumb-optimize" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+url.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
