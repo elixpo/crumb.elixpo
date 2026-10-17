@@ -54,8 +54,8 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kind", "bundle_url"],
-          "properties": {"kind": {"const": "sigstore_bundle"}, "bundle_url": {"$ref": "#/$defs/httpsUrl"}}
+          "required": ["kind"],
+          "properties": {"kind": {"const": "sigstore_bundle"}}
         }
       ]
     },
@@ -102,12 +102,13 @@
     "artifact": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "sha256", "size_bytes", "url"],
+      "required": ["path", "sha256", "size_bytes", "url", "bundle_url"],
       "properties": {
         "path": {"$ref": "#/$defs/relativePath"},
         "sha256": {"type": "string", "pattern": "^[A-Fa-f0-9]{64}$"},
         "size_bytes": {"type": "integer", "minimum": 1, "maximum": 262144},
-        "url": {"oneOf": [{"$ref": "#/$defs/httpsUrl"}, {"type": "null"}]}
+        "url": {"oneOf": [{"$ref": "#/$defs/httpsUrl"}, {"type": "null"}]},
+        "bundle_url": {"oneOf": [{"$ref": "#/$defs/httpsUrl"}, {"type": "null"}]}
       }
     },
     "skill": {
@@ -171,4 +172,3 @@
     }
   }
 }
-

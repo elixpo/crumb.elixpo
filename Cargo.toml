@@ -58,6 +58,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 semver = "1.0"
 sha2 = "0.10.9"
+sigstore-trust-root = { version = "0.15.0", default-features = false }
+sigstore-types = "0.15.0"
+sigstore-verify = "0.15.0"
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["time"] }
 zeroize = "1.9"

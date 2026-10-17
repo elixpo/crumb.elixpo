@@ -9,13 +9,18 @@ use chrono::DateTime;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sigstore_trust_root::{SIGSTORE_PRODUCTION_TRUSTED_ROOT, TrustedRoot};
+use sigstore_types::Bundle;
+use sigstore_verify::{VerificationPolicy, Verifier};
 use tempfile::{Builder, NamedTempFile};
-use url::Url;
+use url::{Host, Url};
 
 const MAX_ARTIFACT_BYTES: usize = 256 * 1024;
 const MAX_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum accepted size for a downloaded marketplace catalog.
 pub const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum accepted size for one Sigstore bundle.
+pub const MAX_SIGSTORE_BUNDLE_BYTES: usize = 256 * 1024;
 const BUNDLED_CATALOG: &[u8] = include_bytes!("../../../marketplace/catalog.json");
 #[cfg(test)]
 const PUBLIC_CATALOG: &[u8] =
@@ -94,7 +99,7 @@ pub struct Publisher {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReleaseTrust {
     Bundled,
-    SigstoreBundle { bundle_url: String },
+    SigstoreBundle,
 }
 
 /// Immutable source and release identity.
@@ -152,6 +157,7 @@ pub struct Artifact {
     pub sha256: String,
     pub size_bytes: u64,
     pub url: Option<String>,
+    pub bundle_url: Option<String>,
 }
 
 /// Skill entry exposed after package installation.
@@ -333,6 +339,58 @@ pub fn bundled_catalog() -> Result<Catalog> {
     Catalog::parse(BUNDLED_CATALOG)
 }
 
+/// Offline verifier backed by the Sigstore public-good production trust root.
+pub struct SigstoreVerifier {
+    verifier: Verifier,
+}
+
+impl SigstoreVerifier {
+    /// Builds a verifier from the production root embedded by the Sigstore crate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the embedded trust root cannot be parsed or prepared.
+    pub fn production() -> Result<Self> {
+        let root = TrustedRoot::from_json(SIGSTORE_PRODUCTION_TRUSTED_ROOT)
+            .context("Sigstore production trust root is invalid")?;
+        let verifier = Verifier::new(&root).context("Sigstore verifier is unavailable")?;
+        Ok(Self { verifier })
+    }
+
+    /// Verifies bytes against a standard Sigstore bundle and an exact signer identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed/oversized bundles, signer mismatch, or any failed
+    /// certificate, SCT, transparency-log, consistency, digest, or signature check.
+    pub fn verify(
+        &self,
+        artifact: &[u8],
+        bundle_bytes: &[u8],
+        identity: &PublisherIdentity,
+    ) -> Result<()> {
+        if bundle_bytes.is_empty() || bundle_bytes.len() > MAX_SIGSTORE_BUNDLE_BYTES {
+            bail!("Sigstore bundle exceeds the size limit");
+        }
+        let bundle_json =
+            std::str::from_utf8(bundle_bytes).context("Sigstore bundle is not UTF-8")?;
+        let bundle = Bundle::from_json(bundle_json).context("Sigstore bundle is invalid")?;
+        let policy = VerificationPolicy::new(&identity.subject, &identity.issuer);
+        let result = self
+            .verifier
+            .verify(artifact, &bundle, &policy)
+            .context("Sigstore verification failed")?;
+        if !result.certificate_verified()
+            || !result.sct_verified()
+            || !result.tlog_verified()
+            || !result.identity_policy_checked()
+        {
+            bail!("Sigstore bundle did not provide the required verification evidence");
+        }
+        Ok(())
+    }
+}
+
 /// Immutable, content-addressed cache for validated remote catalogs.
 ///
 /// Cached metadata remains inspection-only until a separate trust verifier authenticates it.
@@ -485,7 +543,7 @@ impl Package {
             {
                 bail!("package `{}` has invalid bundled provenance", self.id);
             }
-            ReleaseTrust::SigstoreBundle { .. } if !valid_https_url(&self.source) => {
+            ReleaseTrust::SigstoreBundle if !valid_https_url(&self.source) => {
                 bail!("package `{}` must use an HTTPS source", self.id);
             }
             _ => {}
@@ -530,13 +588,32 @@ impl Package {
                 .url
                 .as_deref()
                 .is_some_and(|url| !valid_https_url(url))
+                || artifact
+                    .bundle_url
+                    .as_deref()
+                    .is_some_and(|url| !valid_https_url(url))
             {
-                bail!("package `{}` has an invalid artifact URL", self.id);
+                bail!(
+                    "package `{}` has an invalid artifact or bundle URL",
+                    self.id
+                );
             }
-            if matches!(self.provenance.trust, ReleaseTrust::SigstoreBundle { .. })
-                && !artifact.url.as_deref().is_some_and(valid_https_url)
-            {
-                bail!("package `{}` has an invalid remote artifact URL", self.id);
+            match self.provenance.trust {
+                ReleaseTrust::SigstoreBundle
+                    if !artifact.url.as_deref().is_some_and(valid_https_url)
+                        || !artifact.bundle_url.as_deref().is_some_and(valid_https_url) =>
+                {
+                    bail!("package `{}` has incomplete remote artifact trust", self.id);
+                }
+                ReleaseTrust::Bundled
+                    if artifact.url.is_some() || artifact.bundle_url.is_some() =>
+                {
+                    bail!(
+                        "package `{}` has remote URLs for a bundled artifact",
+                        self.id
+                    );
+                }
+                _ => {}
             }
         }
         Ok(paths)
@@ -656,11 +733,6 @@ impl ReleaseProvenance {
         {
             bail!("marketplace release provenance is invalid");
         }
-        if let ReleaseTrust::SigstoreBundle { bundle_url } = &self.trust
-            && !valid_https_url(bundle_url)
-        {
-            bail!("marketplace Sigstore bundle URL is invalid");
-        }
         Ok(())
     }
 }
@@ -735,6 +807,12 @@ pub struct InstalledPackage {
     pub package: Package,
 }
 
+/// Downloaded bytes and the Sigstore bundle authenticating exactly those bytes.
+pub struct SignedArtifact {
+    pub bytes: Vec<u8>,
+    pub bundle: Vec<u8>,
+}
+
 /// Installs packages from an already-fetched, trusted source directory.
 pub struct Installer {
     destination_root: PathBuf,
@@ -786,6 +864,52 @@ impl Installer {
                         artifact.path.display()
                     )
                 })
+        })
+    }
+
+    /// Verifies and installs a complete remote artifact set.
+    ///
+    /// Every artifact must match its signed catalog size and digest and pass Sigstore
+    /// verification against the exact publisher identity. Installation remains disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-Sigstore release, publisher mismatch, incomplete download,
+    /// integrity/authenticity failure, or filesystem failure.
+    pub fn install_sigstore(
+        &self,
+        package: &Package,
+        publisher: &Publisher,
+        downloads: &BTreeMap<PathBuf, SignedArtifact>,
+        verifier: &SigstoreVerifier,
+    ) -> Result<InstalledPackage> {
+        package.validate()?;
+        if package.provenance.trust != ReleaseTrust::SigstoreBundle {
+            bail!("remote installation requires Sigstore release trust");
+        }
+        if publisher.id != package.publisher || downloads.len() != package.artifacts.len() {
+            bail!("remote package publisher or artifact set does not match the catalog");
+        }
+        for artifact in &package.artifacts {
+            let download = downloads.get(&artifact.path).with_context(|| {
+                format!("remote artifact `{}` is missing", artifact.path.display())
+            })?;
+            if u64::try_from(download.bytes.len()).unwrap_or(u64::MAX) != artifact.size_bytes
+                || !format!("{:x}", Sha256::digest(&download.bytes))
+                    .eq_ignore_ascii_case(&artifact.sha256)
+            {
+                bail!(
+                    "remote artifact `{}` failed catalog integrity verification",
+                    artifact.path.display()
+                );
+            }
+            verifier.verify(&download.bytes, &download.bundle, &publisher.identity)?;
+        }
+        self.install_from(package, |artifact| {
+            downloads
+                .get(&artifact.path)
+                .map(|download| download.bytes.clone())
+                .context("verified remote artifact is unavailable")
         })
     }
 
@@ -947,9 +1071,30 @@ fn valid_env_name(value: &str) -> bool {
 fn valid_https_url(value: &str) -> bool {
     Url::parse(value).is_ok_and(|url| {
         url.scheme() == "https"
-            && url.host_str().is_some()
             && url.username().is_empty()
             && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.host().is_some_and(|host| match host {
+                Host::Domain(domain) => {
+                    domain.split('.').next_back() != Some("localhost")
+                        && domain.split('.').next_back() != Some("local")
+                }
+                Host::Ipv4(address) => {
+                    !address.is_loopback()
+                        && !address.is_private()
+                        && !address.is_link_local()
+                        && !address.is_unspecified()
+                        && !address.is_multicast()
+                }
+                Host::Ipv6(address) => {
+                    !address.is_loopback()
+                        && !address.is_unique_local()
+                        && !address.is_unicast_link_local()
+                        && !address.is_unspecified()
+                        && !address.is_multicast()
+                }
+            })
     })
 }
 
@@ -968,12 +1113,14 @@ mod tests {
         RemoteCatalogCache, Revocation, bundled_catalog,
     };
     use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     fn catalog_json(hash: &str, path: &str) -> String {
         format!(
-            r#"{{"schema_version":2,"name":"crumb-public","publishers":[{{"id":"crumb","display_name":"Crumb","source_url":"https://example.test/crumb","identity":{{"issuer":"https://issuer.example.test","subject":"repo:crumb/test"}}}}],"revocations":[],"packages":[{{"id":"crumb/review","publisher":"crumb","version":"1.0.0","kind":"skill","display_name":"Review","description":"Review code","license":"MIT","source":"./packages/review","compatibility":{{"minimum_crumb_version":"0.1.0","maximum_crumb_version_exclusive":"0.2.0","platforms":["linux","macos","windows"]}},"provenance":{{"repository":"https://example.test/review","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","released_at":"2026-10-17T00:00:00Z","trust":{{"kind":"bundled"}}}},"disclosures":{{"security_url":"https://example.test/security","privacy_url":null,"data_flow":"local only"}},"connector_requirements":[],"deprecation":null,"artifacts":[{{"path":"{path}","sha256":"{hash}","size_bytes":9,"url":null}}],"skills":[{{"id":"review","path":"{path}"}}]}}]}}"#
+            r#"{{"schema_version":2,"name":"crumb-public","publishers":[{{"id":"crumb","display_name":"Crumb","source_url":"https://example.test/crumb","identity":{{"issuer":"https://issuer.example.test","subject":"repo:crumb/test"}}}}],"revocations":[],"packages":[{{"id":"crumb/review","publisher":"crumb","version":"1.0.0","kind":"skill","display_name":"Review","description":"Review code","license":"MIT","source":"./packages/review","compatibility":{{"minimum_crumb_version":"0.1.0","maximum_crumb_version_exclusive":"0.2.0","platforms":["linux","macos","windows"]}},"provenance":{{"repository":"https://example.test/review","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","released_at":"2026-10-17T00:00:00Z","trust":{{"kind":"bundled"}}}},"disclosures":{{"security_url":"https://example.test/security","privacy_url":null,"data_flow":"local only"}},"connector_requirements":[],"deprecation":null,"artifacts":[{{"path":"{path}","sha256":"{hash}","size_bytes":9,"url":null,"bundle_url":null}}],"skills":[{{"id":"review","path":"{path}"}}]}}]}}"#
         )
     }
 
@@ -1024,11 +1171,20 @@ mod tests {
 
         let mut value: serde_json::Value =
             serde_json::from_str(&catalog_json(&"a".repeat(64), "SKILL.md")).expect("catalog JSON");
-        value["packages"][0]["provenance"]["trust"] = serde_json::json!({
-            "kind": "sigstore_bundle",
-            "bundle_url": "http://example.test/bundle.json"
-        });
+        value["packages"][0]["provenance"]["trust"] =
+            serde_json::json!({"kind": "sigstore_bundle"});
         value["packages"][0]["source"] = serde_json::json!("http://example.test/review");
+        assert!(Catalog::parse(value.to_string().as_bytes()).is_err());
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&catalog_json(&"a".repeat(64), "SKILL.md")).expect("catalog JSON");
+        value["packages"][0]["source"] = serde_json::json!("https://127.0.0.1/review");
+        value["packages"][0]["provenance"]["trust"] =
+            serde_json::json!({"kind": "sigstore_bundle"});
+        value["packages"][0]["artifacts"][0]["url"] =
+            serde_json::json!("https://localhost/SKILL.md");
+        value["packages"][0]["artifacts"][0]["bundle_url"] =
+            serde_json::json!("https://localhost/SKILL.md.sigstore.json");
         assert!(Catalog::parse(value.to_string().as_bytes()).is_err());
     }
 
@@ -1102,5 +1258,90 @@ mod tests {
 
         assert_eq!(cache.load().expect("cache should fall back"), Some(stored));
         assert!(cache.store(&vec![b'x'; MAX_CATALOG_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn sigstore_verification_requires_exact_identity_and_untampered_bytes() {
+        const ARTIFACT: &[u8] = include_bytes!("../tests/fixtures/cosign-v3-blob.txt");
+        const BUNDLE: &[u8] = include_bytes!("../tests/fixtures/cosign-v3-blob.sigstore.json");
+        let verifier = super::SigstoreVerifier::production().expect("production verifier");
+        let identity = super::PublisherIdentity {
+            issuer: "https://github.com/login/oauth".to_owned(),
+            subject: "w.vollprecht@gmail.com".to_owned(),
+        };
+
+        verifier
+            .verify(ARTIFACT, BUNDLE, &identity)
+            .expect("public-good fixture should verify");
+        let mut wrong_identity = identity.clone();
+        wrong_identity.subject = "attacker@example.test".to_owned();
+        assert!(verifier.verify(ARTIFACT, BUNDLE, &wrong_identity).is_err());
+        assert!(verifier.verify(b"tampered", BUNDLE, &identity).is_err());
+        assert!(
+            verifier
+                .verify(
+                    ARTIFACT,
+                    &vec![b'x'; super::MAX_SIGSTORE_BUNDLE_BYTES + 1],
+                    &identity,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_install_verifies_every_artifact_and_stays_atomic() {
+        const ARTIFACT: &[u8] = include_bytes!("../tests/fixtures/cosign-v3-blob.txt");
+        const BUNDLE: &[u8] = include_bytes!("../tests/fixtures/cosign-v3-blob.sigstore.json");
+        let hash = format!("{:x}", Sha256::digest(ARTIFACT));
+        let mut value: serde_json::Value =
+            serde_json::from_str(&catalog_json(&hash, "SKILL.md")).expect("catalog JSON");
+        value["publishers"][0]["identity"] = serde_json::json!({
+            "issuer": "https://github.com/login/oauth",
+            "subject": "w.vollprecht@gmail.com"
+        });
+        value["packages"][0]["source"] = serde_json::json!("https://example.test/review");
+        value["packages"][0]["provenance"]["trust"] =
+            serde_json::json!({"kind": "sigstore_bundle"});
+        value["packages"][0]["artifacts"][0]["size_bytes"] = serde_json::json!(ARTIFACT.len());
+        value["packages"][0]["artifacts"][0]["url"] =
+            serde_json::json!("https://example.test/SKILL.md");
+        value["packages"][0]["artifacts"][0]["bundle_url"] =
+            serde_json::json!("https://example.test/SKILL.md.sigstore.json");
+        let catalog = Catalog::parse(value.to_string().as_bytes()).expect("remote catalog");
+        let package = catalog
+            .installable_package("crumb/review")
+            .expect("installable package");
+        let publisher = &catalog.publishers[0];
+        let mut downloads = BTreeMap::from([(
+            PathBuf::from("SKILL.md"),
+            super::SignedArtifact {
+                bytes: ARTIFACT.to_vec(),
+                bundle: BUNDLE.to_vec(),
+            },
+        )]);
+        let destination = tempdir().expect("destination");
+        let verifier = super::SigstoreVerifier::production().expect("production verifier");
+
+        let installed = Installer::new(destination.path())
+            .install_sigstore(package, publisher, &downloads, &verifier)
+            .expect("signed package should install");
+        assert_eq!(
+            fs::read(installed.root.join("SKILL.md")).expect("installed artifact"),
+            ARTIFACT
+        );
+
+        downloads.get_mut(&PathBuf::from("SKILL.md")).unwrap().bytes[0] ^= 1;
+        let second_destination = tempdir().expect("second destination");
+        assert!(
+            Installer::new(second_destination.path())
+                .install_sigstore(package, publisher, &downloads, &verifier)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_dir(second_destination.path())
+                .expect("empty destination")
+                .count(),
+            0
+        );
     }
 }
