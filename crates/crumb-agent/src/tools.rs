@@ -132,22 +132,30 @@ impl ApprovalBroker for DenyAllApprovals {
 /// Approval policy derived only from explicit user configuration.
 #[derive(Clone, Debug, Default)]
 pub struct ConfiguredApprovals {
-    network_tools: BTreeSet<String>,
-    workspace_tools: BTreeSet<String>,
+    network: BTreeSet<String>,
+    workspace: BTreeSet<String>,
+    processes: BTreeSet<String>,
 }
 
 impl ConfiguredApprovals {
     #[must_use]
     pub fn new(network_tools: BTreeSet<String>) -> Self {
         Self {
-            network_tools,
-            workspace_tools: BTreeSet::new(),
+            network: network_tools,
+            workspace: BTreeSet::new(),
+            processes: BTreeSet::new(),
         }
     }
 
     #[must_use]
     pub fn with_workspace_tools(mut self, workspace_tools: BTreeSet<String>) -> Self {
-        self.workspace_tools = workspace_tools;
+        self.workspace = workspace_tools;
+        self
+    }
+
+    #[must_use]
+    pub fn with_process_tools(mut self, process_tools: BTreeSet<String>) -> Self {
+        self.processes = process_tools;
         self
     }
 }
@@ -159,9 +167,10 @@ impl ApprovalBroker for ConfiguredApprovals {
         _arguments: &serde_json::Value,
         _cancellation: &CancellationToken,
     ) -> ApprovalDecision {
-        if (request.risk == RiskClass::NetworkAccess && self.network_tools.contains(&request.tool))
-            || (request.risk == RiskClass::WriteWorkspace
-                && self.workspace_tools.contains(&request.tool))
+        if (request.risk == RiskClass::NetworkAccess && self.network.contains(&request.tool))
+            || (request.risk == RiskClass::WriteWorkspace && self.workspace.contains(&request.tool))
+            || (request.risk == RiskClass::ProcessExecution
+                && self.processes.contains(&request.tool))
         {
             ApprovalDecision::AllowOnce
         } else {
@@ -551,6 +560,26 @@ mod tests {
                 &serde_json::json!({}),
                 &cancellation,
             ),
+            ApprovalDecision::Deny
+        );
+    }
+
+    #[test]
+    fn supervised_process_grant_is_exact_and_risk_scoped() {
+        let approvals = ConfiguredApprovals::new(BTreeSet::new())
+            .with_process_tools(BTreeSet::from(["mcp__graphify__query".to_owned()]));
+        let cancellation = CancellationToken::default();
+        let request = ApprovalRequest {
+            tool: "mcp__graphify__query".to_owned(),
+            risk: RiskClass::ProcessExecution,
+            arguments_digest: "digest".to_owned(),
+        };
+        assert_eq!(
+            approvals.decide(&request, &serde_json::json!({}), &cancellation),
+            ApprovalDecision::AllowOnce
+        );
+        assert_eq!(
+            ConfiguredApprovals::default().decide(&request, &serde_json::json!({}), &cancellation),
             ApprovalDecision::Deny
         );
     }
