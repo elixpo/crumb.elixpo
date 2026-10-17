@@ -5,7 +5,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use crumb_native::{NativeShell, ShellKind};
 use crumb_pty::{CommandSpec, SystemPty, TerminalSize};
 
@@ -55,6 +55,11 @@ fn powershell_state_persists_in_one_resizable_conpty() {
 fn exercise_persistent_powershell() -> Result<String> {
     let mut process = DeterministicPowerShell.spawn(&SystemPty, TerminalSize::new(24, 80))?;
     let mut reader = process.try_clone_reader()?;
+    let reader_worker = thread::spawn(move || {
+        let mut output = String::new();
+        reader.read_to_string(&mut output)?;
+        Ok::<_, std::io::Error>(output)
+    });
 
     process.resize(TerminalSize::new(40, 120))?;
     process.write_input(
@@ -62,8 +67,8 @@ fn exercise_persistent_powershell() -> Result<String> {
     )?;
 
     process.wait()?;
-
-    let mut output = String::new();
-    reader.read_to_string(&mut output)?;
-    Ok(output)
+    reader_worker
+        .join()
+        .map_err(|_| anyhow!("ConPTY reader thread panicked"))?
+        .map_err(Into::into)
 }
