@@ -80,12 +80,14 @@ mod agent_runtime;
 mod completion;
 mod context;
 mod device_auth;
+mod provider_discovery;
 mod provider_projection;
 mod shell_completion;
 
 use agent_runtime::{AgentRuntime, apply_selected_profile, validate_skill_path};
 use completion::{COMPLETION_PALETTE_ROWS, CompletionWorkspace, CrumbCompleter};
 use context::{parse_attachment, resolve_request_context};
+use provider_discovery::{compatibility_diagnostics, discover_models};
 use shell_completion::{CompletionShell, write_completion};
 
 const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
@@ -2649,6 +2651,7 @@ fn configure_provider(command: &str, cwd: &Path, writer: &mut dyn Write) -> Resu
     match arguments.as_slice() {
         [] | ["list"] => show_providers(cwd, writer),
         ["show", id] => show_provider(cwd, id, writer),
+        ["discover", id] => discover_provider_models(cwd, id, writer),
         ["remove", id] => remove_provider(cwd, id, writer),
         ["preset", preset] => add_provider_preset(cwd, preset, preset, writer),
         ["preset", preset, id] => add_provider_preset(cwd, preset, id, writer),
@@ -2694,9 +2697,40 @@ fn configure_provider(command: &str, cwd: &Path, writer: &mut dyn Write) -> Resu
             add_provider(cwd, id, protocol, base_url, Some(credential), writer)
         }
         _ => Err(anyhow!(
-            "usage: /config provider <list|show|add|remove|preset|set|retry|pricing|compatibility|credential|header|model ...>"
+            "usage: /config provider <list|show|discover|add|remove|preset|set|retry|pricing|compatibility|credential|header|model ...>"
         )),
     }
+}
+
+fn discover_provider_models(cwd: &Path, provider_id: &str, writer: &mut dyn Write) -> Result<()> {
+    let config = raw_agent_config(cwd).load_or_default()?;
+    let provider = config
+        .providers
+        .get(provider_id)
+        .with_context(|| format!("provider `{provider_id}` is not configured"))?;
+    let discovered = discover_models(provider)?;
+    let discovered_count = discovered.len();
+    let mut added = 0_usize;
+    update_agent_config(cwd, |config| {
+        let models = &mut config
+            .providers
+            .get_mut(provider_id)
+            .with_context(|| format!("provider `{provider_id}` is not configured"))?
+            .models;
+        for model in &discovered {
+            if !models.iter().any(|existing| existing.id == model.id) {
+                models.push(model.clone());
+                added = added.saturating_add(1);
+            }
+        }
+        models.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(())
+    })?;
+    writeln!(
+        writer,
+        "◆ Provider discovery · {provider_id} · {discovered_count} reported · {added} added"
+    )?;
+    Ok(())
 }
 
 fn configure_provider_model(arguments: &[&str], cwd: &Path, writer: &mut dyn Write) -> Result<()> {
@@ -3733,6 +3767,15 @@ fn show_doctor(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         Some(HarnessConfig::Native) => writeln!(writer, "  native Harness  unavailable")?,
         None => writeln!(writer, "  none configured · native shell remains available")?,
     }
+    writeln!(writer, "◆ Provider compatibility")?;
+    let diagnostics = compatibility_diagnostics(&config);
+    if diagnostics.is_empty() {
+        writeln!(writer, "  selected routes are locally compatible")?;
+    } else {
+        for diagnostic in diagnostics {
+            writeln!(writer, "  warning · {diagnostic}")?;
+        }
+    }
     writeln!(writer, "◆ Token optimizers")?;
     if config.optimizers.is_empty() {
         writeln!(
@@ -4036,27 +4079,40 @@ fn show_models(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     writeln!(writer, "◆ Model routes")?;
     if config.models.values().all(Vec::is_empty) {
         writeln!(writer, "  No model routes configured in .crumb/agent.json")?;
-        return Ok(());
-    }
-    for (modality, routes) in &config.models {
-        for (index, route) in routes.iter().enumerate() {
-            let marker = if index == 0 { "●" } else { "○" };
-            let effort = route
-                .reasoning_effort
-                .as_deref()
-                .or(config.reasoning_effort.as_deref())
-                .map_or(String::new(), |effort| format!(" · effort {effort}"));
-            writeln!(
-                writer,
-                "  {marker} {:<13} {}/{}{}",
-                modality_name(*modality),
-                route.provider,
-                route.model,
-                effort
-            )?;
+    } else {
+        for (modality, routes) in &config.models {
+            for (index, route) in routes.iter().enumerate() {
+                let marker = if index == 0 { "●" } else { "○" };
+                let effort = route
+                    .reasoning_effort
+                    .as_deref()
+                    .or(config.reasoning_effort.as_deref())
+                    .map_or(String::new(), |effort| format!(" · effort {effort}"));
+                writeln!(
+                    writer,
+                    "  {marker} {:<13} {}/{}{}",
+                    modality_name(*modality),
+                    route.provider,
+                    route.model,
+                    effort
+                )?;
+            }
         }
+        writeln!(writer, "  ● active route · ○ fallback")?;
     }
-    writeln!(writer, "  ● active route · ○ fallback")?;
+    writeln!(writer, "◆ Discovered provider catalogs")?;
+    for (provider_id, provider) in &config.providers {
+        writeln!(
+            writer,
+            "  {provider_id:<18} {} models{}",
+            provider.models.len(),
+            if provider.models.is_empty() {
+                format!(" · run `/config provider discover {provider_id}`")
+            } else {
+                String::new()
+            }
+        )?;
+    }
     Ok(())
 }
 
