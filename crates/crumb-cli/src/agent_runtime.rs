@@ -171,6 +171,11 @@ impl EventSink for NativeEventBridge<'_> {
             HarnessEvent::ToolFinished { name, success, .. } => {
                 Some(HarnessActivity::ToolFinished { name, success })
             }
+            HarnessEvent::ToolOutput { name, content, .. } => Some(HarnessActivity::ToolOutput {
+                name,
+                bytes: u64::try_from(content.len()).ok(),
+                content: Some(content),
+            }),
             HarnessEvent::TurnFinished => Some(HarnessActivity::Completed {
                 reason: "stop".to_owned(),
             }),
@@ -1610,6 +1615,32 @@ mod tests {
             activities,
             vec![HarnessActivity::Progress {
                 label: "Koi · Reading · read_file".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn native_bridge_forwards_bounded_tool_output_for_rendering() {
+        let mut activities = Vec::new();
+        let mut capture = |activity| {
+            activities.push(activity);
+            Ok(())
+        };
+        let mut bridge = NativeEventBridge::new(&mut capture);
+
+        bridge.emit(HarnessEvent::ToolOutput {
+            id: "call-1".to_owned(),
+            name: "run_shell".to_owned(),
+            content: "folder-a\nfolder-b".to_owned(),
+        });
+        bridge.finish().expect("activity callback succeeds");
+
+        assert_eq!(
+            activities,
+            vec![HarnessActivity::ToolOutput {
+                name: "run_shell".to_owned(),
+                bytes: Some(17),
+                content: Some("folder-a\nfolder-b".to_owned()),
             }]
         );
     }

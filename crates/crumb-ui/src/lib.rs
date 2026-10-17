@@ -730,6 +730,32 @@ impl Renderer {
         }
     }
 
+    /// Renders bounded tool output as a distinct transcript block.
+    #[must_use]
+    pub fn agent_tool_output_for_width(&self, content: &str, terminal_width: u16) -> String {
+        let content = content.trim_end();
+        if self.settings.output == OutputMode::ScreenReader {
+            return format!("Tool output:\n{content}");
+        }
+        let content_width = usize::from(terminal_width.saturating_sub(10)).max(1);
+        let mut output = format!(
+            "  {}    {}",
+            self.paint("│", "35"),
+            self.paint("tool output", "38;5;245")
+        );
+        for source_line in content.lines() {
+            for line in wrap_terminal_line(source_line, content_width) {
+                let _ = write!(
+                    output,
+                    "\n  {}    {}",
+                    self.paint("│", "35"),
+                    self.paint(&line, "2")
+                );
+            }
+        }
+        output
+    }
+
     /// Renders a durable tool outcome in the scrolling transcript.
     #[must_use]
     pub fn agent_tool_result(&self, name: &str, success: bool) -> String {
@@ -1782,6 +1808,10 @@ mod tests {
         assert_eq!(
             renderer.agent_tool_result("write_file", false),
             "  [ CRUMB ]  Tool failed · write_file"
+        );
+        assert_eq!(
+            renderer.agent_tool_output_for_width("folder-a\nfolder-b", 80),
+            "  │    tool output\n  │    folder-a\n  │    folder-b"
         );
         assert_eq!(
             renderer.agent_approval_required("write_file"),

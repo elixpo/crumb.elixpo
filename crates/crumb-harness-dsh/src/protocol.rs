@@ -89,6 +89,7 @@ pub enum HarnessActivity {
     ToolOutput {
         name: String,
         bytes: Option<u64>,
+        content: Option<String>,
     },
     ToolFinished {
         name: String,
@@ -133,6 +134,7 @@ impl Notification {
             "tool/output" | "tool/result" => Some(HarnessActivity::ToolOutput {
                 name,
                 bytes: data.get("outputBytes").and_then(Value::as_u64),
+                content: None,
             }),
             "tool/end" | "tool/completed" => Some(HarnessActivity::ToolFinished {
                 name,

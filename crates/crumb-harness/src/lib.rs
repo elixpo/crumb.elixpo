@@ -75,6 +75,11 @@ pub enum HarnessEvent {
         name: String,
         success: bool,
     },
+    ToolOutput {
+        id: String,
+        name: String,
+        content: String,
+    },
     Usage(TokenUsage),
     TurnFinished,
 }
@@ -414,6 +419,7 @@ impl NativeHarness {
                 metrics.tool_calls += 1;
                 let result = self.execute_tool(session, &call, cancellation, deadline, sink)?;
                 add_output_bytes(&mut output_bytes, result.content.len(), self.limits)?;
+                emit_tool_output(sink, &call, &result);
                 if result.success {
                     round_succeeded = true;
                 } else {
@@ -770,6 +776,14 @@ fn record_successful_tool_evidence(messages: &mut Vec<ChatMessage>, round_succee
 fn record_usage(total: &mut TokenUsage, round: TokenUsage) {
     total.input_tokens = total.input_tokens.saturating_add(round.input_tokens);
     total.output_tokens = total.output_tokens.saturating_add(round.output_tokens);
+}
+
+fn emit_tool_output(sink: &mut dyn EventSink, call: &ToolCall, result: &ExecutedTool) {
+    sink.emit(HarnessEvent::ToolOutput {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        content: result.content.clone(),
+    });
 }
 
 fn initial_tool_requirement(definitions: &[crumb_llm::ToolDefinition], user_message: &str) -> bool {
@@ -1602,6 +1616,11 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, HarnessEvent::ToolFinished { success: true, .. }))
         );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HarnessEvent::ToolOutput { name, content, .. }
+                if name == "weather" && content == "24 C"
+        )));
         let streamed = events
             .iter()
             .filter_map(|event| match event {

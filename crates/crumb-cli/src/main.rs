@@ -1858,6 +1858,11 @@ fn terminal_agent_response(renderer: Renderer, response: &str) -> String {
     renderer.agent_response_for_width(response, terminal_width)
 }
 
+fn terminal_tool_output(renderer: Renderer, content: &str) -> String {
+    let terminal_width = size().map_or(80, |(columns, _)| columns);
+    renderer.agent_tool_output_for_width(content, terminal_width)
+}
+
 fn write_bounded_response_delta(
     writer: &mut dyn Write,
     text: &str,
@@ -3096,7 +3101,7 @@ fn harness_activity_label(activity: &HarnessActivity) -> String {
             "approval required · parallel agent team".to_owned()
         }
         HarnessActivity::ApprovalRequired { name } => format!("approval required · {name}"),
-        HarnessActivity::ToolOutput { name, bytes } => bytes.map_or_else(
+        HarnessActivity::ToolOutput { name, bytes, .. } => bytes.map_or_else(
             || format!("tool output · {name}"),
             |bytes| format!("tool output · {name} · {bytes} bytes"),
         ),
@@ -3168,13 +3173,17 @@ fn render_harness_activity(
                 fullscreen,
             );
         }
-        HarnessActivity::ToolOutput { name, bytes } => {
-            let label = bytes.map_or_else(
-                || tool_activity_label(name),
-                |bytes| format!("{} · {bytes} bytes", tool_activity_label(name)),
-            );
-            replace_activity(indicator, renderer, &label, fullscreen);
-        }
+        HarnessActivity::ToolOutput {
+            name,
+            bytes,
+            content,
+        } => render_tool_output_activity(
+            (name, *bytes, content.as_deref()),
+            indicator,
+            renderer,
+            writer,
+            fullscreen,
+        )?,
         HarnessActivity::ToolFinished { name, success } => {
             render_finished_tool(
                 name, *success, indicator, state, renderer, writer, fullscreen,
@@ -3210,6 +3219,29 @@ fn render_harness_activity(
             replace_activity(indicator, renderer, "Request accepted", fullscreen);
         }
         HarnessActivity::Usage { .. } => {}
+    }
+    Ok(())
+}
+
+fn render_tool_output_activity(
+    tool: (&str, Option<u64>, Option<&str>),
+    indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    fullscreen: bool,
+) -> Result<()> {
+    let (name, bytes, content) = tool;
+    if let Some(content) = content {
+        finish_activity_line(indicator, writer)?;
+        writeln!(writer, "{}", terminal_tool_output(renderer, content))?;
+        writer.flush()?;
+        replace_activity(indicator, renderer, "Thinking", fullscreen);
+    } else {
+        let label = bytes.map_or_else(
+            || tool_activity_label(name),
+            |bytes| format!("{} · {bytes} bytes", tool_activity_label(name)),
+        );
+        replace_activity(indicator, renderer, &label, fullscreen);
     }
     Ok(())
 }
