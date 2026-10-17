@@ -41,7 +41,8 @@ use crumb_graph::{
 use crumb_harness_dsh::HarnessActivity;
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_marketplace::{
-    Catalog, InstallScope, Installer, Package, bundled_catalog, verify_package_files,
+    Catalog, InstallScope, Installer, McpTransport as MarketplaceMcpTransport, Package,
+    ReleaseTrust, bundled_catalog, verify_package_files,
 };
 use crumb_mcp::{
     McpDispatcher, StdioMcpLimits, StreamableHttpLimits, register_stdio_servers,
@@ -4989,7 +4990,7 @@ fn show_marketplace(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result
         let package = catalog
             .package(id.trim())
             .with_context(|| format!("marketplace package `{}` was not found", id.trim()))?;
-        return show_marketplace_package(package, writer);
+        return show_marketplace_package(&catalog, package, writer);
     }
     if let Some(arguments) = command.strip_prefix("/marketplace install ") {
         return install_marketplace_package(&catalog, arguments, cwd, writer);
@@ -5042,7 +5043,16 @@ fn validate_marketplace_path(path: &str, cwd: &Path, writer: &mut dyn Write) -> 
     Ok(())
 }
 
-fn show_marketplace_package(package: &Package, writer: &mut dyn Write) -> Result<()> {
+fn show_marketplace_package(
+    catalog: &Catalog,
+    package: &Package,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let publisher = catalog
+        .publishers
+        .iter()
+        .find(|publisher| publisher.id == package.publisher)
+        .context("marketplace package publisher is unavailable")?;
     writeln!(writer, "◆ {} · {}", package.display_name, package.id)?;
     writeln!(
         writer,
@@ -5053,6 +5063,40 @@ fn show_marketplace_package(package: &Package, writer: &mut dyn Write) -> Result
     )?;
     writeln!(writer, "  {}", package.description)?;
     writeln!(writer, "  source {}", package.source)?;
+    writeln!(
+        writer,
+        "  publisher {} · trust {} · revision {}",
+        publisher.display_name,
+        match package.provenance.trust {
+            ReleaseTrust::Bundled => "bundled",
+            ReleaseTrust::SigstoreBundle { .. } => "Sigstore bundle metadata",
+        },
+        &package.provenance.revision[..12]
+    )?;
+    writeln!(writer, "  publisher source {}", publisher.source_url)?;
+    writeln!(
+        writer,
+        "  state {}",
+        if catalog.is_revoked(package) {
+            "revoked"
+        } else if package.deprecation.is_some() {
+            "deprecated"
+        } else {
+            "available"
+        }
+    )?;
+    writeln!(
+        writer,
+        "  compatibility Crumb >= {}{} · {:?}",
+        package.compatibility.minimum_crumb_version,
+        package
+            .compatibility
+            .maximum_crumb_version_exclusive
+            .as_deref()
+            .map_or_else(String::new, |version| format!(" and < {version}")),
+        package.compatibility.platforms
+    )?;
+    writeln!(writer, "  data flow {}", package.disclosures.data_flow)?;
     let capabilities = package
         .capabilities
         .iter()
@@ -5093,9 +5137,7 @@ fn install_marketplace_package(
             ));
         }
     };
-    let package = catalog
-        .package(id)
-        .with_context(|| format!("marketplace package `{id}` was not found"))?;
+    let package = catalog.installable_package(id)?;
     let (_, project_root) = agent_config_location(cwd);
     let destination = match scope {
         InstallScope::Project => project_root.join(".crumb/marketplace/packages"),
@@ -5163,28 +5205,34 @@ fn register_installed_package(
             }
         }
         for entry in &installed.package.mcp_servers {
-            let command = if entry.command == "crumb" {
-                current_executable.clone()
-            } else {
-                PathBuf::from(&entry.command)
+            let transport = match entry.transport {
+                MarketplaceMcpTransport::Stdio => crumb_agent::McpTransport::Stdio,
+                MarketplaceMcpTransport::StreamableHttp => {
+                    crumb_agent::McpTransport::StreamableHttp
+                }
+            };
+            let command = match entry.command.as_deref() {
+                Some("crumb") => current_executable.clone(),
+                Some(command) => PathBuf::from(command),
+                None => PathBuf::new(),
             };
             if let Some(server) = config
                 .mcp_servers
                 .iter_mut()
                 .find(|server| server.id == entry.id)
             {
-                server.transport = crumb_agent::McpTransport::Stdio;
+                server.transport = transport;
                 server.command = command;
                 server.arguments.clone_from(&entry.arguments);
-                server.url = None;
+                server.url.clone_from(&entry.url);
                 server.credential = None;
             } else {
                 config.mcp_servers.push(McpServer {
                     id: entry.id.clone(),
-                    transport: crumb_agent::McpTransport::Stdio,
+                    transport,
                     command,
                     arguments: entry.arguments.clone(),
-                    url: None,
+                    url: entry.url.clone(),
                     credential: None,
                     enabled: false,
                 });
@@ -6177,6 +6225,7 @@ impl Drop for RawModeGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use crumb_agent::{
@@ -6191,7 +6240,7 @@ mod tests {
         openrouter_preset, parse_credential_reference, parse_provider_header,
         parse_resume_session_argument, read_agent_config, resolve_memory_keep, show_graph,
         show_marketplace, show_memory, show_profile_with_stores, suggestion_width,
-        workspace_read_host,
+        validate_marketplace_path, workspace_read_host,
     };
 
     #[test]
@@ -6356,6 +6405,12 @@ mod tests {
 
     #[test]
     fn marketplace_install_is_verified_scoped_and_disabled_by_default() {
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut validation = Vec::new();
+        validate_marketplace_path("marketplace/catalog.json", &repository, &mut validation)
+            .expect("contributor catalog should pass authoritative validation");
+        assert!(String::from_utf8_lossy(&validation).contains("3 packages"));
+
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is valid")
@@ -6363,6 +6418,18 @@ mod tests {
         let workspace = std::env::temp_dir().join(format!("crumb-marketplace-{suffix}"));
         std::fs::create_dir_all(&workspace).expect("workspace can be created");
         let mut output = Vec::new();
+
+        show_marketplace(
+            "/marketplace inspect crumb/code-review",
+            &workspace,
+            &mut output,
+        )
+        .expect("bundled package trust metadata should render");
+        let inspection = String::from_utf8_lossy(&output);
+        assert!(inspection.contains("publisher Crumb · trust bundled"));
+        assert!(inspection.contains("state available"));
+        assert!(inspection.contains("compatibility Crumb >= 0.1.0 and < 0.2.0"));
+        output.clear();
 
         show_marketplace(
             "/marketplace install crumb/code-review --scope project",

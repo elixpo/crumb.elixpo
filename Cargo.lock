@@ -615,10 +615,13 @@ name = "crumb-marketplace"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "url",
 ]
 
 [[package]]

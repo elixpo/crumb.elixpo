@@ -110,10 +110,10 @@ engines remain replaceable; none may bypass Crumb's permission, credential, or s
 
 ### Phase 1 — grounded context
 
-- [ ] [Add provenance-aware memory retrieval and conflict handling](https://github.com/elixpo/crumb.elixpo/issues/43).
-- [ ] [Add named personas and portable agent profiles](https://github.com/elixpo/crumb.elixpo/issues/44).
+- [x] [Add provenance-aware memory retrieval and conflict handling](https://github.com/elixpo/crumb.elixpo/issues/43).
+- [x] [Add named personas and portable agent profiles](https://github.com/elixpo/crumb.elixpo/issues/44).
 - [ ] [Add graph-grounded project context with an optional Graphify adapter](https://github.com/elixpo/crumb.elixpo/issues/45).
-  - [ ] [WP-024: provider-neutral graph core and pinned Graphify adapter](https://github.com/elixpo/crumb.elixpo/issues/100).
+  - [x] [WP-024: provider-neutral graph core and pinned Graphify adapter](https://github.com/elixpo/crumb.elixpo/issues/100).
   - Keep Graphify opt-in, local-first, pinned, and replaceable.
   - Require source/edge provenance, freshness detection, bounded retrieval, and native-search fallback.
   - Route its MCP surface through Crumb's approval and supervision boundary.
@@ -122,7 +122,10 @@ engines remain replaceable; none may bypass Crumb's permission, credential, or s
 
 - [ ] [Expand the public skill and connector ecosystem](https://github.com/elixpo/crumb.elixpo/issues/46).
 - [ ] [Supervise and authorize third-party MCP servers](https://github.com/elixpo/crumb.elixpo/issues/47).
+  - [x] Supervise bounded local STDIO MCP servers ([PR #96](https://github.com/elixpo/crumb.elixpo/pull/96)).
+  - [x] Supervise remote Streamable HTTP MCP servers ([issue #97](https://github.com/elixpo/crumb.elixpo/issues/97)).
 - [ ] [Build marketplace trust, publishing, updates, rollback, and revocation](https://github.com/elixpo/crumb.elixpo/issues/48).
+  - [x] [WP-025: marketplace schema v2 trust metadata](https://github.com/elixpo/crumb.elixpo/issues/106).
   - Keep external packages disabled after installation until the user reviews and enables them.
   - Prefer standard remote MCP OAuth and OS-keyring credential references.
   - Prohibit arbitrary install hooks and implicit capability grants.
