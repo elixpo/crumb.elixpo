@@ -380,8 +380,8 @@ fn perform_request(
     };
     let response = match send() {
         Ok(response) => response,
-        Err(_) if request.retry_safe => send().context("external MCP HTTP request failed")?,
-        Err(error) => return Err(error).context("external MCP HTTP request failed"),
+        Err(_) if request.retry_safe => send().map_err(|error| sanitized_http_error(&error))?,
+        Err(error) => return Err(sanitized_http_error(&error)),
     };
     let session_id = response
         .headers()
@@ -414,6 +414,14 @@ fn perform_request(
         bail!("external MCP response ID is invalid");
     }
     Ok((value, session_id))
+}
+
+fn sanitized_http_error(error: &reqwest::Error) -> anyhow::Error {
+    if error.is_timeout() {
+        anyhow!("external MCP request timed out")
+    } else {
+        anyhow!("external MCP HTTP request failed")
+    }
 }
 
 fn read_bounded(response: Response, maximum: usize) -> Result<Vec<u8>> {
