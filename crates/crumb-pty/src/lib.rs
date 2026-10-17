@@ -122,6 +122,17 @@ impl PtyBackend for SystemPty {
         drop(pair.slave);
         let writer = PtyInput::new(pair.master.take_writer()?);
 
+        // portable-pty enables ConPTY cursor inheritance. Windows starts that
+        // handshake with a device-status query and will not relay child I/O
+        // until the terminal reports a cursor position. Crumb owns the PTY
+        // screen, so seed a valid origin response before sending shell input.
+        #[cfg(target_os = "windows")]
+        {
+            let mut cursor_writer = writer.clone();
+            cursor_writer.write_all(b"\x1b[1;1R")?;
+            cursor_writer.flush()?;
+        }
+
         Ok(PtyProcess {
             master: Arc::new(Mutex::new(pair.master)),
             writer: Some(writer),
