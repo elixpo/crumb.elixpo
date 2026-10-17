@@ -77,7 +77,7 @@ impl CompletionProtocol {
                 self.token
             ),
             ShellKind::PowerShell =>
-                "Remove-Module PSReadLine -ErrorAction SilentlyContinue; $global:LASTEXITCODE = $null\r"
+                "Remove-Module PSReadLine -ErrorAction SilentlyContinue; $global:LASTEXITCODE = $null; "
                     .to_owned(),
         }
     }
