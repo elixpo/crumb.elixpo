@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 pub const GRAPHIFY_PINNED_VERSION: &str = "0.9.92";
 const VERSION_OUTPUT_LIMIT: usize = 4096;
+const BUILD_DIAGNOSTIC_LIMIT: usize = 32 * 1024;
 const GRAPHIFY_EXTRACT_ARGS: [&str; 5] = ["extract", ".", "--out", ".", "--code-only"];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -211,21 +212,56 @@ impl GraphifyAdapter {
             .env("PYTHONHASHSEED", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         preserve_runtime_path(&mut command);
         let mut child = command.spawn().context("Graphify could not be started")?;
-        wait_for_child(
+        let stderr = child
+            .stderr
+            .take()
+            .context("Graphify diagnostics are unavailable")?;
+        let diagnostics = read_bounded(stderr, BUILD_DIAGNOSTIC_LIMIT);
+        let outcome = wait_for_child(
             &mut child,
             timeout,
             cancelled,
             "Graphify extraction failed; run `graphify extract . --out . --code-only` directly for diagnostics",
-        )?;
+        );
+        let diagnostics = diagnostics
+            .join()
+            .map_err(|_| anyhow::anyhow!("Graphify diagnostic reader failed"))??;
+        if let Err(error) = outcome {
+            let diagnostics = String::from_utf8_lossy(&diagnostics);
+            if diagnostics.trim().is_empty() {
+                return Err(error);
+            }
+            bail!("{error}\nGraphify diagnostics:\n{}", diagnostics.trim());
+        }
         let graph_path = self.graph_path(workspace);
         if !graph_path.is_file() {
             bail!("Graphify completed without producing graph.json");
         }
         Ok(graph_path)
     }
+}
+
+fn read_bounded(
+    mut reader: impl Read + Send + 'static,
+    limit: usize,
+) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                return Ok(output);
+            }
+            output.extend_from_slice(&buffer[..read]);
+            if output.len() > limit {
+                output.drain(..output.len() - limit);
+            }
+        }
+    })
 }
 
 fn run_version(command: &Path) -> Result<String> {
@@ -395,5 +431,34 @@ mod tests {
         assert!(error.to_string().contains("cancelled"));
         assert!(started.elapsed() < Duration::from_secs(1));
         fs::remove_dir_all(workspace).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_builds_preserve_bounded_graphify_diagnostics() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let script = workspace.path().join("graphify-fixture");
+        fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'graphify 0.9.92'; exit 0; fi\necho 'parser exploded' >&2\nexit 7\n",
+        )
+        .expect("script");
+        let mut permissions = fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("permissions");
+        let adapter = GraphifyAdapter::new(GraphSettings {
+            command: script,
+            ..GraphSettings::default()
+        })
+        .expect("adapter");
+
+        let error = adapter
+            .build(workspace.path(), Duration::from_secs(2), || false)
+            .expect_err("build fails");
+
+        assert!(error.to_string().contains("parser exploded"));
+        assert!(error.to_string().contains("exit status: 7"));
     }
 }
