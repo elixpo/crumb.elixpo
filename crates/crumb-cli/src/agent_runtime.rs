@@ -727,6 +727,10 @@ impl AgentRuntime {
         let prepared_request = attach_skill_context(&memory.request, &skill_context);
         let mut trusted_context = memory.context.into_iter().collect::<Vec<_>>();
         trusted_context.extend(skill_context);
+        trusted_context.push(runtime_session_context(
+            self.token_usage(),
+            context_token_budget(config, route),
+        ));
         let dispatched_request = if native {
             request
         } else {
@@ -1092,6 +1096,15 @@ impl AgentRuntime {
         self.supervisor_limits = None;
         Ok(())
     }
+}
+
+fn runtime_session_context(
+    (context_tokens, session_tokens, compactions): (u64, u64, u32),
+    context_limit: u64,
+) -> String {
+    format!(
+        "## Runtime session state (authoritative)\nThe active Crumb process retains prior completed user and assistant turns in its model conversation. Current estimated context: ~{context_tokens}/{context_limit} tokens. Total estimated session usage: ~{session_tokens} tokens. Automatic compactions: {compactions}. Persistent attachments and approved memory are separate from the live conversation. Never claim that every interaction starts fresh."
+    )
 }
 
 const MAX_SKILL_BYTES: usize = 64 * 1024;
@@ -1539,6 +1552,17 @@ mod tests {
         let mut unmanaged = AgentRuntime::new().expect("runtime");
         unmanaged.record_token_estimate(&"x".repeat(400), None, 100, false);
         assert_eq!(unmanaged.token_usage(), (100, 100, 0));
+    }
+
+    #[test]
+    fn runtime_context_truthfully_describes_live_conversation_state() {
+        let context = super::runtime_session_context((1_250, 4_800, 2), 64_000);
+
+        assert!(context.contains("~1250/64000 tokens"));
+        assert!(context.contains("~4800 tokens"));
+        assert!(context.contains("Automatic compactions: 2"));
+        assert!(context.contains("retains prior completed user and assistant turns"));
+        assert!(context.contains("Never claim that every interaction starts fresh"));
     }
 
     #[test]

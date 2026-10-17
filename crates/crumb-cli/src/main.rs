@@ -1968,7 +1968,7 @@ fn observe_agent_turn(
     ));
     let mut streamed_response = false;
     let mut streamed_column = 0_usize;
-    let mut input = SteeringInput::new(renderer, steering_bytes);
+    let mut input = SteeringInput::new(renderer, steering_bytes, terminal.fullscreen);
     let raw_mode = terminal
         .interactive
         .then(RawModeGuard::enable)
@@ -1992,7 +1992,7 @@ fn observe_agent_turn(
             )?;
             refresh_active_footer(renderer, terminal.fullscreen)?;
             activity = Some(start_activity(renderer, "Thinking", terminal.fullscreen));
-            input.redraw(writer)?;
+            restore_steering_input(&mut input, &mut activity, writer)?;
         }
         match task.recv_timeout(Duration::from_millis(15)) {
             Ok(event) => {
@@ -2007,7 +2007,7 @@ fn observe_agent_turn(
                     terminal.fullscreen,
                 )?;
                 refresh_active_footer(renderer, terminal.fullscreen)?;
-                input.redraw(writer)?;
+                restore_steering_input(&mut input, &mut activity, writer)?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2043,7 +2043,7 @@ fn observe_agent_turn(
             terminal.fullscreen,
         )?;
         refresh_active_footer(renderer, terminal.fullscreen)?;
-        input.redraw(writer)?;
+        restore_steering_input(&mut input, &mut activity, writer)?;
     }
     let interruption = input.interruption;
     input.clear_line(writer)?;
@@ -2059,6 +2059,19 @@ fn observe_agent_turn(
         interruption,
         streamed_response,
     ))
+}
+
+fn restore_steering_input(
+    input: &mut SteeringInput,
+    activity: &mut Option<crumb_ui::ActivityIndicator>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    if input.is_editing()
+        && let Some(indicator) = activity.take()
+    {
+        indicator.finish();
+    }
+    input.redraw(writer)
 }
 
 fn handle_active_terminal_event(
@@ -2083,7 +2096,9 @@ fn handle_active_terminal_event(
             )
         }
         TerminalEvent::Resize(_, _) => {
+            input.clear_line(writer)?;
             refresh_active_footer(input.renderer, terminal.fullscreen)?;
+            input.redraw(writer)?;
             Ok(false)
         }
         _ => Ok(false),
@@ -2095,13 +2110,13 @@ fn refresh_active_footer(renderer: Renderer, fullscreen: bool) -> io::Result<()>
         return Ok(());
     }
     let (columns, rows) = size()?;
-    let mut terminal = io::stderr();
-    write!(
-        terminal,
+    let frame = format!(
         "\x1b7\x1b[{};1H\x1b[2K{}\x1b8",
         rows,
         renderer.composer_active_hotkeys(columns)
-    )?;
+    );
+    let mut terminal = io::stderr();
+    terminal.write_all(frame.as_bytes())?;
     terminal.flush()
 }
 
@@ -2269,16 +2284,18 @@ struct SteeringInput {
     buffer: String,
     max_bytes: usize,
     visible: bool,
+    fullscreen: bool,
     interruption: TurnInterruption,
 }
 
 impl SteeringInput {
-    const fn new(renderer: Renderer, max_bytes: usize) -> Self {
+    const fn new(renderer: Renderer, max_bytes: usize, fullscreen: bool) -> Self {
         Self {
             renderer,
             buffer: String::new(),
             max_bytes,
             visible: false,
+            fullscreen,
             interruption: TurnInterruption::None,
         }
     }
@@ -2324,7 +2341,6 @@ impl SteeringInput {
                     && self.buffer.len().saturating_add(character.len_utf8()) <= self.max_bytes =>
             {
                 self.buffer.push(character);
-                self.visible = true;
                 self.redraw(writer)?;
             }
             _ => {}
@@ -2431,7 +2447,21 @@ impl SteeringInput {
 
     fn clear_line(&mut self, writer: &mut dyn Write) -> Result<()> {
         if self.visible {
-            self.redraw_composer(None, writer)?;
+            if self.fullscreen {
+                let (columns, rows) = size()?;
+                let composer_row = rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
+                let available_width = columns.saturating_sub(7);
+                let mut frame = Vec::new();
+                crossterm::execute!(frame, MoveTo(4, composer_row))?;
+                write!(frame, "{}", " ".repeat(usize::from(available_width)))?;
+                write!(frame, "\x1b8")?;
+                let mut terminal = io::stderr();
+                terminal.write_all(&frame)?;
+                terminal.flush()?;
+            } else {
+                write!(writer, "\r\x1b[2K")?;
+                writer.flush()?;
+            }
             self.visible = false;
         }
         Ok(())
@@ -2441,26 +2471,37 @@ impl SteeringInput {
         if self.buffer.is_empty() {
             return self.clear_line(writer);
         }
-        self.redraw_composer(Some(&self.buffer), writer)?;
+        self.redraw_composer(&self.buffer, writer)?;
         self.visible = true;
         Ok(())
     }
 
-    fn redraw_composer(&self, input: Option<&str>, writer: &mut dyn Write) -> Result<()> {
+    fn redraw_composer(&self, input: &str, writer: &mut dyn Write) -> Result<()> {
         let (columns, rows) = size()?;
         let available_width = columns.saturating_sub(7);
-        let input_row = rows.saturating_sub(3).saturating_add(1);
-        let rendered = input.map_or_else(
-            || self.renderer.composer_placeholder(available_width),
-            |input| self.renderer.composer_follow_up(input, available_width),
-        );
-        write!(writer, "\x1b7\x1b[{input_row};5H")?;
-        write!(writer, "{}", " ".repeat(usize::from(available_width)))?;
-        write!(writer, "\x1b[{input_row};5H")?;
-        write!(writer, "{rendered}")?;
-        write!(writer, "\x1b8")?;
-        writer.flush()?;
+        let rendered = self.renderer.composer_follow_up(input, available_width);
+        if self.fullscreen {
+            let composer_row = rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
+            let mut frame = Vec::new();
+            if !self.visible {
+                write!(frame, "\x1b7")?;
+            }
+            crossterm::execute!(frame, MoveTo(4, composer_row))?;
+            write!(frame, "{}", " ".repeat(usize::from(available_width)))?;
+            crossterm::execute!(frame, MoveTo(4, composer_row))?;
+            write!(frame, "{rendered}")?;
+            let mut terminal = io::stderr();
+            terminal.write_all(&frame)?;
+            terminal.flush()?;
+        } else {
+            write!(writer, "\r\x1b[2K{rendered}")?;
+            writer.flush()?;
+        }
         Ok(())
+    }
+
+    fn is_editing(&self) -> bool {
+        !self.buffer.is_empty()
     }
 }
 
@@ -2477,7 +2518,7 @@ fn wait_for_paused_turn(
     )?;
     writer.flush()?;
     refresh_active_footer(renderer, terminal.fullscreen)?;
-    let mut input = SteeringInput::new(renderer, steering_bytes);
+    let mut input = SteeringInput::new(renderer, steering_bytes, terminal.fullscreen);
     let raw_mode = terminal
         .interactive
         .then(RawModeGuard::enable)
@@ -2495,7 +2536,9 @@ fn wait_for_paused_turn(
         }
         let event = read_terminal_event()?;
         if matches!(event, TerminalEvent::Resize(_, _)) {
+            input.clear_line(writer)?;
             refresh_active_footer(renderer, terminal.fullscreen)?;
+            input.redraw(writer)?;
             continue;
         }
         let TerminalEvent::Key(key) = event else {
@@ -2599,7 +2642,6 @@ impl SteeringInput {
                     && self.buffer.len().saturating_add(character.len_utf8()) <= self.max_bytes =>
             {
                 self.buffer.push(character);
-                self.visible = true;
                 self.redraw(writer)?;
                 Ok(None)
             }
