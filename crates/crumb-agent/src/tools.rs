@@ -105,6 +105,36 @@ impl ToolOutput {
     }
 }
 
+/// Converts a tool identifier into a stable, non-secret terminal activity label.
+#[must_use]
+pub fn tool_activity_label(name: &str) -> String {
+    let normalized = name.to_ascii_lowercase();
+    let action = if normalized.contains("write")
+        || normalized.contains("edit")
+        || normalized.contains("patch")
+    {
+        "Editing"
+    } else if normalized.contains("search")
+        || normalized.contains("find")
+        || normalized.contains("query")
+    {
+        "Searching"
+    } else if normalized.contains("read") || normalized.contains("list") {
+        "Reading"
+    } else if normalized.contains("run")
+        || normalized.contains("shell")
+        || normalized.contains("process")
+        || normalized.contains("test")
+    {
+        "Running"
+    } else if normalized.contains("web") || normalized.contains("fetch") {
+        "Fetching"
+    } else {
+        "Inspecting"
+    };
+    format!("{action} · {name}")
+}
+
 /// Metadata shown to a trusted approval UI. Raw arguments are deliberately
 /// replaced with a digest.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -217,6 +247,21 @@ pub trait ToolHandler: Send + Sync {
         arguments: &serde_json::Value,
         cancellation: &CancellationToken,
     ) -> Result<ToolOutput>;
+
+    /// Executes while optionally publishing bounded, non-secret activity labels.
+    /// Implementations that do not expose intermediate work use the regular call.
+    ///
+    /// # Errors
+    ///
+    /// Returns only redacted internal failures, matching [`Self::call`].
+    fn call_with_progress(
+        &self,
+        arguments: &serde_json::Value,
+        cancellation: &CancellationToken,
+        _progress: &mut dyn FnMut(&str),
+    ) -> Result<ToolOutput> {
+        self.call(arguments, cancellation)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -317,6 +362,24 @@ impl ToolHost {
         approvals: &dyn ApprovalBroker,
         cancellation: &CancellationToken,
     ) -> std::result::Result<ToolOutput, ToolCallError> {
+        self.call_with_progress(name, arguments, mode, approvals, cancellation, &mut |_| {})
+    }
+
+    /// Authorizes and executes one tool call while forwarding safe progress labels.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed, redacted error when the tool is unknown, denied,
+    /// cancelled, or fails internally.
+    pub fn call_with_progress(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        mode: AgentMode,
+        approvals: &dyn ApprovalBroker,
+        cancellation: &CancellationToken,
+        progress: &mut dyn FnMut(&str),
+    ) -> std::result::Result<ToolOutput, ToolCallError> {
         let descriptor = self
             .registry
             .get(name)
@@ -334,7 +397,7 @@ impl ToolHost {
                 "tool implementation unavailable",
             )
         })?;
-        let output = match handler.call(arguments, cancellation) {
+        let output = match handler.call_with_progress(arguments, cancellation, progress) {
             Ok(output) => output,
             Err(_) if cancellation.is_cancelled() => {
                 return Err(ToolCallError::new(
@@ -466,8 +529,19 @@ mod tests {
     use super::{
         ApprovalBroker, ApprovalDecision, ApprovalRequest, ConfiguredApprovals, DenyAllApprovals,
         RiskClass, ToolCallErrorKind, ToolDescriptor, ToolHandler, ToolHost, ToolOutput,
-        ToolRegistry, ToolTransport,
+        ToolRegistry, ToolTransport, tool_activity_label,
     };
+
+    #[test]
+    fn tool_activity_terms_are_stable_and_human_readable() {
+        assert_eq!(tool_activity_label("read_file"), "Reading · read_file");
+        assert_eq!(tool_activity_label("web_search"), "Searching · web_search");
+        assert_eq!(tool_activity_label("write_file"), "Editing · write_file");
+        assert_eq!(
+            tool_activity_label("detect_stack"),
+            "Inspecting · detect_stack"
+        );
+    }
 
     #[test]
     fn duplicate_tools_are_rejected_deterministically() {

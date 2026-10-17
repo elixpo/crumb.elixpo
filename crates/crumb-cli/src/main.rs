@@ -31,7 +31,7 @@ use crumb_agent::{
     ProviderHeader, ProviderModel, ProviderProtocol, ProviderTransport, RiskClass, RouteDecision,
     RouteReason, SkillConfig, SteeringAction, SteeringQueue, TokenOptimizer, ToolHost, TurnStatus,
     UnknownInputPolicy, export_session, list_sessions, search_sessions, session_summary,
-    set_session_archived, set_session_label, trash_session,
+    set_session_archived, set_session_label, tool_activity_label, trash_session,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
@@ -1659,7 +1659,7 @@ fn execute_agent_sequence(
                 renderer,
                 writer,
                 terminal,
-                initial_activity,
+                &initial_activity,
             )? {
                 TurnObservation::Finished(runtime, result, interruption) => {
                     break (*runtime, result, interruption);
@@ -2005,16 +2005,33 @@ const fn approval_risk_label(risk: RiskClass) -> &'static str {
     }
 }
 
-fn initial_agent_activity(request: &str, config: &AgentConfig) -> &'static str {
-    if config.skills.iter().any(|skill| skill.enabled) {
-        "Loading skills"
+fn initial_agent_activity(request: &str, config: &AgentConfig) -> String {
+    let enabled_skills = config
+        .skills
+        .iter()
+        .filter(|skill| skill.enabled)
+        .map(|skill| skill.id.as_str())
+        .collect::<Vec<_>>();
+    if !enabled_skills.is_empty() {
+        let visible = enabled_skills
+            .iter()
+            .take(3)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let overflow = enabled_skills.len().saturating_sub(3);
+        if overflow == 0 {
+            format!("Loading skills · {visible}")
+        } else {
+            format!("Loading skills · {visible} · +{overflow}")
+        }
     } else if request
         .split_whitespace()
         .any(|token| token.starts_with('@') && token.len() > 1)
     {
-        "Attaching context"
+        "Attaching context".to_owned()
     } else {
-        "Thinking"
+        "Thinking".to_owned()
     }
 }
 
@@ -2451,7 +2468,7 @@ fn harness_activity_label(activity: &HarnessActivity) -> String {
         HarnessActivity::ToolStarted { name } if name == "spawn_agents" => {
             "coordinating parallel agent team".to_owned()
         }
-        HarnessActivity::ToolStarted { name } => format!("tool started · {name}"),
+        HarnessActivity::ToolStarted { name } => tool_activity_label(name),
         HarnessActivity::ApprovalRequired { name } if name == "spawn_agents" => {
             "approval required · parallel agent team".to_owned()
         }
@@ -2488,7 +2505,7 @@ fn render_harness_activity(
             );
         }
         HarnessActivity::ToolStarted { name } => {
-            replace_activity(indicator, renderer, &format!("Using {name}"), fullscreen);
+            replace_activity(indicator, renderer, &tool_activity_label(name), fullscreen);
         }
         HarnessActivity::ToolOutput { name, .. } if name == "spawn_agents" => {
             replace_activity(
@@ -2500,8 +2517,8 @@ fn render_harness_activity(
         }
         HarnessActivity::ToolOutput { name, bytes } => {
             let label = bytes.map_or_else(
-                || format!("Using {name}"),
-                |bytes| format!("Using {name} · {bytes} bytes"),
+                || tool_activity_label(name),
+                |bytes| format!("{} · {bytes} bytes", tool_activity_label(name)),
             );
             replace_activity(indicator, renderer, &label, fullscreen);
         }
@@ -8274,7 +8291,7 @@ mod tests {
 
     use crumb_agent::{
         AgentConfig, CredentialReference, HarnessConfig, ProviderHeader, ProviderProtocol,
-        RiskClass,
+        RiskClass, SkillConfig,
     };
     use crumb_marketplace::UpdateStatus;
     use crumb_memory::{MemoryScope, MemorySet, MemoryStore};
@@ -8474,6 +8491,16 @@ mod tests {
         assert_eq!(
             initial_agent_activity("review the project", &AgentConfig::default()),
             "Thinking"
+        );
+        let mut config = AgentConfig::default();
+        config.skills.push(SkillConfig {
+            id: "code-review".to_owned(),
+            path: PathBuf::from("skills/code-review/SKILL.md"),
+            enabled: true,
+        });
+        assert_eq!(
+            initial_agent_activity("review the project", &config),
+            "Loading skills · code-review"
         );
     }
 

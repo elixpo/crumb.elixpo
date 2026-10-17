@@ -40,5 +40,5 @@ pub use tools::{
     ApprovalBroker, ApprovalDecision, ApprovalRequest, ConfiguredApprovals, DenyAllApprovals,
     McpServer, McpTransport, OutputKind, RiskClass, TokenOptimizer, ToolCallError,
     ToolCallErrorKind, ToolDescriptor, ToolHandler, ToolHost, ToolOutput, ToolRegistry,
-    ToolTransport,
+    ToolTransport, tool_activity_label,
 };

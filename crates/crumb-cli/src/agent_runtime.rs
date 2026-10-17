@@ -159,6 +159,7 @@ impl EventSink for NativeEventBridge<'_> {
         let activity = match event {
             HarnessEvent::TurnStarted => Some(HarnessActivity::RequestAccepted),
             HarnessEvent::ToolRequested { name, .. } => Some(HarnessActivity::ToolStarted { name }),
+            HarnessEvent::ToolProgress { label, .. } => Some(HarnessActivity::Progress { label }),
             HarnessEvent::ToolFinished { name, success, .. } => {
                 Some(HarnessActivity::ToolFinished { name, success })
             }
@@ -1390,12 +1391,39 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crumb_agent::{AgentConfig, Modality, ModelRoute, SkillConfig};
+    use crumb_harness::{EventSink, HarnessEvent};
+    use crumb_harness_dsh::HarnessActivity;
     use crumb_profile::{ProfileDocument, ProfileReference, ProfileSelectionStore, ProfileStore};
 
     use super::{
-        AgentRuntime, apply_profile_effort, apply_profile_model, apply_profile_selection,
-        apply_profile_skills, attach_enabled_skills, attach_profile_context, validate_skill_path,
+        AgentRuntime, NativeEventBridge, apply_profile_effort, apply_profile_model,
+        apply_profile_selection, apply_profile_skills, attach_enabled_skills,
+        attach_profile_context, validate_skill_path,
     };
+
+    #[test]
+    fn native_bridge_forwards_safe_tool_progress() {
+        let mut activities = Vec::new();
+        let mut capture = |activity| {
+            activities.push(activity);
+            Ok(())
+        };
+        let mut bridge = NativeEventBridge::new(&mut capture);
+
+        bridge.emit(HarnessEvent::ToolProgress {
+            id: "call-1".to_owned(),
+            name: "spawn_agents".to_owned(),
+            label: "Koi · Reading · read_file".to_owned(),
+        });
+        bridge.finish().expect("activity callback succeeds");
+
+        assert_eq!(
+            activities,
+            vec![HarnessActivity::Progress {
+                label: "Koi · Reading · read_file".to_owned()
+            }]
+        );
+    }
 
     #[test]
     fn enabled_skills_are_loaded_before_the_user_request() {

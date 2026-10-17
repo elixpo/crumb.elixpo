@@ -4,13 +4,15 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use crumb_agent::{
     AgentMode, AgentSession, CancellationToken, DenyAllApprovals, RiskClass, SessionId,
     SessionJournal, ToolDescriptor, ToolHandler, ToolHost, ToolOutput, ToolTransport,
+    tool_activity_label,
 };
 use crumb_llm::LlmProvider;
 use serde_json::{Value, json};
@@ -103,7 +105,16 @@ struct ParallelAgentTool {
 
 impl ToolHandler for ParallelAgentTool {
     fn call(&self, arguments: &Value, cancellation: &CancellationToken) -> Result<ToolOutput> {
-        match run_team(self, arguments, cancellation) {
+        self.call_with_progress(arguments, cancellation, &mut |_| {})
+    }
+
+    fn call_with_progress(
+        &self,
+        arguments: &Value,
+        cancellation: &CancellationToken,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<ToolOutput> {
+        match run_team(self, arguments, cancellation, progress) {
             Ok(output) => Ok(output),
             Err(error) if cancellation.is_cancelled() => Err(error),
             Err(error) => Ok(ToolOutput::error(error.to_string())),
@@ -115,6 +126,7 @@ fn run_team(
     tool: &ParallelAgentTool,
     arguments: &Value,
     cancellation: &CancellationToken,
+    progress: &mut dyn FnMut(&str),
 ) -> Result<ToolOutput> {
     ensure_active(cancellation)?;
     let request = parse_request(arguments, tool.config.team_limits)?;
@@ -125,6 +137,7 @@ fn run_team(
         .enumerate()
         .map(|(index, task)| (NAMES[index].to_owned(), task.clone()))
         .collect::<Vec<_>>();
+    let (activity_tx, activity_rx) = mpsc::sync_channel(64);
     let mut workers = Vec::with_capacity(assignments.len());
     for (index, (name, task)) in assignments.iter().cloned().enumerate() {
         let provider = Arc::clone(&tool.provider);
@@ -141,6 +154,7 @@ fn run_team(
             tools: child_tools,
             config,
             cancellation: cancellation.clone(),
+            activity: activity_tx.clone(),
         };
         workers.push(
             thread::Builder::new()
@@ -149,7 +163,18 @@ fn run_team(
                 .context("failed to start parallel agent")?,
         );
     }
+    drop(activity_tx);
 
+    while workers.iter().any(|worker| !worker.is_finished()) {
+        match activity_rx.recv_timeout(Duration::from_millis(40)) {
+            Ok(label) => progress(&label),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    while let Ok(label) = activity_rx.try_recv() {
+        progress(&label);
+    }
     let mut findings = Vec::with_capacity(workers.len());
     for worker in workers {
         findings.push(
@@ -213,6 +238,7 @@ struct WorkerSpec {
     tools: ToolHost,
     config: ParallelAgentConfig,
     cancellation: CancellationToken,
+    activity: SyncSender<String>,
 }
 
 fn run_worker(worker: WorkerSpec) -> Result<Finding> {
@@ -227,7 +253,9 @@ fn run_worker(worker: WorkerSpec) -> Result<Finding> {
         tools,
         config,
         cancellation,
+        activity,
     } = worker;
+    publish_activity(&activity, format!("{name} · Inspecting assignment"));
     let session_id = SessionId::new(format!(
         "agent-{team}-{}-{}",
         index + 1,
@@ -247,7 +275,7 @@ fn run_worker(worker: WorkerSpec) -> Result<Finding> {
         config.harness_limits,
     );
     let mut conversation = harness.conversation();
-    let mut events = NoopEvents;
+    let mut events = TeamEvents::new(name.clone(), activity.clone());
     let roster = assignments
         .iter()
         .map(|(agent, assignment)| format!("- {agent}: {assignment}"))
@@ -274,11 +302,17 @@ fn run_worker(worker: WorkerSpec) -> Result<Finding> {
         &mut events,
     ));
     let (text, failed) = match outcome {
-        Ok(outcome) => (
-            bounded_text(outcome.text, config.team_limits.max_result_bytes.get()),
-            false,
-        ),
-        Err(error) => (format!("analysis failed: {error}"), true),
+        Ok(outcome) => {
+            publish_activity(&activity, format!("{name} · Reported findings"));
+            (
+                bounded_text(outcome.text, config.team_limits.max_result_bytes.get()),
+                false,
+            )
+        }
+        Err(error) => {
+            publish_activity(&activity, format!("{name} · Failed safely"));
+            (format!("analysis failed: {error}"), true)
+        }
     };
     Ok(Finding {
         name,
@@ -355,10 +389,49 @@ fn ensure_active(cancellation: &CancellationToken) -> Result<()> {
     Ok(())
 }
 
-struct NoopEvents;
+struct TeamEvents {
+    name: String,
+    activity: SyncSender<String>,
+    reporting: bool,
+}
 
-impl EventSink for NoopEvents {
-    fn emit(&mut self, _event: HarnessEvent) {}
+impl TeamEvents {
+    fn new(name: String, activity: SyncSender<String>) -> Self {
+        Self {
+            name,
+            activity,
+            reporting: false,
+        }
+    }
+}
+
+impl EventSink for TeamEvents {
+    fn emit(&mut self, event: HarnessEvent) {
+        let label = match event {
+            HarnessEvent::TurnStarted => Some("Thinking".to_owned()),
+            HarnessEvent::ToolRequested { name, .. } => Some(tool_activity_label(&name)),
+            HarnessEvent::ToolProgress { label, .. } => Some(label),
+            HarnessEvent::ToolFinished { name, success, .. } => Some(format!(
+                "{} · {}",
+                tool_activity_label(&name),
+                if success { "done" } else { "failed" }
+            )),
+            HarnessEvent::TextDelta(_) if !self.reporting => {
+                self.reporting = true;
+                Some("Reporting findings".to_owned())
+            }
+            HarnessEvent::TextDelta(_) | HarnessEvent::Usage(_) | HarnessEvent::TurnFinished => {
+                None
+            }
+        };
+        if let Some(label) = label {
+            publish_activity(&self.activity, format!("{} · {label}", self.name));
+        }
+    }
+}
+
+fn publish_activity(activity: &SyncSender<String>, label: String) {
+    let _ = activity.try_send(label);
 }
 
 fn descriptor(limits: ParallelAgentLimits) -> ToolDescriptor {
@@ -466,8 +539,9 @@ mod tests {
         .expect("parallel tool registers");
         let approvals = ConfiguredApprovals::new(BTreeSet::from(["spawn_agents".to_owned()]));
 
+        let mut progress = Vec::new();
         let output = host
-            .call(
+            .call_with_progress(
                 "spawn_agents",
                 &json!({
                     "objective":"map both surfaces",
@@ -476,6 +550,7 @@ mod tests {
                 AgentMode::Auto,
                 &approvals,
                 &CancellationToken::default(),
+                &mut |label| progress.push(label.to_owned()),
             )
             .expect("parallel analysis succeeds");
 
@@ -497,6 +572,16 @@ mod tests {
                 .expect("journals exist")
                 .count(),
             2
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|label| label == "Koi · Inspecting assignment")
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|label| label == "Nyx · Reporting findings")
         );
     }
 }

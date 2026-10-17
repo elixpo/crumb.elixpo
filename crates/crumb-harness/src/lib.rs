@@ -63,6 +63,11 @@ pub enum HarnessEvent {
         id: String,
         name: String,
     },
+    ToolProgress {
+        id: String,
+        name: String,
+        label: String,
+    },
     ToolFinished {
         id: String,
         name: String,
@@ -463,12 +468,20 @@ impl NativeHarness {
             id: call.id.clone(),
             name: call.name.clone(),
         });
-        let result = self.tools.call(
+        let mut report_progress = |label: &str| {
+            sink.emit(HarnessEvent::ToolProgress {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                label: label.to_owned(),
+            });
+        };
+        let result = self.tools.call_with_progress(
             &call.name,
             &call.arguments,
             session.mode(),
             self.approvals.as_ref(),
             cancellation,
+            &mut report_progress,
         );
         ensure_active(cancellation, deadline)?;
         let (content, success) = match result {
