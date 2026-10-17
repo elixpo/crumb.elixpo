@@ -1564,7 +1564,7 @@ fn execute_agent_sequence(
             workspace.to_path_buf(),
             activity_capacity,
         )?;
-        let (returned_runtime, result, steered) = loop {
+        let (returned_runtime, result, interruption) = loop {
             match observe_agent_turn(
                 task,
                 &mut steering,
@@ -1574,8 +1574,8 @@ fn execute_agent_sequence(
                 terminal,
                 initial_activity,
             )? {
-                TurnObservation::Finished(runtime, result, steered) => {
-                    break (*runtime, result, steered);
+                TurnObservation::Finished(runtime, result, interruption) => {
+                    break (*runtime, result, interruption);
                 }
                 TurnObservation::Backgrounded(returned_task) => {
                     match promote_agent_turn(
@@ -1602,19 +1602,27 @@ fn execute_agent_sequence(
             }
         };
         active_runtime = returned_runtime;
-        let completed = result.is_ok() || steered;
-        if steered {
-            writeln!(
+        match finish_agent_turn(
+            &result,
+            interruption,
+            &persisted_request,
+            &mut AgentTurnUi {
+                steering: &mut steering,
+                steering_bytes,
+                renderer,
                 writer,
-                "{}",
-                renderer.agent_response("Steering to your latest instruction.")
-            )?;
-        } else {
-            render_agent_result(&result, renderer, writer)?;
-        }
-        if !completed {
-            steering.clear();
-            break;
+                terminal,
+            },
+        )? {
+            AgentSequenceStep::Continue(next_request) => {
+                request = next_request;
+                continue;
+            }
+            AgentSequenceStep::Stop => {
+                steering.clear();
+                break;
+            }
+            AgentSequenceStep::RunFollowUps => {}
         }
         let Some(queued) = steering.pop() else {
             break;
@@ -1630,11 +1638,65 @@ fn execute_agent_sequence(
     Ok(())
 }
 
+enum AgentSequenceStep {
+    Continue(String),
+    RunFollowUps,
+    Stop,
+}
+
+struct AgentTurnUi<'a> {
+    steering: &'a mut SteeringQueue,
+    steering_bytes: usize,
+    renderer: Renderer,
+    writer: &'a mut dyn Write,
+    terminal: AgentTerminal,
+}
+
+fn finish_agent_turn(
+    result: &Result<crumb_harness_dsh::RunResult>,
+    interruption: TurnInterruption,
+    persisted_request: &str,
+    ui: &mut AgentTurnUi<'_>,
+) -> Result<AgentSequenceStep> {
+    match interruption {
+        TurnInterruption::Steered => {
+            writeln!(
+                ui.writer,
+                "{}",
+                ui.renderer
+                    .agent_response("Steering to your latest instruction.")
+            )?;
+            Ok(AgentSequenceStep::RunFollowUps)
+        }
+        TurnInterruption::Paused if result.is_err() => match wait_for_paused_turn(
+            ui.steering,
+            ui.steering_bytes,
+            ui.renderer,
+            ui.writer,
+            ui.terminal,
+        )? {
+            PausedTurnAction::Resume => Ok(AgentSequenceStep::Continue(resume_paused_request(
+                persisted_request,
+            ))),
+            PausedTurnAction::Steer(message) => Ok(AgentSequenceStep::Continue(message)),
+            PausedTurnAction::Cancel => Ok(AgentSequenceStep::Stop),
+        },
+        TurnInterruption::None | TurnInterruption::Paused => {
+            render_agent_result(result, ui.renderer, ui.writer)?;
+            Ok(if result.is_ok() {
+                AgentSequenceStep::RunFollowUps
+            } else {
+                AgentSequenceStep::Stop
+            })
+        }
+    }
+}
+
 enum TurnObservation {
     Finished(
         Box<AgentRuntime>,
         Result<crumb_harness_dsh::RunResult>,
-        bool,
+        TurnInterruption,
     ),
     Backgrounded(agent_runtime::AgentTurnTask),
 }
@@ -1755,7 +1817,7 @@ fn observe_agent_turn(
         render_harness_activity(&event, &mut activity, renderer, writer, terminal.fullscreen)?;
         input.redraw(writer)?;
     }
-    let steered = input.steer_requested;
+    let interruption = input.interruption;
     input.clear_line(writer)?;
     drop(enhanced_keys);
     drop(raw_mode);
@@ -1766,7 +1828,7 @@ fn observe_agent_turn(
     Ok(TurnObservation::Finished(
         Box::new(runtime),
         result,
-        steered,
+        interruption,
     ))
 }
 
@@ -1789,12 +1851,35 @@ enum SteeringInputAction {
     Background,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TurnInterruption {
+    None,
+    Steered,
+    Paused,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PausedTurnAction {
+    Resume,
+    Steer(String),
+    Cancel,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PausedSubmission {
+    Resume,
+    Cancel,
+    Wait,
+    Background,
+    FollowUp(SteeringAction, String),
+}
+
 struct SteeringInput {
     renderer: Renderer,
     buffer: String,
     max_bytes: usize,
     visible: bool,
-    steer_requested: bool,
+    interruption: TurnInterruption,
 }
 
 impl SteeringInput {
@@ -1804,7 +1889,7 @@ impl SteeringInput {
             buffer: String::new(),
             max_bytes,
             visible: false,
-            steer_requested: false,
+            interruption: TurnInterruption::None,
         }
     }
 
@@ -1819,6 +1904,7 @@ impl SteeringInput {
         if code == TerminalKeyCode::Char('c') && modifiers.contains(TerminalModifiers::CONTROL) {
             task.cancel();
             steering.clear();
+            self.interruption = TurnInterruption::None;
             self.buffer.clear();
             self.clear_line(writer)?;
             writeln!(writer, "◇ Cancelling active agent turn")?;
@@ -1872,6 +1958,7 @@ impl SteeringInput {
         if input == "/cancel" {
             task.cancel();
             steering.clear();
+            self.interruption = TurnInterruption::None;
             self.buffer.clear();
             self.clear_line(writer)?;
             writeln!(writer, "◇ Cancelling active agent turn")?;
@@ -1881,6 +1968,17 @@ impl SteeringInput {
             self.buffer.clear();
             self.clear_line(writer)?;
             return Ok(SteeringInputAction::Background);
+        }
+        if input == "/pause" {
+            task.cancel();
+            self.interruption = TurnInterruption::Paused;
+            self.clear_line(writer)?;
+            self.render_transcript(&input, writer)?;
+            self.buffer.clear();
+            self.visible = false;
+            writeln!(writer, "◇ Pausing active agent turn safely")?;
+            writer.flush()?;
+            return Ok(SteeringInputAction::Continue);
         }
         let (action, message) = input.strip_prefix("/replace ").map_or_else(
             || {
@@ -1907,7 +2005,7 @@ impl SteeringInput {
                 )?;
                 match action {
                     SteeringAction::Steer => {
-                        self.steer_requested = true;
+                        self.interruption = TurnInterruption::Steered;
                         task.cancel();
                         writeln!(writer, "◇ Steering active turn")?;
                     }
@@ -1925,6 +2023,20 @@ impl SteeringInput {
         self.visible = false;
         writer.flush()?;
         Ok(SteeringInputAction::Continue)
+    }
+
+    fn render_transcript(&self, message: &str, writer: &mut dyn Write) -> Result<()> {
+        writeln!(
+            writer,
+            "{}",
+            self.renderer.transcript_input_at(
+                &terminal_username(),
+                message,
+                Some(&Local::now().format("%H:%M").to_string()),
+                size().map_or(80, |(columns, _)| columns),
+            )
+        )?;
+        Ok(())
     }
 
     fn clear_line(&mut self, writer: &mut dyn Write) -> Result<()> {
@@ -1959,6 +2071,203 @@ impl SteeringInput {
         write!(writer, "\x1b8")?;
         writer.flush()?;
         Ok(())
+    }
+}
+
+fn wait_for_paused_turn(
+    steering: &mut SteeringQueue,
+    steering_bytes: usize,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    terminal: AgentTerminal,
+) -> Result<PausedTurnAction> {
+    writeln!(
+        writer,
+        "◇ Turn paused · /resume continue · Enter steer · Ctrl+Enter queue · /cancel stop"
+    )?;
+    writer.flush()?;
+    let mut input = SteeringInput::new(renderer, steering_bytes);
+    let raw_mode = terminal
+        .interactive
+        .then(RawModeGuard::enable)
+        .transpose()?;
+    let enhanced_keys = terminal
+        .interactive
+        .then(KeyboardEnhancementGuard::enable)
+        .transpose()?;
+    let action = loop {
+        if !terminal.interactive {
+            break PausedTurnAction::Cancel;
+        }
+        if !poll_terminal_event(Duration::from_millis(100))? {
+            continue;
+        }
+        let TerminalEvent::Key(key) = read_terminal_event()? else {
+            continue;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        if let Some(action) = input.handle_paused_key(key.code, key.modifiers, steering, writer)? {
+            break action;
+        }
+    };
+    input.clear_line(writer)?;
+    drop(enhanced_keys);
+    drop(raw_mode);
+    if action == PausedTurnAction::Resume {
+        writeln!(writer, "◇ Resuming paused turn from the last safe point")?;
+    } else if matches!(action, PausedTurnAction::Steer(_)) {
+        writeln!(writer, "◇ Steering paused turn to the new instruction")?;
+    } else {
+        writeln!(writer, "◇ Paused turn cancelled")?;
+    }
+    writer.flush()?;
+    Ok(action)
+}
+
+fn resume_paused_request(request: &str) -> String {
+    format!(
+        "Continue the paused request below from the last safe point. Inspect the current session and workspace state before repeating any action.\n\nPaused request:\n{request}"
+    )
+}
+
+fn parse_paused_submission(input: &str, requested_action: SteeringAction) -> PausedSubmission {
+    let input = input.trim();
+    match input {
+        "/resume" => PausedSubmission::Resume,
+        "/cancel" => PausedSubmission::Cancel,
+        "/pause" => PausedSubmission::Wait,
+        "/background" => PausedSubmission::Background,
+        _ => {
+            let (action, message) = input.strip_prefix("/replace ").map_or_else(
+                || {
+                    input.strip_prefix("/queue ").map_or_else(
+                        || {
+                            input
+                                .strip_prefix("/steer ")
+                                .map_or((requested_action, input), |message| {
+                                    (SteeringAction::Steer, message)
+                                })
+                        },
+                        |message| (SteeringAction::Queue, message),
+                    )
+                },
+                |message| (SteeringAction::Replace, message),
+            );
+            PausedSubmission::FollowUp(action, message.to_owned())
+        }
+    }
+}
+
+impl SteeringInput {
+    fn handle_paused_key(
+        &mut self,
+        code: TerminalKeyCode,
+        modifiers: TerminalModifiers,
+        steering: &mut SteeringQueue,
+        writer: &mut dyn Write,
+    ) -> Result<Option<PausedTurnAction>> {
+        if code == TerminalKeyCode::Char('c') && modifiers.contains(TerminalModifiers::CONTROL) {
+            steering.clear();
+            self.buffer.clear();
+            self.clear_line(writer)?;
+            return Ok(Some(PausedTurnAction::Cancel));
+        }
+        match code {
+            TerminalKeyCode::Enter => {
+                let requested_action = if modifiers.contains(TerminalModifiers::CONTROL) {
+                    SteeringAction::Queue
+                } else {
+                    SteeringAction::Steer
+                };
+                self.submit_while_paused(requested_action, steering, writer)
+            }
+            TerminalKeyCode::Backspace => {
+                self.buffer.pop();
+                self.redraw(writer)?;
+                Ok(None)
+            }
+            TerminalKeyCode::Esc => {
+                self.buffer.clear();
+                self.clear_line(writer)?;
+                Ok(None)
+            }
+            TerminalKeyCode::Char('u') if modifiers.contains(TerminalModifiers::CONTROL) => {
+                self.buffer.clear();
+                self.clear_line(writer)?;
+                Ok(None)
+            }
+            TerminalKeyCode::Char(character)
+                if !modifiers.intersects(TerminalModifiers::CONTROL | TerminalModifiers::ALT)
+                    && self.buffer.len().saturating_add(character.len_utf8()) <= self.max_bytes =>
+            {
+                self.buffer.push(character);
+                self.visible = true;
+                self.redraw(writer)?;
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn submit_while_paused(
+        &mut self,
+        requested_action: SteeringAction,
+        steering: &mut SteeringQueue,
+        writer: &mut dyn Write,
+    ) -> Result<Option<PausedTurnAction>> {
+        let input = self.buffer.trim().to_owned();
+        if input.is_empty() {
+            self.clear_line(writer)?;
+            return Ok(None);
+        }
+        let submission = parse_paused_submission(&input, requested_action);
+        self.clear_line(writer)?;
+        self.render_transcript(&input, writer)?;
+        self.buffer.clear();
+        self.visible = false;
+        match submission {
+            PausedSubmission::Resume => Ok(Some(PausedTurnAction::Resume)),
+            PausedSubmission::Cancel => {
+                steering.clear();
+                Ok(Some(PausedTurnAction::Cancel))
+            }
+            PausedSubmission::Wait => {
+                writeln!(writer, "◇ Turn is already paused")?;
+                writer.flush()?;
+                Ok(None)
+            }
+            PausedSubmission::Background => {
+                writeln!(
+                    writer,
+                    "◇ A paused turn cannot be backgrounded · /resume first"
+                )?;
+                writer.flush()?;
+                Ok(None)
+            }
+            PausedSubmission::FollowUp(SteeringAction::Steer, message) => {
+                if message.trim().is_empty() {
+                    writeln!(writer, "◇ Steering instruction cannot be empty")?;
+                    writer.flush()?;
+                    return Ok(None);
+                }
+                Ok(Some(PausedTurnAction::Steer(message)))
+            }
+            PausedSubmission::FollowUp(action, message) => {
+                match steering.submit(action, &message) {
+                    Ok(()) if action == SteeringAction::Replace => {
+                        writeln!(writer, "◇ Replaced follow-ups · {} waiting", steering.len())?;
+                    }
+                    Ok(()) => {
+                        writeln!(writer, "◇ Follow-up queued · {} waiting", steering.len())?;
+                    }
+                    Err(error) => writeln!(writer, "◇ Follow-up rejected · {error}")?,
+                }
+                writer.flush()?;
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -2277,6 +2586,8 @@ fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
                 "/review",
                 "/jobs",
                 "/background",
+                "/pause",
+                "/resume",
                 "/cancel",
                 "/cost",
             ][..],
@@ -7741,11 +8052,12 @@ mod tests {
     use crumb_profile::{ProfileSelectionStore, ProfileStore};
 
     use super::{
-        ExitGesture, MarketplaceContent, SessionCommandContext, agent_config_location,
-        configure_plugin, effort_display_name, effort_wire_name, failed_command_recovery,
-        initial_agent_activity, marketplace_update_blocker, openrouter_preset,
-        parse_credential_reference, parse_provider_header, parse_resume_session_argument,
-        read_agent_config, read_bounded_response, register_local_skill, resolve_memory_keep,
+        ExitGesture, MarketplaceContent, PausedSubmission, SessionCommandContext, SteeringAction,
+        agent_config_location, configure_plugin, effort_display_name, effort_wire_name,
+        failed_command_recovery, initial_agent_activity, marketplace_update_blocker,
+        openrouter_preset, parse_credential_reference, parse_paused_submission,
+        parse_provider_header, parse_resume_session_argument, read_agent_config,
+        read_bounded_response, register_local_skill, resolve_memory_keep,
         sanitize_transcript_output, set_skill_enabled, show_graph, show_marketplace, show_memory,
         show_profile_with_stores, suggestion_width, unregister_local_skill,
         validate_marketplace_path, validate_marketplace_response, workspace_read_host,
@@ -7769,6 +8081,26 @@ mod tests {
 
         assert!(!gesture.register_interrupt_at(started));
         assert!(gesture.register_interrupt_at(started + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn paused_turn_controls_preserve_explicit_intent() {
+        assert_eq!(
+            parse_paused_submission("/resume", SteeringAction::Steer),
+            PausedSubmission::Resume
+        );
+        assert_eq!(
+            parse_paused_submission("next task", SteeringAction::Queue),
+            PausedSubmission::FollowUp(SteeringAction::Queue, "next task".to_owned())
+        );
+        assert_eq!(
+            parse_paused_submission("/steer change course", SteeringAction::Queue),
+            PausedSubmission::FollowUp(SteeringAction::Steer, "change course".to_owned())
+        );
+        assert_eq!(
+            parse_paused_submission("/replace final task", SteeringAction::Steer),
+            PausedSubmission::FollowUp(SteeringAction::Replace, "final task".to_owned())
+        );
     }
 
     #[test]

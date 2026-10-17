@@ -302,7 +302,7 @@ impl Renderer {
         let guide = if terminal_width < 80 {
             "Enter send · Tab complete · PgUp/PgDn chat · / commands · ? help"
         } else {
-            "Enter send/steer · Ctrl+Enter queue · PgUp/PgDn chat · Tab complete · @ context · / commands · ? help · Ctrl+C cancel"
+            "Enter send/steer · Ctrl+Enter queue · /pause turn · PgUp/PgDn chat · Tab complete · @ context · / commands · ? help · Ctrl+C cancel"
         };
         self.paint(&format!("  {guide}"), "2")
     }
@@ -952,10 +952,10 @@ fn animate_activity(label: &str, color: bool, running: &AtomicBool, row: Option<
         let cookie = COOKIE_SPINNER[frame];
         let line = if color {
             format!(
-                "\x1b[35;1m{cookie}\x1b[0m \x1b[90m{label} · type to steer · Ctrl+C to cancel\x1b[0m"
+                "\x1b[35;1m{cookie}\x1b[0m \x1b[90m{label} · Enter steer · Ctrl+Enter queue · /pause · Ctrl+C cancel\x1b[0m"
             )
         } else {
-            format!("{cookie} {label} · type to steer · Ctrl+C to cancel")
+            format!("{cookie} {label} · Enter steer · Ctrl+Enter queue · /pause · Ctrl+C cancel")
         };
         write_activity_line(&line, row);
         let _ = io::stderr().flush();

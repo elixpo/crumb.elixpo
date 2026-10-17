@@ -81,6 +81,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Expose bounded Pollinations web search through MCP with an explicit network-tool grant.
 - [x] Add provider-neutral, public-HTTPS page fetching with DNS, redirect, byte, and time bounds.
 - [x] Add bounded Enter-to-steer and Ctrl+Enter FIFO follow-ups with queue replacement.
+- [x] Add safe active-turn pause/resume while retaining steering and bounded queued follow-ups.
 - [x] Add queued steering and richer tool-specific event projection to the Harness stream.
 - [ ] Add interactive approval, tool-call, patch, error, and completion components.
 - [x] Add live model, effort, and mode selection backed by atomic configuration writes.
