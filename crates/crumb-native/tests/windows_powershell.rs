@@ -1,11 +1,11 @@
 #![cfg(target_os = "windows")]
 
-use std::io::Read;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, bail};
+use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::{NativeShell, ShellKind};
 use crumb_pty::{CommandSpec, SystemPty, TerminalSize};
 
@@ -53,22 +53,25 @@ fn powershell_state_persists_in_one_resizable_conpty() {
 }
 
 fn exercise_persistent_powershell() -> Result<String> {
-    let mut process = DeterministicPowerShell.spawn(&SystemPty, TerminalSize::new(24, 80))?;
-    let mut reader = process.try_clone_reader()?;
-    let reader_worker = thread::spawn(move || {
-        let mut output = String::new();
-        reader.read_to_string(&mut output)?;
-        Ok::<_, std::io::Error>(output)
-    });
-
-    process.resize(TerminalSize::new(40, 120))?;
-    process.write_input(
-        b"Set-Location C:\\Windows\r\n$env:CRUMB_WP004_STATE = 'ready'\r\nWrite-Output \"__CRUMB_STATE__ cwd=$((Get-Location).Path) env=$env:CRUMB_WP004_STATE\"\r\nexit\r\n",
+    eprintln!("starting deterministic PowerShell session");
+    let mut session = ShellSession::start(
+        &DeterministicPowerShell,
+        &SystemPty,
+        TerminalSize::new(24, 80),
     )?;
+    eprintln!("PowerShell lifecycle ready");
+    session.resize(TerminalSize::new(40, 120))?;
 
-    process.wait()?;
-    reader_worker
-        .join()
-        .map_err(|_| anyhow!("ConPTY reader thread panicked"))?
-        .map_err(Into::into)
+    let mut output = Vec::new();
+    let outcome = session.execute(
+        "$env:CRUMB_WP004_STATE = 'ready'; Set-Location C:\\Windows; Write-Output \"__CRUMB_STATE__ cwd=$((Get-Location).Path) env=$env:CRUMB_WP004_STATE\"",
+        &mut output,
+    )?;
+    eprintln!("PowerShell command completed");
+    if !matches!(outcome, CommandOutcome::Completed(_)) {
+        bail!("PowerShell exited before reporting command completion");
+    }
+    session.shutdown()?;
+    eprintln!("PowerShell session shut down");
+    Ok(String::from_utf8(output)?)
 }
