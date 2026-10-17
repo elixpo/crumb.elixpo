@@ -2186,7 +2186,7 @@ fn observe_agent_turn(
                     context.workspace,
                     context.live_context_tokens,
                 )?;
-                preserve_active_scroll(context, renderer)?;
+                preserve_active_scroll(context, renderer, &mut activity)?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2313,12 +2313,22 @@ fn handle_active_terminal_event(
 ) -> Result<bool> {
     if let Some(direction) = active_scroll_direction(event) {
         if terminal.fullscreen {
+            let activity_label = activity.as_ref().map(|active| active.label().to_owned());
+            if let Some(active) = activity.take() {
+                active.finish();
+            }
             let mut state = terminal
                 .transcript
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.scroll(direction, terminal.header_rows);
             render_transcript_view(&state, input.renderer, terminal.header_rows)?;
+            if state.scroll_offset == 0
+                && let Some(label) = activity_label
+            {
+                position_after_transcript(&state, terminal.header_rows)?;
+                *activity = Some(start_activity(input.renderer, &label, true));
+            }
             refresh_active_footer(input.renderer, true)?;
         }
         return Ok(false);
@@ -2369,7 +2379,11 @@ fn active_scroll_direction(event: &TerminalEvent) -> Option<TranscriptScroll> {
     }
 }
 
-fn preserve_active_scroll(context: &ActiveTurnContext<'_>, renderer: Renderer) -> io::Result<()> {
+fn preserve_active_scroll(
+    context: &ActiveTurnContext<'_>,
+    renderer: Renderer,
+    activity: &mut Option<crumb_ui::ActivityIndicator>,
+) -> io::Result<()> {
     if !context.terminal.fullscreen {
         return Ok(());
     }
@@ -2380,6 +2394,9 @@ fn preserve_active_scroll(context: &ActiveTurnContext<'_>, renderer: Renderer) -
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if state.scroll_offset == 0 {
         return Ok(());
+    }
+    if let Some(active) = activity.take() {
+        active.finish();
     }
     // Live activity is captured as a batch when the turn settles. Until then,
     // advertise that content exists below without counting provider chunks as
@@ -3215,11 +3232,22 @@ fn start_activity(
     fullscreen: bool,
 ) -> crumb_ui::ActivityIndicator {
     if fullscreen {
-        let row = size().map_or(0, |(_, rows)| rows.saturating_sub(3));
+        let row = size().map_or(0, |(_, rows)| {
+            let cursor_row = cursor_position().map_or(0, |(_, row)| row);
+            transcript_activity_row(cursor_row, rows)
+        });
         renderer.activity_at(label, row)
     } else {
         renderer.activity(label)
     }
+}
+
+fn transcript_activity_row(cursor_row: u16, terminal_rows: u16) -> u16 {
+    cursor_row.min(
+        terminal_rows
+            .saturating_sub(FULLSCREEN_COMPOSER_ROWS)
+            .saturating_sub(1),
+    )
 }
 
 const fn agent_mode_name(mode: AgentMode) -> &'static str {
@@ -9295,9 +9323,9 @@ mod tests {
         parse_resume_session_argument, read_agent_config, read_bounded_response,
         register_local_skill, resolve_memory_keep, sanitize_transcript_output, set_skill_enabled,
         shell_tool_config, should_auto_enable_rtk, show_graph, show_marketplace, show_memory,
-        show_profile_with_stores, suggestion_width, unregister_local_skill,
-        validate_marketplace_path, validate_marketplace_response, visible_tool_activity,
-        workspace_read_host, write_bounded_response_delta,
+        show_profile_with_stores, suggestion_width, transcript_activity_row,
+        unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
+        visible_tool_activity, workspace_read_host, write_bounded_response_delta,
     };
 
     #[test]
@@ -10159,6 +10187,8 @@ mod tests {
     fn fullscreen_prompt_is_anchored_above_the_fixed_footer() {
         assert_eq!(composer_anchor_sequence(40), "\x1b[35;1H");
         assert_eq!(composer_anchor_sequence(4), "\x1b[1;1H");
+        assert_eq!(transcript_activity_row(12, 40), 12);
+        assert_eq!(transcript_activity_row(39, 40), 33);
     }
 
     #[test]

@@ -1111,6 +1111,7 @@ pub struct ActivityIndicator {
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     started: Instant,
+    label: String,
     visible: bool,
     color: bool,
     row: Option<u16>,
@@ -1128,10 +1129,18 @@ impl ActivityIndicator {
             running,
             thread,
             started: Instant::now(),
+            label: label.to_owned(),
             visible: animated,
             color,
             row,
         }
+    }
+
+    /// Returns the stable activity label so a fullscreen caller can relocate
+    /// the animation after repainting a scrollable viewport.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// Stops and clears the activity line before another message is rendered.

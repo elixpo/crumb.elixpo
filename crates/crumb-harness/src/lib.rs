@@ -877,6 +877,7 @@ fn tool_request_detail(name: &str, arguments: &serde_json::Value) -> Option<Stri
         "run_shell" => "command",
         "web_search" => "query",
         "web_fetch" => "url",
+        "read_file" | "list_directory" | "write_file" => "path",
         _ => return None,
     };
     let raw = arguments.get(field)?.as_str()?.trim();
@@ -1839,6 +1840,14 @@ mod tests {
             super::tool_request_detail(
                 "write_file",
                 &serde_json::json!({"path":"secret.txt", "content":"never expose this"})
+            )
+            .as_deref(),
+            Some("secret.txt")
+        );
+        assert_eq!(
+            super::tool_request_detail(
+                "run_disposable",
+                &serde_json::json!({"script":"echo never-expose-this"})
             ),
             None
         );
