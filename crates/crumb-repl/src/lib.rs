@@ -248,6 +248,10 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "verify and install a package",
     },
     SlashCommand {
+        usage: "/marketplace install-remote ",
+        description: "verify and install a signed remote package",
+    },
+    SlashCommand {
         usage: "/marketplace validate ",
         description: "validate a local marketplace catalog",
     },
