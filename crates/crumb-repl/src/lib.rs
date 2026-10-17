@@ -208,6 +208,22 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "inspect installed plugins",
     },
     SlashCommand {
+        usage: "/plugins enable ",
+        description: "enable supervised MCP discovery",
+    },
+    SlashCommand {
+        usage: "/plugins disable ",
+        description: "disable a supervised MCP server",
+    },
+    SlashCommand {
+        usage: "/plugins allow ",
+        description: "allow one exact supervised MCP tool",
+    },
+    SlashCommand {
+        usage: "/plugins deny ",
+        description: "remove one MCP tool grant",
+    },
+    SlashCommand {
         usage: "/marketplace",
         description: "browse installable skills and MCPs",
     },

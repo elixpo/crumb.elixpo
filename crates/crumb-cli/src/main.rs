@@ -39,7 +39,7 @@ use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_marketplace::{
     Catalog, InstallScope, Installer, Package, bundled_catalog, verify_package_files,
 };
-use crumb_mcp::{McpDispatcher, serve_stdio};
+use crumb_mcp::{McpDispatcher, StdioMcpLimits, register_stdio_servers, serve_stdio};
 use crumb_memory::{
     MemoryProvenance, MemoryRecord, MemoryRetirement, MemoryScope, MemorySet, MemoryStore,
 };
@@ -304,12 +304,32 @@ fn serve_mcp() -> Result<()> {
     let workspace = current_process_dir()?;
     let config = read_agent_config(&workspace)?;
     let search_api_key = pollinations_environment_key();
-    let host = workspace_read_host(&workspace, &config, search_api_key)?;
+    let mut host = workspace_read_host(&workspace, &config, search_api_key)?;
+    let diagnostics = register_stdio_servers(
+        &mut host,
+        &config.mcp_servers,
+        &workspace,
+        StdioMcpLimits {
+            startup_timeout: Duration::from_secs(config.limits.max_harness_initialize_seconds),
+            request_timeout: Duration::from_secs(config.limits.max_wall_time_seconds),
+            shutdown_timeout: Duration::from_secs(config.limits.max_harness_shutdown_seconds),
+            max_frame_bytes: usize::try_from(config.limits.max_output_bytes)
+                .context("max_output_bytes exceeds this platform's address space")?,
+            max_tools: 128,
+        },
+    );
+    for diagnostic in diagnostics {
+        eprintln!(
+            "warning: MCP {} · {}",
+            diagnostic.server_id, diagnostic.message
+        );
+    }
     let dispatcher = McpDispatcher::new(
         host,
         Arc::new(
             ConfiguredApprovals::new(config.permissions.allow_network_tools.clone())
-                .with_workspace_tools(config.permissions.allow_workspace_tools.clone()),
+                .with_workspace_tools(config.permissions.allow_workspace_tools.clone())
+                .with_process_tools(config.permissions.allow_process_tools.clone()),
         ),
         config.mode,
         env!("CARGO_PKG_VERSION"),
@@ -2152,6 +2172,9 @@ fn show_reserved(
         }
         "/doctor" => show_doctor(cwd, writer)?,
         "/plugins" => show_plugins(cwd, writer)?,
+        command if command.starts_with("/plugins ") => {
+            configure_plugin(command, cwd, writer)?;
+        }
         command if command == "/marketplace" || command.starts_with("/marketplace ") => {
             show_marketplace(command, cwd, writer)?;
         }
@@ -3826,7 +3849,7 @@ fn show_plugins(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         writeln!(writer, "  No plugins configured in .crumb/agent.json")?;
         return Ok(());
     }
-    for server in config.mcp_servers {
+    for server in &config.mcp_servers {
         writeln!(
             writer,
             "  {} {}",
@@ -3835,6 +3858,75 @@ fn show_plugins(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         )?;
     }
     writeln!(writer, "  ● enabled · ○ disabled")?;
+    writeln!(
+        writer,
+        "  {} exact process-tool grants",
+        config.permissions.allow_process_tools.len()
+    )?;
+    Ok(())
+}
+
+fn configure_plugin(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let arguments = command
+        .strip_prefix("/plugins ")
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [action @ ("enable" | "disable"), id] => {
+            let enabled = *action == "enable";
+            update_agent_config(cwd, |config| {
+                let server = config
+                    .mcp_servers
+                    .iter_mut()
+                    .find(|server| server.id == *id)
+                    .with_context(|| format!("MCP server `{id}` is not configured"))?;
+                server.enabled = enabled;
+                Ok(())
+            })?;
+            writeln!(
+                writer,
+                "◆ MCP {id} · {}",
+                if enabled { "enabled" } else { "disabled" }
+            )?;
+            if enabled {
+                writeln!(
+                    writer,
+                    "  Discovery starts with the next agent MCP process; tool calls remain denied"
+                )?;
+            }
+        }
+        [action @ ("allow" | "deny"), tool] => {
+            if tool
+                .strip_prefix("mcp__")
+                .and_then(|name| name.split_once("__"))
+                .is_none_or(|(server, name)| server.is_empty() || name.is_empty())
+            {
+                bail!("MCP tool grants must use the exact `mcp__server__tool` name");
+            }
+            let allowed = *action == "allow";
+            update_agent_config(cwd, |config| {
+                if allowed {
+                    config
+                        .permissions
+                        .allow_process_tools
+                        .insert((*tool).to_owned());
+                } else {
+                    config.permissions.allow_process_tools.remove(*tool);
+                }
+                Ok(())
+            })?;
+            writeln!(
+                writer,
+                "◆ MCP tool {tool} · {}",
+                if allowed { "allowed" } else { "denied" }
+            )?;
+        }
+        _ => writeln!(
+            writer,
+            "usage: /plugins [enable <server> | disable <server> | allow <mcp__server__tool> | deny <mcp__server__tool>]"
+        )?,
+    }
     Ok(())
 }
 
@@ -5750,11 +5842,11 @@ mod tests {
     use crumb_profile::{ProfileSelectionStore, ProfileStore};
 
     use super::{
-        ExitGesture, SessionCommandContext, agent_config_location, effort_display_name,
-        effort_wire_name, failed_command_recovery, initial_agent_activity, openrouter_preset,
-        parse_credential_reference, parse_provider_header, parse_resume_session_argument,
-        read_agent_config, resolve_memory_keep, show_marketplace, show_memory,
-        show_profile_with_stores, suggestion_width, workspace_read_host,
+        ExitGesture, SessionCommandContext, agent_config_location, configure_plugin,
+        effort_display_name, effort_wire_name, failed_command_recovery, initial_agent_activity,
+        openrouter_preset, parse_credential_reference, parse_provider_header,
+        parse_resume_session_argument, read_agent_config, resolve_memory_keep, show_marketplace,
+        show_memory, show_profile_with_stores, suggestion_width, workspace_read_host,
     };
 
     #[test]
@@ -5943,6 +6035,41 @@ mod tests {
         assert!(!skill.enabled);
         assert!(skill.path.ends_with("skills/code-review/SKILL.md"));
         assert!(workspace.join(&skill.path).is_file());
+        std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
+    }
+
+    #[test]
+    fn mcp_enablement_and_tool_grants_are_separate_explicit_actions() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-mcp-config-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace can be created");
+        let mut output = Vec::new();
+        show_marketplace(
+            "/marketplace install crumb/workspace-mcp --scope project",
+            &workspace,
+            &mut output,
+        )
+        .expect("MCP package installs disabled");
+        configure_plugin("/plugins enable crumb-workspace", &workspace, &mut output)
+            .expect("MCP discovery enabled");
+        configure_plugin(
+            "/plugins allow mcp__crumb-workspace__read_file",
+            &workspace,
+            &mut output,
+        )
+        .expect("exact tool granted");
+
+        let config = read_agent_config(&workspace).expect("agent config");
+        assert!(config.mcp_servers[0].enabled);
+        assert!(
+            config
+                .permissions
+                .allow_process_tools
+                .contains("mcp__crumb-workspace__read_file")
+        );
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
     }
 

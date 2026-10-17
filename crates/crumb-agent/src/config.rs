@@ -353,6 +353,8 @@ pub struct ToolPermissions {
     pub allow_network_tools: BTreeSet<String>,
     /// Workspace-write tools explicitly enabled by the user.
     pub allow_workspace_tools: BTreeSet<String>,
+    /// Supervised local-process tools explicitly allowed by the user.
+    pub allow_process_tools: BTreeSet<String>,
 }
 
 /// Complete live configuration. Secrets are deliberately not representable.
@@ -459,6 +461,11 @@ impl AgentConfig {
             .iter()
             .chain(&self.permissions.allow_workspace_tools)
             .any(|tool| !valid_identifier(tool))
+            || self
+                .permissions
+                .allow_process_tools
+                .iter()
+                .any(|tool| !valid_mcp_tool_name(tool))
         {
             bail!("tool permission entries must be valid identifiers");
         }
@@ -674,6 +681,14 @@ fn validate_environment_name(name: &str) -> Result<()> {
 fn valid_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+}
+
+fn valid_mcp_tool_name(value: &str) -> bool {
+    value.starts_with("mcp__")
+        && value.len() <= 135
         && value
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
