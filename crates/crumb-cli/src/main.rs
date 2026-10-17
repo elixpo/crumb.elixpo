@@ -26,11 +26,11 @@ use crumb_agent::{
     AgentConfig, AgentMode, BackendDiscovery, CacheRetention, CancellationToken, CommandCatalog,
     CompatibilityFlag, ConfiguredApprovals, CredentialReference, HarnessConfig, InputRoute, JobId,
     JobSchedule, JobState, JobStore, LiveConfig, McpServer, McpTransport, MistakePolicy, Modality,
-    ModelRoute, NewJob, OutputKind, ProviderCompatibility, ProviderConfig, ProviderHeader,
-    ProviderModel, ProviderProtocol, ProviderTransport, RouteDecision, RouteReason, SkillConfig,
-    SteeringAction, SteeringQueue, TokenOptimizer, ToolHost, TurnStatus, UnknownInputPolicy,
-    export_session, list_sessions, search_sessions, session_summary, set_session_archived,
-    set_session_label, trash_session,
+    ModelRoute, NewJob, OutputKind, PendingApproval, ProviderCompatibility, ProviderConfig,
+    ProviderHeader, ProviderModel, ProviderProtocol, ProviderTransport, RiskClass, RouteDecision,
+    RouteReason, SkillConfig, SteeringAction, SteeringQueue, TokenOptimizer, ToolHost, TurnStatus,
+    UnknownInputPolicy, export_session, list_sessions, search_sessions, session_summary,
+    set_session_archived, set_session_label, trash_session,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
@@ -1790,6 +1790,9 @@ fn promote_agent_turn(
             {
                 task.cancel();
             }
+            while let Ok(pending) = task.recv_approval_timeout(Duration::ZERO) {
+                let _ = pending.deny();
+            }
             let _ = task.recv_timeout(Duration::from_millis(50));
         }
         while task.recv_timeout(Duration::ZERO).is_ok() {}
@@ -1826,6 +1829,15 @@ fn observe_agent_turn(
         .then(KeyboardEnhancementGuard::enable)
         .transpose()?;
     while !task.is_finished() {
+        if let Ok(pending) = task.recv_approval_timeout(Duration::ZERO) {
+            input.clear_line(writer)?;
+            if let Some(indicator) = activity.take() {
+                indicator.finish();
+            }
+            resolve_tool_approval(pending, renderer, writer, terminal.interactive)?;
+            activity = Some(start_activity(renderer, "Thinking", terminal.fullscreen));
+            input.redraw(writer)?;
+        }
         match task.recv_timeout(Duration::from_millis(15)) {
             Ok(event) => {
                 input.clear_line(writer)?;
@@ -1881,6 +1893,80 @@ fn observe_agent_turn(
         result,
         interruption,
     ))
+}
+
+fn resolve_tool_approval(
+    pending: PendingApproval,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    interactive: bool,
+) -> Result<()> {
+    let request = pending.request();
+    writeln!(
+        writer,
+        "{}",
+        renderer.agent_approval_prompt(
+            &request.tool,
+            approval_risk_label(request.risk),
+            &request.arguments_digest,
+        )
+    )?;
+    writer.flush()?;
+    if !interactive {
+        let _ = pending.deny();
+        writeln!(writer, "◇ Tool denied · interactive approval unavailable")?;
+        return Ok(());
+    }
+    loop {
+        let TerminalEvent::Key(key) = read_terminal_event()? else {
+            continue;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        match key.code {
+            TerminalKeyCode::Enter | TerminalKeyCode::Char('y') => {
+                let accepted = pending.allow_once();
+                writeln!(
+                    writer,
+                    "◇ Tool {}",
+                    if accepted {
+                        "allowed once"
+                    } else {
+                        "request expired"
+                    }
+                )?;
+                return Ok(());
+            }
+            TerminalKeyCode::Esc | TerminalKeyCode::Char('n') => {
+                let denied = pending.deny();
+                writeln!(
+                    writer,
+                    "◇ Tool {}",
+                    if denied { "denied" } else { "request expired" }
+                )?;
+                return Ok(());
+            }
+            TerminalKeyCode::Char('c') if key.modifiers.contains(TerminalModifiers::CONTROL) => {
+                let _ = pending.deny();
+                writeln!(writer, "◇ Tool denied")?;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+}
+
+const fn approval_risk_label(risk: RiskClass) -> &'static str {
+    match risk {
+        RiskClass::ReadOnly => "read only",
+        RiskClass::NetworkAccess => "network access",
+        RiskClass::WriteWorkspace => "workspace write",
+        RiskClass::ProcessExecution => "process execution",
+        RiskClass::SystemMutation => "system mutation",
+        RiskClass::Destructive => "destructive",
+        RiskClass::CredentialSensitive => "credential sensitive",
+    }
 }
 
 fn initial_agent_activity(request: &str, config: &AgentConfig) -> &'static str {
@@ -4307,7 +4393,7 @@ fn show_doctor(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
                 command.display()
             )?;
         }
-        Some(HarnessConfig::Native) => writeln!(writer, "  native Harness  unavailable")?,
+        Some(HarnessConfig::Native) => writeln!(writer, "  native Harness  ready")?,
         None => writeln!(writer, "  none configured · native shell remains available")?,
     }
     writeln!(writer, "◆ Provider compatibility")?;
