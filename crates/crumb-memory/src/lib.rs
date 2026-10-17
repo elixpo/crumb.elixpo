@@ -1,6 +1,7 @@
 //! Explicitly approved, bounded memory for Crumb agent sessions.
 
-use std::collections::BTreeSet;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Write;
@@ -22,6 +23,7 @@ const MAX_CONTEXT_BYTES: usize = 16 * 1024;
 const MAX_TAGS: usize = 16;
 const MAX_TAG_BYTES: usize = 64;
 const MAX_SOURCE_BYTES: usize = 128;
+const DEFAULT_RETRIEVAL_RECORDS: usize = 24;
 
 /// Durable memory scope selected by the user.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -81,6 +83,113 @@ pub struct MemoryStatus {
     pub bytes: usize,
 }
 
+/// Deterministic limits applied before approved memory reaches a model prompt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetrievalPolicy {
+    pub max_records: usize,
+    pub max_bytes: usize,
+    pub stale_after_ms: Option<u64>,
+}
+
+impl Default for RetrievalPolicy {
+    fn default() -> Self {
+        Self {
+            max_records: DEFAULT_RETRIEVAL_RECORDS,
+            max_bytes: MAX_CONTEXT_BYTES,
+            stale_after_ms: None,
+        }
+    }
+}
+
+/// Non-sensitive explanation of why one record was selected.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetrievedMemory {
+    pub record: MemoryRecord,
+    pub lexical_hits: usize,
+    pub tag_hits: usize,
+}
+
+/// Records sharing an explicit `conflict:<topic>` tag with different values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryConflict {
+    pub topic: String,
+    pub record_ids: Vec<String>,
+}
+
+/// Bounded retrieval result. IDs and scores can be audited without logging content.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryRetrieval {
+    pub selected: Vec<RetrievedMemory>,
+    pub conflicts: Vec<MemoryConflict>,
+    pub omitted: usize,
+}
+
+impl MemoryRetrieval {
+    /// Renders selected records and conflict notices within the prompt budget.
+    #[must_use]
+    pub fn prompt_context(&self) -> Option<String> {
+        let mut context = String::new();
+        for conflict in &self.conflicts {
+            let line = format!(
+                "- [memory conflict:{}; records:{}; user resolution required]",
+                conflict.topic,
+                conflict.record_ids.join(",")
+            );
+            if !push_context_line(&mut context, &line) {
+                let _ = push_context_line(&mut context, "- [additional memory conflicts omitted]");
+                return Some(context);
+            }
+        }
+        let mut current_scope = None;
+        for selected in &self.selected {
+            let header = (current_scope != Some(selected.record.scope)).then_some(
+                match selected.record.scope {
+                    MemoryScope::Project => "## Project memory",
+                    MemoryScope::User => "## User memory",
+                },
+            );
+            current_scope = Some(selected.record.scope);
+            let provenance = provenance_label(&selected.record.provenance);
+            let line = format!(
+                "- [memory:{}; source:{provenance}] {}",
+                selected.record.id, selected.record.content
+            );
+            let required = header.map_or(0, |value| value.len() + 1) + line.len() + 1;
+            if context.len().saturating_add(required) > MAX_CONTEXT_BYTES {
+                let _ = push_context_line(&mut context, "- [additional approved memory omitted]");
+                break;
+            }
+            if let Some(header) = header {
+                let _ = push_context_line(&mut context, header);
+            }
+            let _ = push_context_line(&mut context, &line);
+        }
+        if self.omitted > 0 {
+            let line = format!("- [{} additional approved memories omitted]", self.omitted);
+            let _ = push_context_line(&mut context, &line);
+        }
+        (!context.is_empty()).then_some(context)
+    }
+
+    /// Returns selected record IDs for redacted session auditing.
+    #[must_use]
+    pub fn selected_ids(&self) -> Vec<String> {
+        self.selected
+            .iter()
+            .map(|selected| selected.record.id.clone())
+            .collect()
+    }
+
+    /// Returns conflict topics without exposing record contents.
+    #[must_use]
+    pub fn conflict_topics(&self) -> Vec<String> {
+        self.conflicts
+            .iter()
+            .map(|conflict| conflict.topic.clone())
+            .collect()
+    }
+}
+
 impl MemorySet {
     /// Resolves the closest Crumb project and the current user's private memory.
     ///
@@ -108,34 +217,63 @@ impl MemorySet {
     ///
     /// Returns an error when an existing memory file is malformed or unreadable.
     pub fn prompt_context(&self) -> Result<Option<String>> {
-        let mut context = String::new();
-        for (label, store) in [
-            ("User memory", &self.user),
-            ("Project memory", &self.project),
-        ] {
-            let records = store.records()?;
-            if records.is_empty() {
-                continue;
-            }
-            context.push_str("## ");
-            context.push_str(label);
-            context.push('\n');
-            for record in records {
-                let provenance = provenance_label(&record.provenance);
-                let rendered = format!(
-                    "- [memory:{}; source:{provenance}] {}\n",
-                    record.id, record.content
-                );
-                let projected = context.len().saturating_add(rendered.len());
-                if projected > MAX_CONTEXT_BYTES {
-                    context.push_str("- [additional approved memory omitted]\n");
-                    return Ok(Some(context));
-                }
-                context.push_str(&rendered);
-            }
-        }
-        Ok((!context.is_empty()).then_some(context))
+        self.prompt_context_for_request("")
     }
+
+    /// Retrieves and renders approved memory relevant to one user request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an existing memory file is malformed or unreadable.
+    pub fn prompt_context_for_request(&self, request: &str) -> Result<Option<String>> {
+        let retrieval = self.retrieve_for_request(request)?;
+        Ok(retrieval.prompt_context())
+    }
+
+    /// Retrieves approved memory using the default bounded policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage is invalid or the system clock is unavailable.
+    pub fn retrieve_for_request(&self, request: &str) -> Result<MemoryRetrieval> {
+        self.retrieve(
+            request,
+            &[],
+            unix_timestamp_ms()?,
+            RetrievalPolicy::default(),
+        )
+    }
+
+    /// Selects approved memory with stable ranking and explicit conflict reporting.
+    ///
+    /// `now_unix_ms` is supplied by the caller so identical inputs remain reproducible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage is invalid or retrieval limits are zero.
+    pub fn retrieve(
+        &self,
+        query: &str,
+        tags: &[&str],
+        now_unix_ms: u64,
+        policy: RetrievalPolicy,
+    ) -> Result<MemoryRetrieval> {
+        if policy.max_records == 0 || policy.max_bytes == 0 {
+            bail!("memory retrieval limits must be greater than zero");
+        }
+        let mut records = self.user.records()?;
+        records.extend(self.project.records()?);
+        Ok(retrieve_records(records, query, tags, now_unix_ms, policy))
+    }
+}
+
+fn push_context_line(context: &mut String, line: &str) -> bool {
+    if context.len().saturating_add(line.len()).saturating_add(1) > MAX_CONTEXT_BYTES {
+        return false;
+    }
+    context.push_str(line);
+    context.push('\n');
+    true
 }
 
 impl MemoryStore {
@@ -370,6 +508,152 @@ impl MemoryStore {
     }
 }
 
+fn retrieve_records(
+    records: Vec<MemoryRecord>,
+    query: &str,
+    requested_tags: &[&str],
+    now_unix_ms: u64,
+    policy: RetrievalPolicy,
+) -> MemoryRetrieval {
+    let superseded = records
+        .iter()
+        .filter_map(|record| record.supersedes.clone())
+        .collect::<BTreeSet<_>>();
+    let active = records
+        .into_iter()
+        .filter(|record| !superseded.contains(&record.id))
+        .filter(|record| {
+            policy.stale_after_ms.is_none_or(|maximum_age| {
+                now_unix_ms.saturating_sub(record.updated_at_unix_ms) <= maximum_age
+            })
+        })
+        .collect::<Vec<_>>();
+    let conflicts = detect_conflicts(&active);
+    let conflicting_ids = conflicts
+        .iter()
+        .flat_map(|conflict| conflict.record_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let query_terms = terms(query);
+    let requested_tags = requested_tags
+        .iter()
+        .map(|tag| tag.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let include_without_match = query_terms.is_empty() && requested_tags.is_empty();
+    let mut ranked = active
+        .into_iter()
+        .filter(|record| !conflicting_ids.contains(&record.id))
+        .map(|record| {
+            let record_terms = terms(&record.content);
+            let lexical_hits = query_terms.intersection(&record_terms).count();
+            let tag_hits = record
+                .tags
+                .iter()
+                .filter(|tag| requested_tags.contains(&tag.to_ascii_lowercase()))
+                .count();
+            RetrievedMemory {
+                record,
+                lexical_hits,
+                tag_hits,
+            }
+        })
+        .filter(|candidate| {
+            include_without_match
+                || candidate.lexical_hits > 0
+                || candidate.tag_hits > 0
+                || candidate
+                    .record
+                    .tags
+                    .iter()
+                    .any(|tag| tag.eq_ignore_ascii_case("always"))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|candidate| {
+        (
+            Reverse(candidate.tag_hits),
+            Reverse(candidate.lexical_hits),
+            Reverse(matches!(candidate.record.scope, MemoryScope::Project)),
+            Reverse(candidate.record.updated_at_unix_ms),
+            candidate.record.id.clone(),
+        )
+    });
+
+    let candidates = ranked.len();
+    let mut used_bytes = 0_usize;
+    let mut selected = Vec::new();
+    for candidate in ranked {
+        if selected.len() >= policy.max_records {
+            break;
+        }
+        let record_bytes = rendered_record_bytes(&candidate.record);
+        if used_bytes.saturating_add(record_bytes) <= policy.max_bytes {
+            used_bytes = used_bytes.saturating_add(record_bytes);
+            selected.push(candidate);
+        }
+    }
+    let omitted = candidates.saturating_sub(selected.len());
+    MemoryRetrieval {
+        selected,
+        conflicts,
+        omitted,
+    }
+}
+
+fn rendered_record_bytes(record: &MemoryRecord) -> usize {
+    record
+        .content
+        .len()
+        .saturating_add(record.id.len())
+        .saturating_add(provenance_label(&record.provenance).len())
+        .saturating_add(24)
+}
+
+fn detect_conflicts(records: &[MemoryRecord]) -> Vec<MemoryConflict> {
+    let mut topics = BTreeMap::<String, Vec<&MemoryRecord>>::new();
+    for record in records {
+        for tag in &record.tags {
+            let normalized = tag.to_ascii_lowercase();
+            if let Some(topic) = normalized.strip_prefix("conflict:")
+                && !topic.is_empty()
+            {
+                topics.entry(topic.to_owned()).or_default().push(record);
+            }
+        }
+    }
+    topics
+        .into_iter()
+        .filter_map(|(topic, records)| {
+            let values = records
+                .iter()
+                .map(|record| normalize_entry(&record.content).to_ascii_lowercase())
+                .collect::<BTreeSet<_>>();
+            (values.len() > 1).then(|| {
+                let mut record_ids = records
+                    .iter()
+                    .map(|record| record.id.clone())
+                    .collect::<Vec<_>>();
+                record_ids.sort();
+                record_ids.dedup();
+                MemoryConflict { topic, record_ids }
+            })
+        })
+        .collect()
+}
+
+fn terms(value: &str) -> BTreeSet<String> {
+    value
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| term.len() > 1)
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn is_safe_metadata_value(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || " ._-".contains(character))
+}
+
 fn parse_memory_file(contents: &str, scope: MemoryScope) -> Result<Vec<MemoryRecord>> {
     let file: MemoryFile = serde_json::from_str(contents).context("memory file is malformed")?;
     if file.version != STORAGE_VERSION {
@@ -401,7 +685,7 @@ fn validate_records(records: &[MemoryRecord], scope: MemoryScope) -> Result<()> 
             MemoryProvenance::LegacyMigration { source, index }
                 if source.is_empty()
                     || source.len() > MAX_SOURCE_BYTES
-                    || source.chars().any(char::is_control)
+                    || !is_safe_metadata_value(source)
                     || *index == 0 =>
             {
                 bail!("memory record has invalid legacy provenance");
@@ -414,6 +698,14 @@ fn validate_records(records: &[MemoryRecord], scope: MemoryScope) -> Result<()> 
         for tag in &record.tags {
             if tag.is_empty() || tag.len() > MAX_TAG_BYTES || tag.chars().any(char::is_control) {
                 bail!("memory tags must contain 1-{MAX_TAG_BYTES} safe bytes");
+            }
+            let normalized = tag.to_ascii_lowercase();
+            if let Some(topic) = normalized.strip_prefix("conflict:")
+                && !is_safe_metadata_value(topic)
+            {
+                bail!(
+                    "memory conflict topics must use letters, numbers, spaces, dots, dashes, or underscores"
+                );
             }
         }
         if record
@@ -496,7 +788,7 @@ fn looks_sensitive(entry: &str) -> bool {
 mod tests {
     use super::{
         LEGACY_HEADER, MemoryFile, MemoryProvenance, MemoryRecord, MemoryScope, MemorySet,
-        MemoryStore, stable_record_id,
+        MemoryStore, RetrievalPolicy, stable_record_id,
     };
     use tempfile::tempdir;
 
@@ -643,5 +935,189 @@ mod tests {
         .expect("provenance fixture");
         let store = MemoryStore::new(path, MemoryScope::Project);
         assert!(store.records().is_err());
+    }
+
+    #[test]
+    fn retrieval_ranks_tags_lexical_relevance_scope_and_recency() {
+        let directory = tempdir().expect("memory tempdir");
+        let set = memory_set(directory.path());
+        set.user
+            .write_records(&[
+                record(
+                    MemoryScope::User,
+                    "Use workspace tests",
+                    20,
+                    &["workflow"],
+                    None,
+                ),
+                record(
+                    MemoryScope::User,
+                    "Prefer concise replies",
+                    30,
+                    &["always"],
+                    None,
+                ),
+                record(
+                    MemoryScope::User,
+                    "Deploy with the retired script",
+                    40,
+                    &[],
+                    None,
+                ),
+            ])
+            .expect("user records");
+        set.project
+            .write_records(&[record(
+                MemoryScope::Project,
+                "Run cargo workspace tests",
+                10,
+                &["workflow"],
+                None,
+            )])
+            .expect("project records");
+
+        let retrieved = set
+            .retrieve(
+                "please run workspace tests",
+                &["workflow"],
+                50,
+                RetrievalPolicy::default(),
+            )
+            .expect("retrieval");
+
+        assert_eq!(retrieved.selected.len(), 3);
+        assert_eq!(retrieved.selected[0].record.scope, MemoryScope::Project);
+        assert_eq!(retrieved.selected[0].tag_hits, 1);
+        assert_eq!(retrieved.selected[0].lexical_hits, 3);
+        assert_eq!(retrieved.selected[1].record.scope, MemoryScope::User);
+        assert_eq!(retrieved.selected[2].lexical_hits, 0);
+        assert!(
+            retrieved
+                .selected
+                .iter()
+                .all(|candidate| !candidate.record.content.contains("retired"))
+        );
+    }
+
+    #[test]
+    fn retrieval_excludes_superseded_stale_and_conflicting_records() {
+        let directory = tempdir().expect("memory tempdir");
+        let set = memory_set(directory.path());
+        let old = record(
+            MemoryScope::Project,
+            "Use tabs for indentation",
+            800,
+            &["conflict:indentation"],
+            None,
+        );
+        let replacement = record(
+            MemoryScope::Project,
+            "Use four spaces for indentation",
+            950,
+            &["conflict:indentation"],
+            Some(old.id.clone()),
+        );
+        let user_preference = record(
+            MemoryScope::User,
+            "Use two spaces for indentation",
+            975,
+            &["Conflict:Indentation"],
+            None,
+        );
+        let stale = record(
+            MemoryScope::User,
+            "Use the retired formatter",
+            100,
+            &[],
+            None,
+        );
+        set.project
+            .write_records(&[old, replacement])
+            .expect("project records");
+        set.user
+            .write_records(&[user_preference, stale])
+            .expect("user records");
+
+        let retrieved = set
+            .retrieve(
+                "indent the file",
+                &[],
+                1_000,
+                RetrievalPolicy {
+                    stale_after_ms: Some(100),
+                    ..RetrievalPolicy::default()
+                },
+            )
+            .expect("retrieval");
+
+        assert_eq!(retrieved.selected.len(), 0);
+        assert_eq!(retrieved.conflicts.len(), 1);
+        assert_eq!(retrieved.conflicts[0].topic, "indentation");
+        assert_eq!(retrieved.conflicts[0].record_ids.len(), 2);
+    }
+
+    #[test]
+    fn retrieval_is_stable_and_honors_count_and_byte_limits() {
+        let directory = tempdir().expect("memory tempdir");
+        let set = memory_set(directory.path());
+        set.project
+            .write_records(&[
+                record(MemoryScope::Project, "Alpha project rule", 5, &[], None),
+                record(MemoryScope::Project, "Beta project rule", 5, &[], None),
+            ])
+            .expect("project records");
+        let policy = RetrievalPolicy {
+            max_records: 1,
+            max_bytes: 256,
+            stale_after_ms: None,
+        };
+
+        let first = set.retrieve("rule", &[], 5, policy).expect("retrieval");
+        let second = set.retrieve("rule", &[], 5, policy).expect("retrieval");
+        assert_eq!(first, second);
+        assert_eq!(first.selected.len(), 1);
+        assert_eq!(first.omitted, 1);
+        assert_eq!(
+            set.retrieve(
+                "rule",
+                &[],
+                5,
+                RetrievalPolicy {
+                    max_bytes: 1,
+                    ..policy
+                }
+            )
+            .expect("bounded retrieval")
+            .selected
+            .len(),
+            0
+        );
+    }
+
+    fn memory_set(root: &std::path::Path) -> MemorySet {
+        MemorySet {
+            user: MemoryStore::new(root.join("user.json"), MemoryScope::User),
+            project: MemoryStore::new(root.join("project.json"), MemoryScope::Project),
+        }
+    }
+
+    fn record(
+        scope: MemoryScope,
+        content: &str,
+        updated_at_unix_ms: u64,
+        tags: &[&str],
+        supersedes: Option<String>,
+    ) -> MemoryRecord {
+        let provenance = MemoryProvenance::Manual;
+        MemoryRecord {
+            id: stable_record_id(scope, content, &provenance),
+            scope,
+            content: content.to_owned(),
+            created_at_unix_ms: updated_at_unix_ms,
+            updated_at_unix_ms,
+            provenance,
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            supersedes,
+        }
     }
 }

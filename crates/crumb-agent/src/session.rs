@@ -130,6 +130,12 @@ pub enum SessionEvent {
         request_bytes: usize,
         request_digest: String,
     },
+    MemoryRetrieved {
+        at_ms: u64,
+        record_ids: Vec<String>,
+        conflict_topics: Vec<String>,
+        omitted: usize,
+    },
     ToolRequested {
         at_ms: u64,
         name: String,
@@ -453,6 +459,7 @@ const fn event_timestamp(event: &SessionEvent) -> u64 {
     match event {
         SessionEvent::SessionStarted { at_ms, .. }
         | SessionEvent::TurnStarted { at_ms, .. }
+        | SessionEvent::MemoryRetrieved { at_ms, .. }
         | SessionEvent::ToolRequested { at_ms, .. }
         | SessionEvent::ToolFinished { at_ms, .. }
         | SessionEvent::TurnFinished { at_ms, .. }
@@ -635,6 +642,25 @@ impl AgentSession {
         })
     }
 
+    /// Records selected memory IDs and conflict topics, never memory contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the event cannot be persisted.
+    pub fn record_memory_retrieval(
+        &mut self,
+        record_ids: Vec<String>,
+        conflict_topics: Vec<String>,
+        omitted: usize,
+    ) -> Result<()> {
+        self.journal.append(&SessionEvent::MemoryRetrieved {
+            at_ms: timestamp_ms(),
+            record_ids,
+            conflict_topics,
+            omitted,
+        })
+    }
+
     /// Records only the tool name, policy risk, and argument digest.
     ///
     /// # Errors
@@ -755,6 +781,13 @@ mod tests {
             .record_turn_start("private raw request")
             .expect("turn starts");
         session
+            .record_memory_retrieval(
+                vec!["mem_0123456789abcdef01234567".to_owned()],
+                vec!["formatter".to_owned()],
+                2,
+            )
+            .expect("memory retrieval is recorded");
+        session
             .record_turn_end(TurnStatus::Complete, 1, 0)
             .expect("turn ends");
         drop(session);
@@ -775,6 +808,8 @@ mod tests {
             serde_json::to_string(&export_session(&root, id.as_str()).expect("session exports"))
                 .expect("export serializes");
         assert!(!encoded.contains("private raw request"));
+        assert!(encoded.contains("mem_0123456789abcdef01234567"));
+        assert!(encoded.contains("formatter"));
         let trashed = trash_session(&root, id.as_str()).expect("session moves to trash");
         assert!(trashed.is_dir());
         assert!(session_summary(&root, id.as_str()).is_err());
