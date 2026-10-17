@@ -290,9 +290,9 @@ impl Renderer {
     #[must_use]
     pub fn composer_hotkeys(&self, terminal_width: u16) -> String {
         let guide = if terminal_width < 80 {
-            "Enter send · Tab complete · / commands · ? help"
+            "Enter send · Tab complete · PgUp/PgDn chat · / commands · ? help"
         } else {
-            "Enter send/steer · Ctrl+Enter queue · Tab complete · @ context · / commands · ? help · Ctrl+C cancel"
+            "Enter send/steer · Ctrl+Enter queue · PgUp/PgDn chat · Tab complete · @ context · / commands · ? help · Ctrl+C cancel"
         };
         self.paint(&format!("  {guide}"), "2")
     }
@@ -364,9 +364,9 @@ impl Renderer {
         let card_width = usize::from(terminal_width.saturating_sub(4));
         let content_width = card_width.saturating_sub(2);
         let timestamp = timestamp.unwrap_or_default();
-        let mut body = Vec::new();
+        let mut body = vec![String::new()];
         for line in input.lines().take(TRANSCRIPT_INPUT_MAX_ROWS) {
-            let first = body.is_empty();
+            let first = body.len() == 1;
             let marker = if first { "◆ >" } else { "  │" };
             let timestamp_width = if first && !timestamp.is_empty() {
                 timestamp.chars().count().saturating_add(1)
@@ -1103,7 +1103,7 @@ mod tests {
         );
         assert_eq!(
             renderer.transcript_input("elixpo", "fix this"),
-            "  ◆ > fix this\n  "
+            "  \n  ◆ > fix this\n  "
         );
         assert_eq!(renderer.native_output_prefix(), "  ╰──▶ ");
         let handoff =
