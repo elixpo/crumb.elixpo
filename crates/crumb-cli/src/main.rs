@@ -829,7 +829,7 @@ struct TranscriptState {
 
 impl TranscriptState {
     const MAX_LINES: usize = 4_096;
-    const SCROLL_STEP: usize = 1;
+    const SCROLL_STEP: usize = 4;
 
     fn append(&mut self, output: &str) -> bool {
         let appended = sanitize_transcript_output(output)
@@ -8445,17 +8445,19 @@ fn render_transcript_view(
     let end = state.lines.len().saturating_sub(state.scroll_offset);
     let start = end.saturating_sub(height);
     let visible = state.lines.range(start..end);
-    let mut writer = io::stdout();
-    write!(writer, "\x1b7\x1b[r")?;
+    let mut frame = Vec::new();
+    write!(frame, "\x1b7\x1b[r")?;
     for row in top..=bottom {
-        crossterm::execute!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+        crossterm::execute!(frame, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
     }
     for (row, line) in (top..=bottom).zip(visible) {
-        crossterm::execute!(writer, MoveTo(0, row))?;
-        write!(writer, "{line}")?;
+        crossterm::execute!(frame, MoveTo(0, row))?;
+        write!(frame, "{line}")?;
     }
-    render_transcript_footer_with_writer(&mut writer, state, renderer, header_rows)?;
-    write!(writer, "\x1b8")?;
+    render_transcript_footer_with_writer(&mut frame, state, renderer, header_rows)?;
+    write!(frame, "\x1b8")?;
+    let mut writer = io::stdout();
+    writer.write_all(&frame)?;
     writer.flush()
 }
 

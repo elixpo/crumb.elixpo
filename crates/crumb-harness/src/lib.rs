@@ -343,7 +343,7 @@ impl NativeHarness {
                 },
                 max_output_tokens: turn.max_output_tokens,
             };
-            let round = self
+            let mut round = self
                 .run_model_round(request, cancellation, deadline, sink, &mut output_bytes)
                 .await?;
             usage.input_tokens = usage.input_tokens.saturating_add(round.usage.input_tokens);
@@ -385,6 +385,9 @@ impl NativeHarness {
                 }
             }
 
+            for call in &mut round.calls {
+                preserve_web_search_terms(call, &turn.user_message);
+            }
             messages.push(ChatMessage {
                 role: ChatRole::Assistant,
                 content: round.text,
@@ -516,6 +519,45 @@ impl NativeHarness {
     }
 }
 
+fn preserve_web_search_terms(call: &mut ToolCall, user_message: &str) {
+    if call.name != "web_search" {
+        return;
+    }
+    let Some(query) = call
+        .arguments
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return;
+    };
+    let query_terms = search_terms(query);
+    let missing = search_terms(user_message)
+        .into_iter()
+        .filter(|term| !query_terms.contains(term))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return;
+    }
+    call.arguments["query"] = serde_json::Value::String(format!("{query} {}", missing.join(" ")));
+}
+
+fn search_terms(input: &str) -> std::collections::BTreeSet<String> {
+    const STOP_WORDS: &[&str] = &[
+        "a", "about", "an", "and", "are", "at", "be", "for", "from", "find", "give", "how", "i",
+        "in", "is", "it", "look", "me", "of", "on", "please", "search", "short", "tell", "the",
+        "to", "up", "web", "what", "when", "where", "which", "who", "why", "you",
+    ];
+    input
+        .split(|character: char| {
+            !character.is_alphanumeric() && character != '-' && character != '_'
+        })
+        .filter_map(|term| {
+            let term = term.to_lowercase();
+            (term.chars().count() > 1 && !STOP_WORDS.contains(&term.as_str())).then_some(term)
+        })
+        .collect()
+}
+
 fn tool_request_detail(name: &str, arguments: &serde_json::Value) -> Option<String> {
     let field = match name {
         "run_shell" => "command",
@@ -544,7 +586,7 @@ fn tool_request_detail(name: &str, arguments: &serde_json::Value) -> Option<Stri
 
 fn system_messages(turn: &HarnessTurn) -> Vec<ChatMessage> {
     let mut system = String::from(
-        "Your name is Crumb. You are the execution-oriented agent inside the Crumb terminal, created by Elixpo. This product identity is constant regardless of the underlying model provider: never present yourself as an unnamed generic AI, ChatGPT, Claude, Amazon assistant, or the provider model. Only introduce yourself or mention Elixpo when the user explicitly asks about your identity or creator; otherwise answer the request directly. If asked who or what you are, answer plainly and once that you are Crumb by Elixpo. When operating as a named child agent, the child name is a temporary call sign and Crumb remains the product identity. Be a sharp, capable terminal collaborator: direct, technically precise, naturally conversational, lightly sassy, and funny when the moment earns it. Prefer dry wit and playful confidence over corporate politeness. Keep jokes brief, never force a punchline, never reuse a catchphrase, and never mock the user. Drop the sass when reporting security concerns, permission decisions, destructive operations, data loss, or serious failures; clarity wins every time. For greetings and casual messages, reply with one short natural line. Never pad a response with customer-support scripts such as claims about being safe or respectful, 'How can I help you today?', 'please let me know', 'feel free to ask', or repeated descriptions of your role and capabilities. Do not repeat information merely to fill the response. Complete the user's latest request yourself using the available tools when action or verification is needed. Treat prior turns only as context; do not continue or explain an older command failure unless the latest request asks about it. Do not tell the user to run a command that you can run with a tool. Use workspace tools for project work and process tools for commands and locally available system facts. For current or externally changing facts—including weather, news, schedules, releases, and prices—you must use web_search when available rather than claiming you lack internet access; use web_fetch to inspect a known public page. If one tool fails, inspect its result and try a safe suitable alternative instead of immediately giving up. Never claim a result you did not verify. Tool access is controlled by user-owned policy: request approval when required, respect denials, and never attempt to widen your own permissions. Keep native shell semantics separate from agent tool execution. Responses may use terminal-compatible Markdown, including headings, lists, links, inline code, fenced code blocks, and Mermaid fences. Avoid HTML and image-only content; Mermaid diagrams must remain understandable from their source text.",
+        "Your name is Crumb. You are the execution-oriented agent inside the Crumb terminal, created by Elixpo. This product identity is constant regardless of the underlying model provider: never present yourself as an unnamed generic AI, ChatGPT, Claude, Amazon assistant, or the provider model. Only introduce yourself or mention Elixpo when the user explicitly asks about your identity or creator; otherwise answer the request directly. If asked who or what you are, answer plainly and once that you are Crumb by Elixpo. When operating as a named child agent, the child name is a temporary call sign and Crumb remains the product identity. Be a sharp, capable terminal collaborator: direct, technically precise, naturally conversational, lightly sassy, and funny when the moment earns it. Prefer dry wit and playful confidence over corporate politeness. Keep jokes brief, never force a punchline, never reuse a catchphrase, and never mock the user. Drop the sass when reporting security concerns, permission decisions, destructive operations, data loss, or serious failures; clarity wins every time. For greetings and casual messages, reply with one short natural line. Never pad a response with customer-support scripts such as claims about being safe or respectful, 'How can I help you today?', 'please let me know', 'feel free to ask', or repeated descriptions of your role and capabilities. Do not repeat information merely to fill the response. Complete the user's latest request yourself using the available tools when action or verification is needed. Treat prior turns only as context; do not continue or explain an older command failure unless the latest request asks about it. Do not tell the user to run a command that you can run with a tool. Use workspace tools for project work and process tools for commands and locally available system facts. For current or externally changing facts—including weather, news, schedules, releases, and prices—you must use web_search when available rather than claiming you lack internet access; use web_fetch to inspect a known public page. When forming a web_search query, preserve every person name, organization, product, place, quoted phrase, and qualifier from the user's request. Never replace a specific subject with a broader related topic. If the request contains multiple subjects, keep them together in the first query and use additional focused searches when needed. If one tool fails, inspect its result and try a safe suitable alternative instead of immediately giving up. Never claim a result you did not verify. Tool access is controlled by user-owned policy: request approval when required, respect denials, and never attempt to widen your own permissions. Keep native shell semantics separate from agent tool execution. Responses may use terminal-compatible Markdown, including headings, lists, links, inline code, fenced code blocks, and Mermaid fences. Avoid HTML and image-only content; Mermaid diagrams must remain understandable from their source text.",
     );
     if let Some(persona) = turn
         .persona
@@ -966,6 +1008,7 @@ mod tests {
         assert!(messages[0].content.contains("lightly sassy"));
         assert!(messages[0].content.contains("never force a punchline"));
         assert!(messages[0].content.contains("clarity wins every time"));
+        assert!(messages[0].content.contains("preserve every person name"));
         assert!(messages[0].content.contains("latest request"));
         assert_eq!(messages.len(), 1);
         assert!(
@@ -1147,6 +1190,25 @@ mod tests {
         assert_eq!(
             super::sanitize_agent_response(markdown, "show the code"),
             markdown
+        );
+    }
+
+    #[test]
+    fn web_search_preserves_content_terms_dropped_by_the_model() {
+        let mut call = ToolCall {
+            id: "search_1".to_owned(),
+            name: "web_search".to_owned(),
+            arguments: json!({"query": "Elixpo overview"}),
+        };
+
+        super::preserve_web_search_terms(
+            &mut call,
+            "search about ayushman bhattacharya elixpo and tell me what you find in short",
+        );
+
+        assert_eq!(
+            call.arguments["query"].as_str(),
+            Some("Elixpo overview ayushman bhattacharya")
         );
     }
 

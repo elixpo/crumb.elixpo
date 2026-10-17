@@ -1171,15 +1171,12 @@ fn animate_activity(label: &str, color: bool, running: &AtomicBool, row: Option<
 }
 
 fn write_activity_line(line: &str, row: Option<u16>) {
-    if let Some(row) = row {
-        let _ = write!(
-            io::stderr(),
-            "\x1b7\x1b[{};1H\x1b[2K  {line}\x1b8",
-            row.saturating_add(1)
-        );
+    let rendered = if let Some(row) = row {
+        format!("\x1b7\x1b[{};1H\x1b[2K  {line}\x1b8", row.saturating_add(1))
     } else {
-        let _ = write!(io::stderr(), "\r\x1b[2K{line}");
-    }
+        format!("\r\x1b[2K{line}")
+    };
+    let _ = io::stderr().write_all(rendered.as_bytes());
 }
 
 fn clear_activity_line(row: Option<u16>) {

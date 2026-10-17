@@ -81,11 +81,16 @@ pub fn register_web_search_tool(
     host.register(
         ToolDescriptor {
             name: "web_search".to_owned(),
-            description: "Search the public web for current information and return cited results. Requires explicit network permission.".to_owned(),
+            description: "Search the public web for current information and return cited results. Preserve all names, organizations, places, quoted phrases, and qualifiers from the user's request in the query; never broaden a specific subject into a generic topic. Requires explicit network permission.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "minLength": 1, "maxLength": MAX_QUERY_BYTES}
+                    "query": {
+                        "type": "string",
+                        "description": "A precise search query retaining every named entity and qualifier from the user's request.",
+                        "minLength": 1,
+                        "maxLength": MAX_QUERY_BYTES
+                    }
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -141,7 +146,7 @@ impl PollinationsSearch {
             .json(&json!({
                 "model": self.config.model,
                 "messages": [
-                    {"role": "system", "content": "Search the web. Be concise, distinguish uncertain claims, and include source URLs."},
+                    {"role": "system", "content": "Search the web for the exact query supplied. Do not omit, replace, or broaden any named person, organization, place, product, quoted phrase, or qualifier. Be concise, distinguish uncertain claims, and include source URLs."},
                     {"role": "user", "content": query}
                 ],
                 "stream": false
