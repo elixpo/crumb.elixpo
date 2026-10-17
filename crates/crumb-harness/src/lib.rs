@@ -746,11 +746,7 @@ fn build_request(
     ChatRequest {
         model: turn.model.clone(),
         messages: messages.to_vec(),
-        tools: if suppress_tools {
-            Vec::new()
-        } else {
-            definitions.to_vec()
-        },
+        tools: definitions.to_vec(),
         tool_choice: if definitions.is_empty() || suppress_tools {
             ToolChoice::None
         } else if require_tool {
@@ -1295,8 +1291,12 @@ fn ensure_active(cancellation: &CancellationToken, deadline: Instant) -> Result<
     }
 }
 
-fn provider_error(_error: ProviderError) -> HarnessError {
-    HarnessError::new(HarnessErrorKind::Provider, "model provider failed")
+fn provider_error(error: ProviderError) -> HarnessError {
+    let ProviderError { message, .. } = error;
+    HarnessError::new(
+        HarnessErrorKind::Provider,
+        format!("model provider failed: {message}"),
+    )
 }
 
 fn persistence_error(_error: anyhow::Error) -> HarnessError {
@@ -1540,6 +1540,21 @@ mod tests {
         assert!(messages[1].content.contains("Locale: en-IN"));
     }
 
+    #[test]
+    fn provider_failures_keep_the_safe_upstream_diagnostic() {
+        let error = super::provider_error(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "Pollinations request failed with HTTP 400 Bad Request",
+            false,
+        ));
+
+        assert_eq!(error.kind, HarnessErrorKind::Provider);
+        assert_eq!(
+            error.to_string(),
+            "model provider failed: Pollinations request failed with HTTP 400 Bad Request"
+        );
+    }
+
     fn tool_round() -> Vec<ChatEvent> {
         vec![
             ChatEvent::TextDelta("Unverified placeholder draft.".to_owned()),
@@ -1639,7 +1654,7 @@ mod tests {
                 .any(|message| message.role == crumb_llm::ChatRole::Tool)
         );
         assert_eq!(requests[1].tool_choice, ToolChoice::None);
-        assert_eq!(requests[1].tools.len(), 0);
+        assert_eq!(requests[1].tools.len(), 1);
         drop(requests);
         let journal = export_session(root.path(), "harness-test").expect("session exports");
         assert!(journal.events.iter().any(|event| matches!(
