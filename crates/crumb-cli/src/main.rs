@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Read, Write};
@@ -62,9 +63,10 @@ use crumb_profile::{ProfileDocument, ProfileSelectionStore, ProfileStore};
 use crumb_pty::{PtyInput, PtyResizer, SystemPty, TerminalSize};
 use crumb_repl::{ReplOutcome, read_classified_line};
 use crumb_tools::{
-    CheckpointDecision, CheckpointStatus, CheckpointStore, WebFetchLimits, WorkspaceToolLimits,
-    WorkspaceWriteLimits, register_web_fetch_tool, register_workspace_read_tools,
-    register_workspace_write_tool,
+    CheckpointDecision, CheckpointStatus, CheckpointStore, DisposableToolConfig,
+    StackDetectionLimits, WebFetchLimits, WorkspaceToolLimits, WorkspaceWriteLimits,
+    register_disposable_tool, register_stack_detection_tool, register_web_fetch_tool,
+    register_workspace_read_tools, register_workspace_write_tool,
 };
 use crumb_ui::{GitSegment, PromptContext, Renderer, StartupContext, UiSettings};
 use directories::BaseDirs;
@@ -77,6 +79,7 @@ use reedline::{
 };
 
 mod agent_runtime;
+mod bundled_skills;
 mod completion;
 mod context;
 mod device_auth;
@@ -404,6 +407,16 @@ fn workspace_read_host(
             max_file_bytes: max_file_write_bytes,
         },
     )?;
+    register_stack_detection_tool(
+        &mut host,
+        workspace,
+        StackDetectionLimits { max_output_bytes },
+    )?;
+    register_disposable_tool(
+        &mut host,
+        workspace,
+        disposable_tool_config(config, max_output_bytes),
+    )?;
     register_web_fetch_tool(
         &mut host,
         WebFetchLimits {
@@ -425,6 +438,29 @@ fn workspace_read_host(
         )?;
     }
     Ok(host)
+}
+
+fn disposable_tool_config(config: &AgentConfig, max_output_bytes: usize) -> DisposableToolConfig {
+    #[cfg(unix)]
+    let (program, arguments) = (PathBuf::from("/bin/sh"), vec![OsString::from("-c")]);
+    #[cfg(windows)]
+    let (program, arguments) = (
+        PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()))
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe"),
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+    );
+    DisposableToolConfig {
+        program,
+        arguments,
+        path: std::env::var_os("PATH"),
+        timeout: Duration::from_secs(config.limits.max_wall_time_seconds.min(60)),
+        max_script_bytes: max_output_bytes.min(64 * 1024),
+        max_input_bytes: max_output_bytes.saturating_mul(4),
+        max_output_bytes,
+    }
 }
 
 fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
@@ -1469,7 +1505,7 @@ fn read_agent_config(cwd: &Path) -> Result<AgentConfig> {
         }
     }
     for skill in &mut config.skills {
-        if skill.path.is_relative() {
+        if bundled_skills::id_from_path(&skill.path).is_none() && skill.path.is_relative() {
             skill.path = config_root.join(skill.path.as_path());
         }
     }
@@ -2806,16 +2842,8 @@ fn show_context(runtime: Option<&AgentRuntime>, writer: &mut dyn Write) -> Resul
 
 fn show_skills(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     let config = read_agent_config(cwd)?;
-    if config.skills.is_empty() {
-        writeln!(writer, "◇ No skills configured")?;
-        writeln!(
-            writer,
-            "  Add skills to .crumb/agent.json; configured skills then appear in the `/` palette."
-        )?;
-        return Ok(());
-    }
     writeln!(writer, "◆ Agent skills")?;
-    for skill in config.skills {
+    for skill in &config.skills {
         writeln!(
             writer,
             "  {}  {}",
@@ -2826,6 +2854,12 @@ fn show_skills(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
             },
             skill.id
         )?;
+    }
+    for skill in bundled_skills::ALL
+        .iter()
+        .filter(|bundled| !config.skills.iter().any(|skill| skill.id == bundled.id))
+    {
+        writeln!(writer, "  ◌ bundled  {} · {}", skill.id, skill.description)?;
     }
     writeln!(
         writer,
@@ -2939,7 +2973,9 @@ fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     for (name, risk, available) in [
         ("read_file", "workspace read", true),
         ("list_directory", "workspace read", true),
+        ("detect_stack", "workspace read", true),
         ("write_file", "workspace write", true),
+        ("run_disposable", "one-shot process", true),
         ("web_fetch", "network", true),
         (
             "web_search",
@@ -2950,7 +2986,8 @@ fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
                 .is_some_and(|routes| !routes.is_empty()),
         ),
     ] {
-        let granted = config.permissions.allow_network_tools.contains(name)
+        let granted = matches!(name, "read_file" | "list_directory" | "detect_stack")
+            || config.permissions.allow_network_tools.contains(name)
             || config.permissions.allow_workspace_tools.contains(name);
         writeln!(
             writer,
@@ -3089,12 +3126,17 @@ fn set_skill_enabled(
         .filter(|id| !id.is_empty())
         .with_context(|| format!("usage: /skills {action} <id>"))?;
     update_agent_config(cwd, |config| {
-        let skill = config
-            .skills
-            .iter_mut()
-            .find(|skill| skill.id == id)
-            .with_context(|| format!("skill `{id}` is not configured"))?;
-        skill.enabled = enabled;
+        if let Some(skill) = config.skills.iter_mut().find(|skill| skill.id == id) {
+            skill.enabled = enabled;
+        } else if enabled && bundled_skills::get(id).is_some() {
+            config.skills.push(SkillConfig {
+                id: id.to_owned(),
+                path: bundled_skills::path(id),
+                enabled: true,
+            });
+        } else {
+            bail!("skill `{id}` is not configured");
+        }
         Ok(())
     })?;
     writeln!(
@@ -8304,6 +8346,33 @@ mod tests {
     }
 
     #[test]
+    fn bundled_skills_load_without_external_files() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-bundled-skill-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace is created");
+        let mut output = Vec::new();
+
+        set_skill_enabled(
+            "/skills load failure-autopsy",
+            &workspace,
+            true,
+            &mut output,
+        )
+        .expect("bundled skill loads");
+        let config = read_agent_config(&workspace).expect("config loads");
+        assert!(config.skills[0].enabled);
+        assert_eq!(
+            config.skills[0].path,
+            crate::bundled_skills::path("failure-autopsy")
+        );
+
+        std::fs::remove_dir_all(workspace).expect("workspace removed");
+    }
+
+    #[test]
     fn friendly_effort_names_map_to_harness_values() {
         for (friendly, wire) in [
             ("light", "low"),
@@ -8402,10 +8471,12 @@ mod tests {
         let host = workspace_read_host(&workspace, &AgentConfig::default(), None)
             .expect("workspace tools are registered");
         let tools = host.tools().collect::<Vec<_>>();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 6);
         for (name, risk) in [
+            ("detect_stack", RiskClass::ReadOnly),
             ("list_directory", RiskClass::ReadOnly),
             ("read_file", RiskClass::ReadOnly),
+            ("run_disposable", RiskClass::ProcessExecution),
             ("web_fetch", RiskClass::NetworkAccess),
             ("write_file", RiskClass::WriteWorkspace),
         ] {
