@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentMode, CancellationToken};
+use crate::{AgentMode, CancellationToken, CredentialReference};
 
 /// Deterministic risk assigned by Rust-owned tool metadata.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -25,14 +25,30 @@ pub enum RiskClass {
     Destructive,
 }
 
-/// External MCP server process configuration. Credentials must come from the
-/// process environment or OS credential store, never this structure.
+/// Transport used to reach an external MCP server.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    StreamableHttp,
+}
+
+/// External MCP server configuration. Credentials are non-secret references;
+/// their values are resolved only while the transport is being registered.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct McpServer {
     pub id: String,
+    #[serde(default)]
+    pub transport: McpTransport,
+    #[serde(default)]
     pub command: PathBuf,
     #[serde(default)]
     pub arguments: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<CredentialReference>,
     #[serde(default)]
     pub enabled: bool,
 }
@@ -135,6 +151,7 @@ pub struct ConfiguredApprovals {
     network: BTreeSet<String>,
     workspace: BTreeSet<String>,
     processes: BTreeSet<String>,
+    mcp: BTreeSet<String>,
 }
 
 impl ConfiguredApprovals {
@@ -144,6 +161,7 @@ impl ConfiguredApprovals {
             network: network_tools,
             workspace: BTreeSet::new(),
             processes: BTreeSet::new(),
+            mcp: BTreeSet::new(),
         }
     }
 
@@ -158,6 +176,12 @@ impl ConfiguredApprovals {
         self.processes = process_tools;
         self
     }
+
+    #[must_use]
+    pub fn with_mcp_tools(mut self, mcp_tools: BTreeSet<String>) -> Self {
+        self.mcp = mcp_tools;
+        self
+    }
 }
 
 impl ApprovalBroker for ConfiguredApprovals {
@@ -167,7 +191,8 @@ impl ApprovalBroker for ConfiguredApprovals {
         _arguments: &serde_json::Value,
         _cancellation: &CancellationToken,
     ) -> ApprovalDecision {
-        if (request.risk == RiskClass::NetworkAccess && self.network.contains(&request.tool))
+        if (request.tool.starts_with("mcp__") && self.mcp.contains(&request.tool))
+            || (request.risk == RiskClass::NetworkAccess && self.network.contains(&request.tool))
             || (request.risk == RiskClass::WriteWorkspace && self.workspace.contains(&request.tool))
             || (request.risk == RiskClass::ProcessExecution
                 && self.processes.contains(&request.tool))
