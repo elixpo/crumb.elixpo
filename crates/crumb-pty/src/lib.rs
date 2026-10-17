@@ -125,19 +125,49 @@ impl PtyBackend for SystemPty {
         // portable-pty enables ConPTY cursor inheritance. Windows starts that
         // handshake with a device-status query and will not relay child I/O
         // until the terminal reports a cursor position. Crumb owns the PTY
-        // screen, so seed a valid origin response before sending shell input.
+        // screen, so finish that exchange before sending shell input.
         #[cfg(target_os = "windows")]
-        {
-            let mut cursor_writer = writer.clone();
-            cursor_writer.write_all(b"\x1b[1;1R")?;
-            cursor_writer.flush()?;
-        }
+        complete_cursor_inheritance_handshake(pair.master.as_ref(), writer.clone())?;
 
         Ok(PtyProcess {
             master: Arc::new(Mutex::new(pair.master)),
             writer: Some(writer),
             child,
         })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn complete_cursor_inheritance_handshake(
+    master: &dyn MasterPty,
+    mut writer: PtyInput,
+) -> Result<()> {
+    const CURSOR_QUERY: &[u8] = b"\x1b[6n";
+    const CURSOR_ORIGIN: &[u8] = b"\x1b[1;1R";
+
+    let mut reader = master.try_clone_reader()?;
+    let mut pending = Vec::with_capacity(CURSOR_QUERY.len());
+    let mut buffer = [0_u8; 64];
+
+    loop {
+        let bytes_read = reader.read(&mut buffer)?;
+        if bytes_read == 0 {
+            return Err(anyhow!(
+                "ConPTY closed before completing cursor inheritance"
+            ));
+        }
+        pending.extend_from_slice(&buffer[..bytes_read]);
+        if pending
+            .windows(CURSOR_QUERY.len())
+            .any(|window| window == CURSOR_QUERY)
+        {
+            writer.write_all(CURSOR_ORIGIN)?;
+            writer.flush()?;
+            return Ok(());
+        }
+
+        let retained = pending.len().min(CURSOR_QUERY.len().saturating_sub(1));
+        pending.drain(..pending.len() - retained);
     }
 }
 
