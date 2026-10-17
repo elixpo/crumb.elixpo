@@ -76,10 +76,9 @@ impl CompletionProtocol {
                 "stty -echo; PS1=''; RPS1=''; unsetopt zle prompt_cr prompt_sp; __crumb_emit() {{ __crumb_status=$?; if [ -n \"${{__crumb_seq-}}\" ]; then stty -echo; __crumb_cwd_hex=$(printf %s \"$PWD\" | od -An -tx1 | tr -d ' \\n'); printf '\\036crumb:{}:%s:%s:%s\\037' \"$__crumb_seq\" \"$__crumb_status\" \"$__crumb_cwd_hex\"; unset __crumb_seq; fi; }}; precmd_functions=(__crumb_emit)\n",
                 self.token
             ),
-            ShellKind::PowerShell => format!(
-                "Remove-Module PSReadLine -ErrorAction SilentlyContinue; function global:prompt {{ $__crumb_status = if ($?) {{ 0 }} elseif ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }}; if ($null -ne $global:__crumb_sequence) {{ $__crumb_cwd_hex = [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes((Get-Location).Path)).ToLowerInvariant(); [Console]::Write([char]0x1e + 'crumb:{}:' + $global:__crumb_sequence + ':' + $__crumb_status + ':' + $__crumb_cwd_hex + [char]0x1f); $global:__crumb_sequence = $null }}; '' }}\r\n",
-                self.token
-            ),
+            ShellKind::PowerShell =>
+                "Remove-Module PSReadLine -ErrorAction SilentlyContinue; $global:LASTEXITCODE = $null\r\n"
+                    .to_owned(),
         }
     }
 
@@ -89,7 +88,7 @@ impl CompletionProtocol {
     pub fn submission(&self, kind: ShellKind, command: &str, sequence: u64) -> String {
         match kind {
             ShellKind::Bash | ShellKind::Zsh => Self::posix_submission(command, sequence),
-            ShellKind::PowerShell => Self::powershell_submission(command, sequence),
+            ShellKind::PowerShell => self.powershell_submission(command, sequence),
         }
     }
 
@@ -133,8 +132,11 @@ impl CompletionProtocol {
         format!("__crumb_seq={sequence}; stty echo; {command}\n")
     }
 
-    fn powershell_submission(command: &str, sequence: u64) -> String {
-        format!("$global:LASTEXITCODE=$null; $global:__crumb_sequence={sequence}; {command}\r\n")
+    fn powershell_submission(&self, command: &str, sequence: u64) -> String {
+        format!(
+            "$global:LASTEXITCODE=$null; {command}; $__crumb_status = if ($?) {{ 0 }} elseif ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }}; $__crumb_cwd_hex = [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes((Get-Location).Path)).ToLowerInvariant(); [Console]::Write([char]0x1e + 'crumb:{}:{sequence}:' + $__crumb_status + ':' + $__crumb_cwd_hex + [char]0x1f)\r\n",
+            self.token
+        )
     }
 
     fn parse_frame(&self, frame: &[u8]) -> Result<CommandCompletion> {
@@ -225,7 +227,7 @@ mod tests {
 
         assert_eq!(
             submission,
-            "$global:LASTEXITCODE=$null; $global:__crumb_sequence=9; Set-Location C:\\\\\r\n"
+            "$global:LASTEXITCODE=$null; Set-Location C:\\\\; $__crumb_status = if ($?) { 0 } elseif ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 1 }; $__crumb_cwd_hex = [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes((Get-Location).Path)).ToLowerInvariant(); [Console]::Write([char]0x1e + 'crumb:abc123:9:' + $__crumb_status + ':' + $__crumb_cwd_hex + [char]0x1f)\r\n"
         );
     }
 
@@ -239,8 +241,8 @@ mod tests {
 
         assert!(bash.contains("PROMPT_COMMAND=__crumb_emit"));
         assert!(zsh.contains("precmd_functions=(__crumb_emit)"));
-        assert!(powershell.contains("function global:prompt"));
-        for bootstrap in [bash, zsh, powershell] {
+        assert!(powershell.contains("Remove-Module PSReadLine"));
+        for bootstrap in [bash, zsh] {
             assert!(bootstrap.contains("crumb:abc123:"));
         }
     }
