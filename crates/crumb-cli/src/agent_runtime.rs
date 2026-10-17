@@ -18,6 +18,7 @@ use crumb_agent::{
 };
 use crumb_harness::{
     Conversation, EventSink, HarnessEvent, HarnessLimits, HarnessTurn, NativeHarness,
+    ParallelAgentConfig, ParallelAgentLimits, register_parallel_agent_tool,
 };
 use crumb_harness_cli::{CodingCliLaunch, run_text as run_coding_cli_text};
 use crumb_harness_dsh::{
@@ -99,6 +100,19 @@ fn native_harness_limits(config: &AgentConfig) -> Result<HarnessLimits> {
         max_history_turns: NonZeroUsize::new(12).expect("constant is non-zero"),
         turn_timeout: Duration::from_secs(config.limits.max_wall_time_seconds),
     })
+}
+
+fn parallel_harness_limits(parent: HarnessLimits) -> HarnessLimits {
+    HarnessLimits {
+        max_model_rounds: NonZeroUsize::new(parent.max_model_rounds.get().min(4))
+            .expect("parent limits are non-zero"),
+        max_tool_calls: NonZeroUsize::new(parent.max_tool_calls.get().min(8))
+            .expect("parent limits are non-zero"),
+        max_output_bytes: NonZeroUsize::new(parent.max_output_bytes.get().min(16 * 1024))
+            .expect("parent limits are non-zero"),
+        max_history_turns: NonZeroUsize::MIN,
+        turn_timeout: parent.turn_timeout,
+    }
 }
 
 fn configured_max_output_tokens(
@@ -844,7 +858,7 @@ impl AgentRuntime {
         route: &crumb_agent::ModelRoute,
         session_id: &str,
         request: &str,
-        tools: ToolHost,
+        mut tools: ToolHost,
         approvals: Arc<dyn ApprovalBroker>,
         cancellation: &CancellationToken,
         on_activity: &mut dyn FnMut(HarnessActivity) -> Result<()>,
@@ -873,19 +887,37 @@ impl AgentRuntime {
             .trim_end_matches('/')
             .strip_suffix("/v1")
             .unwrap_or(provider.base_url.trim_end_matches('/'));
-        let provider = PollinationsProvider::new(
+        let provider: Arc<dyn crumb_llm::LlmProvider> = Arc::new(PollinationsProvider::new(
             PollinationsConfig::new(credential)?.with_base_url(base_url)?,
+        )?);
+        let max_output_tokens = configured_max_output_tokens(config, route);
+        let team_limits = ParallelAgentLimits::default();
+        let child_output_tokens = max_output_tokens.map(|tokens| {
+            tokens.div_ceil(u32::try_from(team_limits.max_agents.get()).unwrap_or(u32::MAX))
+        });
+        let workspace = self
+            .session
+            .as_ref()
+            .context("agent session is unavailable")?
+            .workspace()
+            .to_path_buf();
+        let harness_limits = native_harness_limits(config)?;
+        register_parallel_agent_tool(
+            &mut tools,
+            Arc::clone(&provider),
+            ParallelAgentConfig {
+                journal_root: session_root(&workspace).join("agents"),
+                workspace,
+                model: route.model.clone(),
+                max_output_tokens: child_output_tokens,
+                harness_limits: parallel_harness_limits(harness_limits),
+                team_limits,
+            },
         )?;
-        let harness = NativeHarness::new(
-            Arc::new(provider),
-            tools,
-            approvals,
-            native_harness_limits(config)?,
-        );
+        let harness = NativeHarness::new(provider, tools, approvals, harness_limits);
         let conversation = self
             .native_conversation
             .get_or_insert_with(|| harness.conversation());
-        let max_output_tokens = configured_max_output_tokens(config, route);
         let turn = HarnessTurn {
             model: route.model.clone(),
             user_message: request.to_owned(),

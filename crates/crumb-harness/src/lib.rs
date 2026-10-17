@@ -18,6 +18,10 @@ use crumb_llm::{
 };
 use tokio::time::Instant;
 
+mod parallel;
+
+pub use parallel::{ParallelAgentConfig, ParallelAgentLimits, register_parallel_agent_tool};
+
 /// Hard limits applied to one user turn and its model/tool rounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HarnessLimits {
@@ -190,6 +194,7 @@ struct ModelRound {
 }
 
 /// Provider-neutral harness with Rust-owned tools and approval policy.
+#[derive(Clone)]
 pub struct NativeHarness {
     provider: Arc<dyn LlmProvider>,
     tools: ToolHost,

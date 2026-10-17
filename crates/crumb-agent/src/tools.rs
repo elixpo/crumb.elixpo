@@ -252,13 +252,33 @@ impl fmt::Display for ToolCallError {
 impl Error for ToolCallError {}
 
 /// Registry plus Rust-owned policy and native implementations.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ToolHost {
     registry: ToolRegistry,
     handlers: BTreeMap<String, Arc<dyn ToolHandler>>,
 }
 
 impl ToolHost {
+    /// Clones only passive read-only tools for isolated analysis workers.
+    #[must_use]
+    pub fn read_only(&self) -> Self {
+        let mut host = Self::default();
+        for descriptor in self
+            .registry
+            .iter()
+            .filter(|descriptor| descriptor.risk == RiskClass::ReadOnly)
+        {
+            if let Some(handler) = self.handlers.get(&descriptor.name) {
+                host.registry
+                    .tools
+                    .insert(descriptor.name.clone(), descriptor.clone());
+                host.handlers
+                    .insert(descriptor.name.clone(), Arc::clone(handler));
+            }
+        }
+        host
+    }
+
     /// Registers metadata and its implementation atomically.
     ///
     /// # Errors
@@ -606,6 +626,39 @@ mod tests {
         assert_eq!(
             ConfiguredApprovals::default().decide(&request, &serde_json::json!({}), &cancellation),
             ApprovalDecision::Deny
+        );
+    }
+
+    #[test]
+    fn read_only_host_excludes_every_escalating_capability() {
+        let mut host = ToolHost::default();
+        for (name, risk) in [
+            ("read", RiskClass::ReadOnly),
+            ("write", RiskClass::WriteWorkspace),
+            ("network", RiskClass::NetworkAccess),
+            ("process", RiskClass::ProcessExecution),
+        ] {
+            host.register(
+                ToolDescriptor {
+                    name: name.to_owned(),
+                    description: "fixture".to_owned(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                    risk,
+                    transport: ToolTransport::Native,
+                },
+                Arc::new(FixtureHandler),
+            )
+            .expect("fixture registers");
+        }
+
+        let restricted = host.read_only();
+
+        assert_eq!(
+            restricted
+                .tools()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read"]
         );
     }
 
