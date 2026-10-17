@@ -1398,6 +1398,27 @@ fn skill_is_relevant(skill: &SkillConfig, request: &str) -> bool {
             "search", "web", "online", "current", "latest", "today", "weather", "news", "price",
             "festival", "who is", "what is",
         ]),
+        "karpathy-guidelines" => contains_any(&[
+            "code",
+            "coding",
+            "implement",
+            "review",
+            "refactor",
+            "debug",
+            "fix",
+            "change",
+            "simplify",
+            "karpathy",
+        ]),
+        "skill-authoring" => contains_any(&[
+            "create skill",
+            "make skill",
+            "write skill",
+            "update skill",
+            "custom skill",
+            "skill file",
+            "skill.md",
+        ]),
         _ => true,
     }
 }
@@ -1692,6 +1713,40 @@ mod tests {
         assert_eq!(code_context.len(), 1);
         assert!(code_context[0].contains("codebase-map"));
         assert!(!code_context[0].contains("web-research"));
+    }
+
+    #[test]
+    fn community_and_authoring_skills_are_discovered_on_demand() {
+        let skills = [
+            SkillConfig {
+                id: "karpathy-guidelines".to_owned(),
+                path: crate::bundled_skills::path("karpathy-guidelines"),
+                enabled: true,
+            },
+            SkillConfig {
+                id: "skill-authoring".to_owned(),
+                path: crate::bundled_skills::path("skill-authoring"),
+                enabled: true,
+            },
+        ];
+
+        let coding = load_enabled_skill_context(
+            &skills,
+            Path::new("."),
+            "refactor this code with a surgical change",
+        )
+        .expect("coding skill routes");
+        let authoring = load_enabled_skill_context(
+            &skills,
+            Path::new("."),
+            "create a custom skill for database migrations",
+        )
+        .expect("authoring skill routes");
+
+        assert_eq!(coding.len(), 1);
+        assert!(coding[0].contains("Karpathy Guidelines"));
+        assert_eq!(authoring.len(), 1);
+        assert!(authoring[0].contains("Skill Authoring"));
     }
 
     #[test]

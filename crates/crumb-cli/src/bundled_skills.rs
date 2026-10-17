@@ -13,6 +13,8 @@ pub(crate) const DEFAULT_IDS: &[&str] = &[
     "security-review",
     "plan-execute",
     "web-research",
+    "karpathy-guidelines",
+    "skill-authoring",
 ];
 
 pub(crate) struct BundledSkill {
@@ -27,6 +29,16 @@ macro_rules! skill {
             id: $id,
             description: $description,
             instructions: include_str!(concat!("../../../skills/core/", $id, "/SKILL.md")),
+        }
+    };
+}
+
+macro_rules! community_skill {
+    ($id:literal, $description:literal) => {
+        BundledSkill {
+            id: $id,
+            description: $description,
+            instructions: include_str!(concat!("../../../skills/community/", $id, "/SKILL.md")),
         }
     };
 }
@@ -71,6 +83,14 @@ pub(crate) static ALL: &[BundledSkill] = &[
     skill!(
         "web-research",
         "automatically research current or uncertain facts with source verification"
+    ),
+    community_skill!(
+        "karpathy-guidelines",
+        "apply Karpathy-inspired simplicity, surgical changes, explicit assumptions, and verification"
+    ),
+    skill!(
+        "skill-authoring",
+        "create or update focused reusable Crumb Agent Skills"
     ),
 ];
 
