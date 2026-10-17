@@ -284,15 +284,18 @@ impl StreamableHttpClient {
         thread::Builder::new()
             .name("crumb-mcp-http".to_owned())
             .spawn(move || {
+                let request = HttpRequest {
+                    encoded,
+                    expected_id,
+                    retry_safe,
+                };
                 let result = perform_request(
                     &client,
                     &endpoint,
                     credential.as_deref(),
                     session_id.as_deref(),
-                    encoded,
-                    expected_id,
                     maximum,
-                    retry_safe,
+                    &request,
                 );
                 let _ = sender.send(result);
             })
@@ -332,15 +335,19 @@ impl StreamableHttpClient {
     }
 }
 
+struct HttpRequest {
+    encoded: Vec<u8>,
+    expected_id: Option<u64>,
+    retry_safe: bool,
+}
+
 fn perform_request(
     client: &Client,
     endpoint: &str,
     credential: Option<&SecretString>,
     session_id: Option<&str>,
-    encoded: Vec<u8>,
-    expected_id: Option<u64>,
     maximum: usize,
-    retry_safe: bool,
+    request: &HttpRequest,
 ) -> Result<(Value, Option<String>)> {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -368,12 +375,12 @@ fn perform_request(
         client
             .post(endpoint)
             .headers(headers.clone())
-            .body(encoded.clone())
+            .body(request.encoded.clone())
             .send()
     };
     let response = match send() {
         Ok(response) => response,
-        Err(_) if retry_safe => send().context("external MCP HTTP request failed")?,
+        Err(_) if request.retry_safe => send().context("external MCP HTTP request failed")?,
         Err(error) => return Err(error).context("external MCP HTTP request failed"),
     };
     let session_id = response
@@ -382,7 +389,7 @@ fn perform_request(
         .map(|value| value.to_str().map(str::to_owned))
         .transpose()
         .context("external MCP session ID is invalid")?;
-    if expected_id.is_none() {
+    if request.expected_id.is_none() {
         if response.status().is_success() {
             return Ok((Value::Null, session_id));
         }
@@ -399,11 +406,11 @@ fn perform_request(
         .context("external MCP HTTP request failed")?;
     let body = read_bounded(response, maximum)?;
     let value = if content_type.starts_with("text/event-stream") {
-        parse_sse(&body, expected_id.expect("checked above"))?
+        parse_sse(&body, request.expected_id.expect("checked above"))?
     } else {
         serde_json::from_slice(&body).context("external MCP returned malformed JSON")?
     };
-    if value.get("id").and_then(Value::as_u64) != expected_id {
+    if value.get("id").and_then(Value::as_u64) != request.expected_id {
         bail!("external MCP response ID is invalid");
     }
     Ok((value, session_id))
