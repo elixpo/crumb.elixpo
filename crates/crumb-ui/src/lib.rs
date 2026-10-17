@@ -1,5 +1,6 @@
 //! Lightweight terminal presentation for crumb.
 
+use std::collections::VecDeque;
 use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -367,7 +368,13 @@ impl Renderer {
         let content_width = card_width.saturating_sub(2);
         let timestamp = timestamp.unwrap_or_default();
         let mut body = vec![String::new()];
-        for line in input.lines().take(TRANSCRIPT_INPUT_MAX_ROWS) {
+        let mut pending = input.lines().map(str::to_owned).collect::<VecDeque<_>>();
+        if pending.is_empty() {
+            pending.push_back(String::new());
+        }
+        while body.len() <= TRANSCRIPT_INPUT_MAX_ROWS
+            && let Some(line) = pending.pop_front()
+        {
             let first = body.len() == 1;
             let marker = if first { "◆ >" } else { "  │" };
             let timestamp_width = if first && !timestamp.is_empty() {
@@ -375,17 +382,14 @@ impl Renderer {
             } else {
                 0
             };
-            let line = if content_width == 0 {
-                line.to_owned()
-            } else {
-                fit_terminal_text(
-                    line,
-                    content_width
-                        .saturating_sub(marker.chars().count())
-                        .saturating_sub(timestamp_width)
-                        .saturating_sub(1),
-                )
-            };
+            let available = content_width
+                .saturating_sub(marker.chars().count())
+                .saturating_sub(timestamp_width)
+                .saturating_sub(1);
+            let (line, remainder) = split_terminal_line(&line, available);
+            if let Some(remainder) = remainder {
+                pending.push_front(remainder);
+            }
             let mut row = format!("{marker} {line}");
             if first && !timestamp.is_empty() {
                 let padding = content_width
@@ -397,7 +401,7 @@ impl Renderer {
             }
             body.push(row);
         }
-        if input.lines().count() > TRANSCRIPT_INPUT_MAX_ROWS
+        if !pending.is_empty()
             && let Some(last) = body.last_mut()
         {
             if content_width == 0 {
@@ -867,6 +871,23 @@ fn fit_terminal_text(text: &str, width: usize) -> String {
     fitted
 }
 
+fn split_terminal_line(text: &str, width: usize) -> (String, Option<String>) {
+    if width == 0 || text.chars().count() <= width {
+        return (text.to_owned(), None);
+    }
+    let prefix = text.chars().take(width).collect::<String>();
+    let split = prefix
+        .char_indices()
+        .filter(|(_, character)| character.is_whitespace())
+        .map(|(index, _)| index)
+        .next_back()
+        .filter(|index| *index > 0)
+        .unwrap_or(prefix.len());
+    let head = prefix[..split].trim_end().to_owned();
+    let remainder = text[split..].trim_start().to_owned();
+    (head, Some(remainder))
+}
+
 fn compose_styled_art(renderer: Renderer, left: &str, right: &str, gap: usize) -> String {
     let left = left.lines().collect::<Vec<_>>();
     let right = right.lines().collect::<Vec<_>>();
@@ -1025,11 +1046,9 @@ fn animate_activity(label: &str, color: bool, running: &AtomicBool, row: Option<
     while running.load(Ordering::Acquire) {
         let cookie = COOKIE_SPINNER[frame];
         let line = if color {
-            format!(
-                "\x1b[35;1m{cookie}\x1b[0m \x1b[90m{label} · Enter steer · Ctrl+Enter queue · /pause · Ctrl+C cancel\x1b[0m"
-            )
+            format!("\x1b[35;1m{cookie}\x1b[0m \x1b[90m{label}\x1b[0m")
         } else {
-            format!("{cookie} {label} · Enter steer · Ctrl+Enter queue · /pause · Ctrl+C cancel")
+            format!("{cookie} {label}")
         };
         write_activity_line(&line, row);
         let _ = io::stderr().flush();
@@ -1273,6 +1292,28 @@ mod tests {
                 .transcript_input_at("you", "pwd", None, 80)
                 .contains("\x1b[1;48;2;85;85;85m")
         );
+    }
+
+    #[test]
+    fn transcript_card_wraps_long_submissions_inside_its_width() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+
+        let card = renderer.transcript_input_at(
+            "you",
+            "Use parallel agents to inspect authentication flow and reconcile findings clearly",
+            Some("21:34"),
+            44,
+        );
+
+        assert!(!card.contains('…'));
+        assert!(card.contains("authentication"));
+        assert!(card.contains("reconcile findings"));
+        assert!(card.lines().all(|line| line.chars().count() <= 42));
     }
 
     #[test]
