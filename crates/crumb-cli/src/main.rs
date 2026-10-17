@@ -805,6 +805,7 @@ impl FullscreenTranscript {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 state.append(&rendered);
                 render_transcript_view(&state, self.renderer, self.header_rows)?;
+                position_after_transcript(&state, self.header_rows)?;
             }
             self.started = true;
         }
@@ -8831,6 +8832,24 @@ fn render_transcript_view(
     write!(frame, "\x1b8")?;
     let mut writer = io::stdout();
     writer.write_all(&frame)?;
+    writer.flush()
+}
+
+fn position_after_transcript(state: &TranscriptState, header_rows: u16) -> io::Result<()> {
+    let (top, bottom, _, _) = fullscreen_rows(header_rows)?;
+    let height = bottom.saturating_sub(top) as usize + 1;
+    let end = state.lines.len().saturating_sub(state.scroll_offset);
+    let start = end.saturating_sub(height);
+    let visible_lines = end.saturating_sub(start);
+    let mut writer = io::stdout();
+    set_transcript_scroll_region(&mut writer, top, bottom)?;
+    if visible_lines < height {
+        let row = top.saturating_add(u16::try_from(visible_lines).unwrap_or(u16::MAX));
+        crossterm::execute!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    } else {
+        crossterm::execute!(writer, MoveTo(0, bottom))?;
+        writeln!(writer)?;
+    }
     writer.flush()
 }
 
