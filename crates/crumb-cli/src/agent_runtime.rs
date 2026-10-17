@@ -56,6 +56,7 @@ struct PreparedTurn<'a> {
     session_id: &'a str,
     request: &'a str,
     persona: Option<&'a str>,
+    static_context: &'a [String],
     trusted_context: &'a [String],
     cancellation: &'a CancellationToken,
 }
@@ -729,7 +730,6 @@ impl AgentRuntime {
         let skill_context = load_enabled_skill_context(&config.skills, &workspace)?;
         let prepared_request = attach_skill_context(&memory.request, &skill_context);
         let mut trusted_context = memory.context.into_iter().collect::<Vec<_>>();
-        trusted_context.extend(skill_context);
         trusted_context.push(runtime_session_context(
             self.token_usage(),
             context_token_budget(config, route),
@@ -751,6 +751,7 @@ impl AgentRuntime {
                 session_id: &session_id,
                 request: dispatched_request,
                 persona: persona.as_deref(),
+                static_context: &skill_context,
                 trusted_context: &trusted_context,
                 cancellation,
             },
@@ -819,6 +820,7 @@ impl AgentRuntime {
                 turn.session_id,
                 turn.request,
                 turn.persona,
+                turn.static_context,
                 turn.trusted_context,
                 resources.tools,
                 resources.approvals,
@@ -891,6 +893,7 @@ impl AgentRuntime {
         session_id: &str,
         request: &str,
         persona: Option<&str>,
+        static_context: &[String],
         trusted_context: &[String],
         mut tools: ToolHost,
         approvals: Arc<dyn ApprovalBroker>,
@@ -956,6 +959,7 @@ impl AgentRuntime {
             model: route.model.clone(),
             user_message: request.to_owned(),
             persona: persona.map(str::to_owned),
+            static_context: static_context.to_vec(),
             trusted_context: trusted_context.to_vec(),
             max_output_tokens,
         };

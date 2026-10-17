@@ -1379,13 +1379,25 @@ impl SessionCommandContext {
 
 fn configured_optimization_pipeline(config: &AgentConfig) -> OptimizationPipeline {
     let timeout = Duration::from_secs(2);
-    let optimizers = config
+    let mut optimizers = config
         .optimizers
         .iter()
         .filter_map(|configured| RtkOptimizer::from_config(configured, timeout))
         .map(|optimizer| Box::new(optimizer) as Box<dyn TokenOptimizer>)
-        .collect();
+        .collect::<Vec<_>>();
+    if should_auto_enable_rtk(config)
+        && let Ok(optimizer) = RtkOptimizer::new(PathBuf::from("rtk"), Vec::new(), timeout)
+    {
+        optimizers.push(Box::new(optimizer));
+    }
     OptimizationPipeline::new(optimizers)
+}
+
+fn should_auto_enable_rtk(config: &AgentConfig) -> bool {
+    !config
+        .optimizers
+        .iter()
+        .any(|optimizer| optimizer.id.eq_ignore_ascii_case("rtk"))
 }
 
 fn command_looks_sensitive(command: &str) -> bool {
@@ -5190,13 +5202,10 @@ fn show_doctor(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         }
     }
     writeln!(writer, "◆ Token optimizers")?;
-    if config.optimizers.is_empty() {
-        writeln!(
-            writer,
-            "  none configured · native filtering remains active"
-        )?;
-        return Ok(());
-    }
+    writeln!(
+        writer,
+        "  native  enabled   redaction · filtering · clipping"
+    )?;
     let timeout = Duration::from_secs(2);
     for configured in &config.optimizers {
         let state = RtkOptimizer::from_config(configured, timeout).map_or("unsupported", |rtk| {
@@ -5216,6 +5225,15 @@ fn show_doctor(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
                 "disabled"
             },
             state
+        )?;
+    }
+    if should_auto_enable_rtk(&config) {
+        let automatic = RtkOptimizer::new(PathBuf::from("rtk"), Vec::new(), timeout)
+            .is_ok_and(|rtk| rtk.available());
+        writeln!(
+            writer,
+            "  rtk     automatic {}",
+            if automatic { "available" } else { "missing" }
         )?;
     }
     writeln!(
@@ -9178,8 +9196,8 @@ mod tests {
         Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
     };
     use crumb_agent::{
-        AgentConfig, ApprovalMode, CredentialReference, HarnessConfig, ProviderHeader,
-        ProviderProtocol, RiskClass, SkillConfig,
+        AgentConfig, ApprovalMode, CredentialReference, HarnessConfig, OptimizerConfig,
+        ProviderHeader, ProviderProtocol, RiskClass, SkillConfig,
     };
     use crumb_marketplace::UpdateStatus;
     use crumb_memory::{MemoryScope, MemorySet, MemoryStore};
@@ -9194,10 +9212,10 @@ mod tests {
         marketplace_update_blocker, openrouter_preset, parse_credential_reference,
         parse_paused_submission, parse_provider_header, parse_resume_session_argument,
         read_agent_config, read_bounded_response, register_local_skill, resolve_memory_keep,
-        sanitize_transcript_output, set_skill_enabled, show_graph, show_marketplace, show_memory,
-        show_profile_with_stores, suggestion_width, unregister_local_skill,
-        validate_marketplace_path, validate_marketplace_response, visible_tool_activity,
-        workspace_read_host, write_bounded_response_delta,
+        sanitize_transcript_output, set_skill_enabled, should_auto_enable_rtk, show_graph,
+        show_marketplace, show_memory, show_profile_with_stores, suggestion_width,
+        unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
+        visible_tool_activity, workspace_read_host, write_bounded_response_delta,
     };
 
     #[test]
@@ -10049,5 +10067,19 @@ mod tests {
             visible_tool_activity("run_shell", Some("command -v g++ && g++ --version")),
             "Running command · $ command -v g++ && g++ --version"
         );
+    }
+
+    #[test]
+    fn rtk_is_automatic_unless_the_user_explicitly_configures_it() {
+        let mut config = AgentConfig::default();
+        assert!(should_auto_enable_rtk(&config));
+
+        config.optimizers.push(OptimizerConfig {
+            id: "RTK".to_owned(),
+            command: PathBuf::from("rtk"),
+            arguments: Vec::new(),
+            enabled: false,
+        });
+        assert!(!should_auto_enable_rtk(&config));
     }
 }

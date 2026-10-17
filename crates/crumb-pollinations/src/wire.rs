@@ -22,12 +22,20 @@ pub(crate) struct ChatCompletionRequest<'a> {
 
 impl<'a> From<&'a ChatRequest> for ChatCompletionRequest<'a> {
     fn from(request: &'a ChatRequest) -> Self {
+        let prompt_cache_supported =
+            supports_prompt_cache(&request.model, request.tools.is_empty());
         Self {
             model: &request.model,
             messages: request
                 .messages
                 .iter()
-                .map(ChatCompletionMessage::from)
+                .enumerate()
+                .map(|(index, message)| {
+                    ChatCompletionMessage::new(
+                        message,
+                        prompt_cache_supported && index == 0 && message.role == ChatRole::System,
+                    )
+                })
                 .collect(),
             stream: true,
             max_tokens: request.max_output_tokens,
@@ -43,18 +51,26 @@ impl<'a> From<&'a ChatRequest> for ChatCompletionRequest<'a> {
 #[derive(Debug, Serialize)]
 struct ChatCompletionMessage<'a> {
     role: &'static str,
-    content: &'a str,
+    content: ChatCompletionContent<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<AssistantToolCall<'a>>,
 }
 
-impl<'a> From<&'a crumb_llm::ChatMessage> for ChatCompletionMessage<'a> {
-    fn from(message: &'a crumb_llm::ChatMessage) -> Self {
+impl<'a> ChatCompletionMessage<'a> {
+    fn new(message: &'a crumb_llm::ChatMessage, cacheable: bool) -> Self {
         Self {
             role: role_name(message.role),
-            content: &message.content,
+            content: if cacheable {
+                ChatCompletionContent::Cached([CachedTextBlock {
+                    kind: "text",
+                    text: &message.content,
+                    cache_control: CacheControl { kind: "ephemeral" },
+                }])
+            } else {
+                ChatCompletionContent::Text(&message.content)
+            },
             tool_call_id: message.tool_call_id.as_deref(),
             tool_calls: message
                 .tool_calls
@@ -63,6 +79,38 @@ impl<'a> From<&'a crumb_llm::ChatMessage> for ChatCompletionMessage<'a> {
                 .collect(),
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ChatCompletionContent<'a> {
+    Text(&'a str),
+    Cached([CachedTextBlock<'a>; 1]),
+}
+
+#[derive(Debug, Serialize)]
+struct CachedTextBlock<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+    cache_control: CacheControl,
+}
+
+#[derive(Debug, Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+fn supports_prompt_cache(model: &str, tools_empty: bool) -> bool {
+    let model = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    matches!(model.as_str(), "nova" | "nova-fast")
+        || model.starts_with("claude")
+        || (tools_empty && model.starts_with("gemini"))
 }
 
 #[derive(Debug, Serialize)]
@@ -472,6 +520,49 @@ mod tests {
         assert_eq!(json["max_tokens"], 64);
         assert!(json.get("tools").is_none());
         assert!(json.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn nova_request_marks_only_the_stable_system_prefix_for_caching() {
+        let request = ChatRequest {
+            model: "nova-fast".to_owned(),
+            messages: vec![
+                ChatMessage::text(ChatRole::System, "stable"),
+                ChatMessage::text(ChatRole::System, "dynamic"),
+                ChatMessage::text(ChatRole::User, "hello"),
+            ],
+            tools: Vec::new(),
+            tool_choice: ToolChoice::None,
+            max_output_tokens: None,
+        };
+
+        let json = serde_json::to_value(ChatCompletionRequest::from(&request))
+            .expect("request should serialize");
+
+        assert_eq!(json["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(json["messages"][0]["content"][0]["text"], "stable");
+        assert_eq!(
+            json["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(json["messages"][1]["content"], "dynamic");
+        assert_eq!(json["messages"][2]["content"], "hello");
+    }
+
+    #[test]
+    fn unsupported_model_keeps_plain_string_messages() {
+        let request = ChatRequest {
+            model: "openai".to_owned(),
+            messages: vec![ChatMessage::text(ChatRole::System, "stable")],
+            tools: Vec::new(),
+            tool_choice: ToolChoice::None,
+            max_output_tokens: None,
+        };
+
+        let json = serde_json::to_value(ChatCompletionRequest::from(&request))
+            .expect("request should serialize");
+
+        assert_eq!(json["messages"][0]["content"], "stable");
     }
 
     #[test]

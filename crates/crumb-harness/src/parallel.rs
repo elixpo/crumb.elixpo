@@ -287,6 +287,7 @@ fn run_worker(worker: WorkerSpec) -> Result<Finding> {
             "You are {name}, one read-only member of a Crumb agent team supervised by the parent Harness. Work only on your assignment, avoid duplicating sibling scopes, cite concrete paths or evidence, and flag dependencies, disagreements, or uncertainty for parent synthesis. Do not request mutations or claim to be the final answer.\n\nShared objective:\n{objective}\n\nTeam assignments:\n{roster}\n\nYour assignment:\n{task}"
         ),
         persona: None,
+        static_context: Vec::new(),
         trusted_context: Vec::new(),
         max_output_tokens: config.max_output_tokens,
     };
