@@ -129,7 +129,7 @@ engines remain replaceable; none may bypass Crumb's permission, credential, or s
   - [x] Add read-only stack detection and approval-gated disposable tool execution.
   - [x] Add bounded read-only parallel agents with short session identities.
   - Defer all connector implementation until the connector-free terminal is release-ready.
-- [ ] [Supervise and authorize third-party MCP servers](https://github.com/elixpo/crumb.elixpo/issues/47).
+- [x] [Supervise and authorize third-party MCP servers](https://github.com/elixpo/crumb.elixpo/issues/47).
   - [x] Supervise bounded local STDIO MCP servers ([PR #96](https://github.com/elixpo/crumb.elixpo/pull/96)).
   - [x] Supervise remote Streamable HTTP MCP servers ([issue #97](https://github.com/elixpo/crumb.elixpo/issues/97)).
   - [x] [WP-033: audit supervised MCP lifecycle and tool outcomes](https://github.com/elixpo/crumb.elixpo/issues/124).

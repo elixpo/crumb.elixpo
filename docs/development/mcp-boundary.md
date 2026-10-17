@@ -1,9 +1,10 @@
 # Crumb MCP boundary
 
-Crumb exposes tools through a Rust-owned MCP server rather than granting the
-Harness direct shell or filesystem capabilities. The initial server supports
-newline-delimited stdio for MCP `2025-11-25`, used by the current DeepSeek
-Harness client, and the stateless `2026-07-28` discovery shape.
+Crumb exposes its own tools through a Rust-owned MCP server rather than granting
+the Harness direct shell or filesystem capabilities. It also consumes optional
+third-party MCP servers through supervised local STDIO and remote Streamable
+HTTP clients. All three paths terminate at the same Rust-owned tool registry and
+approval boundary.
 
 ## Policy
 
@@ -19,6 +20,24 @@ Harness client, and the stateless `2026-07-28` discovery shape.
 
 Tool annotations are derived from trusted Rust metadata. Model-provided or
 third-party annotations never change Crumb's risk class or approval decision.
+
+## Third-party MCP supervision
+
+- Installing or configuring a server does not enable it or grant any tool.
+- Local servers start with a cleared environment in the canonical workspace;
+  recursive Crumb launches are rejected.
+- Remote credentials are resolved by the trusted caller and held only in
+  secret wrappers. Configuration and diagnostics contain references, not values.
+- Discovered tools become `mcp__<server>__<tool>`. Duplicate or colliding names
+  reject the server instead of replacing an existing capability.
+- STDIO tools are classified as process execution. Streamable HTTP tools are
+  classified as network access. Publisher annotations cannot lower either risk.
+- Discovery count, schema, frame, response, startup, request, and shutdown
+  limits are enforced before results reach the model.
+- Cancellation reaches active local and remote requests. Local children are
+  terminated and reaped; one failed server does not disable the terminal.
+- External errors are reduced to a bounded allowlist of diagnostics so secrets
+  and arbitrary server text cannot cross into logs or UI errors.
 
 ## Workspace reads
 
@@ -69,6 +88,8 @@ agent indefinitely.
 2. [x] Isolated shell execution with output/time ceilings.
 3. [x] Interactive allow-once approval bridge for negotiate mode.
 4. [x] `crumb mcp serve` entry point and Harness Cordis composition.
+5. [x] Supervised local STDIO client with namespaced discovery and cancellation.
+6. [x] Supervised remote Streamable HTTP client with scoped credential resolution.
 
 The stdio entry point registers `read_file`, `list_directory`, and checkpointed
 `write_file`. Its stdout is MCP-only and it loads limits, mode, and exact
