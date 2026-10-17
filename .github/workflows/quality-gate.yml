@@ -67,7 +67,7 @@ jobs:
       # ── Node.js setup (nextjs) ─────────────────────────────────────
       - name: Setup Node.js
         if: steps.manifest.outputs.exists == 'true' && steps.manifest.outputs.stack == 'nextjs'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ steps.manifest.outputs.node_version }}
           cache: npm
