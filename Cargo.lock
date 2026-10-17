@@ -616,6 +616,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crumb-agent",
+ "crumb-auth",
+ "reqwest",
  "serde_json",
 ]
 

@@ -190,18 +190,21 @@ fn project_headers(
 }
 
 fn resolve_credential(reference: &CredentialReference) -> Result<(String, SecretString)> {
+    let secret = resolve_credential_secret(reference)?;
+    let name = match reference {
+        CredentialReference::Environment { name } => name.clone(),
+        CredentialReference::Keyring { .. } => KEYRING_CREDENTIAL_ENV.to_owned(),
+    };
+    Ok((name, secret))
+}
+
+pub(crate) fn resolve_credential_secret(reference: &CredentialReference) -> Result<SecretString> {
     match reference {
-        CredentialReference::Environment { name } => Ok((
-            name.clone(),
-            environment_secret(name, "provider credential")?,
-        )),
+        CredentialReference::Environment { name } => environment_secret(name, "credential"),
         CredentialReference::Keyring { service, account } => {
-            let secret = OsCredentialStore::named(service, account)?
+            OsCredentialStore::named(service, account)?
                 .get()?
-                .with_context(|| {
-                    format!("provider keyring reference `{service}/{account}` is empty")
-                })?;
-            Ok((KEYRING_CREDENTIAL_ENV.to_owned(), secret))
+                .with_context(|| format!("keyring reference `{service}/{account}` is empty"))
         }
     }
 }

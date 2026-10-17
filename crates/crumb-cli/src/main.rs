@@ -39,7 +39,10 @@ use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_marketplace::{
     Catalog, InstallScope, Installer, Package, bundled_catalog, verify_package_files,
 };
-use crumb_mcp::{McpDispatcher, StdioMcpLimits, register_stdio_servers, serve_stdio};
+use crumb_mcp::{
+    McpDispatcher, StdioMcpLimits, StreamableHttpLimits, register_stdio_servers,
+    register_streamable_http_servers, serve_stdio,
+};
 use crumb_memory::{
     MemoryProvenance, MemoryRecord, MemoryRetirement, MemoryScope, MemorySet, MemoryStore,
 };
@@ -305,7 +308,7 @@ fn serve_mcp() -> Result<()> {
     let config = read_agent_config(&workspace)?;
     let search_api_key = pollinations_environment_key();
     let mut host = workspace_read_host(&workspace, &config, search_api_key)?;
-    let diagnostics = register_stdio_servers(
+    let mut diagnostics = register_stdio_servers(
         &mut host,
         &config.mcp_servers,
         &workspace,
@@ -318,6 +321,18 @@ fn serve_mcp() -> Result<()> {
             max_tools: 128,
         },
     );
+    diagnostics.extend(register_streamable_http_servers(
+        &mut host,
+        &config.mcp_servers,
+        StreamableHttpLimits {
+            startup_timeout: Duration::from_secs(config.limits.max_harness_initialize_seconds),
+            request_timeout: Duration::from_secs(config.limits.max_wall_time_seconds),
+            max_response_bytes: usize::try_from(config.limits.max_output_bytes)
+                .context("max_output_bytes exceeds this platform's address space")?,
+            max_tools: 128,
+        },
+        provider_projection::resolve_credential_secret,
+    ));
     for diagnostic in diagnostics {
         eprintln!(
             "warning: MCP {} · {}",
@@ -329,7 +344,7 @@ fn serve_mcp() -> Result<()> {
         Arc::new(
             ConfiguredApprovals::new(config.permissions.allow_network_tools.clone())
                 .with_workspace_tools(config.permissions.allow_workspace_tools.clone())
-                .with_process_tools(config.permissions.allow_process_tools.clone()),
+                .with_mcp_tools(config.permissions.allow_mcp_tools.clone()),
         ),
         config.mode,
         env!("CARGO_PKG_VERSION"),
@@ -3860,8 +3875,8 @@ fn show_plugins(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     writeln!(writer, "  ● enabled · ○ disabled")?;
     writeln!(
         writer,
-        "  {} exact process-tool grants",
-        config.permissions.allow_process_tools.len()
+        "  {} exact MCP tool grants",
+        config.permissions.allow_mcp_tools.len()
     )?;
     Ok(())
 }
@@ -3909,10 +3924,10 @@ fn configure_plugin(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result
                 if allowed {
                     config
                         .permissions
-                        .allow_process_tools
+                        .allow_mcp_tools
                         .insert((*tool).to_owned());
                 } else {
-                    config.permissions.allow_process_tools.remove(*tool);
+                    config.permissions.allow_mcp_tools.remove(*tool);
                 }
                 Ok(())
             })?;
@@ -4836,13 +4851,19 @@ fn register_installed_package(
                 .iter_mut()
                 .find(|server| server.id == entry.id)
             {
+                server.transport = crumb_agent::McpTransport::Stdio;
                 server.command = command;
                 server.arguments.clone_from(&entry.arguments);
+                server.url = None;
+                server.credential = None;
             } else {
                 config.mcp_servers.push(McpServer {
                     id: entry.id.clone(),
+                    transport: crumb_agent::McpTransport::Stdio,
                     command,
                     arguments: entry.arguments.clone(),
+                    url: None,
+                    credential: None,
                     enabled: false,
                 });
             }
@@ -6067,7 +6088,7 @@ mod tests {
         assert!(
             config
                 .permissions
-                .allow_process_tools
+                .allow_mcp_tools
                 .contains("mcp__crumb-workspace__read_file")
         );
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");

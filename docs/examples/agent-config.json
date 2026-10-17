@@ -69,10 +69,19 @@
     "embeddings": [{ "provider": "pollinations", "model": "openai-3-small", "effort": null }]
   },
   "skills": [],
-  "mcp_servers": [],
+  "mcp_servers": [
+    {
+      "id": "example-remote",
+      "transport": "streamable_http",
+      "url": "https://mcp.example.com/api",
+      "credential": { "source": "environment", "name": "EXAMPLE_MCP_TOKEN" },
+      "enabled": false
+    }
+  ],
   "permissions": {
     "allow_network_tools": ["web_search"],
-    "allow_workspace_tools": ["write_file"]
+    "allow_workspace_tools": ["write_file"],
+    "allow_mcp_tools": []
   },
   "optimizers": [
     { "id": "rtk", "command": "rtk", "arguments": [], "enabled": true }

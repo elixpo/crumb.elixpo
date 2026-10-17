@@ -37,6 +37,7 @@ pub use session::{
 pub use steering::{SteeringAction, SteeringQueue};
 pub use tools::{
     ApprovalBroker, ApprovalDecision, ApprovalRequest, ConfiguredApprovals, DenyAllApprovals,
-    McpServer, OutputKind, RiskClass, TokenOptimizer, ToolCallError, ToolCallErrorKind,
-    ToolDescriptor, ToolHandler, ToolHost, ToolOutput, ToolRegistry, ToolTransport,
+    McpServer, McpTransport, OutputKind, RiskClass, TokenOptimizer, ToolCallError,
+    ToolCallErrorKind, ToolDescriptor, ToolHandler, ToolHost, ToolOutput, ToolRegistry,
+    ToolTransport,
 };

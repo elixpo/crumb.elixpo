@@ -353,8 +353,9 @@ pub struct ToolPermissions {
     pub allow_network_tools: BTreeSet<String>,
     /// Workspace-write tools explicitly enabled by the user.
     pub allow_workspace_tools: BTreeSet<String>,
-    /// Supervised local-process tools explicitly allowed by the user.
-    pub allow_process_tools: BTreeSet<String>,
+    /// Supervised MCP tools explicitly allowed by the user.
+    #[serde(alias = "allow_process_tools")]
+    pub allow_mcp_tools: BTreeSet<String>,
 }
 
 /// Complete live configuration. Secrets are deliberately not representable.
@@ -443,12 +444,8 @@ impl AgentConfig {
             }) => self.validate_coding_cli(command, capabilities)?,
             _ => {}
         }
-        if self
-            .mcp_servers
-            .iter()
-            .any(|server| server.id.trim().is_empty() || server.command.as_os_str().is_empty())
-        {
-            bail!("MCP servers require an identifier and command");
+        for server in &self.mcp_servers {
+            validate_mcp_server(server)?;
         }
         if self.optimizers.iter().any(|optimizer| {
             optimizer.id.trim().is_empty() || optimizer.command.as_os_str().is_empty()
@@ -463,7 +460,7 @@ impl AgentConfig {
             .any(|tool| !valid_identifier(tool))
             || self
                 .permissions
-                .allow_process_tools
+                .allow_mcp_tools
                 .iter()
                 .any(|tool| !valid_mcp_tool_name(tool))
         {
@@ -608,6 +605,57 @@ fn validate_provider(id: &str, provider: &ProviderConfig) -> Result<()> {
         };
         if !valid_identifier(metric) || !parsed.is_finite() || parsed < 0.0 {
             bail!("provider `{id}` pricing entries require identifier keys and numeric values");
+        }
+    }
+    Ok(())
+}
+
+fn validate_mcp_server(server: &crate::tools::McpServer) -> Result<()> {
+    use crate::tools::McpTransport;
+
+    if !valid_identifier(&server.id) {
+        bail!("MCP servers require a valid identifier");
+    }
+    match server.transport {
+        McpTransport::Stdio => {
+            if server.command.as_os_str().is_empty()
+                || server.url.is_some()
+                || server.credential.is_some()
+            {
+                bail!("STDIO MCP servers require a command and cannot configure HTTP fields");
+            }
+        }
+        McpTransport::StreamableHttp => {
+            if !server.command.as_os_str().is_empty() || !server.arguments.is_empty() {
+                bail!("Streamable HTTP MCP servers cannot configure a process command");
+            }
+            let endpoint = url::Url::parse(
+                server
+                    .url
+                    .as_deref()
+                    .context("Streamable HTTP MCP servers require a URL")?,
+            )
+            .context("Streamable HTTP MCP server URL is invalid")?;
+            let loopback = endpoint
+                .host_str()
+                .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"));
+            if !matches!(endpoint.scheme(), "http" | "https")
+                || endpoint.host_str().is_none()
+                || !endpoint.username().is_empty()
+                || endpoint.password().is_some()
+                || endpoint.fragment().is_some()
+                || (endpoint.scheme() != "https" && !loopback)
+            {
+                bail!(
+                    "Streamable HTTP MCP URLs require HTTPS, except for credential-free loopback fixtures"
+                );
+            }
+            if let Some(credential) = &server.credential {
+                validate_credential_reference(credential)?;
+                if endpoint.scheme() != "https" {
+                    bail!("Streamable HTTP MCP credentials require HTTPS");
+                }
+            }
         }
     }
     Ok(())
@@ -815,7 +863,7 @@ mod tests {
     use super::{
         AgentConfig, AgentMode, HarnessConfig, LiveConfig, MistakePolicy, Modality, ModelRoute,
     };
-    use crate::{CodingBackend, ModelCapabilities};
+    use crate::{CodingBackend, McpTransport, ModelCapabilities};
 
     #[test]
     fn model_routes_are_data_driven() {
@@ -847,6 +895,57 @@ mod tests {
     fn secrets_are_not_part_of_the_config_schema() {
         let result = serde_json::from_str::<AgentConfig>(r#"{"api_key":"secret"}"#);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn streamable_http_mcp_requires_https_except_for_loopback() {
+        let secure = serde_json::from_str::<AgentConfig>(
+            r#"{"mcp_servers":[{"id":"remote","transport":"streamable_http","url":"https://mcp.example.test/api","enabled":true}]}"#,
+        )
+        .expect("HTTP MCP shape parses");
+        secure.validate().expect("HTTPS MCP validates");
+        assert_eq!(
+            secure.mcp_servers[0].transport,
+            McpTransport::StreamableHttp
+        );
+
+        let loopback = serde_json::from_str::<AgentConfig>(
+            r#"{"mcp_servers":[{"id":"fixture","transport":"streamable_http","url":"http://127.0.0.1:8765/mcp"}]}"#,
+        )
+        .expect("loopback shape parses");
+        loopback.validate().expect("loopback fixture validates");
+
+        let plaintext = serde_json::from_str::<AgentConfig>(
+            r#"{"mcp_servers":[{"id":"unsafe","transport":"streamable_http","url":"http://mcp.example.test/api"}]}"#,
+        )
+        .expect("plaintext shape parses");
+        assert!(plaintext.validate().is_err());
+    }
+
+    #[test]
+    fn streamable_http_mcp_only_persists_credential_references() {
+        let config = serde_json::from_str::<AgentConfig>(
+            r#"{
+                "mcp_servers":[{
+                    "id":"remote",
+                    "transport":"streamable_http",
+                    "url":"https://mcp.example.test/api",
+                    "credential":{"source":"environment","name":"REMOTE_MCP_TOKEN"}
+                }],
+                "permissions":{"allow_process_tools":["mcp__remote__query"]}
+            }"#,
+        )
+        .expect("credential reference parses");
+        config.validate().expect("credential reference validates");
+        assert!(
+            config
+                .permissions
+                .allow_mcp_tools
+                .contains("mcp__remote__query")
+        );
+        let encoded = serde_json::to_string(&config).expect("config serializes");
+        assert!(encoded.contains("allow_mcp_tools"));
+        assert!(!encoded.contains("allow_process_tools"));
     }
 
     #[test]

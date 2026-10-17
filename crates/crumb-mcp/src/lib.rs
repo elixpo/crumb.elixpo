@@ -1,8 +1,10 @@
 //! Policy-enforcing MCP server owned by Crumb.
 
 mod client;
+mod http_client;
 
 pub use client::{McpDiagnostic, StdioMcpLimits, register_stdio_servers};
+pub use http_client::{StreamableHttpLimits, register_streamable_http_servers};
 
 use std::io::{BufRead, Write};
 use std::sync::Arc;

@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use crumb_agent::{
-    CancellationToken, McpServer, RiskClass, ToolDescriptor, ToolHandler, ToolHost, ToolOutput,
-    ToolTransport,
+    CancellationToken, McpServer, McpTransport, RiskClass, ToolDescriptor, ToolHandler, ToolHost,
+    ToolOutput, ToolTransport,
 };
 use serde_json::{Value, json};
 
@@ -52,7 +52,10 @@ pub fn register_stdio_servers(
     limits: StdioMcpLimits,
 ) -> Vec<McpDiagnostic> {
     let mut diagnostics = Vec::new();
-    for server in servers.iter().filter(|server| server.enabled) {
+    for server in servers
+        .iter()
+        .filter(|server| server.enabled && server.transport == McpTransport::Stdio)
+    {
         if let Err(error) = register_server(host, server, workspace, limits) {
             diagnostics.push(McpDiagnostic {
                 server_id: server.id.clone(),
@@ -109,10 +112,10 @@ fn register_server(
     Ok(())
 }
 
-struct DiscoveredTool {
-    name: String,
-    description: String,
-    input_schema: Value,
+pub(crate) struct DiscoveredTool {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) input_schema: Value,
 }
 
 struct StdioMcpClient {
@@ -348,7 +351,7 @@ impl ToolHandler for StdioToolHandler {
     }
 }
 
-fn parse_tool(value: &Value) -> Result<DiscoveredTool> {
+pub(crate) fn parse_tool(value: &Value) -> Result<DiscoveredTool> {
     let name = value
         .get("name")
         .and_then(Value::as_str)
@@ -375,7 +378,7 @@ fn parse_tool(value: &Value) -> Result<DiscoveredTool> {
     })
 }
 
-fn parse_tool_output(result: &Value, maximum: usize) -> Result<ToolOutput> {
+pub(crate) fn parse_tool_output(result: &Value, maximum: usize) -> Result<ToolOutput> {
     let mut text = String::new();
     if let Some(content) = result.get("content").and_then(Value::as_array) {
         for block in content {
@@ -409,7 +412,7 @@ fn parse_tool_output(result: &Value, maximum: usize) -> Result<ToolOutput> {
     })
 }
 
-fn validate_component(value: &str, label: &str) -> Result<()> {
+pub(crate) fn validate_component(value: &str, label: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 64
         || !value
@@ -433,7 +436,7 @@ fn read_frame(reader: &mut dyn BufRead, maximum: usize) -> Result<Option<Vec<u8>
     Ok(Some(frame))
 }
 
-fn redacted_error(error: &anyhow::Error) -> String {
+pub(crate) fn redacted_error(error: &anyhow::Error) -> String {
     let text = error.to_string();
     for allowed in [
         "unavailable",
@@ -520,8 +523,11 @@ mod tests {
         std::fs::write(&script, contents).expect("fixture script");
         let server = McpServer {
             id: "fixture".to_owned(),
+            transport: crumb_agent::McpTransport::Stdio,
             command: "/bin/sh".into(),
             arguments: vec![script.to_string_lossy().into_owned()],
+            url: None,
+            credential: None,
             enabled: true,
         };
         let mut host = ToolHost::default();
@@ -548,7 +554,7 @@ mod tests {
         assert!(!marker.exists());
 
         let approvals = ConfiguredApprovals::default()
-            .with_process_tools(["mcp__fixture__echo".to_owned()].into_iter().collect());
+            .with_mcp_tools(["mcp__fixture__echo".to_owned()].into_iter().collect());
         let output = host
             .call(
                 "mcp__fixture__echo",
