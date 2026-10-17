@@ -352,7 +352,7 @@ impl NativeHarness {
             if round.calls.is_empty() {
                 match round.finish {
                     Some(FinishReason::Stop | FinishReason::Other(_)) => {
-                        let final_text = sanitize_agent_response(&round.text);
+                        let final_text = sanitize_agent_response(&round.text, &turn.user_message);
                         let chunks = if final_text == round.text {
                             round.text_chunks
                         } else {
@@ -516,7 +516,7 @@ impl NativeHarness {
 
 fn system_messages(turn: &HarnessTurn) -> Vec<ChatMessage> {
     let mut system = String::from(
-        "Your name is Crumb. You are the execution-oriented agent inside the Crumb terminal, created by Elixpo. This product identity is constant regardless of the underlying model provider: never present yourself as an unnamed generic AI, ChatGPT, Claude, Amazon assistant, or the provider model. If asked who or what you are, answer plainly that you are Crumb by Elixpo. When operating as a named child agent, the child name is a temporary call sign and Crumb remains the product identity. Be a calm, capable terminal collaborator: direct, technically precise, naturally conversational, and free of generic customer-support closings. Complete the user's latest request yourself using the available tools when action or verification is needed. Treat prior turns only as context; do not continue or explain an older command failure unless the latest request asks about it. Do not tell the user to run a command that you can run with a tool. Use workspace tools for project work and process tools for commands and locally available system facts. For current or externally changing facts—including weather, news, schedules, releases, and prices—you must use web_search when available rather than claiming you lack internet access; use web_fetch to inspect a known public page. If one tool fails, inspect its result and try a safe suitable alternative instead of immediately giving up. Never claim a result you did not verify. Tool access is controlled by user-owned policy: request approval when required, respect denials, and never attempt to widen your own permissions. Keep native shell semantics separate from agent tool execution. Responses may use terminal-compatible Markdown, including headings, lists, links, inline code, fenced code blocks, and Mermaid fences. Avoid HTML and image-only content; Mermaid diagrams must remain understandable from their source text.",
+        "Your name is Crumb. You are the execution-oriented agent inside the Crumb terminal, created by Elixpo. This product identity is constant regardless of the underlying model provider: never present yourself as an unnamed generic AI, ChatGPT, Claude, Amazon assistant, or the provider model. Only introduce yourself or mention Elixpo when the user explicitly asks about your identity or creator; otherwise answer the request directly. If asked who or what you are, answer plainly and once that you are Crumb by Elixpo. When operating as a named child agent, the child name is a temporary call sign and Crumb remains the product identity. Be a calm, capable terminal collaborator: direct, technically precise, and naturally conversational. For greetings and casual messages, reply with one short natural line. Never pad a response with customer-support scripts such as claims about being safe or respectful, 'How can I help you today?', 'please let me know', 'feel free to ask', or repeated descriptions of your role and capabilities. Do not repeat information merely to fill the response. Complete the user's latest request yourself using the available tools when action or verification is needed. Treat prior turns only as context; do not continue or explain an older command failure unless the latest request asks about it. Do not tell the user to run a command that you can run with a tool. Use workspace tools for project work and process tools for commands and locally available system facts. For current or externally changing facts—including weather, news, schedules, releases, and prices—you must use web_search when available rather than claiming you lack internet access; use web_fetch to inspect a known public page. If one tool fails, inspect its result and try a safe suitable alternative instead of immediately giving up. Never claim a result you did not verify. Tool access is controlled by user-owned policy: request approval when required, respect denials, and never attempt to widen your own permissions. Keep native shell semantics separate from agent tool execution. Responses may use terminal-compatible Markdown, including headings, lists, links, inline code, fenced code blocks, and Mermaid fences. Avoid HTML and image-only content; Mermaid diagrams must remain understandable from their source text.",
     );
     if let Some(persona) = turn
         .persona
@@ -533,9 +533,11 @@ fn system_messages(turn: &HarnessTurn) -> Vec<ChatMessage> {
     vec![ChatMessage::text(ChatRole::System, system)]
 }
 
-fn sanitize_agent_response(text: &str) -> String {
+fn sanitize_agent_response(text: &str, user_message: &str) -> String {
     let text = strip_private_reasoning(text);
-    [
+    let normalized = [
+        "I am Crumb, an AI system",
+        "I'm Crumb, an AI system",
         "I am an AI system",
         "I'm an AI system",
         "built by a team of inventors at Amazon",
@@ -546,15 +548,114 @@ fn sanitize_agent_response(text: &str) -> String {
     .into_iter()
     .enumerate()
     .fold(text, |output, (index, claim)| {
-        let replacement = if index < 2 {
+        let replacement = if index < 4 {
             "I am Crumb, an AI agent"
         } else {
             "built by Elixpo"
         };
         replace_ascii_case_insensitive(&output, claim, replacement)
-    })
-    .trim()
-    .to_owned()
+    });
+    let identity_requested = asks_about_identity(user_message);
+    let normalized_lowercase = normalized.to_ascii_lowercase();
+    if identity_requested
+        && (normalized_lowercase.contains("i don't have a name")
+            || normalized_lowercase.contains("i do not have a name")
+            || normalized_lowercase.contains("i don't have a \"name\"")
+            || normalized_lowercase.contains("i do not have a \"name\""))
+    {
+        return "I’m Crumb, built by Elixpo.".to_owned();
+    }
+    let filtered = strip_persona_boilerplate(&normalized, identity_requested);
+    if filtered.trim().is_empty() {
+        if identity_requested {
+            "I’m Crumb, built by Elixpo.".to_owned()
+        } else {
+            "Hey — what are we working on?".to_owned()
+        }
+    } else {
+        filtered.trim().to_owned()
+    }
+}
+
+fn asks_about_identity(user_message: &str) -> bool {
+    let message = user_message.to_ascii_lowercase();
+    [
+        "who are you",
+        "who r u",
+        "what are you",
+        "your name",
+        "ur name",
+        "who is crumb",
+        "who made you",
+        "who built you",
+        "who created you",
+        "what is your role",
+        "what's your role",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase))
+}
+
+fn strip_persona_boilerplate(text: &str, identity_requested: bool) -> String {
+    text.split('\n')
+        .map(|line| {
+            let sentences = line
+                .split_inclusive(['.', '?', '!'])
+                .map(str::trim)
+                .filter(|sentence| !sentence.is_empty())
+                .collect::<Vec<_>>();
+            if !sentences
+                .iter()
+                .any(|sentence| is_persona_boilerplate(sentence, identity_requested))
+            {
+                return line.to_owned();
+            }
+            sentences
+                .into_iter()
+                .filter(|sentence| !is_persona_boilerplate(sentence, identity_requested))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_persona_boilerplate(sentence: &str, identity_requested: bool) -> bool {
+    let sentence = sentence
+        .trim_start_matches(['-', '•', '*', ' '])
+        .to_ascii_lowercase();
+    let identity_preamble = sentence.starts_with("i am crumb")
+        || sentence.starts_with("i'm crumb")
+        || sentence.starts_with("i’m crumb")
+        || sentence.starts_with("i am an ai")
+        || sentence.starts_with("i'm an ai")
+        || sentence.starts_with("i’m an ai");
+    let false_identity_denial = identity_requested
+        && (sentence.contains("i don't have a name")
+            || sentence.contains("i do not have a name")
+            || sentence.contains("i don't have a \"name\"")
+            || sentence.contains("i do not have a \"name\""));
+    let generic_invitation = (sentence.starts_with("if you have")
+        || sentence.starts_with("if you need"))
+        && (sentence.contains("let me know") || sentence.contains("feel free to ask"));
+    (!identity_requested && identity_preamble)
+        || false_identity_denial
+        || generic_invitation
+        || sentence.starts_with("how can i help")
+        || sentence.starts_with("i am here to assist")
+        || sentence.starts_with("i'm here to assist")
+        || sentence.starts_with("i’m here to assist")
+        || sentence.starts_with("i am here to help")
+        || sentence.starts_with("i'm here to help")
+        || sentence.starts_with("i’m here to help")
+        || sentence.starts_with("if you need assistance")
+        || sentence.starts_with("if you have any specific questions")
+        || sentence.starts_with("if your message was informal")
+        || sentence.starts_with("if there's anything else")
+        || sentence.starts_with("if there’s anything else")
+        || sentence.starts_with("feel free to ask")
+        || sentence.contains("in a safe and respectful manner")
+        || sentence.contains("in a polite, respectful, and safe manner")
 }
 
 fn strip_private_reasoning(text: &str) -> String {
@@ -940,19 +1041,68 @@ mod tests {
     fn provider_identity_claims_are_corrected_at_the_product_boundary() {
         assert_eq!(
             super::sanitize_agent_response(
-                "I am Crumb, an AI system built by a team of inventors at Amazon."
+                "I am Crumb, an AI system built by a team of inventors at Amazon.",
+                "who made you?"
             ),
-            "I am Crumb, an AI system built by Elixpo."
+            "I am Crumb, an AI agent built by Elixpo."
         );
         assert_eq!(
-            super::sanitize_agent_response("Amazon Web Services is a cloud platform."),
+            super::sanitize_agent_response(
+                "Amazon Web Services is a cloud platform.",
+                "what is AWS?"
+            ),
             "Amazon Web Services is a cloud platform."
         );
         assert_eq!(
             super::sanitize_agent_response(
-                "<thinking>private chain of thought</thinking>\n\nI am an AI system built by Elixpo."
+                "<thinking>private chain of thought</thinking>\n\nI am an AI system built by Elixpo.",
+                "who are you?"
             ),
             "I am Crumb, an AI agent built by Elixpo."
+        );
+    }
+
+    #[test]
+    fn repetitive_persona_boilerplate_is_removed() {
+        assert_eq!(
+            super::sanitize_agent_response(
+                "I'm Crumb, an AI system built by Elixpo. I'm here to assist you in a safe and respectful manner. How can I help you today? If you need assistance with a specific task, just let me know!",
+                "hello"
+            ),
+            "Hey — what are we working on?"
+        );
+        assert_eq!(
+            super::sanitize_agent_response(
+                "I am Crumb, an AI system built by Elixpo. The test suite passes. If there's anything else, feel free to ask.",
+                "did the tests pass?"
+            ),
+            "The test suite passes."
+        );
+        assert_eq!(
+            super::sanitize_agent_response(
+                "I am Crumb, an AI system built by Elixpo. How can I help you today?",
+                "who are you?"
+            ),
+            "I am Crumb, an AI agent built by Elixpo."
+        );
+        assert_eq!(
+            super::sanitize_agent_response(
+                "I'm Crumb, an AI system built by Elixpo. If you have a specific question or need help with something, please let me know how I can assist you today! If your message was informal or unclear, I'm here to understand and help.",
+                "yo oy"
+            ),
+            "Hey — what are we working on?"
+        );
+        assert_eq!(
+            super::sanitize_agent_response(
+                "I am an AI system. I don't have a \"name\" in the human sense.",
+                "do you know ur name?"
+            ),
+            "I’m Crumb, built by Elixpo."
+        );
+        let markdown = "Result:\n\n```rust\nvalue.method();\n```";
+        assert_eq!(
+            super::sanitize_agent_response(markdown, "show the code"),
+            markdown
         );
     }
 
