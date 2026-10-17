@@ -214,6 +214,11 @@ impl Renderer {
     #[must_use]
     pub fn welcome(&self, context: &StartupContext<'_>, terminal_width: u16) -> String {
         let panda = panda_art(panda_mood(Some(context.agent_configured)));
+        let wordmark = if terminal_width < 60 {
+            "CRUMB"
+        } else {
+            WORDMARK
+        };
         let model = context.model.unwrap_or("model not configured");
         let state = if context.agent_configured {
             format!("Ready · {model} · {}", context.mode)
@@ -221,7 +226,7 @@ impl Renderer {
             "Native shell ready · run /auth login for AI".to_owned()
         };
         let copy = format!(
-            "{WORDMARK}\nCrumb CLI v{} · Native commands stay native.\n{} · effort {}\nContext {} / {} · session budget {}{}\nTip: type naturally · : forces AI · / opens actions",
+            "{wordmark}\nCrumb CLI v{} · Native commands stay native.\n{} · effort {}\nContext {} / {} · session budget {}{}\nTip: type naturally · : forces AI · / opens actions",
             context.version,
             state,
             context.effort.unwrap_or("default"),
@@ -234,9 +239,14 @@ impl Renderer {
                 ""
             }
         );
-        if terminal_width < 76 {
+        if terminal_width < 96 {
             let panda = format!("  {}", trim_art(panda).replace('\n', "\n  "));
-            let copy = paint_welcome_copy(*self, &copy, "  ");
+            let copy = paint_welcome_copy(
+                *self,
+                &copy,
+                "  ",
+                usize::from(terminal_width.saturating_sub(2)),
+            );
             return format!("{}\n\n{}", self.paint_panda(&panda), copy);
         }
         compose_welcome(*self, trim_art(panda), &copy)
@@ -697,10 +707,15 @@ impl Renderer {
     fn brand_art(self, terminal_width: u16) -> String {
         let panda = panda_art(panda_mood(None));
         if terminal_width < 76 {
+            let wordmark = if terminal_width < 60 {
+                "CRUMB"
+            } else {
+                WORDMARK
+            };
             return format!(
                 "{}\n{}",
                 self.paint_panda(trim_art(panda)),
-                self.paint(WORDMARK, "38;2;255;255;204;1")
+                self.paint(wordmark, "38;2;255;255;204;1")
             );
         }
         compose_styled_art(self, trim_art(panda), WORDMARK, 4)
@@ -835,10 +850,15 @@ fn compose_welcome(renderer: Renderer, panda: &str, copy: &str) -> String {
         .join("\n")
 }
 
-fn paint_welcome_copy(renderer: Renderer, copy: &str, gutter: &str) -> String {
+fn paint_welcome_copy(renderer: Renderer, copy: &str, gutter: &str, width: usize) -> String {
     copy.lines()
         .enumerate()
-        .map(|(row, line)| format!("{gutter}{}", renderer.paint(line, welcome_copy_style(row))))
+        .map(|(row, line)| {
+            format!(
+                "{gutter}{}",
+                renderer.paint(&fit_terminal_text(line, width), welcome_copy_style(row))
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1238,6 +1258,20 @@ mod tests {
     }
 
     #[test]
+    fn reduced_motion_never_starts_an_activity_animation_thread() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Rich,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+
+        let indicator = renderer.activity("Thinking");
+        assert!(!indicator.visible);
+        assert!(indicator.thread.is_none());
+    }
+
+    #[test]
     fn startup_status_contains_only_non_secret_readiness_metadata() {
         let renderer = Renderer::new(UiSettings {
             color: false,
@@ -1278,6 +1312,39 @@ mod tests {
         assert!(welcome.contains("Crumb CLI v0.1.0 · Native commands stay native."));
         assert!(welcome.contains("Ready · pollinations/nova-fast · auto"));
         assert!(welcome.contains("╭▄█▄╮"));
+    }
+
+    #[test]
+    fn welcome_layout_stays_inside_narrow_standard_and_wide_viewports() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Rich,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Full,
+        });
+        let context = StartupContext {
+            version: "0.1.0",
+            platform: Platform::Linux,
+            model: Some("pollinations/nova-fast"),
+            mode: "auto",
+            effort: Some("extra high"),
+            session_budget_tokens: 64_000,
+            context_tokens: 48_000,
+            auto_compaction: true,
+            agent_configured: true,
+        };
+
+        for width in [40_u16, 60, 80, 96, 120] {
+            let welcome = renderer.welcome(&context, width);
+            assert!(
+                welcome
+                    .lines()
+                    .all(|line| line.chars().count() <= usize::from(width)),
+                "welcome exceeded {width} columns:\n{welcome}"
+            );
+        }
+        assert!(renderer.welcome(&context, 40).contains("CRUMB"));
+        assert!(renderer.welcome(&context, 60).contains("░█████╗░██████╗░"));
     }
 
     #[test]

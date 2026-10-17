@@ -84,7 +84,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Add queued steering and richer tool-specific event projection to the Harness stream.
 - [ ] Add interactive approval, tool-call, patch, error, and completion components.
 - [x] Add live model, effort, and mode selection backed by atomic configuration writes.
-- [ ] Add terminal-width snapshots, reduced-motion behavior, and accessibility checks.
+- [x] Add terminal-width snapshots, reduced-motion behavior, and accessibility checks.
 - [ ] Package signed standalone binaries for Linux, macOS, and Windows.
 
 ### Competitive terminal roadmap
