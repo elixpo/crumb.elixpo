@@ -6,20 +6,22 @@ This is the local source of truth for implementation order. GitHub issues provid
 
 - [x] [WP-001 — workspace bootstrap](https://github.com/elixpo/crumb.elixpo/issues/1)
 - [x] [WP-002 — persistent Linux Bash PTY](https://github.com/elixpo/crumb.elixpo/issues/4)
+- [x] [WP-003 — macOS Zsh parity](https://github.com/elixpo/crumb.elixpo/issues/6) ([PR #7](https://github.com/elixpo/crumb.elixpo/pull/7))
+- [x] [WP-004 — Windows PowerShell parity](https://github.com/elixpo/crumb.elixpo/issues/8) ([PR #9](https://github.com/elixpo/crumb.elixpo/pull/9))
+- [x] [WP-005 — shell lifecycle protocol](https://github.com/elixpo/crumb.elixpo/issues/10) ([PR #12](https://github.com/elixpo/crumb.elixpo/pull/12))
+- [x] [WP-006 — terminal UI layer](https://github.com/elixpo/crumb.elixpo/issues/13) ([PR #14](https://github.com/elixpo/crumb.elixpo/pull/14))
+- [x] [WP-007 — persistent history](https://github.com/elixpo/crumb.elixpo/issues/15) ([PR #17](https://github.com/elixpo/crumb.elixpo/pull/17))
+- [x] [WP-008 — provider-neutral LLM interface](https://github.com/elixpo/crumb.elixpo/issues/19) ([PR #20](https://github.com/elixpo/crumb.elixpo/pull/20))
+- [x] [WP-009 — Pollinations adapter](https://github.com/elixpo/crumb.elixpo/issues/21) ([PR #23](https://github.com/elixpo/crumb.elixpo/pull/23))
+- [x] [WP-010 — secure Pollinations BYOK](https://github.com/elixpo/crumb.elixpo/issues/24) ([PR #27](https://github.com/elixpo/crumb.elixpo/pull/27))
+- [x] [WP-011 — browser account connector](https://github.com/elixpo/crumb.elixpo/issues/26) ([PR #28](https://github.com/elixpo/crumb.elixpo/pull/28))
 
 ## Active stack
 
-- [ ] [WP-003 — macOS Zsh parity](https://github.com/elixpo/crumb.elixpo/issues/6) ([PR #7](https://github.com/elixpo/crumb.elixpo/pull/7))
-- [ ] [WP-004 — Windows PowerShell parity](https://github.com/elixpo/crumb.elixpo/issues/8) ([PR #9](https://github.com/elixpo/crumb.elixpo/pull/9))
-- [ ] [WP-005 — shell lifecycle protocol](https://github.com/elixpo/crumb.elixpo/issues/10) ([PR #12](https://github.com/elixpo/crumb.elixpo/pull/12))
-- [ ] [WP-006 — terminal UI layer](https://github.com/elixpo/crumb.elixpo/issues/13) ([PR #14](https://github.com/elixpo/crumb.elixpo/pull/14))
-- [ ] [WP-007 — persistent history](https://github.com/elixpo/crumb.elixpo/issues/15) ([PR #17](https://github.com/elixpo/crumb.elixpo/pull/17))
 - [ ] [Linux terminal parity](https://github.com/elixpo/crumb.elixpo/issues/16) ([PR #18](https://github.com/elixpo/crumb.elixpo/pull/18))
-- [ ] [WP-008 — provider-neutral LLM interface](https://github.com/elixpo/crumb.elixpo/issues/19) ([PR #20](https://github.com/elixpo/crumb.elixpo/pull/20))
-- [ ] [WP-009 — Pollinations adapter](https://github.com/elixpo/crumb.elixpo/issues/21) ([PR #23](https://github.com/elixpo/crumb.elixpo/pull/23))
-- [ ] [WP-010 — secure Pollinations BYOK](https://github.com/elixpo/crumb.elixpo/issues/24) ([PR #27](https://github.com/elixpo/crumb.elixpo/pull/27))
 
-## Current milestone: [WP-011 — browser account connector](https://github.com/elixpo/crumb.elixpo/issues/26)
+<details>
+<summary>WP-011 completion details</summary>
 
 - [x] Add the minimal Next.js Cloudflare Worker surface.
 - [x] Add Elixpo Accounts sign-in with `openid profile email`.
@@ -31,10 +33,12 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Keep the OS keyring as the terminal credential boundary.
 - [x] Pin the initial multimodal Pollinations connector allowlist.
 - [x] Configure local D1, KV, and `.env.local` credentials.
-- [ ] Register and validate the signed Accounts deletion webhook.
-- [ ] Validate the browser-to-terminal flow.
-- [ ] Pass Rust and web checks.
-- [ ] Merge WP-011.
+- [x] Register and validate the signed Accounts deletion webhook.
+- [x] Validate the browser-to-terminal flow.
+- [x] Pass Rust and web checks.
+- [x] Merge WP-011.
+
+</details>
 
 <details>
 <summary>WP-001 completion details</summary>

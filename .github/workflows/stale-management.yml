@@ -2,6 +2,9 @@ name: Stale Issue and PR Management
 
 on:
   workflow_call:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1"
 
 permissions:
   issues: write
