@@ -784,6 +784,7 @@ impl TranscriptState {
 struct TranscriptCapture<W> {
     writer: W,
     captured: Vec<u8>,
+    terminal_modes: TerminalModeTracker,
 }
 
 impl<W> TranscriptCapture<W> {
@@ -793,16 +794,22 @@ impl<W> TranscriptCapture<W> {
         Self {
             writer,
             captured: Vec::new(),
+            terminal_modes: TerminalModeTracker::new(),
         }
     }
 
     fn into_capture(self) -> Vec<u8> {
-        self.captured
+        if self.terminal_modes.used_alternate_screen {
+            Vec::new()
+        } else {
+            self.captured
+        }
     }
 }
 
 impl<W: Write> Write for TranscriptCapture<W> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.terminal_modes.observe(buffer);
         let written = self.writer.write(buffer)?;
         let remaining = Self::MAX_CAPTURE_BYTES.saturating_sub(self.captured.len());
         self.captured
@@ -812,6 +819,43 @@ impl<W: Write> Write for TranscriptCapture<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
+    }
+}
+
+#[derive(Default)]
+struct TerminalModeTracker {
+    tail: Vec<u8>,
+    used_alternate_screen: bool,
+}
+
+impl TerminalModeTracker {
+    const ALTERNATE_SCREEN_ENTERS: [&'static [u8]; 3] =
+        [b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"];
+    const MAX_SEQUENCE_BYTES: usize = 8;
+
+    const fn new() -> Self {
+        Self {
+            tail: Vec::new(),
+            used_alternate_screen: false,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8]) {
+        if self.used_alternate_screen {
+            return;
+        }
+        let mut candidate = Vec::with_capacity(self.tail.len().saturating_add(bytes.len()));
+        candidate.extend_from_slice(&self.tail);
+        candidate.extend_from_slice(bytes);
+        self.used_alternate_screen = Self::ALTERNATE_SCREEN_ENTERS.iter().any(|sequence| {
+            candidate
+                .windows(sequence.len())
+                .any(|window| window == *sequence)
+        });
+        let retained = candidate
+            .len()
+            .min(Self::MAX_SEQUENCE_BYTES.saturating_sub(1));
+        self.tail = candidate[candidate.len().saturating_sub(retained)..].to_vec();
     }
 }
 
@@ -1159,6 +1203,7 @@ struct CapturedOutput<'a> {
     bytes: Vec<u8>,
     limit: usize,
     display_prefix: Option<String>,
+    terminal_modes: TerminalModeTracker,
 }
 
 impl<'a> CapturedOutput<'a> {
@@ -1168,11 +1213,16 @@ impl<'a> CapturedOutput<'a> {
             bytes: Vec::with_capacity(limit),
             limit,
             display_prefix,
+            terminal_modes: TerminalModeTracker::default(),
         }
     }
 
     fn finish(self) -> Vec<u8> {
-        self.bytes
+        if self.terminal_modes.used_alternate_screen {
+            Vec::new()
+        } else {
+            self.bytes
+        }
     }
 
     fn capture(&mut self, bytes: &[u8]) {
@@ -1196,6 +1246,7 @@ impl<'a> CapturedOutput<'a> {
 
 impl Write for CapturedOutput<'_> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.terminal_modes.observe(buffer);
         if !buffer.is_empty()
             && let Some(prefix) = self.display_prefix.take()
         {
@@ -8040,7 +8091,7 @@ impl Drop for RawModeGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -8053,11 +8104,11 @@ mod tests {
 
     use super::{
         ExitGesture, MarketplaceContent, PausedSubmission, SessionCommandContext, SteeringAction,
-        agent_config_location, configure_plugin, effort_display_name, effort_wire_name,
-        failed_command_recovery, initial_agent_activity, marketplace_update_blocker,
-        openrouter_preset, parse_credential_reference, parse_paused_submission,
-        parse_provider_header, parse_resume_session_argument, read_agent_config,
-        read_bounded_response, register_local_skill, resolve_memory_keep,
+        TerminalModeTracker, TranscriptCapture, agent_config_location, configure_plugin,
+        effort_display_name, effort_wire_name, failed_command_recovery, initial_agent_activity,
+        marketplace_update_blocker, openrouter_preset, parse_credential_reference,
+        parse_paused_submission, parse_provider_header, parse_resume_session_argument,
+        read_agent_config, read_bounded_response, register_local_skill, resolve_memory_keep,
         sanitize_transcript_output, set_skill_enabled, show_graph, show_marketplace, show_memory,
         show_profile_with_stores, suggestion_width, unregister_local_skill,
         validate_marketplace_path, validate_marketplace_response, workspace_read_host,
@@ -8109,6 +8160,20 @@ mod tests {
         let sanitized = sanitize_transcript_output(output);
 
         assert_eq!(sanitized, "\x1b[31mred\x1b[0m\nnext");
+    }
+
+    #[test]
+    fn alternate_screen_frames_are_not_saved_to_chat_history() {
+        let mut tracker = TerminalModeTracker::default();
+        tracker.observe(b"before\x1b[?10");
+        tracker.observe(b"49hscreen contents");
+        assert!(tracker.used_alternate_screen);
+
+        let mut capture = TranscriptCapture::new(Vec::new());
+        capture
+            .write_all(b"\x1b[?1049hfull screen\x1b[?1049l")
+            .expect("terminal output is written");
+        assert_eq!(capture.into_capture(), Vec::<u8>::new());
     }
 
     #[test]
