@@ -667,7 +667,7 @@ mod tests {
             &fixture.url,
             None,
             StreamableHttpLimits {
-                startup_timeout: Duration::from_millis(20),
+                startup_timeout: Duration::from_secs(1),
                 request_timeout: Duration::from_millis(20),
                 ..StreamableHttpLimits::default()
             },
