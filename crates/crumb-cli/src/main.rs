@@ -5656,6 +5656,7 @@ fn create_line_editor(
         .with_hinter(Box::new(CrumbHinter::default()))
         .with_completer(Box::new(CrumbCompleter::new(workspace.clone())))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
+        .with_persistent_menus(true)
         .with_edit_mode(Box::new(Emacs::new(keybindings)));
     Ok(InteractiveLineEditor { editor, workspace })
 }
