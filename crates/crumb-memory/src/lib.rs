@@ -124,6 +124,13 @@ pub struct MemoryRetrieval {
     pub omitted: usize,
 }
 
+/// Inspectable lexical search result across durable scopes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemorySearchMatch {
+    pub record: MemoryRecord,
+    pub lexical_hits: usize,
+}
+
 impl MemoryRetrieval {
     /// Renders selected records and conflict notices within the prompt budget.
     #[must_use]
@@ -265,6 +272,56 @@ impl MemorySet {
         records.extend(self.project.records()?);
         Ok(retrieve_records(records, query, tags, now_unix_ms, policy))
     }
+
+    /// Searches all records, including superseded history, with stable ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty query, zero result limit, or invalid storage.
+    pub fn search(&self, query: &str, max_results: usize) -> Result<Vec<MemorySearchMatch>> {
+        let query_terms = terms(query);
+        if query_terms.is_empty() || max_results == 0 {
+            bail!("memory search requires a query and a positive result limit");
+        }
+        let mut records = self.user.records()?;
+        records.extend(self.project.records()?);
+        let mut matches = records
+            .into_iter()
+            .filter_map(|record| {
+                let lexical_hits = query_terms.intersection(&terms(&record.content)).count();
+                (lexical_hits > 0).then_some(MemorySearchMatch {
+                    record,
+                    lexical_hits,
+                })
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|candidate| {
+            (
+                Reverse(candidate.lexical_hits),
+                Reverse(matches!(candidate.record.scope, MemoryScope::Project)),
+                Reverse(candidate.record.updated_at_unix_ms),
+                candidate.record.id.clone(),
+            )
+        });
+        matches.truncate(max_results);
+        Ok(matches)
+    }
+
+    /// Lists conflicts among active project and user records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage is invalid.
+    pub fn conflicts(&self) -> Result<Vec<MemoryConflict>> {
+        let mut records = self.user.records()?;
+        records.extend(self.project.records()?);
+        let superseded = records
+            .iter()
+            .filter_map(|record| record.supersedes.clone())
+            .collect::<BTreeSet<_>>();
+        records.retain(|record| !superseded.contains(&record.id));
+        Ok(detect_conflicts(&records))
+    }
 }
 
 fn push_context_line(context: &mut String, line: &str) -> bool {
@@ -330,6 +387,15 @@ impl MemoryStore {
         parse_memory_file(&contents, self.scope)
     }
 
+    /// Finds a record by stable ID, including superseded history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage is invalid.
+    pub fn record(&self, id: &str) -> Result<Option<MemoryRecord>> {
+        Ok(self.records()?.into_iter().find(|record| record.id == id))
+    }
+
     /// Persists a single explicit, user-approved memory.
     ///
     /// # Errors
@@ -374,6 +440,114 @@ impl MemoryStore {
         let removed = records.remove(index - 1);
         self.write_records(&records)?;
         Ok(removed.content)
+    }
+
+    /// Removes one explicitly selected record by stable ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the ID is absent or storage cannot be saved.
+    pub fn forget_approved_id(&self, id: &str) -> Result<String> {
+        let mut records = self.records()?;
+        let index = records
+            .iter()
+            .position(|record| record.id == id)
+            .with_context(|| format!("memory record `{id}` was not found"))?;
+        let removed = records.remove(index);
+        self.write_records(&records)?;
+        Ok(removed.content)
+    }
+
+    /// Adds an explicit retrieval or conflict tag to a record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the ID or tag is invalid or storage cannot be saved.
+    pub fn tag_approved(&self, id: &str, tag: &str) -> Result<bool> {
+        let mut records = self.records()?;
+        let record = records
+            .iter_mut()
+            .find(|record| record.id == id)
+            .with_context(|| format!("memory record `{id}` was not found"))?;
+        if record
+            .tags
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(tag))
+        {
+            return Ok(false);
+        }
+        record.tags.push(tag.to_owned());
+        record.updated_at_unix_ms = unix_timestamp_ms()?;
+        self.write_records(&records)?;
+        Ok(true)
+    }
+
+    /// Removes an explicit tag from a record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the ID is absent or storage cannot be saved.
+    pub fn untag_approved(&self, id: &str, tag: &str) -> Result<bool> {
+        let mut records = self.records()?;
+        let record = records
+            .iter_mut()
+            .find(|record| record.id == id)
+            .with_context(|| format!("memory record `{id}` was not found"))?;
+        let before = record.tags.len();
+        record
+            .tags
+            .retain(|existing| !existing.eq_ignore_ascii_case(tag));
+        if record.tags.len() == before {
+            return Ok(false);
+        }
+        record.updated_at_unix_ms = unix_timestamp_ms()?;
+        self.write_records(&records)?;
+        Ok(true)
+    }
+
+    /// Creates a new record that explicitly supersedes the selected record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid content, an absent ID, a replacement fork,
+    /// a duplicate stable ID, or failed persistence.
+    pub fn replace_approved(&self, id: &str, entry: &str) -> Result<MemoryRecord> {
+        let normalized = normalize_entry(entry);
+        validate_entry(&normalized)?;
+        let mut records = self.records()?;
+        let previous = records
+            .iter()
+            .find(|record| record.id == id)
+            .cloned()
+            .with_context(|| format!("memory record `{id}` was not found"))?;
+        if previous.content == normalized {
+            bail!("replacement memory must differ from the selected record");
+        }
+        if records
+            .iter()
+            .any(|record| record.supersedes.as_deref() == Some(id))
+        {
+            bail!("memory record `{id}` already has a replacement");
+        }
+        let provenance = MemoryProvenance::Manual;
+        let replacement_id = stable_record_id(self.scope, &normalized, &provenance);
+        if records.iter().any(|record| record.id == replacement_id) {
+            bail!("replacement duplicates an existing memory record");
+        }
+        let timestamp = unix_timestamp_ms()?;
+        let replacement = MemoryRecord {
+            id: replacement_id,
+            scope: self.scope,
+            content: normalized,
+            created_at_unix_ms: timestamp,
+            updated_at_unix_ms: timestamp,
+            provenance,
+            tags: previous.tags,
+            supersedes: Some(previous.id),
+        };
+        records.push(replacement.clone());
+        self.write_records(&records)?;
+        Ok(replacement)
     }
 
     /// Removes duplicate entries while preserving first-seen order.
@@ -1092,6 +1266,88 @@ mod tests {
             .len(),
             0
         );
+    }
+
+    #[test]
+    fn explicit_record_management_preserves_supersession_history() {
+        let directory = tempdir().expect("memory tempdir");
+        let store = MemoryStore::new(directory.path().join("project.json"), MemoryScope::Project);
+        store
+            .remember_approved("Use tabs for indentation")
+            .expect("remember original");
+        let original = store.records().expect("records").remove(0);
+
+        assert!(
+            store
+                .tag_approved(&original.id, "conflict:indentation")
+                .expect("tag original")
+        );
+        assert!(
+            !store
+                .tag_approved(&original.id, "Conflict:Indentation")
+                .expect("duplicate tag")
+        );
+        assert!(store.tag_approved(&original.id, "conflict:bad]").is_err());
+
+        let replacement = store
+            .replace_approved(&original.id, "Use four spaces for indentation")
+            .expect("replace original");
+        assert_eq!(
+            replacement.supersedes.as_deref(),
+            Some(original.id.as_str())
+        );
+        assert_eq!(replacement.tags, ["conflict:indentation"]);
+        assert!(store.record(&original.id).expect("lookup").is_some());
+        assert!(
+            store
+                .replace_approved(&original.id, "Use two spaces for indentation")
+                .is_err()
+        );
+        assert!(
+            store
+                .untag_approved(&replacement.id, "CONFLICT:INDENTATION")
+                .expect("untag replacement")
+        );
+        assert_eq!(
+            store
+                .forget_approved_id(&replacement.id)
+                .expect("forget replacement"),
+            "Use four spaces for indentation"
+        );
+    }
+
+    #[test]
+    fn memory_search_is_stable_across_scopes_and_includes_history() {
+        let directory = tempdir().expect("memory tempdir");
+        let set = memory_set(directory.path());
+        let old = record(MemoryScope::Project, "Run workspace checks", 10, &[], None);
+        let replacement = record(
+            MemoryScope::Project,
+            "Run workspace checks before release",
+            20,
+            &[],
+            Some(old.id.clone()),
+        );
+        set.project
+            .write_records(&[old.clone(), replacement])
+            .expect("project records");
+        set.user
+            .write_records(&[record(
+                MemoryScope::User,
+                "Workspace checks are preferred",
+                30,
+                &[],
+                None,
+            )])
+            .expect("user records");
+
+        let first = set.search("workspace checks", 10).expect("search");
+        let second = set.search("workspace checks", 10).expect("search");
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[0].record.scope, MemoryScope::Project);
+        assert!(first.iter().any(|candidate| candidate.record.id == old.id));
+        assert!(set.search("", 10).is_err());
     }
 
     fn memory_set(root: &std::path::Path) -> MemorySet {
