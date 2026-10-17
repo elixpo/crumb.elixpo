@@ -9,8 +9,8 @@ use anyhow::{Result, anyhow};
 
 use crate::ShellKind;
 
-const FRAME_START: u8 = 0x1e;
-const FRAME_END: u8 = 0x1f;
+const FRAME_START: &str = "__CRUMB_FRAME__";
+const FRAME_END: &str = "__CRUMB_END__";
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
 /// Metadata collected when a native command completes.
@@ -69,11 +69,11 @@ impl CompletionProtocol {
     pub fn bootstrap(&self, kind: ShellKind) -> String {
         match kind {
             ShellKind::Bash => format!(
-                "stty -echo; PS1=''; __crumb_emit() {{ __crumb_status=$?; if [ -n \"${{__crumb_seq-}}\" ]; then stty -echo; __crumb_cwd_hex=$(printf %s \"$PWD\" | od -An -tx1 | tr -d ' \\n'); printf '\\036crumb:{}:%s:%s:%s\\037' \"$__crumb_seq\" \"$__crumb_status\" \"$__crumb_cwd_hex\"; unset __crumb_seq; fi; }}; PROMPT_COMMAND=__crumb_emit\n",
+                "stty -echo; PS1=''; __crumb_emit() {{ __crumb_status=$?; if [ -n \"${{__crumb_seq-}}\" ]; then stty -echo; __crumb_cwd_hex=$(printf %s \"$PWD\" | od -An -tx1 | tr -d ' \\n'); printf '__CRUMB_''FRAME__crumb:{}:%s:%s:%s__CRUMB_''END__' \"$__crumb_seq\" \"$__crumb_status\" \"$__crumb_cwd_hex\"; unset __crumb_seq; fi; }}; PROMPT_COMMAND=__crumb_emit\n",
                 self.token
             ),
             ShellKind::Zsh => format!(
-                "stty -echo; PS1=''; RPS1=''; unsetopt zle prompt_cr prompt_sp; __crumb_emit() {{ __crumb_status=$?; if [ -n \"${{__crumb_seq-}}\" ]; then stty -echo; __crumb_cwd_hex=$(printf %s \"$PWD\" | od -An -tx1 | tr -d ' \\n'); printf '\\036crumb:{}:%s:%s:%s\\037' \"$__crumb_seq\" \"$__crumb_status\" \"$__crumb_cwd_hex\"; unset __crumb_seq; fi; }}; precmd_functions=(__crumb_emit)\n",
+                "stty -echo; PS1=''; RPS1=''; unsetopt zle prompt_cr prompt_sp; __crumb_emit() {{ __crumb_status=$?; if [ -n \"${{__crumb_seq-}}\" ]; then stty -echo; __crumb_cwd_hex=$(printf %s \"$PWD\" | od -An -tx1 | tr -d ' \\n'); printf '__CRUMB_''FRAME__crumb:{}:%s:%s:%s__CRUMB_''END__' \"$__crumb_seq\" \"$__crumb_status\" \"$__crumb_cwd_hex\"; unset __crumb_seq; fi; }}; precmd_functions=(__crumb_emit)\n",
                 self.token
             ),
             ShellKind::PowerShell =>
@@ -112,12 +112,12 @@ impl CompletionProtocol {
             };
 
             decoded.visible.extend(self.pending.drain(..start));
-            let Some(relative_end) = self.pending.iter().position(|byte| *byte == FRAME_END) else {
+            let Some(relative_end) = find_subslice(&self.pending, FRAME_END.as_bytes()) else {
                 break;
             };
 
             let frame = self.pending[..relative_end].to_vec();
-            self.pending.drain(..=relative_end);
+            self.pending.drain(..relative_end + FRAME_END.len());
             decoded.completions.push(self.parse_frame(&frame)?);
         }
 
@@ -125,7 +125,7 @@ impl CompletionProtocol {
     }
 
     fn frame_prefix(&self) -> Vec<u8> {
-        format!("{}crumb:{}:", char::from(FRAME_START), self.token).into_bytes()
+        format!("{FRAME_START}crumb:{}:", self.token).into_bytes()
     }
 
     fn posix_submission(command: &str, sequence: u64) -> String {
@@ -134,7 +134,7 @@ impl CompletionProtocol {
 
     fn powershell_submission(&self, command: &str, sequence: u64) -> String {
         format!(
-            "$global:LASTEXITCODE=$null; {command}; $__crumb_status = if ($?) {{ 0 }} elseif ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }}; $__crumb_cwd_hex = [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes((Get-Location).Path)).ToLowerInvariant(); [Console]::Write([char]0x1e + 'crumb:{}:{sequence}:' + $__crumb_status + ':' + $__crumb_cwd_hex + [char]0x1f)\r",
+            "$global:LASTEXITCODE=$null; {command}; $__crumb_status = if ($?) {{ 0 }} elseif ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }}; $__crumb_cwd_hex = [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes((Get-Location).Path)).ToLowerInvariant(); [Console]::Write('__CRUMB_' + 'FRAME__crumb:{}:{sequence}:' + $__crumb_status + ':' + $__crumb_cwd_hex + '__CRUMB_' + 'END__')\r",
             self.token
         )
     }
@@ -142,7 +142,7 @@ impl CompletionProtocol {
     fn parse_frame(&self, frame: &[u8]) -> Result<CommandCompletion> {
         let text = std::str::from_utf8(frame)?;
         let payload = text
-            .strip_prefix(&format!("{}crumb:{}:", char::from(FRAME_START), self.token))
+            .strip_prefix(&format!("{FRAME_START}crumb:{}:", self.token))
             .ok_or_else(|| anyhow!("completion frame has an invalid session prefix"))?;
         let mut fields = payload.splitn(3, ':');
         let sequence = fields
@@ -227,7 +227,7 @@ mod tests {
 
         assert_eq!(
             submission,
-            "$global:LASTEXITCODE=$null; Set-Location C:\\\\; $__crumb_status = if ($?) { 0 } elseif ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 1 }; $__crumb_cwd_hex = [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes((Get-Location).Path)).ToLowerInvariant(); [Console]::Write([char]0x1e + 'crumb:abc123:9:' + $__crumb_status + ':' + $__crumb_cwd_hex + [char]0x1f)\r"
+            "$global:LASTEXITCODE=$null; Set-Location C:\\\\; $__crumb_status = if ($?) { 0 } elseif ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 1 }; $__crumb_cwd_hex = [Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes((Get-Location).Path)).ToLowerInvariant(); [Console]::Write('__CRUMB_' + 'FRAME__crumb:abc123:9:' + $__crumb_status + ':' + $__crumb_cwd_hex + '__CRUMB_' + 'END__')\r"
         );
     }
 
@@ -252,10 +252,10 @@ mod tests {
         let mut protocol = CompletionProtocol::with_token("abc123".to_owned());
 
         let first = protocol
-            .decode(b"hello\r\n\x1ecrumb:abc")
+            .decode(b"hello\r\n__CRUMB_FRAME__crumb:abc")
             .expect("first chunk should decode");
         let second = protocol
-            .decode(b"123:7:0:2f746d70\x1f")
+            .decode(b"123:7:0:2f746d70__CRUMB_END__")
             .expect("second chunk should decode");
 
         assert_eq!(first.visible, b"hello\r\n");
