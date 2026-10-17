@@ -8161,6 +8161,7 @@ impl CompletionOverlay {
 
     fn paint_overlay(&self, body: &str) -> String {
         let (columns, top, composer_row) = self.overlay_rows();
+        let terminal_rows = size().map_or(24, |(_, rows)| rows);
         let transcript = self
             .transcript
             .lock()
@@ -8173,29 +8174,13 @@ impl CompletionOverlay {
                 frame.push_str(line);
             }
         }
-        let _ = write!(
-            frame,
-            "\x1b[{};1H\x1b[2K{}",
-            composer_row.saturating_add(4),
-            self.renderer.composer_idle_status()
-        );
-        if let Some((column, indicator)) =
-            transcript_new_content_indicator(&transcript, self.renderer, columns)
-        {
-            let _ = write!(
-                frame,
-                "\x1b[{};{}H{}",
-                composer_row.saturating_add(4),
-                column.saturating_add(1),
-                indicator
-            );
-        }
-        let _ = write!(
-            frame,
-            "\x1b[{};1H\x1b[2K{}",
-            size().map_or(24, |(_, rows)| rows),
-            self.renderer.composer_hotkeys(columns)
-        );
+        frame.push_str(&completion_footer_frame(
+            &transcript,
+            self.renderer,
+            columns,
+            composer_row,
+            terminal_rows,
+        ));
         frame
     }
 
@@ -8208,7 +8193,8 @@ impl CompletionOverlay {
     }
 
     fn restore_overlay_frame(&self) -> String {
-        let (_, top, composer_row) = self.overlay_rows();
+        let (columns, top, composer_row) = self.overlay_rows();
+        let terminal_rows = size().map_or(24, |(_, rows)| rows);
         let transcript = self
             .transcript
             .lock()
@@ -8230,8 +8216,51 @@ impl CompletionOverlay {
                 frame.push_str(line);
             }
         }
+        frame.push_str(&completion_footer_frame(
+            &transcript,
+            self.renderer,
+            columns,
+            composer_row,
+            terminal_rows,
+        ));
         frame
     }
+}
+
+fn completion_footer_frame(
+    state: &TranscriptState,
+    renderer: Renderer,
+    columns: u16,
+    composer_row: u16,
+    terminal_rows: u16,
+) -> String {
+    let mut frame = String::new();
+    let status_row = composer_row.saturating_add(4);
+    let context_row = composer_row.saturating_add(5);
+    let _ = write!(
+        frame,
+        "\x1b[{status_row};1H\x1b[2K{}",
+        renderer.composer_idle_status()
+    );
+    if let Some((column, indicator)) = transcript_new_content_indicator(state, renderer, columns) {
+        let _ = write!(
+            frame,
+            "\x1b[{status_row};{}H{}",
+            column.saturating_add(1),
+            indicator
+        );
+    }
+    let _ = write!(
+        frame,
+        "\x1b[{context_row};1H\x1b[2K{}",
+        state.footer_context
+    );
+    let _ = write!(
+        frame,
+        "\x1b[{terminal_rows};1H\x1b[2K{}",
+        renderer.composer_hotkeys(columns)
+    );
+    frame
 }
 
 impl Menu for CompletionOverlay {
@@ -9204,9 +9233,10 @@ mod tests {
     use crumb_profile::{ProfileSelectionStore, ProfileStore};
 
     use super::{
-        CrumbEditMode, ExitGesture, MarketplaceContent, PausedSubmission, SessionCommandContext,
-        SteeringAction, TerminalModeTracker, TranscriptCapture, TranscriptScroll, TranscriptState,
-        active_scroll_direction, agent_config_location, composer_anchor_sequence,
+        CrumbEditMode, ExitGesture, MarketplaceContent, PausedSubmission, Renderer,
+        SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
+        TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
+        agent_config_location, completion_footer_frame, composer_anchor_sequence,
         configure_permissions, configure_plugin, effort_display_name, effort_wire_name,
         failed_command_recovery, fixed_footer_frame, initial_agent_activity,
         marketplace_update_blocker, openrouter_preset, parse_credential_reference,
@@ -10053,6 +10083,24 @@ mod tests {
             frame,
             "\x1b7\x1b[40;1H\x1b[2K  Type a follow-up · Enter steer · Ctrl+Enter queue · /pause · Ctrl+C cancel\x1b8"
         );
+    }
+
+    #[test]
+    fn completion_palette_preserves_every_fixed_footer_row() {
+        let renderer = Renderer::new(UiSettings::from_environment(false));
+        let state = TranscriptState {
+            footer_context: "Model context · 3.3k / 64.0k".to_owned(),
+            ..TranscriptState::default()
+        };
+
+        let frame = completion_footer_frame(&state, renderer, 120, 30, 40);
+
+        assert!(frame.contains("Ready"));
+        assert!(frame.contains("Model context · 3.3k / 64.0k"));
+        assert!(frame.contains("Enter send"));
+        assert!(frame.contains("\x1b[34;1H\x1b[2K"));
+        assert!(frame.contains("\x1b[35;1H\x1b[2K"));
+        assert!(frame.contains("\x1b[40;1H\x1b[2K"));
     }
 
     #[test]
