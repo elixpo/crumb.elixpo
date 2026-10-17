@@ -54,21 +54,26 @@ fn powershell_state_persists_in_one_resizable_conpty() {
 }
 
 fn exercise_persistent_powershell() -> Result<String> {
+    eprintln!("starting PowerShell session");
     let mut session = ShellSession::start(
         &DeterministicPowerShell,
         &SystemPty,
         TerminalSize::new(24, 80),
     )?;
+    eprintln!("PowerShell session ready");
     session.resize(TerminalSize::new(40, 120))?;
+    eprintln!("PowerShell session resized");
 
     let mut output = Vec::new();
     let outcome = session.execute(
         "$env:CRUMB_WP004_STATE = 'ready'; Set-Location C:\\Windows; Write-Output \"__CRUMB_STATE__ cwd=$((Get-Location).Path) env=$env:CRUMB_WP004_STATE\"",
         &mut output,
     )?;
+    eprintln!("PowerShell command completed");
     if !matches!(outcome, CommandOutcome::Completed(_)) {
         bail!("PowerShell exited before reporting command completion");
     }
     session.shutdown()?;
+    eprintln!("PowerShell session shut down");
     Ok(String::from_utf8(output)?)
 }
