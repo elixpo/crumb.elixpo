@@ -2933,6 +2933,9 @@ fn show_reserved(
         command if command == "/config provider" || command.starts_with("/config provider ") => {
             configure_provider(command, cwd, writer)?;
         }
+        "/config harness native" => {
+            set_native_harness(cwd, writer)?;
+        }
         "/doctor" => show_doctor(cwd, writer)?,
         "/plugins" => show_plugins(cwd, writer)?,
         command if command.starts_with("/plugins ") => {
@@ -2967,6 +2970,19 @@ fn show_reserved(
     Ok(())
 }
 
+fn set_native_harness(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    update_agent_config(cwd, |config| {
+        config.harness = Some(HarnessConfig::Native);
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Harness · native")?;
+    writeln!(
+        writer,
+        "  Parallel agents and Rust-owned tools are available."
+    )?;
+    Ok(())
+}
+
 fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     let config = read_agent_config(cwd)?;
     writeln!(writer, "◆ Agent tools")?;
@@ -2976,6 +2992,7 @@ fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         ("detect_stack", "workspace read", true),
         ("write_file", "workspace write", true),
         ("run_disposable", "one-shot process", true),
+        ("spawn_agents", "parallel analysis", true),
         ("web_fetch", "network", true),
         (
             "web_search",
@@ -3029,8 +3046,8 @@ fn configure_permissions(command: &str, cwd: &Path, writer: &mut dyn Write) -> R
     let [action, tool] = arguments.as_slice() else {
         bail!("usage: /permissions [allow-network|deny-network <tool>]");
     };
-    if !matches!(*tool, "web_fetch" | "web_search") {
-        bail!("network permission tool must be web_fetch or web_search");
+    if !matches!(*tool, "web_fetch" | "web_search" | "spawn_agents") {
+        bail!("network permission tool must be web_fetch, web_search, or spawn_agents");
     }
     let allow = match *action {
         "allow-network" => true,
@@ -4803,6 +4820,16 @@ fn show_config_summary(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         writer,
         "  mode {} · {routes} model routes · {enabled_skills} skills · {enabled_plugins} plugins",
         agent_mode_name(config.mode)
+    )?;
+    writeln!(
+        writer,
+        "  harness {}",
+        match config.harness {
+            Some(HarnessConfig::Native) => "native",
+            Some(HarnessConfig::Process { .. }) => "process",
+            Some(HarnessConfig::CodingCli { .. }) => "coding CLI",
+            None => "not configured",
+        }
     )?;
     writeln!(
         writer,
@@ -8224,7 +8251,8 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use crumb_agent::{
-        AgentConfig, CredentialReference, ProviderHeader, ProviderProtocol, RiskClass,
+        AgentConfig, CredentialReference, HarnessConfig, ProviderHeader, ProviderProtocol,
+        RiskClass,
     };
     use crumb_marketplace::UpdateStatus;
     use crumb_memory::{MemoryScope, MemorySet, MemoryStore};
@@ -8369,6 +8397,25 @@ mod tests {
             crate::bundled_skills::path("failure-autopsy")
         );
 
+        std::fs::remove_dir_all(workspace).expect("workspace removed");
+    }
+
+    #[test]
+    fn native_harness_can_be_selected_from_the_terminal() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-native-harness-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace is created");
+        let mut output = Vec::new();
+
+        super::set_native_harness(&workspace, &mut output).expect("native harness is selected");
+
+        assert!(matches!(
+            read_agent_config(&workspace).expect("config loads").harness,
+            Some(HarnessConfig::Native)
+        ));
         std::fs::remove_dir_all(workspace).expect("workspace removed");
     }
 

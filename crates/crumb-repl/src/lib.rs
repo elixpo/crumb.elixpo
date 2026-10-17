@@ -404,6 +404,10 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "configure Harness providers and models",
     },
     SlashCommand {
+        usage: "/config harness native",
+        description: "use Crumb's native tool and multi-agent Harness",
+    },
+    SlashCommand {
         usage: "/config provider discover ",
         description: "discover provider models on demand",
     },
