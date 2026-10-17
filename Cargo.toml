@@ -15,6 +15,7 @@ members = [
     "crates/crumb-native",
     "crates/crumb-optimize",
     "crates/crumb-platform",
+    "crates/crumb-profile",
     "crates/crumb-pollinations",
     "crates/crumb-pty",
     "crates/crumb-repl",

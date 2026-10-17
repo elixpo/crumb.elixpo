@@ -667,6 +667,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "crumb-profile"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "directories",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "crumb-pty"
 version = "0.1.0"
 dependencies = [
