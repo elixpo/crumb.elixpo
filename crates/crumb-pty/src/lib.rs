@@ -161,10 +161,8 @@ fn complete_cursor_inheritance_handshake(
             .windows(CURSOR_QUERY.len())
             .any(|window| window == CURSOR_QUERY)
         {
-            eprintln!("ConPTY cursor query received");
             writer.write_all(CURSOR_ORIGIN)?;
             writer.flush()?;
-            eprintln!("ConPTY cursor response written");
             return Ok(());
         }
 
