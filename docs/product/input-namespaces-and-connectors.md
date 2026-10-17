@@ -39,6 +39,8 @@ never interpreted as prompts or passed to the native shell accidentally.
 - `/permissions` — inspect or change user-granted policy
 - `/memory` — inspect, edit, or clear user-approved memory
 - `/config` — inspect and safely patch live configuration
+- `/pause` — safely cancel the active execution boundary and hold the turn for resume, steering, or more queued follow-ups
+- `/resume` — continue a paused turn from the last safe point after checking current session and workspace state
 - `/cancel` — cancel the active agent turn and its child processes
 - `/doctor` — diagnose Harness, provider, connector, and optimizer health
 - `/cost` — show session token and provider usage when available

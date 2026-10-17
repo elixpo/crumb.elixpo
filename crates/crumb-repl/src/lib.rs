@@ -196,6 +196,18 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "continue the active agent turn as a local job",
     },
     SlashCommand {
+        usage: "/pause",
+        description: "pause the active agent turn at a safe boundary",
+    },
+    SlashCommand {
+        usage: "/resume",
+        description: "continue a paused agent turn",
+    },
+    SlashCommand {
+        usage: "/cancel",
+        description: "cancel the active agent turn",
+    },
+    SlashCommand {
         usage: "/attach ",
         description: "attach a typed @ reference",
     },
