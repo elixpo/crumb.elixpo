@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -9,9 +10,14 @@ use anyhow::{Context, Result, bail};
 use crumb_agent::config::SkillConfig;
 use crumb_agent::session::TurnStatus;
 use crumb_agent::{
-    AgentConfig, AgentMode, AgentSession, BackendDiscovery, CancellationToken, HarnessConfig,
-    Modality, SessionAttachment, SessionId, SessionJournal, attach_session_context,
-    detach_session_context, session_attachments, session_summary,
+    AgentConfig, AgentMode, AgentSession, ApprovalBroker, ApprovalDecision, ApprovalInbox,
+    ApprovalRequest, BackendDiscovery, CancellationToken, ConfiguredApprovals, HarnessConfig,
+    InteractiveApprovalBroker, Modality, SessionAttachment, SessionId, SessionJournal, ToolHost,
+    approval_channel, attach_session_context, detach_session_context, session_attachments,
+    session_summary,
+};
+use crumb_harness::{
+    Conversation, EventSink, HarnessEvent, HarnessLimits, HarnessTurn, NativeHarness,
 };
 use crumb_harness_cli::{CodingCliLaunch, run_text as run_coding_cli_text};
 use crumb_harness_dsh::{
@@ -19,6 +25,7 @@ use crumb_harness_dsh::{
     Notification, RunResult, SupervisorLimits,
 };
 use crumb_memory::{MemorySet, RetrievalPolicy};
+use crumb_pollinations::{PollinationsConfig, PollinationsProvider};
 use crumb_profile::{ProfileDocument, ProfileSelectionStore, ProfileStore};
 
 use crate::provider_projection::project_provider;
@@ -26,9 +33,148 @@ use crate::provider_projection::project_provider;
 type TurnThreadResult = (AgentRuntime, Result<RunResult>);
 static ACTIVE_CANCELLATION: OnceLock<Arc<Mutex<Option<CancellationToken>>>> = OnceLock::new();
 
+struct TurnApprovals {
+    configured: ConfiguredApprovals,
+    interactive: InteractiveApprovalBroker,
+}
+
+struct TurnResources {
+    tools: ToolHost,
+    approvals: Arc<dyn ApprovalBroker>,
+}
+
+struct TurnInteraction {
+    interactive: Option<InteractiveApprovalBroker>,
+}
+
+struct PreparedTurn<'a> {
+    config: &'a AgentConfig,
+    workspace: &'a Path,
+    route: &'a crumb_agent::ModelRoute,
+    effort: Option<String>,
+    session_id: &'a str,
+    request: &'a str,
+    cancellation: &'a CancellationToken,
+}
+
+impl ApprovalBroker for TurnApprovals {
+    fn decide(
+        &self,
+        request: &ApprovalRequest,
+        arguments: &serde_json::Value,
+        cancellation: &CancellationToken,
+    ) -> ApprovalDecision {
+        let configured = self.configured.decide(request, arguments, cancellation);
+        if configured == ApprovalDecision::AllowOnce {
+            configured
+        } else {
+            self.interactive.decide(request, arguments, cancellation)
+        }
+    }
+}
+
+fn configured_approvals(config: &AgentConfig) -> ConfiguredApprovals {
+    ConfiguredApprovals::new(config.permissions.allow_network_tools.clone())
+        .with_workspace_tools(config.permissions.allow_workspace_tools.clone())
+        .with_mcp_tools(config.permissions.allow_mcp_tools.clone())
+}
+
+fn native_harness_limits(config: &AgentConfig) -> Result<HarnessLimits> {
+    Ok(HarnessLimits {
+        max_model_rounds: NonZeroUsize::new(
+            usize::try_from(config.limits.max_steps)
+                .context("max_steps exceeds this platform's address space")?,
+        )
+        .context("max_steps must be positive")?,
+        max_tool_calls: NonZeroUsize::new(
+            usize::try_from(config.limits.max_tool_calls)
+                .context("max_tool_calls exceeds this platform's address space")?,
+        )
+        .context("max_tool_calls must be positive")?,
+        max_output_bytes: NonZeroUsize::new(
+            usize::try_from(config.limits.max_output_bytes)
+                .context("max_output_bytes exceeds this platform's address space")?,
+        )
+        .context("max_output_bytes must be positive")?,
+        max_history_turns: NonZeroUsize::new(12).expect("constant is non-zero"),
+        turn_timeout: Duration::from_secs(config.limits.max_wall_time_seconds),
+    })
+}
+
+fn configured_max_output_tokens(
+    config: &AgentConfig,
+    route: &crumb_agent::ModelRoute,
+) -> Option<u32> {
+    config
+        .providers
+        .get(&route.provider)
+        .and_then(|provider| {
+            provider
+                .models
+                .iter()
+                .find(|model| model.id == route.model)
+                .and_then(|model| model.max_output_tokens)
+                .or(provider.default_max_output_tokens)
+        })
+        .map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX))
+}
+
+struct NativeEventBridge<'a> {
+    on_activity: &'a mut dyn FnMut(HarnessActivity) -> Result<()>,
+    error: Option<anyhow::Error>,
+}
+
+impl<'a> NativeEventBridge<'a> {
+    fn new(on_activity: &'a mut dyn FnMut(HarnessActivity) -> Result<()>) -> Self {
+        Self {
+            on_activity,
+            error: None,
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        self.error.map_or(Ok(()), Err)
+    }
+}
+
+impl EventSink for NativeEventBridge<'_> {
+    fn emit(&mut self, event: HarnessEvent) {
+        if self.error.is_some() {
+            return;
+        }
+        let activity = match event {
+            HarnessEvent::TurnStarted => Some(HarnessActivity::RequestAccepted),
+            HarnessEvent::ToolRequested { name, .. } => Some(HarnessActivity::ToolStarted { name }),
+            HarnessEvent::ToolFinished { name, success, .. } => {
+                Some(HarnessActivity::ToolFinished { name, success })
+            }
+            HarnessEvent::TurnFinished => Some(HarnessActivity::Completed {
+                reason: "stop".to_owned(),
+            }),
+            HarnessEvent::TextDelta(_) | HarnessEvent::Usage(_) => None,
+        };
+        if let Some(activity) = activity
+            && let Err(error) = (self.on_activity)(activity)
+        {
+            self.error = Some(error);
+        }
+    }
+}
+
+fn project_notification(
+    notification: &Notification,
+    on_activity: &mut dyn FnMut(HarnessActivity) -> Result<()>,
+) -> Result<()> {
+    if let Some(activity) = notification.activity() {
+        on_activity(activity)?;
+    }
+    Ok(())
+}
+
 /// Background Harness turn whose public event stream is already redacted.
 pub struct AgentTurnTask {
     activities: Receiver<HarnessActivity>,
+    approvals: ApprovalInbox,
     cancellation: CancellationToken,
     worker: JoinHandle<TurnThreadResult>,
 }
@@ -44,6 +190,13 @@ impl AgentTurnTask {
         timeout: Duration,
     ) -> std::result::Result<HarnessActivity, RecvTimeoutError> {
         self.activities.recv_timeout(timeout)
+    }
+
+    pub fn recv_approval_timeout(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<crumb_agent::PendingApproval, RecvTimeoutError> {
+        self.approvals.recv_timeout(timeout)
     }
 
     #[must_use]
@@ -83,6 +236,7 @@ pub struct AgentRuntime {
     session: Option<AgentSession>,
     supervisor: Option<HarnessSupervisor>,
     supervisor_limits: Option<SupervisorLimits>,
+    native_conversation: Option<Conversation>,
     environment_revision: u64,
     context_tokens_estimate: u64,
     session_tokens_estimate: u64,
@@ -249,6 +403,7 @@ impl AgentRuntime {
             session: None,
             supervisor: None,
             supervisor_limits: None,
+            native_conversation: None,
             environment_revision: 1,
             context_tokens_estimate: 0,
             session_tokens_estimate: 0,
@@ -314,6 +469,7 @@ impl AgentRuntime {
         }
         self.supervisor = None;
         self.supervisor_limits = None;
+        self.native_conversation = None;
         self.environment_revision = self.environment_revision.saturating_add(1);
         let journal = SessionJournal::open(&root, &summary.id)?;
         self.session = Some(AgentSession::resume(
@@ -398,6 +554,7 @@ impl AgentRuntime {
         }
         let request = self.attach_review_notes(request);
         let (activity_sender, activities) = sync_channel(activity_capacity);
+        let (interactive, approval_inbox) = approval_channel(NonZeroUsize::MIN);
         let cancellation = CancellationToken::default();
         let worker_cancellation = cancellation.clone();
         let worker = thread::Builder::new()
@@ -408,13 +565,14 @@ impl AgentRuntime {
                     &request,
                     &config,
                     &workspace,
+                    TurnInteraction {
+                        interactive: Some(interactive),
+                    },
                     &worker_cancellation,
-                    |notification| {
-                        if let Some(activity) = notification.activity() {
-                            activity_sender
-                                .send(activity)
-                                .map_err(|_| anyhow::anyhow!("agent activity receiver closed"))?;
-                        }
+                    |activity| {
+                        activity_sender
+                            .send(activity)
+                            .map_err(|_| anyhow::anyhow!("agent activity receiver closed"))?;
                         Ok(())
                     },
                 );
@@ -423,6 +581,7 @@ impl AgentRuntime {
             .context("failed to start agent turn worker")?;
         Ok(AgentTurnTask {
             activities,
+            approvals: approval_inbox,
             cancellation,
             worker,
         })
@@ -441,7 +600,14 @@ impl AgentRuntime {
         workspace: &Path,
         cancellation: &CancellationToken,
     ) -> Result<RunResult> {
-        self.run_with_events_using(request, config, workspace, cancellation, |_| Ok(()))
+        self.run_with_events_using(
+            request,
+            config,
+            workspace,
+            TurnInteraction { interactive: None },
+            cancellation,
+            |_| Ok(()),
+        )
     }
 
     /// Creates or selects the redacted session journal before a local job runs.
@@ -482,8 +648,9 @@ impl AgentRuntime {
         request: &str,
         config: &AgentConfig,
         workspace: &Path,
+        interaction: TurnInteraction,
         cancellation: &CancellationToken,
-        on_notification: impl FnMut(&Notification) -> Result<()>,
+        on_activity: impl FnMut(HarnessActivity) -> Result<()>,
     ) -> Result<RunResult> {
         let workspace = std::fs::canonicalize(workspace)
             .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
@@ -497,6 +664,16 @@ impl AgentRuntime {
             });
         let config = &application.config;
         config.validate()?;
+        let tools =
+            crate::workspace_read_host(&workspace, config, crate::pollinations_runtime_key())?;
+        let configured = configured_approvals(config);
+        let approvals: Arc<dyn ApprovalBroker> = match interaction.interactive {
+            Some(interactive) => Arc::new(TurnApprovals {
+                configured,
+                interactive,
+            }),
+            None => Arc::new(configured),
+        };
         self.ensure_session(&workspace, config.mode)?;
         let route = config
             .models
@@ -504,7 +681,12 @@ impl AgentRuntime {
             .and_then(|routes| routes.first())
             .context("agent config has no text model route")?;
         let effort = config.reasoning_effort_for(route).map(str::to_owned);
-        let session_id = self.start_turn(config.mode, route, effort.clone(), request)?;
+        let native = matches!(config.harness, Some(HarnessConfig::Native));
+        let session_id = if native {
+            self.prepare_native_turn(config.mode, route, effort.clone())?
+        } else {
+            self.start_turn(config.mode, route, effort.clone(), request)?
+        };
         let profiled_request = application.profile.as_ref().map_or_else(
             || request.to_owned(),
             |profile| attach_profile_context(request, profile),
@@ -524,40 +706,20 @@ impl AgentRuntime {
         let prepared_request = attach_enabled_skills(&memory.request, &config.skills, &workspace)?;
         let cancellation_slot = Arc::clone(&self.active_cancellation);
         let _active = ActiveCancellation::new(&cancellation_slot, cancellation.clone())?;
-        let mut on_notification = on_notification;
-        let result = match config
-            .harness
-            .as_ref()
-            .context("agent Harness is not configured")?
-        {
-            HarnessConfig::Process { .. } => self.run_process_harness(
+        let mut on_activity = on_activity;
+        let result = self.dispatch_harness_turn(
+            PreparedTurn {
                 config,
-                &workspace,
+                workspace: &workspace,
                 route,
                 effort,
-                &session_id,
-                &prepared_request,
+                session_id: &session_id,
+                request: &prepared_request,
                 cancellation,
-                &mut on_notification,
-            ),
-            HarnessConfig::CodingCli {
-                backend, command, ..
-            } => self.run_coding_cli(
-                config,
-                &workspace,
-                route,
-                *backend,
-                command,
-                effort.as_deref(),
-                &session_id,
-                &prepared_request,
-                cancellation,
-                &mut on_notification,
-            ),
-            HarnessConfig::Native => {
-                Err(anyhow::anyhow!("native agent Harness is not implemented"))
-            }
-        };
+            },
+            TurnResources { tools, approvals },
+            &mut on_activity,
+        );
         let status = match &result {
             Ok(_) => TurnStatus::Complete,
             Err(_) if cancellation.is_cancelled() => TurnStatus::Cancelled,
@@ -569,11 +731,62 @@ impl AgentRuntime {
             context_token_budget(config, route),
             matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
         );
-        self.session
-            .as_mut()
-            .context("agent session unavailable")?
-            .record_turn_end(status, 0, 0)?;
+        if !native {
+            self.session
+                .as_mut()
+                .context("agent session unavailable")?
+                .record_turn_end(status, 0, 0)?;
+        }
         result
+    }
+
+    fn dispatch_harness_turn(
+        &mut self,
+        turn: PreparedTurn<'_>,
+        resources: TurnResources,
+        on_activity: &mut dyn FnMut(HarnessActivity) -> Result<()>,
+    ) -> Result<RunResult> {
+        match turn
+            .config
+            .harness
+            .as_ref()
+            .context("agent Harness is not configured")?
+        {
+            HarnessConfig::Process { .. } => self.run_process_harness(
+                turn.config,
+                turn.workspace,
+                turn.route,
+                turn.effort,
+                turn.session_id,
+                turn.request,
+                turn.cancellation,
+                &mut |notification| project_notification(notification, on_activity),
+            ),
+            HarnessConfig::CodingCli {
+                backend, command, ..
+            } => self.run_coding_cli(
+                turn.config,
+                turn.workspace,
+                turn.route,
+                *backend,
+                command,
+                turn.effort.as_deref(),
+                turn.session_id,
+                turn.request,
+                turn.cancellation,
+                &mut |notification| project_notification(notification, on_activity),
+            ),
+            HarnessConfig::Native => self.run_native_harness(
+                turn.config,
+                turn.route,
+                turn.session_id,
+                turn.request,
+                resources.tools,
+                resources.approvals,
+                turn.cancellation,
+                on_activity,
+            ),
+        }
     }
 
     fn record_token_estimate(
@@ -608,6 +821,103 @@ impl AgentRuntime {
         session.record_model_selection(route.provider.clone(), route.model.clone(), effort)?;
         session.record_turn_start(request)?;
         Ok(session.id().as_str().to_owned())
+    }
+
+    fn prepare_native_turn(
+        &mut self,
+        mode: AgentMode,
+        route: &crumb_agent::ModelRoute,
+        effort: Option<String>,
+    ) -> Result<String> {
+        let session = self.session.as_mut().context("agent session unavailable")?;
+        if session.mode() != mode {
+            session.set_mode(mode)?;
+        }
+        session.record_model_selection(route.provider.clone(), route.model.clone(), effort)?;
+        Ok(session.id().as_str().to_owned())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_native_harness(
+        &mut self,
+        config: &AgentConfig,
+        route: &crumb_agent::ModelRoute,
+        session_id: &str,
+        request: &str,
+        tools: ToolHost,
+        approvals: Arc<dyn ApprovalBroker>,
+        cancellation: &CancellationToken,
+        on_activity: &mut dyn FnMut(HarnessActivity) -> Result<()>,
+    ) -> Result<RunResult> {
+        if route.provider != "pollinations" {
+            bail!(
+                "native Harness currently supports the Pollinations provider; selected `{}`",
+                route.provider
+            );
+        }
+        let provider = config
+            .providers
+            .get(&route.provider)
+            .context("native Harness provider is not configured")?;
+        let credential = provider
+            .credential
+            .as_ref()
+            .map(crate::provider_projection::resolve_credential_secret)
+            .transpose()?
+            .map_or_else(crate::pollinations_runtime_key, |secret| {
+                Some(secret.expose().to_owned())
+            })
+            .context("Pollinations credential is unavailable")?;
+        let base_url = provider
+            .base_url
+            .trim_end_matches('/')
+            .strip_suffix("/v1")
+            .unwrap_or(provider.base_url.trim_end_matches('/'));
+        let provider = PollinationsProvider::new(
+            PollinationsConfig::new(credential)?.with_base_url(base_url)?,
+        )?;
+        let harness = NativeHarness::new(
+            Arc::new(provider),
+            tools,
+            approvals,
+            native_harness_limits(config)?,
+        );
+        let conversation = self
+            .native_conversation
+            .get_or_insert_with(|| harness.conversation());
+        let max_output_tokens = configured_max_output_tokens(config, route);
+        let turn = HarnessTurn {
+            model: route.model.clone(),
+            user_message: request.to_owned(),
+            persona: None,
+            trusted_context: Vec::new(),
+            max_output_tokens,
+        };
+        let mut events = NativeEventBridge::new(on_activity);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to start native Harness runtime")?;
+        let outcome = runtime.block_on(
+            harness.run_turn(
+                self.session
+                    .as_mut()
+                    .context("agent session is unavailable")?,
+                conversation,
+                turn,
+                cancellation,
+                &mut events,
+            ),
+        );
+        events.finish()?;
+        let outcome = outcome.map_err(anyhow::Error::new)?;
+        Ok(RunResult {
+            session_id: session_id.to_owned(),
+            final_response: outcome.text,
+            finish_reason: Some("stop".to_owned()),
+            events: Vec::new(),
+            notifications: Vec::new(),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -695,6 +1005,7 @@ impl AgentRuntime {
             }
             self.supervisor = None;
             self.supervisor_limits = None;
+            self.native_conversation = None;
             self.session = None;
             self.environment_revision = self.environment_revision.saturating_add(1);
         }

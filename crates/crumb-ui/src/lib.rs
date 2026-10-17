@@ -647,6 +647,26 @@ impl Renderer {
         )
     }
 
+    /// Renders a trusted allow-once decision without exposing raw arguments.
+    #[must_use]
+    pub fn agent_approval_prompt(&self, name: &str, risk: &str, digest: &str) -> String {
+        let short_digest = digest.get(..12).unwrap_or(digest);
+        if self.settings.output == OutputMode::ScreenReader {
+            return format!(
+                "Approval required for {name}, risk {risk}, request {short_digest}. Enter or y allows once; n or escape denies."
+            );
+        }
+        format!(
+            "  {}  {}\n  {} {}\n     {}\n     {}",
+            self.paint("[ CRUMB ]", "38;2;255;255;204;48;5;53;1"),
+            self.paint("Allow this tool once?", "33;1"),
+            self.paint("╰──▶", "33;1"),
+            self.paint(name, "1"),
+            self.paint(&format!("risk {risk} · request {short_digest}"), "2"),
+            self.paint("Enter/y allow once · n/Esc deny", "2")
+        )
+    }
+
     /// Starts a single-line terminal activity animation.
     #[must_use]
     pub fn activity(&self, label: &str) -> ActivityIndicator {
@@ -1236,6 +1256,10 @@ mod tests {
             renderer.agent_approval_required("write_file"),
             "  [ CRUMB ]  Approval required\n  ╰──▶ write_file · user permission required"
         );
+        assert_eq!(
+            renderer.agent_approval_prompt("write_file", "workspace write", "0123456789abcdef"),
+            "  [ CRUMB ]  Allow this tool once?\n  ╰──▶ write_file\n     risk workspace write · request 0123456789ab\n     Enter/y allow once · n/Esc deny"
+        );
     }
 
     #[test]
@@ -1254,6 +1278,10 @@ mod tests {
         assert_eq!(
             renderer.agent_approval_required("write_file"),
             "Approval required for tool write_file"
+        );
+        assert_eq!(
+            renderer.agent_approval_prompt("write_file", "workspace write", "0123456789abcdef"),
+            "Approval required for write_file, risk workspace write, request 0123456789ab. Enter or y allows once; n or escape denies."
         );
     }
 
