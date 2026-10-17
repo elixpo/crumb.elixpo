@@ -792,6 +792,22 @@ mod tests {
         );
         drop(requests);
         let journal = export_session(root.path(), "harness-test").expect("session exports");
+        assert!(journal.events.iter().any(|event| matches!(
+            event,
+            crumb_agent::SessionEvent::ToolRequested {
+                name,
+                arguments_digest,
+                ..
+            } if name == "weather" && arguments_digest.len() == 64
+        )));
+        assert!(journal.events.iter().any(|event| matches!(
+            event,
+            crumb_agent::SessionEvent::ToolFinished {
+                name,
+                success: true,
+                ..
+            } if name == "weather"
+        )));
         let persisted = serde_json::to_string(&journal).expect("session serializes");
         for secret in ["weather in Pune", "Pune", "24 C", "Be warm and brief"] {
             assert!(!persisted.contains(secret));
@@ -808,7 +824,7 @@ mod tests {
             Arc::new(DenyAllApprovals),
             HarnessLimits::default(),
         );
-        let (_root, mut session) = session(AgentMode::Negotiate);
+        let (root, mut session) = session(AgentMode::Negotiate);
         let mut conversation = harness.conversation();
 
         harness
@@ -823,6 +839,16 @@ mod tests {
             .expect("model can recover from denial");
 
         assert_eq!(calls.load(Ordering::Relaxed), 0);
+        let journal = export_session(root.path(), "harness-test").expect("session exports");
+        assert!(journal.events.iter().any(|event| matches!(
+            event,
+            crumb_agent::SessionEvent::ToolFinished {
+                name,
+                success: false,
+                output_bytes,
+                ..
+            } if name == "weather" && *output_bytes <= 64
+        )));
         let requests = provider.requests.lock().expect("request lock");
         assert!(
             requests[1]

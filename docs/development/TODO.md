@@ -125,6 +125,7 @@ engines remain replaceable; none may bypass Crumb's permission, credential, or s
 - [ ] [Supervise and authorize third-party MCP servers](https://github.com/elixpo/crumb.elixpo/issues/47).
   - [x] Supervise bounded local STDIO MCP servers ([PR #96](https://github.com/elixpo/crumb.elixpo/pull/96)).
   - [x] Supervise remote Streamable HTTP MCP servers ([issue #97](https://github.com/elixpo/crumb.elixpo/issues/97)).
+  - [x] [WP-033: audit supervised MCP lifecycle and tool outcomes](https://github.com/elixpo/crumb.elixpo/issues/124).
 - [ ] [Build marketplace trust, publishing, updates, rollback, and revocation](https://github.com/elixpo/crumb.elixpo/issues/48).
   - [x] [WP-025: marketplace schema v2 trust metadata](https://github.com/elixpo/crumb.elixpo/issues/106).
   - [x] [WP-026: bounded remote catalog sync and offline cache](https://github.com/elixpo/crumb.elixpo/issues/108).
