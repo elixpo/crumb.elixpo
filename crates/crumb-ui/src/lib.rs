@@ -231,11 +231,10 @@ impl Renderer {
             "Native shell ready · run /auth login for AI".to_owned()
         };
         let copy = format!(
-            "{wordmark}\nCrumb CLI v{} · Native commands stay native.\n{} · effort {}\n{}\nTip: type naturally · : forces AI · / opens actions",
+            "{wordmark}\nCrumb CLI v{} · Native commands stay native.\n{} · effort {}\nTip: type naturally · : forces AI · / opens actions",
             context.version,
             state,
             context.effort.unwrap_or("default"),
-            context_meter(context),
         );
         if terminal_width < 96 {
             let panda = format!("  {}", trim_art(panda).replace('\n', "\n  "));
@@ -981,7 +980,7 @@ fn context_meter(context: &StartupContext<'_>) -> String {
     );
     let percent = used.saturating_mul(100) / budget;
     format!(
-        "Context [{meter}] {percent:>3}% · {} / {}",
+        "Model context [{meter}] {percent:>3}% · {} / {}",
         compact_tokens(used),
         compact_tokens(context.session_budget_tokens)
     )
@@ -1738,7 +1737,7 @@ mod tests {
             100,
         );
 
-        assert!(footer.contains("Context"));
+        assert!(footer.contains("Model context"));
         assert!(footer.contains("12.8k / 64.0k"));
         assert!(footer.contains("nova-fast · auto · high"));
         assert!(!footer.contains("pollinations/"));
@@ -1876,7 +1875,7 @@ mod tests {
         );
         assert!(welcome.contains("Crumb CLI v0.1.0 · Native commands stay native."));
         assert!(welcome.contains("Ready · pollinations/nova-fast · auto"));
-        assert!(welcome.contains("Context [────────────]   0% · 0 / 64.0k"));
+        assert!(!welcome.contains("Model context"));
         assert!(!welcome.contains("compact"));
         assert!(welcome.contains("╭▄█▄╮"));
     }
