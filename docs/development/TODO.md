@@ -122,6 +122,8 @@ engines remain replaceable; none may bypass Crumb's permission, credential, or s
 ### Phase 2 — extensible ecosystem
 
 - [ ] [Expand the public skill and connector ecosystem](https://github.com/elixpo/crumb.elixpo/issues/46).
+  - [x] [WP-034: register external skills and qualify Harness context lifecycle](https://github.com/elixpo/crumb.elixpo/issues/126).
+  - Defer all connector implementation until the connector-free terminal is release-ready.
 - [ ] [Supervise and authorize third-party MCP servers](https://github.com/elixpo/crumb.elixpo/issues/47).
   - [x] Supervise bounded local STDIO MCP servers ([PR #96](https://github.com/elixpo/crumb.elixpo/pull/96)).
   - [x] Supervise remote Streamable HTTP MCP servers ([issue #97](https://github.com/elixpo/crumb.elixpo/issues/97)).

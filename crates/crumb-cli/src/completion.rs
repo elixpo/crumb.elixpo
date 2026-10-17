@@ -44,7 +44,7 @@ impl Completer for CrumbCompleter {
         };
         let (_, token) = current_token(prefix);
         let suggestions = if prefix.starts_with('/') && !prefix.contains('\n') {
-            slash_suggestions(prefix, pos)
+            slash_suggestions(prefix, pos, &self.workspace.get())
         } else if token.starts_with('@') {
             reference_suggestions(prefix, pos, &self.workspace.get())
         } else if token.starts_with('?') {
@@ -131,12 +131,17 @@ fn current_token(line: &str) -> (usize, &str) {
     (start, &line[start..])
 }
 
-fn slash_suggestions(prefix: &str, pos: usize) -> Vec<Suggestion> {
-    let commands = crumb_repl::SLASH_COMMANDS
+fn slash_suggestions(prefix: &str, pos: usize, workspace: &Path) -> Vec<Suggestion> {
+    let mut commands = crumb_repl::SLASH_COMMANDS
         .iter()
         .filter(|command| !is_setting_command(command.usage))
         .map(|command| (command.usage.to_owned(), command.description.to_owned()))
         .collect::<Vec<_>>();
+    commands.push((
+        "/skills add".to_owned(),
+        "register a local SKILL.md file; starts disabled".to_owned(),
+    ));
+    commands.extend(configured_skill_actions(workspace));
     commands
         .into_iter()
         .filter(|(usage, _)| usage.starts_with(prefix))
@@ -179,8 +184,8 @@ fn configured_skill_actions(workspace: &Path) -> Vec<(String, String)> {
     config
         .skills
         .into_iter()
-        .map(|skill| {
-            if skill.enabled {
+        .flat_map(|skill| {
+            let mut actions = vec![if skill.enabled {
                 (
                     format!("/skills unload {}", skill.id),
                     "unload from agent context".to_owned(),
@@ -190,7 +195,14 @@ fn configured_skill_actions(workspace: &Path) -> Vec<(String, String)> {
                     format!("/skills load {}", skill.id),
                     "load into agent context".to_owned(),
                 )
+            }];
+            if !skill.enabled {
+                actions.push((
+                    format!("/skills remove {}", skill.id),
+                    "remove registration without deleting its source".to_owned(),
+                ));
             }
+            actions
         })
         .collect()
 }
