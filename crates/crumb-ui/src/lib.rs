@@ -22,6 +22,9 @@ const PANDA_COOL: &str = include_str!("../assets/panda-cool.txt");
 const PANDA_CLOSING: &str = include_str!("../assets/panda-closing.txt");
 const COOKIE_SPINNER: [&str; 4] = ["(.:)", "(:.)", "(o.)", "(.o)"];
 const TRANSCRIPT_INPUT_MAX_ROWS: usize = 4;
+const CONTEXT_METER_WIDTH: usize = 12;
+const CRUMB_BADGE: &str = "[ CRUMB ]";
+const PARALLEL_TOOL: &str = "spawn_agents";
 
 const PUNCHLINES: &[&str] = &[
     "Broken biscuit. Working terminal.",
@@ -226,18 +229,11 @@ impl Renderer {
             "Native shell ready · run /auth login for AI".to_owned()
         };
         let copy = format!(
-            "{wordmark}\nCrumb CLI v{} · Native commands stay native.\n{} · effort {}\nContext {} / {} · session budget {}{}\nTip: type naturally · : forces AI · / opens actions",
+            "{wordmark}\nCrumb CLI v{} · Native commands stay native.\n{} · effort {}\n{}\nTip: type naturally · : forces AI · / opens actions",
             context.version,
             state,
             context.effort.unwrap_or("default"),
-            compact_tokens(context.context_tokens),
-            compact_tokens(context.session_budget_tokens),
-            compact_tokens(context.session_budget_tokens),
-            if context.auto_compaction {
-                " · compact at 80%"
-            } else {
-                ""
-            }
+            context_meter(context),
         );
         if terminal_width < 96 {
             let panda = format!("  {}", trim_art(panda).replace('\n', "\n  "));
@@ -300,9 +296,9 @@ impl Renderer {
     #[must_use]
     pub fn composer_hotkeys(&self, terminal_width: u16) -> String {
         let guide = if terminal_width < 80 {
-            "Enter send · Tab complete · PgUp/PgDn chat · / commands · ? help"
+            "Enter send · Tab complete · PgUp/PgDn scroll · / commands"
         } else {
-            "Enter send/steer · Ctrl+Enter queue · /pause turn · PgUp/PgDn chat · Tab complete · @ context · / commands · ? help · Ctrl+C cancel"
+            "Enter send/steer · Ctrl+Enter queue · PgUp/PgDn scroll · Tab complete · @ context · / commands · ? help"
         };
         self.paint(&format!("  {guide}"), "2")
     }
@@ -310,11 +306,7 @@ impl Renderer {
     /// Renders the persistent state row immediately below the composer.
     #[must_use]
     pub fn composer_idle_status(&self) -> String {
-        format!(
-            "  {} {}",
-            self.paint("●", "36"),
-            self.paint("Ready · / commands · ? help", "2")
-        )
+        format!("  {} {}", self.paint("●", "36"), self.paint("Ready", "2"))
     }
 
     /// Renders the bottom edge of the full-width composer.
@@ -497,7 +489,7 @@ impl Renderer {
         } else {
             format!(
                 "  {}  {}",
-                self.paint("[ CRUMB ]", "38;2;255;255;204;48;5;53;1"),
+                self.paint(CRUMB_BADGE, "38;2;255;255;204;48;5;53;1"),
                 self.paint(&details.join(" · "), "2")
             )
         }
@@ -619,16 +611,39 @@ impl Renderer {
     #[must_use]
     pub fn agent_tool_result(&self, name: &str, success: bool) -> String {
         let state = if success { "completed" } else { "failed" };
+        let (title, detail) = if name == PARALLEL_TOOL {
+            (
+                if success {
+                    "Agent team reported"
+                } else {
+                    "Agent team failed"
+                },
+                "parallel findings returned to the parent Harness",
+            )
+        } else {
+            (
+                if success {
+                    "Tool completed"
+                } else {
+                    "Tool failed"
+                },
+                name,
+            )
+        };
         if self.settings.output == OutputMode::ScreenReader {
-            return format!("Tool {name} {state}");
+            return if name == PARALLEL_TOOL {
+                format!("Parallel agent team {state}")
+            } else {
+                format!("Tool {name} {state}")
+            };
         }
         let color = if success { "32;1" } else { "31;1" };
         format!(
             "  {}  {}\n  {} {}",
-            self.paint("[ CRUMB ]", "38;2;255;255;204;48;5;53;1"),
-            self.paint(&format!("Tool {state}"), color),
+            self.paint(CRUMB_BADGE, "38;2;255;255;204;48;5;53;1"),
+            self.paint(title, color),
             self.paint("╰──▶", color),
-            self.paint(name, "1")
+            self.paint(detail, "1")
         )
     }
 
@@ -638,12 +653,24 @@ impl Renderer {
         if self.settings.output == OutputMode::ScreenReader {
             return format!("Approval required for tool {name}");
         }
+        let detail = if name == PARALLEL_TOOL {
+            "Koi · Nyx · Rune · Echo · user permission required".to_owned()
+        } else {
+            format!("{name} · user permission required")
+        };
         format!(
             "  {}  {}\n  {} {}",
-            self.paint("[ CRUMB ]", "38;2;255;255;204;48;5;53;1"),
-            self.paint("Approval required", "33;1"),
+            self.paint(CRUMB_BADGE, "38;2;255;255;204;48;5;53;1"),
+            self.paint(
+                if name == PARALLEL_TOOL {
+                    "Allow a parallel agent team?"
+                } else {
+                    "Approval required"
+                },
+                "33;1",
+            ),
             self.paint("╰──▶", "33;1"),
-            self.paint(&format!("{name} · user permission required"), "1")
+            self.paint(&detail, "1")
         )
     }
 
@@ -802,6 +829,33 @@ fn compact_tokens(tokens: u64) -> String {
     } else {
         tokens.to_string()
     }
+}
+
+fn context_meter(context: &StartupContext<'_>) -> String {
+    let budget = context.session_budget_tokens.max(1);
+    let used = context.context_tokens.min(budget);
+    let filled = usize::try_from(
+        used.saturating_mul(CONTEXT_METER_WIDTH as u64)
+            .div_ceil(budget),
+    )
+    .unwrap_or(CONTEXT_METER_WIDTH)
+    .min(CONTEXT_METER_WIDTH);
+    let meter = format!(
+        "{}{}",
+        "━".repeat(filled),
+        "─".repeat(CONTEXT_METER_WIDTH.saturating_sub(filled))
+    );
+    let percent = used.saturating_mul(100) / budget;
+    format!(
+        "Context [{meter}] {percent:>3}% · {} / {}{}",
+        compact_tokens(used),
+        compact_tokens(context.session_budget_tokens),
+        if context.auto_compaction {
+            " · compact 80%"
+        } else {
+            ""
+        }
+    )
 }
 
 fn fit_terminal_text(text: &str, width: usize) -> String {
@@ -1260,6 +1314,14 @@ mod tests {
             renderer.agent_approval_prompt("write_file", "workspace write", "0123456789abcdef"),
             "  [ CRUMB ]  Allow this tool once?\n  ╰──▶ write_file\n     risk workspace write · request 0123456789ab\n     Enter/y allow once · n/Esc deny"
         );
+        assert_eq!(
+            renderer.agent_tool_result("spawn_agents", true),
+            "  [ CRUMB ]  Agent team reported\n  ╰──▶ parallel findings returned to the parent Harness"
+        );
+        assert_eq!(
+            renderer.agent_approval_required("spawn_agents"),
+            "  [ CRUMB ]  Allow a parallel agent team?\n  ╰──▶ Koi · Nyx · Rune · Echo · user permission required"
+        );
     }
 
     #[test]
@@ -1339,6 +1401,7 @@ mod tests {
         );
         assert!(welcome.contains("Crumb CLI v0.1.0 · Native commands stay native."));
         assert!(welcome.contains("Ready · pollinations/nova-fast · auto"));
+        assert!(welcome.contains("Context [────────────]   0% · 0 / 64.0k · compact 80%"));
         assert!(welcome.contains("╭▄█▄╮"));
     }
 
