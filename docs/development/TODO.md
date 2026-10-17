@@ -83,7 +83,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Add bounded Enter-to-steer and Ctrl+Enter FIFO follow-ups with queue replacement.
 - [x] Add queued steering and richer tool-specific event projection to the Harness stream.
 - [ ] Add interactive approval, tool-call, patch, error, and completion components.
-- [ ] Add live model, effort, and mode selection backed by atomic configuration writes.
+- [x] Add live model, effort, and mode selection backed by atomic configuration writes.
 - [ ] Add terminal-width snapshots, reduced-motion behavior, and accessibility checks.
 - [ ] Package signed standalone binaries for Linux, macOS, and Windows.
 
@@ -95,7 +95,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] [Add resumable and searchable agent sessions](https://github.com/elixpo/crumb.elixpo/issues/35)
 - [x] [Add opt-in background jobs and scheduled agent work](https://github.com/elixpo/crumb.elixpo/issues/34)
 - [x] [Add pluggable Codex and Claude coding-agent backends](https://github.com/elixpo/crumb.elixpo/issues/39)
-- [ ] [Add terminal-configurable Harness providers and explicit model selection](https://github.com/elixpo/crumb.elixpo/issues/40)
+- [x] [Add terminal-configurable Harness providers and explicit model selection](https://github.com/elixpo/crumb.elixpo/issues/40)
   - [x] Add the provider-neutral, non-secret endpoint and capability schema.
   - [x] Add validated atomic terminal mutations for providers, models, mode, and effort.
   - [x] Add OpenRouter/Pollinations presets and typed credential/header references.
