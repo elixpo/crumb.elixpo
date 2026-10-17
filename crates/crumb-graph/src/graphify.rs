@@ -144,6 +144,24 @@ impl GraphifyAdapter {
         &self.settings
     }
 
+    #[must_use]
+    pub fn mcp_command(&self) -> PathBuf {
+        let parent = self
+            .settings
+            .command
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty());
+        parent.map_or_else(
+            || PathBuf::from("graphify-mcp"),
+            |path| path.join("graphify-mcp"),
+        )
+    }
+
+    #[must_use]
+    pub fn mcp_available(&self) -> bool {
+        run_probe(&self.mcp_command(), "--help").is_ok()
+    }
+
     /// Checks the installed executable without installing or updating it.
     #[must_use]
     pub fn status(&self) -> GraphifyStatus {
@@ -179,7 +197,7 @@ impl GraphifyAdapter {
     {
         let status = self.status();
         if !status.available {
-            bail!("Graphify is not installed; install graphifyy=={GRAPHIFY_PINNED_VERSION}");
+            bail!("Graphify is not installed; install graphifyy[mcp]=={GRAPHIFY_PINNED_VERSION}");
         }
         if !status.compatible {
             bail!("Graphify version is incompatible; expected {GRAPHIFY_PINNED_VERSION}");
@@ -205,9 +223,13 @@ impl GraphifyAdapter {
 }
 
 fn run_version(command: &Path) -> Result<String> {
+    run_probe(command, "--version")
+}
+
+fn run_probe(command: &Path, argument: &str) -> Result<String> {
     let mut process = Command::new(command);
     process
-        .arg("--version")
+        .arg(argument)
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -348,6 +370,7 @@ mod tests {
         })
         .expect("adapter");
         assert!(adapter.status().compatible);
+        assert!(!adapter.mcp_available());
         let started = Instant::now();
         let error = adapter
             .build(&workspace, Duration::from_secs(10), || true)
