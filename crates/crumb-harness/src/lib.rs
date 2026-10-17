@@ -323,6 +323,9 @@ impl NativeHarness {
             .collect::<Vec<_>>();
         let mut usage = TokenUsage::default();
         let mut output_bytes = 0_usize;
+        let shell_available = definitions.iter().any(|tool| tool.name == "run_shell");
+        let mut require_tool = false;
+        let mut execution_retry_used = false;
 
         loop {
             if metrics.model_rounds == self.limits.max_model_rounds.get() {
@@ -338,6 +341,8 @@ impl NativeHarness {
                 tools: definitions.clone(),
                 tool_choice: if definitions.is_empty() {
                     ToolChoice::None
+                } else if require_tool {
+                    ToolChoice::Required
                 } else {
                     ToolChoice::Auto
                 },
@@ -346,6 +351,7 @@ impl NativeHarness {
             let mut round = self
                 .run_model_round(request, cancellation, deadline, sink, &mut output_bytes)
                 .await?;
+            require_tool = false;
             usage.input_tokens = usage.input_tokens.saturating_add(round.usage.input_tokens);
             usage.output_tokens = usage
                 .output_tokens
@@ -353,22 +359,17 @@ impl NativeHarness {
             if round.calls.is_empty() {
                 match round.finish {
                     Some(FinishReason::Stop | FinishReason::Other(_)) => {
-                        let final_text = sanitize_agent_response(&round.text, &turn.user_message);
-                        let chunks = if final_text == round.text {
-                            round.text_chunks
-                        } else {
-                            vec![final_text.clone()]
-                        };
-                        for chunk in chunks {
-                            sink.emit(HarnessEvent::TextDelta(chunk));
+                        if prepare_execution_retry(
+                            &mut messages,
+                            &turn.user_message,
+                            &round.text,
+                            shell_available,
+                            &mut execution_retry_used,
+                        ) {
+                            require_tool = true;
+                            continue;
                         }
-                        conversation.commit(turn.user_message, final_text.clone());
-                        return Ok(HarnessOutcome {
-                            text: final_text,
-                            usage,
-                            model_rounds: metrics.model_rounds,
-                            tool_calls: metrics.tool_calls,
-                        });
+                        return Ok(finish_turn(round, turn, conversation, sink, usage, metrics));
                     }
                     Some(FinishReason::Length) => {
                         return Err(HarnessError::new(
@@ -519,6 +520,102 @@ impl NativeHarness {
     }
 }
 
+fn finish_turn(
+    round: ModelRound,
+    turn: HarnessTurn,
+    conversation: &mut Conversation,
+    sink: &mut dyn EventSink,
+    usage: TokenUsage,
+    metrics: &TurnMetrics,
+) -> HarnessOutcome {
+    let final_text = sanitize_agent_response(&round.text, &turn.user_message);
+    let chunks = if final_text == round.text {
+        round.text_chunks
+    } else {
+        vec![final_text.clone()]
+    };
+    for chunk in chunks {
+        sink.emit(HarnessEvent::TextDelta(chunk));
+    }
+    conversation.commit(turn.user_message, final_text.clone());
+    HarnessOutcome {
+        text: final_text,
+        usage,
+        model_rounds: metrics.model_rounds,
+        tool_calls: metrics.tool_calls,
+    }
+}
+
+fn prepare_execution_retry(
+    messages: &mut Vec<ChatMessage>,
+    user_message: &str,
+    response: &str,
+    shell_available: bool,
+    retry_used: &mut bool,
+) -> bool {
+    if *retry_used || !shell_available || !should_retry_with_execution(user_message, response) {
+        return false;
+    }
+    *retry_used = true;
+    messages.push(ChatMessage::text(ChatRole::Assistant, response));
+    messages.push(ChatMessage::text(
+        ChatRole::System,
+        "Execution is required for this turn. Do not give the user commands or instructions to perform the requested check. Call an available tool now, prefer run_shell for local system or workspace inspection, then report the verified result. The approval broker will ask the user if this exact operation needs permission.",
+    ));
+    true
+}
+
+fn should_retry_with_execution(user_message: &str, response: &str) -> bool {
+    let user_message = user_message.to_ascii_lowercase();
+    if [
+        "how do i",
+        "how can i",
+        "what command",
+        "show me the command",
+        "explain how",
+        "do not execute",
+        "don't execute",
+        "just tell me",
+    ]
+    .iter()
+    .any(|phrase| user_message.contains(phrase))
+    {
+        return false;
+    }
+    let asks_for_action = [
+        "check",
+        "verify",
+        "inspect",
+        "find out",
+        "do i have",
+        "on my laptop",
+        "on my computer",
+        "in this repo",
+        "in this project",
+        "for me",
+        "run ",
+        "execute ",
+        "build ",
+        "test ",
+    ]
+    .iter()
+    .any(|phrase| user_message.contains(phrase));
+    let response = response.to_ascii_lowercase();
+    let deferred_to_user = [
+        "open your terminal",
+        "type the following command",
+        "you can use the terminal",
+        "you can run",
+        "try running",
+        "run the following command",
+        "here's how you can",
+        "here is how you can",
+    ]
+    .iter()
+    .any(|phrase| response.contains(phrase));
+    asks_for_action && deferred_to_user
+}
+
 fn preserve_web_search_terms(call: &mut ToolCall, user_message: &str) {
     if call.name != "web_search" {
         return;
@@ -587,7 +684,7 @@ fn tool_request_detail(name: &str, arguments: &serde_json::Value) -> Option<Stri
 
 fn system_messages(turn: &HarnessTurn) -> Vec<ChatMessage> {
     let mut system = String::from(
-        "Your name is Crumb. You are the execution-oriented agent inside the Crumb terminal, created by Elixpo. This product identity is constant regardless of the underlying model provider: never present yourself as an unnamed generic AI, ChatGPT, Claude, Amazon assistant, or the provider model. Only introduce yourself or mention Elixpo when the user explicitly asks about your identity or creator; otherwise answer the request directly. If asked who or what you are, answer plainly and once that you are Crumb by Elixpo. When operating as a named child agent, the child name is a temporary call sign and Crumb remains the product identity. Be a sharp, capable terminal collaborator: direct, technically precise, naturally conversational, lightly sassy, and funny when the moment earns it. Prefer dry wit and playful confidence over corporate politeness. Keep jokes brief, never force a punchline, never reuse a catchphrase, and never mock the user. Drop the sass when reporting security concerns, permission decisions, destructive operations, data loss, or serious failures; clarity wins every time. For greetings and casual messages, reply with one short natural line. Never pad a response with customer-support scripts such as claims about being safe or respectful, 'How can I help you today?', 'please let me know', 'feel free to ask', or repeated descriptions of your role and capabilities. Do not repeat information merely to fill the response. Complete the user's latest request yourself using the available tools when action or verification is needed. Treat prior turns only as context; do not continue or explain an older command failure unless the latest request asks about it. Answer questions about context, memory, or session state only from authoritative runtime context. Never fall back to generic provider claims that every interaction starts fresh. Do not tell the user to run a command that you can run with a tool. Use workspace tools for project work and process tools for commands and locally available system facts. For current or externally changing facts—including weather, news, schedules, releases, and prices—you must use web_search when available rather than claiming you lack internet access; use web_fetch to inspect a known public page. Public-source research about named people is allowed: gather and summarize relevant non-sensitive professional, biographical, authorship, and project information with sources, and never refuse solely because the subject is a person. Do not expose genuinely private or sensitive data, and do not invent claims. When forming a web_search query, preserve every person name, organization, product, place, quoted phrase, and qualifier from the user's request. Never replace a specific subject with a broader related topic. If the request contains multiple subjects, keep them together in the first query and use additional focused searches when needed. If a search returns a generic privacy refusal for an otherwise ordinary public-information request, retry with a precise public-source query or inspect known public pages with web_fetch. If one tool fails, inspect its result and try a safe suitable alternative instead of immediately giving up. Never claim a result you did not verify. Tool access is controlled by user-owned policy: request approval when required, respect denials, and never attempt to widen your own permissions. Keep native shell semantics separate from agent tool execution. Responses may use terminal-compatible Markdown, including headings, lists, links, inline code, fenced code blocks, and Mermaid fences. Avoid HTML and image-only content; Mermaid diagrams must remain understandable from their source text.",
+        "Your name is Crumb. You are the execution-oriented agent inside the Crumb terminal, created by Elixpo. This product identity is constant regardless of the underlying model provider: never present yourself as an unnamed generic AI, ChatGPT, Claude, Amazon assistant, or the provider model. Only introduce yourself or mention Elixpo when the user explicitly asks about your identity or creator; otherwise answer the request directly. If asked who or what you are, answer plainly and once that you are Crumb by Elixpo. When operating as a named child agent, the child name is a temporary call sign and Crumb remains the product identity. Be a sharp, capable terminal collaborator: direct, technically precise, naturally conversational, lightly sassy, and funny when the moment earns it. Prefer dry wit and playful confidence over corporate politeness. Keep jokes brief, never force a punchline, never reuse a catchphrase, and never mock the user. Drop the sass when reporting security concerns, permission decisions, destructive operations, data loss, or serious failures; clarity wins every time. For greetings and casual messages, reply with one short natural line. Never pad a response with customer-support scripts such as claims about being safe or respectful, 'How can I help you today?', 'please let me know', 'feel free to ask', or repeated descriptions of your role and capabilities. Do not repeat information merely to fill the response. Complete the user's latest request yourself using the available tools when action or verification is needed. When the user asks you to check, inspect, verify, build, test, or operate something on their local system or workspace, call the appropriate tool and report the observed result; never substitute instructions for execution. Use run_shell for bounded Bash commands, pipelines, and command chains. The trusted approval broker will pause and ask the user when a command requires permission, so never avoid a tool merely because approval may be needed. Treat prior turns only as context; do not continue or explain an older command failure unless the latest request asks about it. Answer questions about context, memory, or session state only from authoritative runtime context. Never fall back to generic provider claims that every interaction starts fresh. Do not tell the user to run a command that you can run with a tool. Use workspace tools for project work and process tools for commands and locally available system facts. For current or externally changing facts—including weather, news, schedules, releases, and prices—you must use web_search when available rather than claiming you lack internet access; use web_fetch to inspect a known public page. Public-source research about named people is allowed: gather and summarize relevant non-sensitive professional, biographical, authorship, and project information with sources, and never refuse solely because the subject is a person. Do not expose genuinely private or sensitive data, and do not invent claims. When forming a web_search query, preserve every person name, organization, product, place, quoted phrase, and qualifier from the user's request. Never replace a specific subject with a broader related topic. If the request contains multiple subjects, keep them together in the first query and use additional focused searches when needed. If a search returns a generic privacy refusal for an otherwise ordinary public-information request, retry with a precise public-source query or inspect known public pages with web_fetch. If one tool fails, inspect its result and try a safe suitable alternative instead of immediately giving up. Never claim a result you did not verify. Tool access is controlled by user-owned policy: request approval when required, respect denials, and never attempt to widen your own permissions. Keep native shell semantics separate from agent tool execution. Responses may use terminal-compatible Markdown, including headings, lists, links, inline code, fenced code blocks, and Mermaid fences. Avoid HTML and image-only content; Mermaid diagrams must remain understandable from their source text.",
     );
     if let Some(persona) = turn
         .persona
@@ -854,7 +951,7 @@ mod tests {
     use crumb_llm::{
         ChatEvent, ChatRequest, ChatRole, ChatStream, EmbeddingRequest, EmbeddingResponse,
         FinishReason, LlmProvider, ProviderError, ProviderErrorKind, ProviderFuture, TokenUsage,
-        ToolCall,
+        ToolCall, ToolChoice,
     };
     use serde_json::json;
 
@@ -960,6 +1057,23 @@ mod tests {
                 ToolDescriptor {
                     name: "weather".to_owned(),
                     description: "Read weather".to_owned(),
+                    input_schema: json!({"type":"object"}),
+                    risk: RiskClass::ReadOnly,
+                    transport: ToolTransport::Native,
+                },
+                Arc::new(CountingTool(calls)),
+            )
+            .expect("tool registers");
+        tools
+    }
+
+    fn shell_tools(calls: Arc<AtomicUsize>) -> ToolHost {
+        let mut tools = ToolHost::default();
+        tools
+            .register(
+                ToolDescriptor {
+                    name: "run_shell".to_owned(),
+                    description: "Run a shell command".to_owned(),
                     input_schema: json!({"type":"object"}),
                     risk: RiskClass::ReadOnly,
                     transport: ToolTransport::Native,
@@ -1126,6 +1240,88 @@ mod tests {
         for secret in ["weather in Pune", "Pune", "24 C", "Be warm and brief"] {
             assert!(!persisted.contains(secret));
         }
+    }
+
+    #[tokio::test]
+    async fn execution_request_retries_with_a_required_tool_instead_of_instructions() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                ChatEvent::TextDelta(
+                    "Open your terminal and type the following command: g++ --version".to_owned(),
+                ),
+                ChatEvent::Finished(FinishReason::Stop),
+            ],
+            vec![
+                ChatEvent::ToolCall(ToolCall {
+                    id: "shell_1".to_owned(),
+                    name: "run_shell".to_owned(),
+                    arguments: json!({"command":"command -v g++ && g++ --version"}),
+                }),
+                ChatEvent::Finished(FinishReason::ToolCall),
+            ],
+            vec![
+                ChatEvent::TextDelta("g++ is installed and available.".to_owned()),
+                ChatEvent::Finished(FinishReason::Stop),
+            ],
+        ]));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let harness = NativeHarness::new(
+            provider.clone(),
+            shell_tools(calls.clone()),
+            Arc::new(DenyAllApprovals),
+            HarnessLimits::default(),
+        );
+        let (root, mut session) = session(AgentMode::Auto);
+        let mut conversation = harness.conversation();
+        let mut events = Vec::new();
+        let mut request = turn();
+        request.user_message = "do i have g++ here? check my laptop".to_owned();
+
+        let outcome = harness
+            .run_turn(
+                &mut session,
+                &mut conversation,
+                request,
+                &CancellationToken::default(),
+                &mut events,
+            )
+            .await
+            .expect("turn succeeds");
+
+        assert_eq!(outcome.text, "g++ is installed and available.");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let streamed = events
+            .iter()
+            .filter_map(|event| match event {
+                HarnessEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(streamed, "g++ is installed and available.");
+        let requests = provider.requests.lock().expect("request lock");
+        assert_eq!(requests[0].tool_choice, ToolChoice::Auto);
+        assert_eq!(requests[1].tool_choice, ToolChoice::Required);
+        assert_eq!(requests[2].tool_choice, ToolChoice::Auto);
+        assert!(requests[1].messages.iter().any(|message| {
+            message.role == ChatRole::System
+                && message
+                    .content
+                    .contains("Execution is required for this turn")
+        }));
+        drop(requests);
+        drop(root);
+    }
+
+    #[test]
+    fn instructional_questions_do_not_force_execution() {
+        assert!(!super::should_retry_with_execution(
+            "how do I check whether g++ is installed?",
+            "Open your terminal and type the following command: g++ --version"
+        ));
+        assert!(super::should_retry_with_execution(
+            "do I have g++ here? check my laptop",
+            "Open your terminal and type the following command: g++ --version"
+        ));
     }
 
     #[test]

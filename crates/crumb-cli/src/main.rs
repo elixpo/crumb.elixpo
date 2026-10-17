@@ -8979,8 +8979,8 @@ mod tests {
         read_agent_config, read_bounded_response, register_local_skill, resolve_memory_keep,
         sanitize_transcript_output, set_skill_enabled, show_graph, show_marketplace, show_memory,
         show_profile_with_stores, suggestion_width, unregister_local_skill,
-        validate_marketplace_path, validate_marketplace_response, workspace_read_host,
-        write_bounded_response_delta,
+        validate_marketplace_path, validate_marketplace_response, visible_tool_activity,
+        workspace_read_host, write_bounded_response_delta,
     };
 
     #[test]
@@ -9793,6 +9793,14 @@ mod tests {
         assert_eq!(
             frame,
             "\x1b7\x1b[40;1H\x1b[2K  Type a follow-up · Enter steer · Ctrl+Enter queue · /pause · Ctrl+C cancel\x1b8"
+        );
+    }
+
+    #[test]
+    fn shell_activity_displays_the_exact_command() {
+        assert_eq!(
+            visible_tool_activity("run_shell", Some("command -v g++ && g++ --version")),
+            "Running command · $ command -v g++ && g++ --version"
         );
     }
 }
