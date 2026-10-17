@@ -501,16 +501,16 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
         (None, resume_agent_runtime(&initial_cwd, resume_session)?);
     let (mut last_exit_code, mut command_context) = (None, SessionCommandContext::default());
     let history = open_history(&mut stdout.lock())?;
-    let completion_workspace = CompletionWorkspace::new(initial_cwd);
-    let header_rows = render_startup(
+    let (header_rows, transcript_state) = initialize_transcript(
         renderer,
         platform,
         interactive,
         fullscreen,
+        &initial_cwd,
         runtime_context_tokens(agent_runtime.as_ref()),
         &mut stdout.lock(),
     )?;
-    let transcript_state = Arc::new(Mutex::new(TranscriptState::default()));
+    let completion_workspace = CompletionWorkspace::new(initial_cwd);
     let mut line_editor = optional_line_editor(
         interactive,
         history.as_ref(),
@@ -828,12 +828,14 @@ impl FullscreenTranscript {
         cwd: &Path,
         runtime: Option<&AgentRuntime>,
     ) -> Result<()> {
-        refresh_context_header(
+        refresh_context_footer(
             self.renderer,
             platform,
             cwd,
             runtime_context_tokens(runtime),
             self.enabled,
+            &self.state,
+            self.header_rows,
         )
     }
 }
@@ -843,6 +845,7 @@ struct TranscriptState {
     lines: VecDeque<String>,
     scroll_offset: usize,
     unseen_lines: usize,
+    footer_context: String,
 }
 
 impl TranscriptState {
@@ -1091,10 +1094,7 @@ fn render_startup(
             " ".repeat(usize::from(FULLSCREEN_SIDE_GUTTER)),
             renderer.transcript_divider(content_width)
         )?;
-        let content_rows = u16::try_from(welcome.lines().count())
-            .unwrap_or(u16::MAX)
-            .saturating_add(1);
-        return Ok(content_rows.saturating_add(FULLSCREEN_TOP_GUTTER));
+        return Ok(0);
     }
     let branding = renderer.branding_for_width(terminal_width);
     if !branding.is_empty() {
@@ -1107,16 +1107,57 @@ fn render_startup(
     Ok(0)
 }
 
-fn refresh_context_header(
+fn initialize_transcript(
+    renderer: Renderer,
+    platform: Platform,
+    interactive: bool,
+    fullscreen: bool,
+    cwd: &Path,
+    context_tokens: u64,
+    writer: &mut dyn Write,
+) -> Result<(u16, Arc<Mutex<TranscriptState>>)> {
+    let header_rows = render_startup(
+        renderer,
+        platform,
+        interactive,
+        fullscreen,
+        context_tokens,
+        writer,
+    )?;
+    let state = TranscriptState {
+        footer_context: context_footer_status(renderer, platform, cwd, context_tokens),
+        ..TranscriptState::default()
+    };
+    Ok((header_rows, Arc::new(Mutex::new(state))))
+}
+
+fn refresh_context_footer(
     renderer: Renderer,
     platform: Platform,
     cwd: &Path,
     context_tokens: u64,
     fullscreen: bool,
+    transcript: &Arc<Mutex<TranscriptState>>,
+    header_rows: u16,
 ) -> Result<()> {
     if !fullscreen {
         return Ok(());
     }
+    let footer = context_footer_status(renderer, platform, cwd, context_tokens);
+    let mut state = transcript
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.footer_context = footer;
+    render_transcript_footer(&state, renderer, header_rows)?;
+    Ok(())
+}
+
+fn context_footer_status(
+    renderer: Renderer,
+    platform: Platform,
+    cwd: &Path,
+    context_tokens: u64,
+) -> String {
     let config = read_agent_config(cwd).unwrap_or_default();
     let text_route = config
         .models
@@ -1134,31 +1175,7 @@ fn refresh_context_header(
         auto_compaction: matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
         agent_configured: config.harness.is_some() && model.is_some(),
     };
-    let terminal_width = size().map_or(100, |(columns, _)| columns);
-    let content_width = terminal_width.saturating_sub(FULLSCREEN_SIDE_GUTTER * 2);
-    let welcome = indent_terminal_block(
-        &renderer.welcome(&startup, content_width),
-        FULLSCREEN_SIDE_GUTTER,
-    );
-    let mut lines = vec![String::new(); usize::from(FULLSCREEN_TOP_GUTTER)];
-    lines.extend(welcome.lines().map(str::to_owned));
-    lines.push(format!(
-        "{}{}",
-        " ".repeat(usize::from(FULLSCREEN_SIDE_GUTTER)),
-        renderer.transcript_divider(content_width)
-    ));
-    let mut frame = Vec::new();
-    write!(frame, "\x1b7")?;
-    for (row, line) in lines.iter().enumerate() {
-        let row = u16::try_from(row).unwrap_or(u16::MAX);
-        crossterm::execute!(frame, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
-        write!(frame, "{line}")?;
-    }
-    write!(frame, "\x1b8")?;
-    let mut terminal = io::stdout();
-    terminal.write_all(&frame)?;
-    terminal.flush()?;
-    Ok(())
+    renderer.context_footer(&startup, size().map_or(100, |(columns, _)| columns))
 }
 
 fn runtime_context_tokens(runtime: Option<&AgentRuntime>) -> u64 {
@@ -2187,12 +2204,14 @@ fn render_observed_activity(
         }
         *live_context_tokens =
             (*live_context_tokens).max(input_tokens.saturating_add(*output_tokens));
-        refresh_context_header(
+        refresh_context_footer(
             renderer,
             Platform::current(),
             workspace,
             *live_context_tokens,
             terminal.fullscreen,
+            &terminal.transcript,
+            terminal.header_rows,
         )?;
         *activity = Some(start_activity(renderer, "Thinking", terminal.fullscreen));
     } else {
@@ -3092,7 +3111,7 @@ fn start_activity(
     fullscreen: bool,
 ) -> crumb_ui::ActivityIndicator {
     if fullscreen {
-        let row = size().map_or(0, |(_, rows)| rows.saturating_sub(2));
+        let row = size().map_or(0, |(_, rows)| rows.saturating_sub(3));
         renderer.activity_at(label, row)
     } else {
         renderer.activity(label)
@@ -8578,7 +8597,7 @@ fn context_token_budget(config: &AgentConfig, route: Option<&ModelRoute>) -> u64
     })
 }
 
-const FULLSCREEN_COMPOSER_ROWS: u16 = 5;
+const FULLSCREEN_COMPOSER_ROWS: u16 = 6;
 
 fn fullscreen_rows(header_rows: u16) -> io::Result<(u16, u16, u16, u16)> {
     let (_, rows) = size()?;
@@ -8616,10 +8635,11 @@ fn position_composer(renderer: Renderer, header_rows: u16) -> io::Result<()> {
     // Reedline owns cursor movement while editing. Reset margins before handing
     // it the composer so its redraw bookkeeping cannot erase transcript rows.
     write!(writer, "\x1b[r")?;
+    for row in composer_row..=composer_row.saturating_add(3) {
+        crossterm::execute!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    }
     crossterm::execute!(
         writer,
-        MoveTo(0, composer_row),
-        Clear(ClearType::FromCursorDown),
         MoveTo(columns.saturating_sub(3), composer_row.saturating_add(2))
     )?;
     write!(writer, "{}", renderer.composer_side_border())?;
@@ -8743,6 +8763,12 @@ fn render_transcript_footer_with_writer(
         crossterm::execute!(writer, MoveTo(column, composer_row.saturating_add(3)))?;
         write!(writer, "{indicator}")?;
     }
+    crossterm::execute!(
+        writer,
+        MoveTo(0, composer_row.saturating_add(4)),
+        Clear(ClearType::CurrentLine)
+    )?;
+    write!(writer, "{}", state.footer_context)?;
     crossterm::execute!(writer, MoveTo(0, footer_row), Clear(ClearType::CurrentLine))?;
     write!(writer, "{}", renderer.composer_hotkeys(columns))
 }

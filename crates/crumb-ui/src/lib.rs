@@ -328,6 +328,25 @@ impl Renderer {
         format!("  {} {}", self.paint("●", "36"), self.paint("Ready", "2"))
     }
 
+    /// Renders compact, non-secret model and context state for the fixed footer.
+    #[must_use]
+    pub fn context_footer(&self, context: &StartupContext<'_>, terminal_width: u16) -> String {
+        let model = context
+            .model
+            .unwrap_or("native")
+            .rsplit('/')
+            .next()
+            .unwrap_or("native");
+        let text = format!(
+            "{} · {model} · {} · {}",
+            context_meter(context),
+            context.mode,
+            context.effort.unwrap_or("default")
+        );
+        let text = fit_terminal_text(&text, usize::from(terminal_width.saturating_sub(2)));
+        self.paint(&format!("  {text}"), "2")
+    }
+
     /// Renders the bottom edge of the full-width composer.
     #[must_use]
     pub fn composer_bottom_border(&self, terminal_width: u16) -> String {
@@ -962,14 +981,9 @@ fn context_meter(context: &StartupContext<'_>) -> String {
     );
     let percent = used.saturating_mul(100) / budget;
     format!(
-        "Context [{meter}] {percent:>3}% · {} / {}{}",
+        "Context [{meter}] {percent:>3}% · {} / {}",
         compact_tokens(used),
-        compact_tokens(context.session_budget_tokens),
-        if context.auto_compaction {
-            " · compact 80%"
-        } else {
-            ""
-        }
+        compact_tokens(context.session_budget_tokens)
     )
 }
 
@@ -1702,6 +1716,36 @@ mod tests {
     }
 
     #[test]
+    fn context_footer_keeps_live_usage_and_compact_model_identity() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let footer = renderer.context_footer(
+            &StartupContext {
+                version: "0.1.0",
+                platform: Platform::Linux,
+                model: Some("pollinations/nova-fast"),
+                mode: "auto",
+                effort: Some("high"),
+                session_budget_tokens: 64_000,
+                context_tokens: 12_800,
+                auto_compaction: true,
+                agent_configured: true,
+            },
+            100,
+        );
+
+        assert!(footer.contains("Context"));
+        assert!(footer.contains("12.8k / 64.0k"));
+        assert!(footer.contains("nova-fast · auto · high"));
+        assert!(!footer.contains("pollinations/"));
+        assert!(footer.chars().count() <= 100);
+    }
+
+    #[test]
     fn agent_events_distinguish_tool_results_and_user_owned_approval() {
         let renderer = Renderer::new(UiSettings {
             color: false,
@@ -1832,7 +1876,8 @@ mod tests {
         );
         assert!(welcome.contains("Crumb CLI v0.1.0 · Native commands stay native."));
         assert!(welcome.contains("Ready · pollinations/nova-fast · auto"));
-        assert!(welcome.contains("Context [────────────]   0% · 0 / 64.0k · compact 80%"));
+        assert!(welcome.contains("Context [────────────]   0% · 0 / 64.0k"));
+        assert!(!welcome.contains("compact"));
         assert!(welcome.contains("╭▄█▄╮"));
     }
 
