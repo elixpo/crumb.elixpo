@@ -421,7 +421,7 @@ impl EventSink for TeamEvents {
                 tool_activity_label(&name),
                 if success { "done" } else { "failed" }
             )),
-            HarnessEvent::ToolOutput { .. } => None,
+            HarnessEvent::ToolOutput { .. } | HarnessEvent::FileChanged { .. } => None,
             HarnessEvent::TextDelta(_) if !self.reporting => {
                 self.reporting = true;
                 Some("Reporting findings".to_owned())

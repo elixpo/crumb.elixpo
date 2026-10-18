@@ -87,6 +87,11 @@ pub enum HarnessEvent {
         name: String,
         content: String,
     },
+    FileChanged {
+        path: String,
+        additions: u64,
+        deletions: u64,
+    },
     Usage(TokenUsage),
     TurnFinished,
 }
@@ -262,6 +267,7 @@ struct ModelRound {
 
 struct ExecutedTool {
     content: String,
+    structured: Option<serde_json::Value>,
     success: bool,
 }
 
@@ -573,15 +579,15 @@ impl NativeHarness {
             &mut report_progress,
         );
         ensure_active(cancellation, deadline)?;
-        let (content, success) = match result {
-            Ok(output) => (output.text, !output.is_error),
+        let (content, structured, success) = match result {
+            Ok(output) => (output.text, output.structured, !output.is_error),
             Err(error) if error.kind == ToolCallErrorKind::Cancelled => {
                 return Err(HarnessError::new(
                     HarnessErrorKind::Cancelled,
                     "turn cancelled",
                 ));
             }
-            Err(error) => (error.to_string(), false),
+            Err(error) => (error.to_string(), None, false),
         };
         session
             .record_tool_finish(call.name.clone(), success, content.len())
@@ -591,7 +597,11 @@ impl NativeHarness {
             name: call.name.clone(),
             success,
         });
-        Ok(ExecutedTool { content, success })
+        Ok(ExecutedTool {
+            content,
+            structured,
+            success,
+        })
     }
 }
 
@@ -954,6 +964,21 @@ fn emit_tool_output(sink: &mut dyn EventSink, call: &ToolCall, result: &Executed
         name: call.name.clone(),
         content: result.content.clone(),
     });
+    if call.name == "write_file"
+        && result.success
+        && let Some(change) = result.structured.as_ref()
+        && let (Some(path), Some(additions), Some(deletions)) = (
+            change.get("path").and_then(serde_json::Value::as_str),
+            change.get("additions").and_then(serde_json::Value::as_u64),
+            change.get("deletions").and_then(serde_json::Value::as_u64),
+        )
+    {
+        sink.emit(HarnessEvent::FileChanged {
+            path: path.to_owned(),
+            additions,
+            deletions,
+        });
+    }
 }
 
 fn initial_tool_requirement(definitions: &[crumb_llm::ToolDefinition], user_message: &str) -> bool {
@@ -2653,5 +2678,32 @@ mod tests {
         };
 
         assert_eq!(super::safe_successful_action_fact(&call), None);
+    }
+
+    #[test]
+    fn successful_workspace_writes_emit_file_change_events() {
+        let call = ToolCall {
+            id: "write-1".to_owned(),
+            name: "write_file".to_owned(),
+            arguments: json!({}),
+        };
+        let result = super::ExecutedTool {
+            content: "wrote source.rs".to_owned(),
+            structured: Some(json!({
+                "path": "source.rs",
+                "additions": 4,
+                "deletions": 1
+            })),
+            success: true,
+        };
+        let mut events = Vec::new();
+
+        super::emit_tool_output(&mut events, &call, &result);
+
+        assert!(events.contains(&HarnessEvent::FileChanged {
+            path: "source.rs".to_owned(),
+            additions: 4,
+            deletions: 1,
+        }));
     }
 }

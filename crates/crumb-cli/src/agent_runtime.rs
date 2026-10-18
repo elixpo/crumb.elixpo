@@ -177,6 +177,15 @@ impl EventSink for NativeEventBridge<'_> {
                 bytes: u64::try_from(content.len()).ok(),
                 content: Some(content),
             }),
+            HarnessEvent::FileChanged {
+                path,
+                additions,
+                deletions,
+            } => Some(HarnessActivity::FileChanged {
+                path,
+                additions,
+                deletions,
+            }),
             HarnessEvent::TurnFinished => Some(HarnessActivity::Completed {
                 reason: "stop".to_owned(),
             }),
@@ -1906,6 +1915,32 @@ mod tests {
                 name: "run_shell".to_owned(),
                 bytes: Some(17),
                 content: Some("folder-a\nfolder-b".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn native_bridge_forwards_trusted_file_change_metadata() {
+        let mut activities = Vec::new();
+        let mut capture = |activity| {
+            activities.push(activity);
+            Ok(())
+        };
+        let mut bridge = NativeEventBridge::new(&mut capture);
+
+        bridge.emit(HarnessEvent::FileChanged {
+            path: "src/main.rs".to_owned(),
+            additions: 7,
+            deletions: 2,
+        });
+        bridge.finish().expect("activity callback succeeds");
+
+        assert_eq!(
+            activities,
+            vec![HarnessActivity::FileChanged {
+                path: "src/main.rs".to_owned(),
+                additions: 7,
+                deletions: 2,
             }]
         );
     }

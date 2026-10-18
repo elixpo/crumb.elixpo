@@ -95,6 +95,11 @@ pub enum HarnessActivity {
         name: String,
         success: bool,
     },
+    FileChanged {
+        path: String,
+        additions: u64,
+        deletions: u64,
+    },
     Completed {
         reason: String,
     },

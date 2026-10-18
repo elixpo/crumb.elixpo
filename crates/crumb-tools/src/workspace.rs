@@ -227,9 +227,10 @@ fn write_file(
         &tool.checkpoints,
         cancellation,
     )?;
+    let (additions, deletions) = line_change_counts(before.as_deref(), content.as_bytes());
     Ok(ToolOutput {
         text: format!(
-            "wrote {} bytes to {}\ncheckpoint: {}",
+            "wrote {} bytes to {} (+{additions} -{deletions})\ncheckpoint: {}",
             content.len(),
             relative.display(),
             checkpoint.id
@@ -237,10 +238,62 @@ fn write_file(
         structured: Some(json!({
             "path": relative,
             "bytes": content.len(),
+            "additions": additions,
+            "deletions": deletions,
             "checkpoint": checkpoint.id
         })),
         is_error: false,
     })
+}
+
+fn line_change_counts(before: Option<&[u8]>, after: &[u8]) -> (usize, usize) {
+    const MAX_LCS_CELLS: usize = 4_000_000;
+    let before = before
+        .and_then(|content| std::str::from_utf8(content).ok())
+        .unwrap_or_default()
+        .lines()
+        .collect::<Vec<_>>();
+    let after = std::str::from_utf8(after)
+        .unwrap_or_default()
+        .lines()
+        .collect::<Vec<_>>();
+    let prefix = before
+        .iter()
+        .zip(&after)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix = before[prefix..]
+        .iter()
+        .rev()
+        .zip(after[prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let before = &before[prefix..before.len().saturating_sub(suffix)];
+    let after = &after[prefix..after.len().saturating_sub(suffix)];
+    let Some(cells) = before.len().checked_mul(after.len()) else {
+        return (after.len(), before.len());
+    };
+    if cells > MAX_LCS_CELLS {
+        return (after.len(), before.len());
+    }
+    let mut row = vec![0_usize; after.len().saturating_add(1)];
+    for old_line in before {
+        let mut diagonal = 0_usize;
+        for (column, new_line) in after.iter().enumerate() {
+            let above = row[column + 1];
+            row[column + 1] = if old_line == new_line {
+                diagonal.saturating_add(1)
+            } else {
+                row[column + 1].max(row[column])
+            };
+            diagonal = above;
+        }
+    }
+    let unchanged = row[after.len()];
+    (
+        after.len().saturating_sub(unchanged),
+        before.len().saturating_sub(unchanged),
+    )
 }
 
 fn resolve_write_target(root: &Path, requested: &str) -> Result<(PathBuf, PathBuf)> {
@@ -704,6 +757,8 @@ mod tests {
             )
             .expect("approved write succeeds");
         assert!(!output.is_error);
+        assert_eq!(output.structured.as_ref().unwrap()["additions"], 1);
+        assert_eq!(output.structured.as_ref().unwrap()["deletions"], 0);
         let checkpoint = output
             .structured
             .as_ref()
@@ -715,6 +770,30 @@ mod tests {
             .decide(checkpoint, CheckpointDecision::Reject)
             .expect("checkpoint rewinds");
         assert!(!workspace.path().join("notes.txt").exists());
+    }
+
+    #[test]
+    fn approved_write_reports_changed_line_counts() {
+        let workspace = TempWorkspace::new();
+        fs::write(
+            workspace.path().join("notes.txt"),
+            "same\nold one\nunchanged middle\nold two\ntail\n",
+        )
+        .expect("fixture is written");
+        let output = write_host(workspace.path())
+            .call(
+                "write_file",
+                &json!({"path":"notes.txt","content":"same\nnew one\nunchanged middle\nnew two\ntail\n"}),
+                AgentMode::Auto,
+                &AllowOnce,
+                &CancellationToken::default(),
+            )
+            .expect("approved write succeeds");
+        let structured = output.structured.expect("edit metadata is returned");
+        assert_eq!(structured["path"], "notes.txt");
+        assert_eq!(structured["additions"], 2);
+        assert_eq!(structured["deletions"], 2);
+        assert!(output.text.contains("(+2 -2)"));
     }
 
     #[test]

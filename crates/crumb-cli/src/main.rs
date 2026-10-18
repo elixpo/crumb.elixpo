@@ -2319,6 +2319,7 @@ struct HarnessRenderState {
     streamed_response: bool,
     streamed_column: usize,
     active_tool: Option<(String, Option<String>)>,
+    file_edits: BTreeMap<String, (u64, u64)>,
 }
 
 fn promote_agent_turn(
@@ -2475,6 +2476,7 @@ fn observe_agent_turn(
     if let Some(indicator) = activity.take() {
         indicator.complete();
     }
+    render_coding_summary(&render_state.file_edits, renderer, writer, terminal)?;
     let (runtime, result) = task.finish()?;
     Ok(TurnObservation::Finished(
         Box::new(runtime),
@@ -2515,6 +2517,23 @@ fn render_observed_activity(
     {
         render_fullscreen_finished_tool(
             (name, *success),
+            activity,
+            render_state,
+            renderer,
+            &terminal.transcript,
+            terminal.header_rows,
+        )?;
+    } else if terminal.fullscreen
+        && let HarnessActivity::FileChanged {
+            path,
+            additions,
+            deletions,
+        } = event
+    {
+        render_fullscreen_file_change(
+            path,
+            *additions,
+            *deletions,
             activity,
             render_state,
             renderer,
@@ -2625,6 +2644,34 @@ fn render_fullscreen_finished_tool(
         if success {
             *indicator = Some(start_activity(renderer, "Thinking", true));
         }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_fullscreen_file_change(
+    path: &str,
+    additions: u64,
+    deletions: u64,
+    indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    render_state: &mut HarnessRenderState,
+    renderer: Renderer,
+    transcript: &Arc<Mutex<TranscriptState>>,
+    header_rows: u16,
+) -> io::Result<()> {
+    if let Some(indicator) = indicator.take() {
+        indicator.finish();
+    }
+    record_file_change(render_state, path, additions, deletions);
+    let line = renderer.agent_activity(&format!("Edited · {path} · +{additions} -{deletions}"));
+    let mut state = transcript
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.append(&line);
+    render_transcript_view(&state, renderer, header_rows)?;
+    if state.scroll_offset == 0 {
+        position_after_transcript(&state, header_rows)?;
+        *indicator = Some(start_activity(renderer, "Thinking", true));
     }
     Ok(())
 }
@@ -3467,6 +3514,11 @@ fn harness_activity_label(activity: &HarnessActivity) -> String {
             "tool {} · {name}",
             if *success { "completed" } else { "failed" }
         ),
+        HarnessActivity::FileChanged {
+            path,
+            additions,
+            deletions,
+        } => format!("edited · {path} · +{additions} -{deletions}"),
         HarnessActivity::Completed { reason } => format!("completed · {reason}"),
         HarnessActivity::Failed { reason } => format!("failed · {reason}"),
         HarnessActivity::Cancelled => "cancelled".to_owned(),
@@ -3498,31 +3550,14 @@ fn render_harness_activity(
             write_bounded_response_delta(writer, text, &mut state.streamed_column)?;
             writer.flush()?;
         }
-        HarnessActivity::ToolStarted { name, .. } if name == "spawn_agents" => {
-            state.active_tool = Some((name.clone(), None));
-            replace_activity(
-                indicator,
-                renderer,
-                "Coordinating Koi · Nyx · Rune · Echo",
-                fullscreen,
-            );
-        }
-        HarnessActivity::ToolStarted {
+        HarnessActivity::ToolStarted { name, detail } => render_tool_started(
             name,
-            detail: Some(detail),
-        } => {
-            state.active_tool = Some((name.clone(), Some(detail.clone())));
-            replace_activity(
-                indicator,
-                renderer,
-                &visible_tool_activity(name, Some(detail)),
-                fullscreen,
-            );
-        }
-        HarnessActivity::ToolStarted { name, detail: None } => {
-            state.active_tool = Some((name.clone(), None));
-            replace_activity(indicator, renderer, &tool_activity_label(name), fullscreen);
-        }
+            detail.as_deref(),
+            indicator,
+            state,
+            renderer,
+            fullscreen,
+        ),
         HarnessActivity::ToolOutput { name, .. } if name == "spawn_agents" => {
             replace_activity(
                 indicator,
@@ -3547,6 +3582,18 @@ fn render_harness_activity(
                 name, *success, indicator, state, renderer, writer, fullscreen,
             )?;
         }
+        HarnessActivity::FileChanged {
+            path,
+            additions,
+            deletions,
+        } => render_file_change_activity(
+            (path, *additions, *deletions),
+            indicator,
+            state,
+            renderer,
+            writer,
+            fullscreen,
+        )?,
         HarnessActivity::ApprovalRequired { name } => {
             finish_activity_line(indicator, writer)?;
             writeln!(writer, "{}", renderer.agent_approval_required(name))?;
@@ -3579,6 +3626,50 @@ fn render_harness_activity(
         HarnessActivity::Usage { .. } => {}
     }
     Ok(())
+}
+
+fn render_tool_started(
+    name: &str,
+    detail: Option<&str>,
+    indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    state: &mut HarnessRenderState,
+    renderer: Renderer,
+    fullscreen: bool,
+) {
+    state.active_tool = Some((name.to_owned(), detail.map(str::to_owned)));
+    let label = if name == "spawn_agents" {
+        "Coordinating Koi · Nyx · Rune · Echo".to_owned()
+    } else {
+        visible_tool_activity(name, detail)
+    };
+    replace_activity(indicator, renderer, &label, fullscreen);
+}
+
+fn render_file_change_activity(
+    change: (&str, u64, u64),
+    indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    state: &mut HarnessRenderState,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    fullscreen: bool,
+) -> Result<()> {
+    let (path, additions, deletions) = change;
+    record_file_change(state, path, additions, deletions);
+    finish_activity_line(indicator, writer)?;
+    writeln!(
+        writer,
+        "{}",
+        renderer.agent_activity(&format!("Edited · {path} · +{additions} -{deletions}"))
+    )?;
+    writer.flush()?;
+    replace_activity(indicator, renderer, "Thinking", fullscreen);
+    Ok(())
+}
+
+fn record_file_change(state: &mut HarnessRenderState, path: &str, additions: u64, deletions: u64) {
+    let totals = state.file_edits.entry(path.to_owned()).or_default();
+    totals.0 = totals.0.saturating_add(additions);
+    totals.1 = totals.1.saturating_add(deletions);
 }
 
 fn render_tool_output_activity(
@@ -3646,6 +3737,7 @@ fn render_finished_tool(
 fn visible_tool_activity(name: &str, detail: Option<&str>) -> String {
     match (name, detail) {
         ("run_shell", Some(command)) => format!("Running command · $ {command}"),
+        ("write_file", Some(path)) => format!("Editing file · {path}"),
         ("web_search", Some(query)) => format!("Searching web · {query}"),
         ("web_fetch", Some(url)) => format!("Fetching page · {url}"),
         (_, Some(detail)) => format!("{} · {detail}", tool_activity_label(name)),
@@ -3666,6 +3758,8 @@ fn finished_tool_activity(
         ("web_search", false) => "Web search failed",
         ("web_fetch", true) => "Fetched page",
         ("web_fetch", false) => "Page fetch failed",
+        ("write_file", true) => "Edited file",
+        ("write_file", false) => "Edit failed",
         (_, true) => "Tool completed",
         (_, false) => "Tool failed",
     };
@@ -3675,6 +3769,43 @@ fn finished_tool_activity(
         (_, Some(detail)) => format!("{verb} · {elapsed} · {detail}"),
         (_, None) => format!("{verb} · {elapsed} · {name}"),
     }
+}
+
+fn render_coding_summary(
+    edits: &BTreeMap<String, (u64, u64)>,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    terminal: &AgentTerminal,
+) -> Result<()> {
+    if edits.is_empty() {
+        return Ok(());
+    }
+    let additions = edits.values().map(|counts| counts.0).sum::<u64>();
+    let deletions = edits.values().map(|counts| counts.1).sum::<u64>();
+    let noun = if edits.len() == 1 { "file" } else { "files" };
+    let mut summary = format!(
+        "Changes · {} {noun} · +{additions} -{deletions}",
+        edits.len()
+    );
+    for (path, (added, deleted)) in edits {
+        let _ = write!(summary, "\n  {path}  +{added} -{deleted}");
+    }
+    let activity_line = renderer.agent_activity(&summary);
+    if terminal.fullscreen {
+        let mut state = terminal
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.append(&activity_line);
+        render_transcript_view(&state, renderer, terminal.header_rows)?;
+        if state.scroll_offset == 0 {
+            position_after_transcript(&state, terminal.header_rows)?;
+        }
+    } else {
+        writeln!(writer, "{activity_line}")?;
+        writer.flush()?;
+    }
+    Ok(())
 }
 
 fn format_activity_elapsed(elapsed: Duration) -> String {
@@ -10926,6 +11057,23 @@ mod tests {
             assert!(width >= 1);
             assert!(width <= usize::from(columns.max(1)));
         }
+    }
+
+    #[test]
+    fn file_edits_have_coding_specific_activity_labels() {
+        assert_eq!(
+            visible_tool_activity("write_file", Some("src/main.rs")),
+            "Editing file · src/main.rs"
+        );
+        assert_eq!(
+            finished_tool_activity(
+                "write_file",
+                Some("src/main.rs"),
+                true,
+                Duration::from_millis(1200),
+            ),
+            "Edited file · 1.2s · src/main.rs"
+        );
     }
 
     #[test]
