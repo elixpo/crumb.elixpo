@@ -261,11 +261,52 @@ fn slash_suggestions(prefix: &str, pos: usize, workspace: &Path) -> Vec<Suggesti
         "/skills add".to_owned(),
         "register a local SKILL.md file; starts disabled".to_owned(),
     ));
+    commands.extend(configured_pack_actions(workspace));
     commands.extend(configured_skill_actions(workspace));
     commands
         .into_iter()
         .filter(|(usage, _)| usage.starts_with(prefix))
         .map(|(usage, description)| suggestion(&usage, &description, Span::new(0, pos)))
+        .collect()
+}
+
+fn configured_pack_actions(workspace: &Path) -> Vec<(String, String)> {
+    let config = config_path(workspace)
+        .and_then(|path| LiveConfig::new(path).load().ok())
+        .unwrap_or_default();
+    let mut packs = config
+        .model_packs
+        .iter()
+        .map(|(id, pack)| {
+            (
+                id.clone(),
+                (
+                    pack.label.clone(),
+                    config.active_model_pack.as_deref() == Some(id),
+                ),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for (id, label) in [
+        ("quick", "Quick Crumb"),
+        ("balanced", "Balanced Crumb"),
+        ("deep", "Deep Crumb"),
+    ] {
+        packs.entry(id.to_owned()).or_insert_with(|| {
+            (
+                label.to_owned(),
+                config.active_model_pack.as_deref() == Some(id),
+            )
+        });
+    }
+    packs
+        .into_iter()
+        .map(|(id, (label, selected))| {
+            (
+                format!("/pack use {id}"),
+                selection_description(&label, selected),
+            )
+        })
         .collect()
 }
 
@@ -555,6 +596,49 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.value == "/help")
         );
+    }
+
+    #[test]
+    fn slash_completion_refilters_after_pack_prefix_is_shortened() {
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
+
+        let result = completer.complete("/pac", 4);
+
+        assert!(
+            result
+                .suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "/pack")
+        );
+        assert!(
+            result
+                .suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "/pack use ")
+        );
+    }
+
+    #[test]
+    fn pack_completion_exposes_nested_commands_and_pack_ids() {
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
+
+        let root = completer.complete("/pack", 5);
+        assert!(
+            root.suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "/pack use ")
+        );
+
+        let nested = completer.complete("/pack use ", 10);
+        for id in ["quick", "balanced", "deep"] {
+            assert!(
+                nested
+                    .suggestions()
+                    .iter()
+                    .any(|candidate| candidate.value == format!("/pack use {id}")),
+                "missing nested pack suggestion for {id}"
+            );
+        }
     }
 
     #[test]

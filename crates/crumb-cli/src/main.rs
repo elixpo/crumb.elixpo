@@ -9067,10 +9067,10 @@ fn create_line_editor(
     }
     keybindings.add_binding(
         KeyModifiers::NONE,
-        KeyCode::Char(' '),
+        KeyCode::Backspace,
         ReedlineEvent::Multiple(vec![
-            ReedlineEvent::Edit(vec![EditCommand::InsertChar(' ')]),
-            ReedlineEvent::Esc,
+            ReedlineEvent::Edit(vec![EditCommand::Backspace]),
+            ReedlineEvent::Menu("completion_menu".to_owned()),
         ]),
     );
     keybindings.add_binding(
