@@ -2566,6 +2566,7 @@ struct LoadedSkillContext {
     selected: Vec<SelectedSkill>,
 }
 
+#[cfg(test)]
 fn load_enabled_skill_context(
     skills: &[SkillConfig],
     workspace: &Path,
@@ -3428,8 +3429,10 @@ mod tests {
         let mut request = String::from("inspect");
         for index in 0..=MAX_REQUEST_IMAGES {
             let filename = format!("screen-{index}.png");
-            std::fs::write(workspace.path().join(&filename), [index as u8]).expect("image fixture");
-            request.push_str(&format!(" @file:{filename}"));
+            std::fs::write(workspace.path().join(&filename), [0]).expect("image fixture");
+            request.push(' ');
+            request.push_str("@file:");
+            request.push_str(&filename);
         }
 
         let error = load_request_images(workspace.path(), &request, None)

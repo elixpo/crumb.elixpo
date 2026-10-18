@@ -11091,7 +11091,7 @@ struct PendingPasteArtifacts {
 }
 
 impl PendingPasteArtifacts {
-    fn capture(&mut self, paste: String) -> String {
+    fn capture(&mut self, paste: &str) -> String {
         let paste = paste.replace("\r\n", "\n").replace('\r', "\n");
         if paste.len() < LARGE_PASTE_MIN_BYTES {
             return paste;
@@ -11111,8 +11111,7 @@ impl PendingPasteArtifacts {
         let retained = self.contents.values().map(String::len).sum::<usize>();
         if retained.saturating_add(paste.len()) > MAX_PENDING_PASTE_BYTES {
             return format!(
-                "[paste rejected: pending artifacts exceed the {} byte request limit]",
-                MAX_PENDING_PASTE_BYTES
+                "[paste rejected: pending artifacts exceed the {MAX_PENDING_PASTE_BYTES} byte request limit]"
             );
         }
         self.contents.insert(marker.clone(), paste);
@@ -11527,8 +11526,7 @@ fn create_line_editor(
         KeyCode::PageDown,
         ReedlineEvent::ExecuteHostCommand("crumb:transcript-down".to_owned()),
     );
-    let terminal_width = suggestion_width(size()?.0);
-    let menu_width = u16::try_from(terminal_width).unwrap_or(1);
+    let menu_width = u16::try_from(suggestion_width(size()?.0)).unwrap_or(1);
     let menu = IdeMenu::default()
         .with_name("completion_menu")
         .with_text_style(Style::new().fg(Color::Fixed(245)))
@@ -11616,7 +11614,7 @@ impl EditMode for CrumbEditMode {
                 self.paste_artifacts
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .capture(paste),
+                    .capture(&paste),
             )]),
             TerminalEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
                 ReedlineEvent::ExecuteHostCommand("crumb:transcript-up".to_owned())
@@ -13152,7 +13150,7 @@ mod tests {
         let pasted = "large pasted line\n".repeat(300);
         let mut pending = PendingPasteArtifacts::default();
 
-        let marker = pending.capture(pasted.clone());
+        let marker = pending.capture(&pasted);
         let command = pending
             .materialize(&format!("summarize {marker}"), workspace.path())
             .expect("paste artifact materializes");
@@ -13173,8 +13171,9 @@ mod tests {
     fn small_terminal_paste_stays_inline_and_oversized_paste_is_not_retained() {
         let mut pending = PendingPasteArtifacts::default();
 
-        assert_eq!(pending.capture("short paste".to_owned()), "short paste");
-        let rejected = pending.capture("x".repeat(super::MAX_PASTE_ARTIFACT_BYTES + 1));
+        assert_eq!(pending.capture("short paste"), "short paste");
+        let oversized = "x".repeat(super::MAX_PASTE_ARTIFACT_BYTES + 1);
+        let rejected = pending.capture(&oversized);
 
         assert!(rejected.contains("paste rejected"));
         assert!(pending.contents.is_empty());
