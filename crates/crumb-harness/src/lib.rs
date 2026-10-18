@@ -464,15 +464,17 @@ struct TurnMetrics {
     model_rounds: usize,
     tool_calls: usize,
     action_facts: Vec<String>,
+    successful_tool_outputs: Vec<String>,
 }
 
 impl TurnMetrics {
-    fn record_successful_action(&mut self, call: &ToolCall) {
+    fn record_successful_tool(&mut self, call: &ToolCall, output: &str) {
         if let Some(fact) = safe_successful_action_fact(call)
             && !self.action_facts.contains(&fact)
         {
             self.action_facts.push(fact);
         }
+        self.successful_tool_outputs.push(output.to_owned());
     }
 }
 
@@ -695,10 +697,9 @@ impl NativeHarness {
         let mut output_bytes = 0_usize;
         let mut retries = RequiredToolRetries::new(&definitions);
         let mut require_tool = initial_tool_requirement(&definitions, &turn.user_message);
-        let (mut successful_tool_evidence, mut failed_tool_evidence) = (false, false);
+        let mut failed_tool_evidence = false;
         let (mut grounding_retry_used, mut failure_retry_used) = (false, false);
         let (mut completeness_retry_used, mut suppress_tools_once) = (false, false);
-
         loop {
             begin_model_round(metrics, self.limits.max_model_rounds)?;
             let tool_choice = (require_tool, suppress_tools_once);
@@ -716,7 +717,8 @@ impl NativeHarness {
                             &mut messages,
                             &round.text,
                             &turn.user_message,
-                            successful_tool_evidence,
+                            !metrics.successful_tool_outputs.is_empty(),
+                            &metrics.successful_tool_outputs,
                             failed_tool_evidence,
                             &mut grounding_retry_used,
                             &mut failure_retry_used,
@@ -771,15 +773,14 @@ impl NativeHarness {
                 emit_tool_output(sink, &call, &result);
                 if result.success {
                     round_succeeded = true;
-                    metrics.record_successful_action(&call);
+                    metrics.record_successful_tool(&call, &result.content);
                 } else {
                     failed_tool_evidence = true;
                     failed_tools.push(call.name.clone());
                 }
                 messages.push(ChatMessage::tool_result(call.id, result.content));
             }
-            successful_tool_evidence |=
-                record_successful_tool_evidence(&mut messages, round_succeeded);
+            record_successful_tool_evidence(&mut messages, round_succeeded);
             suppress_tools_once = round_succeeded;
             if retries.prepare_failed_execution(&mut messages, &turn.user_message, &failed_tools) {
                 require_tool = true;
@@ -1100,7 +1101,10 @@ fn finish_turn(
         .usage
         .input_tokens
         .saturating_add(round.usage.output_tokens);
-    let final_text = sanitize_agent_response(&round.text, &turn.user_message);
+    let final_text = repair_tool_identifier_drift(
+        &sanitize_agent_response(&round.text, &turn.user_message),
+        &metrics.successful_tool_outputs,
+    );
     let chunks = if final_text == round.text {
         round.text_chunks
     } else {
@@ -1238,6 +1242,202 @@ fn response_needs_grounding_correction(response: &str, user_message: &str) -> bo
     contradicts_evidence || persona_only
 }
 
+fn response_misquotes_tool_identifier(response: &str, tool_outputs: &[String]) -> bool {
+    let candidates = tool_identifier_candidates(tool_outputs);
+    identifier_spans(response)
+        .into_iter()
+        .any(|(start, end)| closest_tool_identifier(&response[start..end], &candidates).is_some())
+}
+
+fn repair_tool_identifier_drift(text: &str, tool_outputs: &[String]) -> String {
+    let candidates = tool_identifier_candidates(tool_outputs);
+    if candidates.is_empty() {
+        return text.to_owned();
+    }
+    let mut repaired = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end) in identifier_spans(text) {
+        repaired.push_str(&text[cursor..start]);
+        let token = &text[start..end];
+        repaired.push_str(closest_tool_identifier(token, &candidates).unwrap_or(token));
+        cursor = end;
+    }
+    repaired.push_str(&text[cursor..]);
+    repaired
+}
+
+fn tool_identifier_candidates(tool_outputs: &[String]) -> Vec<String> {
+    const MAX_IDENTIFIERS: usize = 256;
+    let mut candidates = Vec::new();
+    for output in tool_outputs {
+        for raw in output.split_whitespace() {
+            let token = trim_identifier(raw);
+            if distinctive_identifier(token) {
+                candidates.push(token.to_owned());
+            }
+        }
+        for line in output.lines() {
+            let line = line.trim();
+            let token = trim_identifier(line);
+            if token == line
+                && token.len() >= 2
+                && token.len() <= 128
+                && token.bytes().all(is_identifier_byte)
+                && !sensitive_identifier(token)
+                && !matches!(
+                    token.to_ascii_lowercase().as_str(),
+                    "stdout" | "stderr" | "output" | "success" | "failed" | "true" | "false"
+                )
+            {
+                candidates.push(token.to_owned());
+            }
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates.truncate(MAX_IDENTIFIERS);
+    candidates
+}
+
+fn trim_identifier(token: &str) -> &str {
+    token
+        .trim_matches(|character: char| {
+            !character.is_ascii() || !is_identifier_byte(character as u8)
+        })
+        .trim_matches(':')
+}
+
+fn distinctive_identifier(token: &str) -> bool {
+    token.len() >= 4
+        && token.len() <= 128
+        && token.bytes().all(is_identifier_byte)
+        && !sensitive_identifier(token)
+        && token.bytes().any(|byte| {
+            byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.' | b'@' | b'/' | b':')
+        })
+}
+
+fn sensitive_identifier(token: &str) -> bool {
+    let token = token.to_ascii_lowercase();
+    [
+        "sk-",
+        "sk_",
+        "ghp_",
+        "gho_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "apikey",
+        "api_key",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "bearer",
+    ]
+    .iter()
+    .any(|prefix| token.starts_with(prefix))
+}
+
+const fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'@' | b'/' | b':')
+}
+
+fn identifier_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (index, character) in text.char_indices() {
+        if character.is_ascii() && is_identifier_byte(character as u8) {
+            start.get_or_insert(index);
+        } else if let Some(start) = start.take() {
+            push_identifier_span(text, start, index, &mut spans);
+        }
+    }
+    if let Some(start) = start {
+        push_identifier_span(text, start, text.len(), &mut spans);
+    }
+    spans
+}
+
+fn push_identifier_span(text: &str, start: usize, mut end: usize, spans: &mut Vec<(usize, usize)>) {
+    while end > start && matches!(text.as_bytes()[end - 1], b'.' | b':') {
+        end -= 1;
+    }
+    if end > start {
+        spans.push((start, end));
+    }
+}
+
+fn closest_tool_identifier<'a>(token: &str, candidates: &'a [String]) -> Option<&'a str> {
+    if token.len() < 2 || token.len() > 128 || candidates.iter().any(|value| value == token) {
+        return None;
+    }
+    let token_lower = token.to_ascii_lowercase();
+    let mut matches = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let candidate_lower = candidate.to_ascii_lowercase();
+            if candidate_lower == token_lower {
+                return Some((0, candidate.as_str()));
+            }
+            let length_delta = candidate.len().abs_diff(token.len());
+            if length_delta > 2 {
+                return None;
+            }
+            let distance = ascii_edit_distance(&token_lower, &candidate_lower);
+            let common_prefix = token_lower
+                .bytes()
+                .zip(candidate_lower.bytes())
+                .take_while(|(left, right)| left == right)
+                .count();
+            let transposed = adjacent_transposition(&token_lower, &candidate_lower);
+            (distance <= 2
+                && ((distinctive_identifier(candidate) && common_prefix >= 2) || transposed))
+                .then_some((distance, candidate.as_str()))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_unstable_by_key(|(distance, candidate)| (*distance, *candidate));
+    let best = matches.first().copied()?;
+    if matches
+        .get(1)
+        .is_some_and(|other| other.0 == best.0 && other.1 != best.1)
+    {
+        return None;
+    }
+    Some(best.1)
+}
+
+fn adjacent_transposition(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let differences = left
+        .bytes()
+        .zip(right.bytes())
+        .enumerate()
+        .filter_map(|(index, (left, right))| (left != right).then_some(index))
+        .collect::<Vec<_>>();
+    differences.len() == 2
+        && differences[1] == differences[0] + 1
+        && left.as_bytes()[differences[0]] == right.as_bytes()[differences[1]]
+        && left.as_bytes()[differences[1]] == right.as_bytes()[differences[0]]
+}
+
+fn ascii_edit_distance(left: &str, right: &str) -> usize {
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_byte) in left.bytes().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_byte) in right.bytes().enumerate() {
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + usize::from(left_byte != right_byte));
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
 fn build_request(
     turn: &HarnessTurn,
     messages: &[ChatMessage],
@@ -1260,15 +1460,14 @@ fn build_request(
     }
 }
 
-fn record_successful_tool_evidence(messages: &mut Vec<ChatMessage>, round_succeeded: bool) -> bool {
+fn record_successful_tool_evidence(messages: &mut Vec<ChatMessage>, round_succeeded: bool) {
     if !round_succeeded {
-        return false;
+        return;
     }
     messages.push(ChatMessage::text(
         ChatRole::System,
-        "Use the successful tool result as authoritative evidence. Answer every requested item directly; do not invent an access or permission failure and do not add identity or unrelated information.",
+        "Use the successful tool result as authoritative evidence. Answer every requested item directly. Copy usernames, account names, branches, paths, versions, hashes, URLs, and other identifiers byte-for-byte from the tool output; never autocorrect, normalize, or guess them. Do not invent an access or permission failure and do not add identity or unrelated information.",
     ));
-    true
 }
 
 fn record_usage(total: &mut TokenUsage, round: TokenUsage) {
@@ -1313,6 +1512,7 @@ fn prepare_response_retry(
     response: &str,
     user_message: &str,
     successful_tool_evidence: bool,
+    successful_tool_outputs: &[String],
     failed_tool_evidence: bool,
     grounding_retry_used: &mut bool,
     failure_retry_used: &mut bool,
@@ -1325,6 +1525,7 @@ fn prepare_response_retry(
         response,
         user_message,
         successful_tool_evidence,
+        successful_tool_outputs,
         grounding_retry_used,
         suppress_tools_once,
     ) {
@@ -1406,19 +1607,21 @@ fn prepare_grounding_retry(
     response: &str,
     user_message: &str,
     successful_tool_evidence: bool,
+    successful_tool_outputs: &[String],
     grounding_retry_used: &mut bool,
     suppress_tools_once: &mut bool,
 ) -> bool {
     if !successful_tool_evidence
         || *grounding_retry_used
-        || !response_needs_grounding_correction(response, user_message)
+        || !(response_needs_grounding_correction(response, user_message)
+            || response_misquotes_tool_identifier(response, successful_tool_outputs))
     {
         return false;
     }
     messages.push(ChatMessage::text(ChatRole::Assistant, response));
     messages.push(ChatMessage::text(
         ChatRole::System,
-        "The prior tool execution succeeded. Correct the answer using its result. Do not claim a permission or access restriction, do not repeat identity, and answer only the user's requested items. Do not call another tool.",
+        "The prior tool execution succeeded, but the draft contradicted or mutated its evidence. Correct the answer using the tool result. Copy every username, account name, branch, path, version, hash, URL, and identifier byte-for-byte; never autocorrect, normalize, or guess one. Do not claim a permission or access restriction, do not repeat identity, and answer only the user's requested items. Do not call another tool.",
     ));
     *grounding_retry_used = true;
     *suppress_tools_once = true;
@@ -2229,6 +2432,22 @@ mod tests {
         }
     }
 
+    struct StaticTool {
+        calls: Arc<AtomicUsize>,
+        output: &'static str,
+    }
+
+    impl ToolHandler for StaticTool {
+        fn call(
+            &self,
+            _arguments: &serde_json::Value,
+            _cancellation: &CancellationToken,
+        ) -> Result<ToolOutput> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ToolOutput::text(self.output))
+        }
+    }
+
     struct FailingTool(Arc<AtomicUsize>);
 
     impl ToolHandler for FailingTool {
@@ -2254,6 +2473,23 @@ mod tests {
                     transport: ToolTransport::Native,
                 },
                 Arc::new(CountingTool(calls)),
+            )
+            .expect("tool registers");
+        tools
+    }
+
+    fn tools_with_output(calls: Arc<AtomicUsize>, output: &'static str) -> ToolHost {
+        let mut tools = ToolHost::default();
+        tools
+            .register(
+                ToolDescriptor {
+                    name: "weather".to_owned(),
+                    description: "Read facts from the host".to_owned(),
+                    input_schema: json!({"type":"object"}),
+                    risk: RiskClass::ReadOnly,
+                    transport: ToolTransport::Native,
+                },
+                Arc::new(StaticTool { calls, output }),
             )
             .expect("tool registers");
         tools
@@ -2862,6 +3098,115 @@ mod tests {
         let requests = provider.requests.lock().expect("request lock");
         assert_eq!(requests[2].tool_choice, ToolChoice::None);
         drop(root);
+    }
+
+    #[tokio::test]
+    async fn successful_tool_identifiers_are_copied_exactly_without_rerunning() {
+        let drifted_round = vec![
+            ChatEvent::TextDelta(
+                "Authenticated as Circuit-Overtake; the current branch is main.".to_owned(),
+            ),
+            ChatEvent::Finished(FinishReason::Stop),
+        ];
+        let corrected_round = vec![
+            ChatEvent::TextDelta(
+                "Authenticated as Circuit-Overtime; the current branch is main.".to_owned(),
+            ),
+            ChatEvent::Finished(FinishReason::Stop),
+        ];
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_round(),
+            drifted_round,
+            corrected_round,
+        ]));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let harness = NativeHarness::new(
+            provider.clone(),
+            tools_with_output(
+                calls.clone(),
+                "Logged in to github.com account Circuit-Overtime\nmain",
+            ),
+            Arc::new(DenyAllApprovals),
+            HarnessLimits::default(),
+        );
+        let (root, mut session) = session(AgentMode::Auto);
+        let mut conversation = harness.conversation();
+        let mut events = Vec::new();
+        let mut request = turn();
+        request.user_message =
+            "check GitHub authentication and tell me the current branch".to_owned();
+
+        let outcome = harness
+            .run_turn(
+                &mut session,
+                &mut conversation,
+                request,
+                &CancellationToken::default(),
+                &mut events,
+            )
+            .await
+            .expect("turn succeeds");
+
+        assert_eq!(
+            outcome.text,
+            "Authenticated as Circuit-Overtime; the current branch is main."
+        );
+        assert_eq!(outcome.model_rounds, 3);
+        assert_eq!(outcome.tool_calls, 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let streamed = events
+            .iter()
+            .filter_map(|event| match event {
+                HarnessEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(streamed, outcome.text);
+        let requests = provider.requests.lock().expect("request lock");
+        assert_eq!(requests[2].tool_choice, ToolChoice::None);
+        assert!(requests[2].messages.iter().any(|message| {
+            message.role == ChatRole::System
+                && message
+                    .content
+                    .contains("Copy every username, account name, branch")
+        }));
+        drop(requests);
+        drop(root);
+    }
+
+    #[test]
+    fn final_boundary_repairs_near_match_tool_identifiers() {
+        let outputs = vec!["Logged in to github.com account Circuit-Overtime\nmain".to_owned()];
+
+        assert!(super::response_misquotes_tool_identifier(
+            "Authenticated as Circuit-Overtake on mian.",
+            &outputs
+        ));
+        assert_eq!(
+            super::repair_tool_identifier_drift(
+                "Authenticated as Circuit-Overtake on mian.",
+                &outputs
+            ),
+            "Authenticated as Circuit-Overtime on main."
+        );
+        assert_eq!(
+            super::repair_tool_identifier_drift(
+                "Authenticated as Circuit-Overtime on main.",
+                &outputs
+            ),
+            "Authenticated as Circuit-Overtime on main."
+        );
+        assert_eq!(
+            super::repair_tool_identifier_drift("Send mail after checking main.", &outputs),
+            "Send mail after checking main."
+        );
+        assert_eq!(
+            super::repair_tool_identifier_drift(
+                "The credential was gho_not-a-real-tokem.",
+                &["gho_not-a-real-token".to_owned()]
+            ),
+            "The credential was gho_not-a-real-tokem."
+        );
     }
 
     #[tokio::test]
