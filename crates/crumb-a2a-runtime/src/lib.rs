@@ -15,9 +15,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use crumb_a2a::{SendMessageRequest, SendMessageResponse};
 use crumb_a2a_local::{
     CompletedResponseReceipt, DeliverySummary, EnqueueReceipt, LocalBus, LocalBusOptions,
-    PeerEntry, PendingDeliverySummary, ProcessMetadata, ReceivedDelivery, ReceivedMessage,
-    Registration, StagedArtifact,
+    PeerEntry, PendingDeliverySummary, ProcessMetadata, ReceivedMessage, Registration,
+    StagedArtifact,
 };
+pub use crumb_a2a_local::{DeliveryKind, ReceivedDelivery};
 use crumb_instance::{InstanceMetadata, InstanceStore};
 
 /// Minimum lease duration that leaves useful scheduling room for a heartbeat.
@@ -406,6 +407,18 @@ impl A2aRuntime {
         self.inner
             .bus
             .acknowledge_response(&registration, delivery_id)
+    }
+
+    /// Claims or resumes one exact response and acknowledges it atomically
+    /// with respect to other local queue operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after shutdown begins or for invalid response queue state.
+    pub fn consume_response(&self, delivery_id: &str) -> Result<String> {
+        self.inner.ensure_running()?;
+        let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
+        self.inner.bus.consume_response(&registration, delivery_id)
     }
 
     /// Acknowledges one claimed delivery.

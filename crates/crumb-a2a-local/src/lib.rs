@@ -1163,6 +1163,63 @@ impl LocalBus {
         self.acknowledge_locked(recipient.instance_id(), delivery_id, None)
     }
 
+    /// Claims a pending response, or resumes an already claimed response, and
+    /// acknowledges it while holding the receiver queue lock.
+    ///
+    /// This is the user-facing response-consumption operation. Retrying after
+    /// a failure between the claim and acknowledgement steps is safe because
+    /// an exact response already present in `processing` is resumed. Requests
+    /// are rejected before any queue mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid ownership, an unknown identifier, a
+    /// request delivery, unsafe storage, or an acknowledgement failure.
+    pub fn consume_response(&self, recipient: &Registration, delivery_id: &str) -> Result<String> {
+        self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
+        self.require_live_owner(recipient, now_ms()?)?;
+        validate_delivery_id(delivery_id)?;
+        let (pending, processing, _acknowledged) =
+            self.queue_directories(recipient.instance_id())?;
+        let filename = delivery_filename(delivery_id)?;
+        let pending_path = pending.join(&filename);
+        let processing_path = processing.join(&filename);
+
+        let envelope = if path_exists_without_following(&pending_path)? {
+            let pending_envelope: DeliveryEnvelope =
+                read_required_json(&pending_path, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+            pending_envelope.validate()?;
+            validate_queued_envelope(&pending_path, &pending_envelope, recipient.instance_id())?;
+            if pending_envelope.kind() != DeliveryKind::Response {
+                bail!("local A2A delivery is a request, not a response");
+            }
+            claim_delivery_file(
+                &pending_path,
+                &processing_path,
+                &pending,
+                &processing,
+                recipient.instance_id(),
+            )?
+            .context("local A2A pending response was not found")?;
+            pending_envelope
+        } else {
+            let processing_envelope =
+                self.read_processing_delivery(recipient.instance_id(), delivery_id)?;
+            if processing_envelope.kind() != DeliveryKind::Response {
+                bail!("local A2A delivery is a request, not a response");
+            }
+            processing_envelope
+        };
+        let sender_instance_id = envelope.sender_instance_id.clone();
+        self.acknowledge_locked(
+            recipient.instance_id(),
+            delivery_id,
+            Some(&sender_instance_id),
+        )?;
+        Ok(sender_instance_id)
+    }
+
     /// Acknowledges and removes a previously claimed delivery.
     ///
     /// # Errors
@@ -3027,6 +3084,80 @@ mod tests {
                 &response("msg-answer-changed", "different answer")
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn response_consumption_claims_or_resumes_without_moving_requests() {
+        let (_temporary, bus, first, second, first_registration, second_registration) = setup();
+        let request_receipt = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &request("msg-consume", "please answer"),
+            )
+            .expect("request enqueue");
+        bus.claim_pending(&second_registration, &request_receipt.delivery_id)
+            .expect("request claim");
+        let response_receipt = bus
+            .complete_claimed_request(
+                &second_registration,
+                &request_receipt.delivery_id,
+                &response("msg-consume-answer", "done"),
+            )
+            .expect("complete request");
+
+        assert_eq!(
+            bus.consume_response(&first_registration, &response_receipt.delivery_id)
+                .expect("consume pending response"),
+            second.instance_id
+        );
+        assert_eq!(
+            bus.list_deliveries(&first_registration)
+                .expect("response removed"),
+            Vec::new()
+        );
+
+        let second_request = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &request("msg-consume-resume", "please answer again"),
+            )
+            .expect("second request enqueue");
+        bus.claim_pending(&second_registration, &second_request.delivery_id)
+            .expect("second request claim");
+        let second_response = bus
+            .complete_claimed_request(
+                &second_registration,
+                &second_request.delivery_id,
+                &response("msg-consume-resume-answer", "done again"),
+            )
+            .expect("second completion");
+        bus.claim_delivery(&first_registration, &second_response.delivery_id)
+            .expect("simulate interrupted response consumption");
+        assert_eq!(
+            bus.consume_response(&first_registration, &second_response.delivery_id)
+                .expect("resume claimed response"),
+            second.instance_id
+        );
+
+        let inbound_request = bus
+            .enqueue(
+                &second_registration,
+                &first.instance_id,
+                &request("msg-not-response", "keep me pending"),
+            )
+            .expect("inbound request");
+        assert!(
+            bus.consume_response(&first_registration, &inbound_request.delivery_id)
+                .is_err()
+        );
+        assert_eq!(
+            bus.list_pending(&first_registration)
+                .expect("request remains pending")
+                .len(),
+            1
         );
     }
 
