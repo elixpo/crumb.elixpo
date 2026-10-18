@@ -43,5 +43,8 @@ jobs:
         working-directory: crumb.elixpo
         run: npm audit --audit-level=low
 
+      - name: Check published marketplace indexes
+        run: node .github/scripts/publish-marketplace.mjs --check
+
       - name: Build Crumb website
         run: ./deploy.sh --worker build

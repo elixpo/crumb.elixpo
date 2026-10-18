@@ -23,17 +23,23 @@
       "display_name": "Code review",
       "description": "Focused correctness, security, compatibility, and test review.",
       "license": "MIT",
-      "source": "./packages/code-review",
+      "source": "https://crumb.elixpo.com/marketplace/packages/code-review",
       "compatibility": {
         "minimum_crumb_version": "0.1.0",
         "maximum_crumb_version_exclusive": "0.2.0",
-        "platforms": ["linux", "macos", "windows"]
+        "platforms": [
+          "linux",
+          "macos",
+          "windows"
+        ]
       },
       "provenance": {
         "repository": "https://github.com/elixpo/crumb.elixpo",
         "revision": "9823e401b457789cf5225d34c7ccc7a475e91ca0",
         "released_at": "2026-10-17T14:39:35+05:30",
-        "trust": {"kind": "bundled"}
+        "trust": {
+          "kind": "sigstore_bundle"
+        }
       },
       "disclosures": {
         "security_url": "https://crumb.elixpo.com/docs/security",
@@ -43,17 +49,24 @@
       "connector_requirements": [],
       "dependencies": [],
       "deprecation": null,
-      "capabilities": ["workspace_read"],
+      "capabilities": [
+        "workspace_read"
+      ],
       "artifacts": [
         {
           "path": "skills/code-review/SKILL.md",
           "sha256": "1728255549947cec3b09df2d6e10f76fea3ef388ff2db4308eaf02dbfaaa2852",
           "size_bytes": 380,
-          "url": null,
-          "bundle_url": null
+          "url": "https://crumb.elixpo.com/marketplace/packages/code-review/skills/code-review/SKILL.md",
+          "bundle_url": "https://crumb.elixpo.com/marketplace/packages/code-review/skills/code-review/SKILL.md.sigstore.json"
         }
       ],
-      "skills": [{"id": "code-review", "path": "skills/code-review/SKILL.md"}]
+      "skills": [
+        {
+          "id": "code-review",
+          "path": "skills/code-review/SKILL.md"
+        }
+      ]
     },
     {
       "id": "crumb/rust-quality",
@@ -64,17 +77,23 @@
       "display_name": "Rust quality",
       "description": "Repository-aware Rust formatting, Clippy, tests, and review.",
       "license": "MIT",
-      "source": "./packages/rust-quality",
+      "source": "https://crumb.elixpo.com/marketplace/packages/rust-quality",
       "compatibility": {
         "minimum_crumb_version": "0.1.0",
         "maximum_crumb_version_exclusive": "0.2.0",
-        "platforms": ["linux", "macos", "windows"]
+        "platforms": [
+          "linux",
+          "macos",
+          "windows"
+        ]
       },
       "provenance": {
         "repository": "https://github.com/elixpo/crumb.elixpo",
         "revision": "9823e401b457789cf5225d34c7ccc7a475e91ca0",
         "released_at": "2026-10-17T14:39:35+05:30",
-        "trust": {"kind": "bundled"}
+        "trust": {
+          "kind": "sigstore_bundle"
+        }
       },
       "disclosures": {
         "security_url": "https://crumb.elixpo.com/docs/security",
@@ -84,17 +103,24 @@
       "connector_requirements": [],
       "dependencies": [],
       "deprecation": null,
-      "capabilities": ["workspace_read"],
+      "capabilities": [
+        "workspace_read"
+      ],
       "artifacts": [
         {
           "path": "skills/rust-quality/SKILL.md",
           "sha256": "c3ebb5f20cc7d3c68460fe90fd28c198dcb4c6475d79f96549d9c439ffdaf7c2",
           "size_bytes": 372,
-          "url": null,
-          "bundle_url": null
+          "url": "https://crumb.elixpo.com/marketplace/packages/rust-quality/skills/rust-quality/SKILL.md",
+          "bundle_url": "https://crumb.elixpo.com/marketplace/packages/rust-quality/skills/rust-quality/SKILL.md.sigstore.json"
         }
       ],
-      "skills": [{"id": "rust-quality", "path": "skills/rust-quality/SKILL.md"}]
+      "skills": [
+        {
+          "id": "rust-quality",
+          "path": "skills/rust-quality/SKILL.md"
+        }
+      ]
     },
     {
       "id": "crumb/workspace-mcp",
@@ -105,17 +131,23 @@
       "display_name": "Workspace MCP",
       "description": "Crumb's built-in policy-controlled workspace MCP server.",
       "license": "MIT",
-      "source": "./packages/workspace-mcp",
+      "source": "https://crumb.elixpo.com/marketplace/packages/workspace-mcp",
       "compatibility": {
         "minimum_crumb_version": "0.1.0",
         "maximum_crumb_version_exclusive": "0.2.0",
-        "platforms": ["linux", "macos", "windows"]
+        "platforms": [
+          "linux",
+          "macos",
+          "windows"
+        ]
       },
       "provenance": {
         "repository": "https://github.com/elixpo/crumb.elixpo",
         "revision": "9823e401b457789cf5225d34c7ccc7a475e91ca0",
         "released_at": "2026-10-17T14:39:35+05:30",
-        "trust": {"kind": "bundled"}
+        "trust": {
+          "kind": "sigstore_bundle"
+        }
       },
       "disclosures": {
         "security_url": "https://crumb.elixpo.com/docs/security",
@@ -125,14 +157,17 @@
       "connector_requirements": [],
       "dependencies": [],
       "deprecation": null,
-      "capabilities": ["workspace_read", "process_execution"],
+      "capabilities": [
+        "workspace_read",
+        "process_execution"
+      ],
       "artifacts": [
         {
           "path": "README.md",
           "sha256": "8c6513c224cf24ffd839a70df680551fc3f76a5ba7df6f7aa35d942bec11f6af",
           "size_bytes": 288,
-          "url": null,
-          "bundle_url": null
+          "url": "https://crumb.elixpo.com/marketplace/packages/workspace-mcp/README.md",
+          "bundle_url": "https://crumb.elixpo.com/marketplace/packages/workspace-mcp/README.md.sigstore.json"
         }
       ],
       "mcp_servers": [
@@ -141,7 +176,10 @@
           "transport": "stdio",
           "command": "crumb",
           "url": null,
-          "arguments": ["mcp", "serve"],
+          "arguments": [
+            "mcp",
+            "serve"
+          ],
           "environment": []
         }
       ]
