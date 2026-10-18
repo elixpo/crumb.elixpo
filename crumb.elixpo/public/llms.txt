@@ -1,6 +1,6 @@
-# Crumb — Natural Language Terminal
+# Crumb — Autonomous Agent Harness and Natural Language Terminal
 
-> Crumb is a native-first terminal that runs Bash, Zsh, and PowerShell commands normally and invokes models, skills, and tools only for explicit natural-language work.
+> Crumb is Elixpo's self-hosted autonomous Rust agent harness and native-first terminal, powered by Pollinations model intelligence.
 
 Canonical site: https://crumb.elixpo.com
 Source: https://github.com/elixpo/crumb.elixpo
@@ -21,6 +21,7 @@ Complete usage guide: https://crumb.elixpo.com/llms-full.txt
 ## Important constraints
 
 - Normal commands never require AI.
+- Crumb owns its primary harness, permissions, memory, sessions, and tools locally.
 - Shell and agent execution environments are separate.
 - Models cannot grant themselves permissions.
 - Secrets are not placed in logs or terminal history.
@@ -28,4 +29,4 @@ Complete usage guide: https://crumb.elixpo.com/llms-full.txt
 
 ## Current status
 
-Crumb is pre-release software. The native shell and secure account/connector foundations are implemented; the complete natural-language agent harness is still under development.
+Crumb is active pre-release software. The native harness and its shell, Pollinations, session, memory, MCP, permission, checkpoint, background-work, and supervision foundations are implemented; packaging, signing, compatibility, and release-readiness work continue.

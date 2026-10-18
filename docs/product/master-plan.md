@@ -1,13 +1,14 @@
 # AI-Native Cross-Platform Shell
 ## Master Architecture, Product Specification, and Agent Implementation Plan
 
-> **Status:** Initial architecture baseline  
+> **Status:** Active architecture baseline; the settled direction is documented in [`direction.md`](direction.md)  
 > **Primary implementation language:** Rust  
 > **Underlying shell:** Bash on Linux, Zsh on macOS, PowerShell on Windows  
 > **Primary AI provider:** Pollinations AI via BYOK/BYOP  
-> **Optional agent harness:** DeepSeek Harness  
+> **Primary agent harness:** Crumb's native Rust harness  
+> **Optional compatibility harness:** DeepSeek Harness behind a replaceable adapter  
 > **Token optimization:** Native filters + optional Rust Token Killer integration  
-> **Working project notation:** `<shellname>`
+> **Product name:** Crumb
 
 ---
 

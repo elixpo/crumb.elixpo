@@ -5,15 +5,15 @@ import './globals.css'
 const sans = Geist({ subsets: ['latin'], variable: '--font-sans' })
 const mono = Geist_Mono({ subsets: ['latin'], variable: '--font-mono' })
 const siteUrl = 'https://crumb.elixpo.com'
-const title = 'Crumb — The Natural Language Terminal'
-const description = 'A native-first terminal that runs shell commands normally and brings in models, skills, and tools only when you ask.'
+const title = 'Crumb — Autonomous Agent Harness and Natural Language Terminal'
+const description = 'A self-hosted Rust agent harness and native-first terminal powered by Pollinations, with user-owned permissions, tools, memory, and shell execution.'
 
 export const metadata: Metadata = {
   metadataBase: new URL(siteUrl),
   title: { default: title, template: '%s · Crumb' },
   description,
-  applicationName: 'Crumb NLT',
-  keywords: ['natural language terminal', 'AI terminal', 'shell', 'developer tools', 'Crumb'],
+  applicationName: 'Crumb',
+  keywords: ['autonomous agent harness', 'self-hosted AI agent', 'Pollinations agent', 'natural language terminal', 'AI terminal', 'Rust', 'Crumb'],
   authors: [{ name: 'Elixpo', url: 'https://elixpo.com' }],
   creator: 'Elixpo',
   publisher: 'Elixpo',
@@ -23,10 +23,10 @@ export const metadata: Metadata = {
   openGraph: {
     type: 'website',
     url: siteUrl,
-    siteName: 'Crumb NLT',
+    siteName: 'Crumb',
     title,
     description,
-    images: [{ url: '/og-image.png', width: 1280, height: 720, alt: 'Crumb — the terminal that speaks your native language' }],
+    images: [{ url: '/og-image.png', width: 1280, height: 720, alt: 'Crumb autonomous agent harness and natural language terminal' }],
   },
   twitter: { card: 'summary_large_image', title, description, images: ['/og-image.png'] },
   icons: {
@@ -40,7 +40,7 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   const software = {
     '@context': 'https://schema.org', '@type': 'SoftwareApplication', name: 'Crumb',
-    alternateName: 'Crumb NLT', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows',
+    alternateName: 'Crumb autonomous agent harness', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows',
     description, url: siteUrl, codeRepository: 'https://github.com/elixpo/crumb.elixpo',
     downloadUrl: 'https://github.com/elixpo/crumb.elixpo/releases',
     offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
