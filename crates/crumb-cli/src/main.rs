@@ -2218,6 +2218,11 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
         return Ok(None);
     }
     let shell = ensure_shell_session(context.session, context.platform)?;
+    // The fullscreen composer owns mouse tracking, but the foreground shell
+    // relay forwards stdin bytes directly to the PTY. Suspend Crumb's mouse
+    // capture so SGR mouse reports (for example ESC[<35;80;37M) cannot be
+    // interpreted as shell input while a native command is running.
+    let _mouse_capture = MouseCapturePause::new(context.fullscreen)?;
     let output_prefix = context
         .fullscreen
         .then(|| context.renderer.native_output_prefix());
@@ -12055,6 +12060,27 @@ fn relay_output(reader: &mut dyn Read, writer: &mut dyn Write) -> io::Result<()>
 struct RawModeGuard;
 
 struct KeyboardEnhancementGuard;
+
+struct MouseCapturePause {
+    restore: bool,
+}
+
+impl MouseCapturePause {
+    fn new(active: bool) -> io::Result<Self> {
+        if active {
+            crossterm::execute!(io::stdout(), DisableMouseCapture)?;
+        }
+        Ok(Self { restore: active })
+    }
+}
+
+impl Drop for MouseCapturePause {
+    fn drop(&mut self) {
+        if self.restore {
+            let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
+        }
+    }
+}
 
 struct AlternateScreenGuard {
     active: bool,
