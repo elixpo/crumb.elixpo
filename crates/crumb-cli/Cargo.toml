@@ -17,6 +17,7 @@ crumb-core = { path = "../crumb-core" }
 crumb-graph = { path = "../crumb-graph" }
 crumb-harness = { path = "../crumb-harness" }
 crumb-history = { path = "../crumb-history" }
+crumb-instance.workspace = true
 crumb-marketplace = { path = "../crumb-marketplace" }
 crumb-memory = { path = "../crumb-memory" }
 crumb-harness-cli = { path = "../crumb-harness-cli" }

@@ -84,6 +84,38 @@ pub enum MotionMode {
     Reduced,
 }
 
+/// Public lifecycle state for one agent-to-agent exchange.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeerActivityState {
+    Connecting,
+    Exchanging,
+    Waiting,
+    Completed,
+    Failed,
+}
+
+impl PeerActivityState {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Connecting => "connecting",
+            Self::Exchanging => "sharing context",
+            Self::Waiting => "waiting",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Bounded, non-secret summary shown while two Crumb instances communicate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerActivity<'a> {
+    pub local_name: &'a str,
+    pub remote_name: &'a str,
+    pub state: PeerActivityState,
+    pub elapsed: Duration,
+    pub artifact_count: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PandaMood {
     Awake,
@@ -167,6 +199,7 @@ pub struct PromptContext<'a> {
 pub struct StartupContext<'a> {
     pub version: &'a str,
     pub platform: Platform,
+    pub instance_name: Option<&'a str>,
     pub model: Option<&'a str>,
     pub mode: &'a str,
     pub effort: Option<&'a str>,
@@ -225,10 +258,13 @@ impl Renderer {
             WORDMARK
         };
         let pack = context.model.unwrap_or("not configured");
+        let instance = context
+            .instance_name
+            .map_or(String::new(), |name| format!(" · {name}"));
         let state = if context.agent_configured {
-            format!("Ready · pack {pack} · {}", context.mode)
+            format!("Ready{instance} · pack {pack} · {}", context.mode)
         } else {
-            "Native shell ready · run /auth login for AI".to_owned()
+            format!("Native shell ready{instance} · run /auth login for AI")
         };
         let copy = format!(
             "{wordmark}\nCrumb CLI v{} · Native commands stay native.\n{} · effort {}\nTip: type naturally · : forces AI · / opens actions",
@@ -331,12 +367,25 @@ impl Renderer {
     #[must_use]
     pub fn context_footer(&self, context: &StartupContext<'_>, terminal_width: u16) -> String {
         let pack = context.model.unwrap_or("native");
-        let text = format!(
-            "effort {} · pack {pack} · {} · {}",
-            context.effort.unwrap_or("default"),
-            context_meter(context),
-            context.mode
-        );
+        let instance = context
+            .instance_name
+            .map_or(String::new(), |name| format!(" · {name}"));
+        let effort = context.effort.unwrap_or("default");
+        let text = if terminal_width < 60 {
+            format!(
+                "{}/{} · effort {effort} · {}",
+                compact_tokens(context.context_tokens),
+                compact_tokens(context.session_budget_tokens),
+                context.mode
+            )
+        } else {
+            format!(
+                "{}{} · effort {effort} · {pack} · {}",
+                context_meter(context),
+                instance,
+                context.mode
+            )
+        };
         let text = fit_terminal_text(&text, usize::from(terminal_width.saturating_sub(2)));
         self.paint(&format!("  {text}"), "2")
     }
@@ -479,6 +528,7 @@ impl Renderer {
     #[must_use]
     pub fn startup_status(&self, context: &StartupContext<'_>) -> String {
         let pack = context.model.unwrap_or("not configured");
+        let instance = context.instance_name.unwrap_or("unnamed");
         let state = if context.agent_configured {
             "agent ready"
         } else {
@@ -486,7 +536,7 @@ impl Renderer {
         };
         if self.settings.output == OutputMode::ScreenReader {
             return format!(
-                "crumb {} on {}\n{state}; pack {pack}; mode {}",
+                "crumb {} on {}\n{state}; instance {instance}; pack {pack}; mode {}",
                 context.version, context.platform, context.mode
             );
         }
@@ -505,7 +555,13 @@ impl Renderer {
                 },
                 "36;1"
             ),
-            self.paint(&format!("{state} · pack {pack} · {}", context.mode), "2")
+            self.paint(
+                &format!(
+                    "{state} · instance {instance} · pack {pack} · {}",
+                    context.mode
+                ),
+                "2"
+            )
         )
     }
 
@@ -721,6 +777,35 @@ impl Renderer {
                 "  {}  ↳ {}",
                 self.paint("│", "35"),
                 self.paint(label, "38;5;245")
+            )
+        }
+    }
+
+    /// Renders one subdued, always-visible summary for an inter-agent exchange.
+    ///
+    /// Message bodies, tool output, and file paths are intentionally excluded;
+    /// a later transcript control can expose approved details independently.
+    #[must_use]
+    pub fn peer_activity(&self, activity: &PeerActivity<'_>) -> String {
+        let seconds = activity.elapsed.as_secs_f32();
+        let artifacts = match activity.artifact_count {
+            0 => String::new(),
+            1 => " · 1 artifact".to_owned(),
+            count => format!(" · {count} artifacts"),
+        };
+        let label = format!(
+            "{} ↔ {} · {} · {seconds:.1}s{artifacts}",
+            activity.local_name,
+            activity.remote_name,
+            activity.state.label(),
+        );
+        if self.settings.output == OutputMode::ScreenReader {
+            format!("Agent exchange: {label}")
+        } else {
+            format!(
+                "  {}  ⇄ {}",
+                self.paint("│", "38;5;245"),
+                self.paint(&label, "38;5;245")
             )
         }
     }
@@ -1558,8 +1643,8 @@ mod tests {
     use crumb_platform::Platform;
 
     use super::{
-        BrandingMode, COOKIE_SPINNER, GitSegment, MotionMode, OutputMode, PUNCHLINES,
-        PromptContext, Renderer, StartupContext, UiSettings,
+        BrandingMode, COOKIE_SPINNER, GitSegment, MotionMode, OutputMode, PUNCHLINES, PeerActivity,
+        PeerActivityState, PromptContext, Renderer, StartupContext, UiSettings,
     };
 
     #[test]
@@ -1806,6 +1891,7 @@ mod tests {
             &StartupContext {
                 version: "0.1.0",
                 platform: Platform::Linux,
+                instance_name: Some("Oreo"),
                 model: Some("Quick Crumb"),
                 mode: "auto",
                 effort: Some("high"),
@@ -1820,7 +1906,8 @@ mod tests {
         assert!(footer.contains("Model context"));
         assert!(footer.contains("12.8k / 64.0k"));
         assert!(footer.contains("effort high"));
-        assert!(footer.contains("pack Quick Crumb"));
+        assert!(footer.contains("· Oreo ·"));
+        assert!(footer.contains("Quick Crumb"));
         assert!(footer.contains("auto"));
         assert!(footer.chars().count() <= 100);
     }
@@ -1837,6 +1924,7 @@ mod tests {
             &StartupContext {
                 version: "0.1.0",
                 platform: Platform::Linux,
+                instance_name: None,
                 model: Some("Quick Crumb"),
                 mode: "auto",
                 effort: None,
@@ -1853,6 +1941,7 @@ mod tests {
             &StartupContext {
                 version: "0.1.0",
                 platform: Platform::Linux,
+                instance_name: None,
                 model: Some("Quick Crumb"),
                 mode: "auto",
                 effort: Some("extra high"),
@@ -1945,6 +2034,48 @@ mod tests {
     }
 
     #[test]
+    fn peer_activity_is_subdued_and_excludes_internal_content() {
+        let renderer = Renderer::new(UiSettings {
+            color: true,
+            output: OutputMode::Rich,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let output = renderer.peer_activity(&PeerActivity {
+            local_name: "Oreo",
+            remote_name: "Miso",
+            state: PeerActivityState::Exchanging,
+            elapsed: Duration::from_millis(1_250),
+            artifact_count: 2,
+        });
+
+        assert!(output.contains("Oreo ↔ Miso"));
+        assert!(output.contains("sharing context · 1.2s · 2 artifacts"));
+        assert!(output.contains("\x1b[38;5;245m"));
+        assert!(!output.contains("message"));
+        assert!(!output.contains("tool output"));
+    }
+
+    #[test]
+    fn screen_reader_peer_activity_has_a_semantic_label() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::ScreenReader,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let output = renderer.peer_activity(&PeerActivity {
+            local_name: "Oreo",
+            remote_name: "Miso",
+            state: PeerActivityState::Waiting,
+            elapsed: Duration::from_secs(3),
+            artifact_count: 0,
+        });
+
+        assert_eq!(output, "Agent exchange: Oreo ↔ Miso · waiting · 3.0s");
+    }
+
+    #[test]
     fn screen_reader_agent_events_avoid_decorative_components() {
         let renderer = Renderer::new(UiSettings {
             color: false,
@@ -1997,6 +2128,7 @@ mod tests {
         let status = renderer.startup_status(&StartupContext {
             version: "0.1.0",
             platform: Platform::Linux,
+            instance_name: Some("Oreo"),
             model: Some("Balanced Crumb"),
             mode: "auto",
             effort: Some("medium"),
@@ -2008,12 +2140,13 @@ mod tests {
 
         assert_eq!(
             status,
-            " SESSION   crumb 0.1.0 · linux\n●  agent ready · pack Balanced Crumb · auto"
+            " SESSION   crumb 0.1.0 · linux\n●  agent ready · instance Oreo · pack Balanced Crumb · auto"
         );
         let welcome = renderer.welcome(
             &StartupContext {
                 version: "0.1.0",
                 platform: Platform::Linux,
+                instance_name: Some("Oreo"),
                 model: Some("Balanced Crumb"),
                 mode: "auto",
                 effort: Some("medium"),
@@ -2025,7 +2158,7 @@ mod tests {
             120,
         );
         assert!(welcome.contains("Crumb CLI v0.1.0 · Native commands stay native."));
-        assert!(welcome.contains("Ready · pack Balanced Crumb · auto"));
+        assert!(welcome.contains("Ready · Oreo · pack Balanced Crumb · auto"));
         assert!(!welcome.contains("Model context"));
         assert!(!welcome.contains("compact"));
         assert!(welcome.contains("╭▄█▄╮"));
@@ -2042,6 +2175,7 @@ mod tests {
         let context = StartupContext {
             version: "0.1.0",
             platform: Platform::Linux,
+            instance_name: Some("Oreo"),
             model: Some("Deep Crumb"),
             mode: "auto",
             effort: Some("extra high"),

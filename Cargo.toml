@@ -1,10 +1,12 @@
 [workspace]
 members = [
+    "crates/crumb-a2a",
     "crates/crumb-agent",
     "crates/crumb-auth",
     "crates/crumb-cli",
     "crates/crumb-core",
     "crates/crumb-history",
+    "crates/crumb-instance",
     "crates/crumb-graph",
     "crates/crumb-harness-dsh",
     "crates/crumb-harness-cli",
@@ -43,6 +45,8 @@ base64 = "0.22.1"
 bytes = "1.11"
 chrono = "0.4.45"
 crossterm = "0.29.0"
+crumb-a2a = { path = "crates/crumb-a2a" }
+crumb-instance = { path = "crates/crumb-instance" }
 ctrlc = "3.4.7"
 directories = "6.0.0"
 futures-util = "0.3.34"

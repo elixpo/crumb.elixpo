@@ -47,6 +47,7 @@ use crumb_graph::{
 use crumb_harness::SelectedSkill;
 use crumb_harness_dsh::HarnessActivity;
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
+use crumb_instance::InstanceStore;
 use crumb_marketplace::{
     Catalog, DiscoveryEntry, DiscoveryIndex, InstallScope, InstallationStore, InstalledRelease,
     Installer, MAX_CATALOG_BYTES, MAX_DISCOVERY_INDEX_BYTES, MAX_PACKAGE_MANIFEST_BYTES,
@@ -271,6 +272,9 @@ fn parse_exec_request(arguments: &[OsString]) -> Result<Option<(bool, String)>> 
 }
 
 fn run_agent_exec(cwd: &Path, request: &str, json: bool, writer: &mut dyn Write) -> Result<()> {
+    instance_store(cwd)
+        .load_or_create()
+        .context("Crumb instance identity could not be initialized")?;
     let config = read_agent_config(cwd)?;
     let mut runtime = AgentRuntime::new()?;
     let cancellation = CancellationToken::default();
@@ -838,11 +842,11 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
     let renderer = Renderer::new(UiSettings::from_environment(interactive));
     let fullscreen = interactive && std::env::var_os("CRUMB_INLINE").is_none();
     let screen = AlternateScreenGuard::enter(fullscreen)?;
-    let platform = Platform::current();
-    let initial_cwd = current_process_dir()?;
+    let (platform, initial_cwd) = (Platform::current(), current_process_dir()?);
     if interactive && !confirm_folder_trust(renderer, &initial_cwd, fullscreen)? {
         return Ok(ReplOutcome::Exit);
     }
+    warn_if_instance_unavailable(&initial_cwd, &mut stdout.lock())?;
     let command_catalog = native_command_catalog(platform);
     let (mut session, mut agent_runtime) =
         (None, resume_agent_runtime(&initial_cwd, resume_session)?);
@@ -1620,6 +1624,7 @@ fn render_startup(
 ) -> Result<u16> {
     let cwd = current_process_dir()?;
     let config = read_agent_config(&cwd).unwrap_or_default();
+    let instance = instance_store(&cwd).load().ok();
     let text_route = config
         .models
         .get(&Modality::Text)
@@ -1628,6 +1633,7 @@ fn render_startup(
     let startup = StartupContext {
         version: env!("CARGO_PKG_VERSION"),
         platform,
+        instance_name: instance.as_ref().map(|metadata| metadata.name.as_str()),
         model: pack,
         mode: agent_mode_name(config.mode),
         effort: Some(
@@ -1750,6 +1756,7 @@ fn context_footer_status(
     context_tokens: u64,
 ) -> String {
     let config = read_agent_config(cwd).unwrap_or_default();
+    let instance = instance_store(cwd).load().ok();
     let text_route = config
         .models
         .get(&Modality::Text)
@@ -1758,6 +1765,7 @@ fn context_footer_status(
     let startup = StartupContext {
         version: env!("CARGO_PKG_VERSION"),
         platform,
+        instance_name: instance.as_ref().map(|metadata| metadata.name.as_str()),
         model: pack,
         mode: agent_mode_name(config.mode),
         effort: Some(
@@ -2386,6 +2394,26 @@ fn agent_config_location(cwd: &Path) -> (PathBuf, PathBuf) {
         }
     }
     (cwd.join(".crumb").join("agent.json"), cwd.to_path_buf())
+}
+
+fn instance_store(cwd: &Path) -> InstanceStore {
+    for directory in cwd.ancestors() {
+        if directory.join(".crumb").join("instance.json").is_file() {
+            return InstanceStore::for_workspace(directory);
+        }
+    }
+    let (_, workspace) = agent_config_location(cwd);
+    InstanceStore::for_workspace(&workspace)
+}
+
+fn warn_if_instance_unavailable(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    if let Err(error) = instance_store(cwd).load_or_create() {
+        writeln!(
+            writer,
+            "warning: Crumb instance identity is unavailable: {error}"
+        )?;
+    }
+    Ok(())
 }
 
 fn handle_agent_boundary(
@@ -5267,9 +5295,7 @@ fn show_reserved(
         command if command == "/config provider" || command.starts_with("/config provider ") => {
             configure_provider(command, cwd, writer)?;
         }
-        "/config harness native" => {
-            set_native_harness(cwd, writer)?;
-        }
+        "/config harness native" => set_native_harness(cwd, writer)?,
         "/doctor" => show_doctor(cwd, writer)?,
         "/plugins" => show_plugins(cwd, writer)?,
         command if command.starts_with("/plugins ") => {
@@ -5296,12 +5322,41 @@ fn show_reserved(
         command if command == "/session" || command.starts_with("/session ") => {
             show_sessions(command, cwd, runtime, writer)?;
         }
+        command if command == "/instance" || command.starts_with("/instance ") => {
+            show_instance(command, cwd, writer)?;
+        }
         "/cost" => show_provider_usage(cwd, runtime.as_ref(), writer)?,
         _ => {
             writeln!(writer, "◇ {command}")?;
             writeln!(writer, "  Reserved by Crumb; not available in this build.")?;
         }
     }
+    Ok(())
+}
+
+fn show_instance(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let store = instance_store(cwd);
+    let metadata = if let Some(name) = command.strip_prefix("/instance rename ") {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("usage: /instance rename <name>");
+        }
+        store.rename(name)?
+    } else if command == "/instance" {
+        store.load_or_create()?
+    } else {
+        bail!("usage: /instance [rename <name>]");
+    };
+
+    writeln!(writer, "◆ Crumb instance")?;
+    writeln!(writer, "  name      {}", metadata.name)?;
+    writeln!(writer, "  id        {}", metadata.instance_id)?;
+    writeln!(writer, "  protocol  A2A 1.0 foundation")?;
+    writeln!(writer, "  metadata  .crumb/instance.json")?;
+    writeln!(
+        writer,
+        "  workspace sessions · memory · graph · jobs · checkpoints · a2a"
+    )?;
     Ok(())
 }
 
@@ -11181,7 +11236,7 @@ mod tests {
         read_agent_config, read_bounded_response, register_local_skill,
         render_skill_discovery_search, resolve_memory_keep, sanitize_transcript_output,
         select_discovery_skill, set_skill_enabled, shell_blast_radius, shell_tool_config,
-        should_auto_enable_rtk, show_graph, show_marketplace, show_memory,
+        should_auto_enable_rtk, show_graph, show_instance, show_marketplace, show_memory,
         show_profile_with_stores, suggestion_width, transcript_activity_row,
         unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
         visible_tool_activity, workspace_read_host, write_bounded_response_delta_for_width,
@@ -11228,6 +11283,32 @@ mod tests {
                 .expect("non-exec arguments")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn instance_command_creates_and_renames_a_stable_identity() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut output = Vec::new();
+
+        show_instance("/instance", workspace.path(), &mut output).expect("create identity");
+        let first = crumb_instance::InstanceStore::for_workspace(workspace.path())
+            .load()
+            .expect("stored identity");
+        show_instance(
+            "/instance rename Build Buddy",
+            workspace.path(),
+            &mut output,
+        )
+        .expect("rename identity");
+        let renamed = crumb_instance::InstanceStore::for_workspace(workspace.path())
+            .load()
+            .expect("renamed identity");
+
+        assert_eq!(renamed.instance_id, first.instance_id);
+        assert_eq!(renamed.name, "Build Buddy");
+        let output = String::from_utf8(output).expect("UTF-8 output");
+        assert!(output.contains("A2A 1.0 foundation"));
+        assert!(output.contains(".crumb/instance.json"));
     }
 
     #[test]

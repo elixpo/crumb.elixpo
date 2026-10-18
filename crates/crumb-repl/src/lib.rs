@@ -184,6 +184,14 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "move a session to recoverable trash",
     },
     SlashCommand {
+        usage: "/instance",
+        description: "show this workspace's stable Crumb identity",
+    },
+    SlashCommand {
+        usage: "/instance rename ",
+        description: "rename this Crumb instance without changing its identity",
+    },
+    SlashCommand {
         usage: "/review",
         description: "review Crumb-owned edits",
     },
