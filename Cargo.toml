@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/crumb-a2a",
+    "crates/crumb-a2a-local",
     "crates/crumb-agent",
     "crates/crumb-auth",
     "crates/crumb-cli",
@@ -46,6 +47,7 @@ bytes = "1.11"
 chrono = "0.4.45"
 crossterm = "0.29.0"
 crumb-a2a = { path = "crates/crumb-a2a" }
+crumb-a2a-local = { path = "crates/crumb-a2a-local" }
 crumb-instance = { path = "crates/crumb-instance" }
 ctrlc = "3.4.7"
 directories = "6.0.0"
