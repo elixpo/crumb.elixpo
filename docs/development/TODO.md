@@ -16,9 +16,9 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] [WP-010 — secure Pollinations BYOK](https://github.com/elixpo/crumb.elixpo/issues/24) ([PR #27](https://github.com/elixpo/crumb.elixpo/pull/27))
 - [x] [WP-011 — browser account connector](https://github.com/elixpo/crumb.elixpo/issues/26) ([PR #28](https://github.com/elixpo/crumb.elixpo/pull/28))
 
-## Active stack
+## Completed platform parity
 
-- [ ] [Linux terminal parity](https://github.com/elixpo/crumb.elixpo/issues/16) ([PR #18](https://github.com/elixpo/crumb.elixpo/pull/18))
+- [x] [Linux terminal parity](https://github.com/elixpo/crumb.elixpo/issues/16) ([PR #18](https://github.com/elixpo/crumb.elixpo/pull/18))
 
 <details>
 <summary>WP-011 completion details</summary>
@@ -83,7 +83,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Add bounded Enter-to-steer and Ctrl+Enter FIFO follow-ups with queue replacement.
 - [x] Add safe active-turn pause/resume while retaining steering and bounded queued follow-ups.
 - [x] Add queued steering and richer tool-specific event projection to the Harness stream.
-- [ ] Add interactive approval, tool-call, patch, error, and completion components.
+- [x] Add interactive approval, tool-call, patch, error, and completion components.
 - [x] Add live model, effort, and mode selection backed by atomic configuration writes.
 - [x] Add terminal-width snapshots, reduced-motion behavior, and accessibility checks.
 - [ ] Package signed standalone binaries for Linux, macOS, and Windows.
@@ -133,7 +133,7 @@ engines remain replaceable; none may bypass Crumb's permission, credential, or s
   - [x] Supervise bounded local STDIO MCP servers ([PR #96](https://github.com/elixpo/crumb.elixpo/pull/96)).
   - [x] Supervise remote Streamable HTTP MCP servers ([issue #97](https://github.com/elixpo/crumb.elixpo/issues/97)).
   - [x] [WP-033: audit supervised MCP lifecycle and tool outcomes](https://github.com/elixpo/crumb.elixpo/issues/124).
-- [ ] [Build marketplace trust, publishing, updates, rollback, and revocation](https://github.com/elixpo/crumb.elixpo/issues/48).
+- [x] [Build marketplace trust, publishing, updates, rollback, and revocation](https://github.com/elixpo/crumb.elixpo/issues/48).
   - [x] [WP-025: marketplace schema v2 trust metadata](https://github.com/elixpo/crumb.elixpo/issues/106).
   - [x] [WP-026: bounded remote catalog sync and offline cache](https://github.com/elixpo/crumb.elixpo/issues/108).
   - [x] [WP-027: signed catalog and per-artifact Sigstore verification](https://github.com/elixpo/crumb.elixpo/issues/110).
@@ -155,11 +155,11 @@ engines remain replaceable; none may bypass Crumb's permission, credential, or s
 
 - [x] [WP-012 — deterministic agent/session foundation](https://github.com/elixpo/crumb.elixpo/issues/33) ([design](agent-foundation.md)).
 - [x] [DeepSeek Harness + RTK/token optimizers](https://github.com/elixpo/crumb.elixpo/issues/22): [Harness adapter](deepseek-harness.md) and measured [optimizer pipeline](token-optimization.md).
-- [ ] [Skills and natural-language routing](https://github.com/elixpo/crumb.elixpo/issues/25): valid commands stay native; unresolved phrases follow configured deterministic policy.
-- [ ] Implement the [`/` command and `@` reference catalog](../product/input-namespaces-and-connectors.md) incrementally; neither symbol activates an AI prompt.
-- [ ] Add connectors in the catalog's priority order, starting with GitHub, Google Drive, Cloudinary, email, and calendar.
-- [ ] [Crumb MCP policy boundary](mcp-boundary.md): Rust-owned risk, approvals, cancellation, and workspace confinement.
-- [ ] Refine the standalone CLI UI after the harness and optimizers.
+- [x] [Skills and natural-language routing](https://github.com/elixpo/crumb.elixpo/issues/25): valid commands stay native; unresolved phrases follow configured deterministic policy.
+- [x] Implement the [`/` command and `@` reference catalog](../product/input-namespaces-and-connectors.md) incrementally; neither symbol activates an AI prompt.
+- [ ] Add non-Pollinations connectors in the catalog's priority order, starting with GitHub, Google Drive, Cloudinary, email, and calendar. Deferred until the selective-prompt smoke-test gate passes.
+- [x] [Crumb MCP policy boundary](mcp-boundary.md): Rust-owned risk, approvals, cancellation, and workspace confinement.
+- [x] Refine the standalone CLI UI after the harness and optimizers.
   - [x] Add compact panda branding, startup readiness, and model/mode status.
   - [x] Add inline history autosuggestions alongside `/` and `@` completion.
   - [x] Add a muted empty-composer placeholder that cannot be accepted as input.
@@ -169,11 +169,15 @@ engines remain replaceable; none may bypass Crumb's permission, credential, or s
   - [x] Surface effort, session budget, estimated context use, and Harness auto-compaction.
   - [x] Keep the startup header fixed above a bounded scrolling transcript.
   - [x] Keep the composer and responsive hotkey guide pinned below the transcript.
-  - [ ] Add the final panda application icon and platform launcher metadata.
+  - [ ] Add the final panda application icon and platform launcher metadata (distribution gate).
   - [x] Add responsive composer borders and a context/model status meter.
-  - [ ] Add installer, signed release binaries, and desktop launch entries.
-- [ ] Resume the `crumb.elixpo` web UI after the CLI UI.
-- [ ] WP-011 — streamed AI question mode.
+  - [ ] Add installer, signed release binaries, and desktop launch entries (distribution gate).
+- [x] Resume the `crumb.elixpo` production web UI after the CLI UI.
+- [x] Stream AI question-mode output and Harness activity.
+
+Signing, installers, launcher metadata, and non-Pollinations connectors remain intentionally deferred
+until the selective-prompt smoke tests are complete. Pollinations is the only production connector in
+the current release candidate.
 
 Later work packages remain defined in the [master plan](../product/master-plan.md). Only the current and immediately upcoming package should be expanded into implementation-level tasks.
 

@@ -14,10 +14,10 @@ Adding a marketplace never happens during terminal startup.
    verifies every SHA-256 digest, and atomically publishes the version.
 4. Installation registers components disabled. It does not run hooks, start MCP processes,
    resolve secret values, or grant permissions.
-5. A later explicit user action may load a skill. External MCP execution will remain disabled
-   until Crumb's MCP client/proxy owns discovery, approval, cancellation, output filtering, and
-   per-call audit events. Passing marketplace MCPs directly into a provider CLI would let that
-   provider bypass Crumb's permission broker, so this release intentionally refuses that shortcut.
+5. A later explicit user action may load a skill or enable an installed MCP entry. Crumb's supervised
+   MCP boundary owns discovery, approval, cancellation, output filtering, health, and per-call audit
+   events. Marketplace MCPs are never passed directly into a provider CLI, so they cannot bypass
+   Crumb's permission broker.
 
 The schema lives at `marketplace/schema/catalog.schema.json`. The initial public catalog contains
 two inspectable skills and one descriptor for Crumb's built-in policy-controlled workspace MCP.
@@ -74,6 +74,7 @@ separate install/enable phases from established CLI marketplaces, and portable `
 Crumb adds digest verification, explicit capability declarations, no lifecycle scripts in schema
 v1, secret references instead of values, and project/user install scopes.
 
-Before general third-party MCP activation, Crumb still needs a policy-owning MCP client/proxy,
-server identity pinning, tool-schema snapshots, per-call approvals, cancellation, health status,
-and bounded optimized outputs. Those are release blockers, not optional polish.
+The policy-owning MCP client/proxy, server identity checks, tool-schema snapshots, per-call
+approvals, cancellation, health status, and bounded outputs are implemented in the native runtime.
+General third-party connector rollout remains a separate release decision; the current production
+scope exposes Pollinations only until the selective-prompt smoke-test gate passes.
