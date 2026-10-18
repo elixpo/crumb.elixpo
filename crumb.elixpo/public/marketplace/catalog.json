@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "name": "crumb-public",
   "publishers": [
     {
@@ -19,6 +19,7 @@
       "publisher": "crumb",
       "version": "1.0.0",
       "kind": "skill",
+      "package_class": "instruction",
       "display_name": "Code review",
       "description": "Focused correctness, security, compatibility, and test review.",
       "license": "MIT",
@@ -40,6 +41,7 @@
         "data_flow": "Reads explicitly approved workspace context locally; sends no data by itself."
       },
       "connector_requirements": [],
+      "dependencies": [],
       "deprecation": null,
       "capabilities": ["workspace_read"],
       "artifacts": [
@@ -58,6 +60,7 @@
       "publisher": "crumb",
       "version": "1.0.0",
       "kind": "skill",
+      "package_class": "instruction",
       "display_name": "Rust quality",
       "description": "Repository-aware Rust formatting, Clippy, tests, and review.",
       "license": "MIT",
@@ -79,6 +82,7 @@
         "data_flow": "Reads approved Rust workspace files and may request user-approved native quality commands."
       },
       "connector_requirements": [],
+      "dependencies": [],
       "deprecation": null,
       "capabilities": ["workspace_read"],
       "artifacts": [
@@ -97,6 +101,7 @@
       "publisher": "crumb",
       "version": "1.0.0",
       "kind": "mcp",
+      "package_class": "mcp",
       "display_name": "Workspace MCP",
       "description": "Crumb's built-in policy-controlled workspace MCP server.",
       "license": "MIT",
@@ -118,6 +123,7 @@
         "data_flow": "Runs locally and exposes only Crumb-owned, policy-controlled workspace tools."
       },
       "connector_requirements": [],
+      "dependencies": [],
       "deprecation": null,
       "capabilities": ["workspace_read", "process_execution"],
       "artifacts": [
