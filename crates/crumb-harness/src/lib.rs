@@ -549,9 +549,9 @@ impl NativeHarness {
     /// Runs one inbound peer message in a fresh, isolated conversation.
     ///
     /// Peer input is never combined with ordinary history, persona, images,
-    /// trusted context, or selected skills. Only a fixed native read-only tool
-    /// allowlist is exposed; peer/A2A and subagent tools are excluded even when
-    /// their descriptor is marked read-only.
+    /// trusted context, or selected skills. Only a context-free native clock
+    /// tool may be exposed; workspace reads, peer/A2A, and subagent tools are
+    /// excluded even when their descriptor is marked read-only.
     ///
     /// # Errors
     ///
@@ -2279,6 +2279,7 @@ mod tests {
     fn isolated_peer_tools(calls: &Arc<AtomicUsize>) -> ToolHost {
         let mut tools = ToolHost::default();
         for (name, risk) in [
+            ("current_time", RiskClass::ReadOnly),
             ("read_file", RiskClass::ReadOnly),
             ("weather", RiskClass::ReadOnly),
             ("list_peer_agents", RiskClass::ReadOnly),
@@ -2513,7 +2514,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["read_file"]
+            vec!["current_time"]
         );
         assert!(request.tools.iter().all(|tool| {
             !matches!(

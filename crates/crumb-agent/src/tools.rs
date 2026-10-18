@@ -451,7 +451,7 @@ impl ToolHost {
         host
     }
 
-    /// Clones the small native read-only surface available to an isolated
+    /// Clones the minimal native read-only surface available to an isolated
     /// inbound peer turn.
     ///
     /// This is deliberately an allowlist instead of a risk-class filter:
@@ -459,7 +459,11 @@ impl ToolHost {
     /// themselves be read-only while still crossing an isolation boundary.
     #[must_use]
     pub fn isolated_peer_read_only(&self) -> Self {
-        const ALLOWED: [&str; 3] = ["current_time", "list_directory", "read_file"];
+        // Accepting peer-authored text is not permission to inspect the local
+        // workspace. File and directory reads need a separate receiver-owned
+        // approval boundary, so the default peer surface is intentionally
+        // limited to a context-free clock lookup.
+        const ALLOWED: [&str; 1] = ["current_time"];
 
         let mut host = Self::default();
         for descriptor in self.registry.iter().filter(|descriptor| {
