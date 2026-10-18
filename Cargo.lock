@@ -524,6 +524,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crumb-a2a-inbound"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crumb-a2a",
+ "crumb-a2a-local",
+ "crumb-a2a-runtime",
+ "crumb-a2a-tasks",
+ "crumb-instance",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "crumb-a2a-local"
 version = "0.1.0"
 dependencies = [

@@ -188,6 +188,18 @@ pub struct EnqueueReceipt {
     pub recipient_instance_id: String,
 }
 
+/// Content-free proof that a correlated response is durably queued or was
+/// acknowledged by its recipient.
+///
+/// The digest covers the transport envelope's stable content fields, but this
+/// projection never exposes the response body or queue paths.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletedResponseReceipt {
+    pub delivery_id: String,
+    pub recipient_instance_id: String,
+    pub digest: String,
+}
+
 /// Content-free receiver view of one pending inbox delivery.
 ///
 /// This intentionally omits message text, structured data, filenames, URLs,
@@ -1027,6 +1039,70 @@ impl LocalBus {
         self.complete_claimed_request(recipient, delivery_id, &response)
     }
 
+    /// Returns content-free proof for an already completed inbound request.
+    ///
+    /// This supports crash reconciliation when the response and inbound
+    /// acknowledgement were persisted before a separate task ledger was
+    /// updated. A request that has not been acknowledged returns `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid ownership, malformed acknowledgement or
+    /// response storage, or an acknowledged request whose correlated response
+    /// is no longer durably represented.
+    pub fn completed_response_receipt(
+        &self,
+        recipient: &Registration,
+        delivery_id: &str,
+    ) -> Result<Option<CompletedResponseReceipt>> {
+        self.inspect_base_directories()?;
+        validate_delivery_id(delivery_id)?;
+
+        let sender_instance_id = {
+            let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
+            self.require_live_owner(recipient, now_ms()?)?;
+            let (_pending, _processing, acknowledged) =
+                self.queue_directories(recipient.instance_id())?;
+            let path = acknowledged.join(delivery_filename(delivery_id)?);
+            if !path_exists_without_following(&path)? {
+                return Ok(None);
+            }
+            let record: Acknowledgement =
+                read_required_json(&path, MAX_REGISTRY_BYTES, "local A2A acknowledgement")?;
+            record.validate()?;
+            if record.delivery_id != delivery_id
+                || record.recipient_instance_id != recipient.instance_id()
+            {
+                bail!("local A2A acknowledgement does not match completed request");
+            }
+            record.sender_instance_id
+        };
+
+        let _locks =
+            self.acquire_instance_locks(&[recipient.instance_id(), &sender_instance_id])?;
+        self.require_live_owner(recipient, now_ms()?)?;
+        self.validate_completed_request_acknowledgement(
+            recipient.instance_id(),
+            delivery_id,
+            &sender_instance_id,
+        )?;
+        let response_id =
+            response_delivery_id(recipient.instance_id(), &sender_instance_id, delivery_id);
+        let digest = self
+            .durable_response_digest(
+                recipient.instance_id(),
+                &sender_instance_id,
+                delivery_id,
+                &response_id,
+            )?
+            .context("completed A2A request has no durable correlated response")?;
+        Ok(Some(CompletedResponseReceipt {
+            delivery_id: response_id,
+            recipient_instance_id: sender_instance_id,
+            digest,
+        }))
+    }
+
     /// Acknowledges a claimed response. Requests are rejected by this API.
     ///
     /// # Errors
@@ -1280,6 +1356,76 @@ impl LocalBus {
             bail!("local A2A acknowledgement does not match completed request");
         }
         Ok(())
+    }
+
+    fn validate_completed_request_acknowledgement(
+        &self,
+        recipient_instance_id: &str,
+        delivery_id: &str,
+        sender_instance_id: &str,
+    ) -> Result<()> {
+        let (_pending, _processing, acknowledged) =
+            self.queue_directories(recipient_instance_id)?;
+        let path = acknowledged.join(delivery_filename(delivery_id)?);
+        let record: Acknowledgement =
+            read_required_json(&path, MAX_REGISTRY_BYTES, "local A2A acknowledgement")?;
+        record.validate()?;
+        if record.delivery_id != delivery_id
+            || record.sender_instance_id != sender_instance_id
+            || record.recipient_instance_id != recipient_instance_id
+        {
+            bail!("local A2A acknowledgement does not match completed request");
+        }
+        Ok(())
+    }
+
+    fn durable_response_digest(
+        &self,
+        responder_instance_id: &str,
+        original_sender_instance_id: &str,
+        inbound_delivery_id: &str,
+        response_delivery_id: &str,
+    ) -> Result<Option<String>> {
+        let (pending, processing, acknowledged) =
+            self.queue_directories(original_sender_instance_id)?;
+        let filename = delivery_filename(response_delivery_id)?;
+        let acknowledgement_path = acknowledged.join(&filename);
+        if path_exists_without_following(&acknowledgement_path)? {
+            let record: Acknowledgement = read_required_json(
+                &acknowledgement_path,
+                MAX_REGISTRY_BYTES,
+                "local A2A acknowledgement",
+            )?;
+            record.validate()?;
+            if record.delivery_id != response_delivery_id
+                || record.sender_instance_id != responder_instance_id
+                || record.recipient_instance_id != original_sender_instance_id
+            {
+                bail!("local A2A correlated response acknowledgement is invalid");
+            }
+            return record
+                .delivery_digest
+                .map(Some)
+                .context("local A2A correlated response acknowledgement lacks a digest");
+        }
+        for path in [pending.join(&filename), processing.join(filename)] {
+            if !path_exists_without_following(&path)? {
+                continue;
+            }
+            let envelope: DeliveryEnvelope =
+                read_required_json(&path, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+            envelope.validate()?;
+            if envelope.delivery_id != response_delivery_id
+                || envelope.sender_instance_id != responder_instance_id
+                || envelope.recipient_instance_id != original_sender_instance_id
+                || envelope.in_reply_to_delivery_id.as_deref() != Some(inbound_delivery_id)
+                || envelope.kind() != DeliveryKind::Response
+            {
+                bail!("local A2A correlated response is invalid");
+            }
+            return Ok(Some(envelope.content_digest()?));
+        }
+        Ok(None)
     }
 
     fn read_claimed_request(

@@ -14,8 +14,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use crumb_a2a::{SendMessageRequest, SendMessageResponse};
 use crumb_a2a_local::{
-    DeliverySummary, EnqueueReceipt, LocalBus, LocalBusOptions, PeerEntry, PendingDeliverySummary,
-    ProcessMetadata, ReceivedDelivery, ReceivedMessage, Registration, StagedArtifact,
+    CompletedResponseReceipt, DeliverySummary, EnqueueReceipt, LocalBus, LocalBusOptions,
+    PeerEntry, PendingDeliverySummary, ProcessMetadata, ReceivedDelivery, ReceivedMessage,
+    Registration, StagedArtifact,
 };
 use crumb_instance::{InstanceMetadata, InstanceStore};
 
@@ -372,6 +373,26 @@ impl A2aRuntime {
         self.inner
             .bus
             .reject_claimed_request(&registration, delivery_id)
+    }
+
+    /// Returns content-free proof for a durably completed inbound request.
+    ///
+    /// This is intended for reconciling a response-before-ledger crash window;
+    /// it does not expose response content or transport paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after shutdown begins or when acknowledgement/response
+    /// storage is unsafe or inconsistent.
+    pub fn completed_response_receipt(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<CompletedResponseReceipt>> {
+        self.inner.ensure_running()?;
+        let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
+        self.inner
+            .bus
+            .completed_response_receipt(&registration, delivery_id)
     }
 
     /// Acknowledges a claimed response without routing it through the agent loop.
