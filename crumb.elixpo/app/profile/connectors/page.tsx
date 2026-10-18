@@ -2,7 +2,7 @@ import { redirect } from 'next/navigation'
 import { SiteFooter } from '@/app/components/SiteFooter'
 import { SiteHeader } from '@/app/components/SiteHeader'
 import { currentUser } from '@/lib/auth'
-import { bindings, config } from '@/lib/cloudflare'
+import { bindings } from '@/lib/cloudflare'
 import { MODEL_POLICY } from '@/lib/model-policy'
 import { pageMetadata } from '@/lib/seo'
 
@@ -17,7 +17,7 @@ export default async function ConnectorsPage({ searchParams }: { searchParams: P
     WHERE user_id = ? AND token_expires_at > unixepoch()
   `).bind(user.id).first<{ token_expires_at: number; oauth_scope: string; updated_at: number }>()
   const result = typeof params.pollinations === 'string' ? params.pollinations : ''
-  return <><SiteHeader /><main className="account-page"><div className="profile-intro"><div className="account-heading"><p className="kicker">Model connection</p><h1>Pollinations, securely connected.</h1><p>Pollinations is the only external connector enabled in this release. Connect it once in the browser, then authorize each Crumb terminal without pasting private keys.</p></div><aside className="profile-pill"><img src={`${config().accountsOrigin}/api/avatar/${encodeURIComponent(user.id)}`} alt="" /><span><small>Signed in as</small><strong>{user.displayName}</strong><em>{user.email}</em></span></aside></div>
+  return <><SiteHeader /><main className="account-page"><div className="account-heading"><p className="kicker">Model connection</p><h1>Pollinations, securely connected.</h1><p>Pollinations is the only external connector enabled in this release. Connect it once in the browser, then authorize each Crumb terminal without pasting private keys. <a href="/profile/sessions">Review active website sessions →</a></p></div>
     {result === 'connected' && <div className="notice success-notice">Pollinations is connected. You can now authorize the CLI.</div>}
     {result === 'disconnected' && <div className="notice success-notice">Pollinations is disconnected from Crumb.</div>}
     {['failed', 'denied', 'invalid_session'].includes(result) && <div className="notice error-notice">The Pollinations connection could not be completed. Please try again.</div>}

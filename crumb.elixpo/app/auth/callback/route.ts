@@ -13,7 +13,7 @@ export async function GET(request: Request) {
   if (!returnTo) return NextResponse.redirect(new URL('/?auth=invalid_state', request.url))
   await env.KV.delete(key)
   try {
-    await finishAccountsLogin(code, request.url)
+    await finishAccountsLogin(code, request.url, request.headers.get('user-agent') || '')
     return NextResponse.redirect(new URL(returnTo, request.url))
   } catch (error) {
     console.error('[crumb/accounts] callback failed', error instanceof Error ? error.message : 'unknown error')
