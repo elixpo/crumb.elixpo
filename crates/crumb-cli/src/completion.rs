@@ -406,11 +406,16 @@ fn reference_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Sugges
 }
 
 fn native_path_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Suggestion> {
-    if line.trim_start().starts_with(':') {
+    if line.trim_start().starts_with([':', '?']) {
         return Vec::new();
     }
     let (start, token) = current_token(line);
-    if start == 0 || token.starts_with('-') || token.contains('=') || token.contains('\n') {
+    if start == 0
+        || token.is_empty()
+        || token.starts_with('-')
+        || token.contains('=')
+        || token.contains('\n')
+    {
         return Vec::new();
     }
     let typed_path = Path::new(token);
@@ -842,6 +847,30 @@ mod tests {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut completer = CrumbCompleter::new(CompletionWorkspace::new(workspace));
         let line = ": what's todays ";
+        let result = completer.complete(line, line.len());
+
+        assert_eq!(result.suggestions(), []);
+    }
+
+    #[test]
+    fn help_queries_do_not_fall_through_to_native_paths() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(workspace));
+        for line in ["? when ", "? when w"] {
+            let result = completer.complete(line, line.len());
+            assert_eq!(
+                result.suggestions(),
+                [],
+                "unexpected suggestions for {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_space_does_not_list_the_workspace() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(workspace));
+        let line = "say something ";
         let result = completer.complete(line, line.len());
 
         assert_eq!(result.suggestions(), []);

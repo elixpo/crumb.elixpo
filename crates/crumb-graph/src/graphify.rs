@@ -26,7 +26,7 @@ pub struct GraphSettings {
 impl Default for GraphSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             adapter: "graphify".to_owned(),
             command: PathBuf::from("graphify"),
             expected_version: GRAPHIFY_PINNED_VERSION.to_owned(),
@@ -379,9 +379,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn settings_are_disabled_and_pinned_by_default() {
+    fn settings_are_enabled_and_pinned_by_default() {
         let settings = GraphSettings::default();
-        assert!(!settings.enabled);
+        assert!(settings.enabled);
         assert_eq!(settings.expected_version, GRAPHIFY_PINNED_VERSION);
         assert!(GRAPHIFY_EXTRACT_ARGS.contains(&"--code-only"));
         settings.validate().expect("defaults validate");

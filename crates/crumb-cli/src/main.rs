@@ -10623,7 +10623,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_commands_are_local_bounded_and_disabled_by_default() {
+    fn graph_commands_are_local_bounded_and_enabled_by_default() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is valid")
@@ -10644,16 +10644,12 @@ mod tests {
         .expect("graph can be created");
         let mut output = Vec::new();
         show_graph("/graph status", &workspace, &mut output).expect("status is available");
-        assert!(String::from_utf8_lossy(&output).contains("disabled"));
+        assert!(String::from_utf8_lossy(&output).contains("enabled"));
         output.clear();
         show_graph("/graph query alpha", &workspace, &mut output)
-            .expect("disabled graph uses native fallback");
-        assert!(String::from_utf8_lossy(&output).contains("Native project evidence"));
+            .expect("enabled graph uses local evidence");
+        assert!(String::from_utf8_lossy(&output).contains("alpha [alpha]"));
 
-        let store = crumb_graph::GraphSettingsStore::for_workspace(&workspace);
-        let mut settings = store.load_or_default().expect("default settings");
-        settings.enabled = true;
-        store.save(&settings).expect("settings save");
         output.clear();
         show_graph("/graph query alpha", &workspace, &mut output).expect("local query");
         let rendered = String::from_utf8(output).expect("UTF-8 output");
