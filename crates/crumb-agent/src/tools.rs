@@ -451,6 +451,33 @@ impl ToolHost {
         host
     }
 
+    /// Clones the small native read-only surface available to an isolated
+    /// inbound peer turn.
+    ///
+    /// This is deliberately an allowlist instead of a risk-class filter:
+    /// peer discovery, subagent coordination, and third-party transports can
+    /// themselves be read-only while still crossing an isolation boundary.
+    #[must_use]
+    pub fn isolated_peer_read_only(&self) -> Self {
+        const ALLOWED: [&str; 3] = ["current_time", "list_directory", "read_file"];
+
+        let mut host = Self::default();
+        for descriptor in self.registry.iter().filter(|descriptor| {
+            descriptor.risk == RiskClass::ReadOnly
+                && descriptor.transport == ToolTransport::Native
+                && ALLOWED.contains(&descriptor.name.as_str())
+        }) {
+            if let Some(handler) = self.handlers.get(&descriptor.name) {
+                host.registry
+                    .tools
+                    .insert(descriptor.name.clone(), descriptor.clone());
+                host.handlers
+                    .insert(descriptor.name.clone(), Arc::clone(handler));
+            }
+        }
+        host
+    }
+
     /// Registers metadata and its implementation atomically.
     ///
     /// # Errors
