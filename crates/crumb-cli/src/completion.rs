@@ -656,6 +656,23 @@ mod tests {
     }
 
     #[test]
+    fn peer_completion_exposes_read_only_inbox_actions() {
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
+
+        let nested = completer.complete("/peer ", 6);
+
+        for command in ["/peer status", "/peer inbox", "/peer inspect "] {
+            assert!(
+                nested
+                    .suggestions()
+                    .iter()
+                    .any(|candidate| candidate.value == command),
+                "missing nested peer suggestion for {command}"
+            );
+        }
+    }
+
+    #[test]
     fn skill_completion_exposes_protocol_operations_after_backspacing() {
         let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
 

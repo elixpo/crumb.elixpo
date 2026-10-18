@@ -204,6 +204,14 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show this instance and active local peers",
     },
     SlashCommand {
+        usage: "/peer inbox",
+        description: "list pending peer deliveries without opening them",
+    },
+    SlashCommand {
+        usage: "/peer inspect ",
+        description: "safely inspect one pending peer delivery",
+    },
+    SlashCommand {
         usage: "/review",
         description: "review Crumb-owned edits",
     },

@@ -27,6 +27,8 @@ const TRANSCRIPT_INPUT_MAX_ROWS: usize = 4;
 const CONTEXT_METER_WIDTH: usize = 12;
 const CRUMB_BADGE: &str = "[ CRUMB ]";
 const PARALLEL_TOOL: &str = "spawn_agents";
+const PEER_INSPECTION_MAX_BYTES: usize = 8 * 1024;
+const PEER_INSPECTION_MAX_LINES: usize = 80;
 
 const PUNCHLINES: &[&str] = &[
     "Broken biscuit. Working terminal.",
@@ -810,6 +812,39 @@ impl Renderer {
         }
     }
 
+    /// Renders explicitly inspected peer content as bounded plain text.
+    ///
+    /// Peer input is never interpreted as terminal Markdown. ANSI sequences,
+    /// terminal controls, and bidirectional text controls are removed before
+    /// subdued rendering, and both source and rendered line counts are capped.
+    #[must_use]
+    pub fn peer_untrusted_text_for_width(&self, content: &str, terminal_width: u16) -> String {
+        let content = sanitize_peer_text(content);
+        let content_width = usize::from(terminal_width.saturating_sub(10)).max(1);
+        let lines = content
+            .lines()
+            .flat_map(|line| wrap_terminal_line(line, content_width))
+            .take(PEER_INSPECTION_MAX_LINES)
+            .collect::<Vec<_>>();
+        if self.settings.output == OutputMode::ScreenReader {
+            return format!("Peer delivery details:\n{}", lines.join("\n"));
+        }
+        let mut output = format!(
+            "  {}  {}",
+            self.paint("│", "38;5;245"),
+            self.paint("peer delivery details", "38;5;245")
+        );
+        for line in lines {
+            let _ = write!(
+                output,
+                "\n  {}    {}",
+                self.paint("│", "38;5;245"),
+                self.paint(&line, "38;5;245")
+            );
+        }
+        output
+    }
+
     /// Renders bounded tool output as a distinct transcript block.
     #[must_use]
     pub fn agent_tool_output_for_width(&self, content: &str, terminal_width: u16) -> String {
@@ -1523,6 +1558,91 @@ fn wrap_terminal_line(line: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
+#[derive(Clone, Copy)]
+enum PeerEscapeState {
+    Text,
+    Escape,
+    Csi,
+    String { escaped: bool },
+}
+
+fn sanitize_peer_text(input: &str) -> String {
+    let mut output = String::with_capacity(input.len().min(PEER_INSPECTION_MAX_BYTES));
+    let mut state = PeerEscapeState::Text;
+    let mut lines = 1_usize;
+    for character in input.chars() {
+        state = match state {
+            PeerEscapeState::Text if character == '\u{1b}' => PeerEscapeState::Escape,
+            PeerEscapeState::Text if character == '\u{9b}' => PeerEscapeState::Csi,
+            PeerEscapeState::Text
+                if matches!(character, '\u{90}' | '\u{98}' | '\u{9d}'..='\u{9f}') =>
+            {
+                PeerEscapeState::String { escaped: false }
+            }
+            PeerEscapeState::Text => {
+                if character == '\n' {
+                    if lines >= PEER_INSPECTION_MAX_LINES {
+                        break;
+                    }
+                    if output.len() + 1 > PEER_INSPECTION_MAX_BYTES {
+                        break;
+                    }
+                    output.push('\n');
+                    lines += 1;
+                } else if character == '\t' {
+                    if output.len() + 1 > PEER_INSPECTION_MAX_BYTES {
+                        break;
+                    }
+                    output.push(' ');
+                } else if !is_peer_control(character) && !is_bidi_control(character) {
+                    if output.len() + character.len_utf8() > PEER_INSPECTION_MAX_BYTES {
+                        break;
+                    }
+                    output.push(character);
+                }
+                PeerEscapeState::Text
+            }
+            PeerEscapeState::Escape => match character {
+                '[' => PeerEscapeState::Csi,
+                ']' | 'P' | 'X' | '^' | '_' => PeerEscapeState::String { escaped: false },
+                _ => PeerEscapeState::Text,
+            },
+            PeerEscapeState::Csi => {
+                if ('@'..='~').contains(&character) {
+                    PeerEscapeState::Text
+                } else {
+                    PeerEscapeState::Csi
+                }
+            }
+            PeerEscapeState::String { escaped: false } if character == '\u{7}' => {
+                PeerEscapeState::Text
+            }
+            PeerEscapeState::String { .. } if character == '\u{9c}' => PeerEscapeState::Text,
+            PeerEscapeState::String { escaped: false } if character == '\u{1b}' => {
+                PeerEscapeState::String { escaped: true }
+            }
+            PeerEscapeState::String { escaped: true } if character == '\\' => PeerEscapeState::Text,
+            PeerEscapeState::String { .. } => PeerEscapeState::String { escaped: false },
+        };
+    }
+    output.trim_end().to_owned()
+}
+
+fn is_peer_control(character: char) -> bool {
+    matches!(character as u32, 0x00..=0x1f | 0x7f..=0x9f)
+}
+
+fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
 fn render_markdown_line(renderer: Renderer, line: &str) -> String {
     let trimmed = line.trim_start();
     let indent = &line[..line.len() - trimmed.len()];
@@ -2090,6 +2210,31 @@ mod tests {
         assert!(output.contains("\x1b[38;5;245m"));
         assert!(!output.contains("message"));
         assert!(!output.contains("tool output"));
+    }
+
+    #[test]
+    fn peer_inspection_is_plain_bounded_and_strips_terminal_controls() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let hostile = format!(
+            "**not markdown**\n\x1b[31mred\x1b[0m\n\u{9d}hidden\u{9c}shown\nleft\u{202e}right\n{}",
+            "x".repeat(10_000)
+        );
+        let output = renderer.peer_untrusted_text_for_width(&hostile, 80);
+
+        assert!(output.contains("**not markdown**"));
+        assert!(output.contains("red"));
+        assert!(output.contains("shown"));
+        assert!(!output.contains("hidden"));
+        assert!(output.contains("leftright"));
+        assert!(!output.contains('\x1b'));
+        assert!(!output.contains('\u{202e}'));
+        assert!(output.lines().count() <= 81);
+        assert!(!output.contains("10_000"));
     }
 
     #[test]

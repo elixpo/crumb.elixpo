@@ -50,6 +50,7 @@ url.workspace = true
 workspace = true
 
 [dev-dependencies]
+crumb-a2a.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

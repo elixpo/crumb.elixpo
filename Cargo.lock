@@ -586,6 +586,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "crossterm",
+ "crumb-a2a",
  "crumb-a2a-runtime",
  "crumb-agent",
  "crumb-auth",

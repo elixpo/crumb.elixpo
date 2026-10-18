@@ -313,6 +313,40 @@ pub struct PeerAgentSummary {
     pub protocol_version: String,
 }
 
+/// Content-free summary of one pending peer delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerInboxSummary {
+    pub delivery_id: String,
+    pub sender_instance_id: String,
+    pub enqueued_at_ms: u64,
+    pub part_count: usize,
+    pub artifact_count: usize,
+}
+
+/// Safe, URL-free projection of one peer-provided message part.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PeerInspectionPart {
+    Text(String),
+    Structured(String),
+    File {
+        filename: String,
+        media_type: String,
+        size_bytes: Option<u64>,
+        digest: Option<String>,
+    },
+}
+
+/// Read-only projection of a pending peer delivery.
+///
+/// File transport URLs and bus paths are deliberately not representable here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerDeliveryInspection {
+    pub delivery_id: String,
+    pub sender_instance_id: String,
+    pub enqueued_at_ms: u64,
+    pub parts: Vec<PeerInspectionPart>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SessionRuntimeKey {
     workspace: PathBuf,
@@ -590,6 +624,87 @@ impl AgentRuntime {
                 protocol_version: entry.protocol_version,
             })
             .collect())
+    }
+
+    /// Lists pending peer deliveries without reading their payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the local peer runtime is unavailable or its
+    /// bounded inbox cannot be read safely.
+    pub fn peer_inbox(&self) -> Result<Vec<PeerInboxSummary>> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        Ok(peer
+            .runtime
+            .list_pending()?
+            .into_iter()
+            .map(|delivery| PeerInboxSummary {
+                delivery_id: delivery.delivery_id,
+                sender_instance_id: delivery.sender_instance_id,
+                enqueued_at_ms: delivery.enqueued_at_ms,
+                part_count: delivery.part_count,
+                artifact_count: delivery.artifact_count,
+            })
+            .collect())
+    }
+
+    /// Inspects one pending peer delivery without claiming or moving it.
+    ///
+    /// The projection omits transport URLs and paths. File parts expose only
+    /// bounded display metadata supplied by the validated A2A envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime is unavailable or the delivery is
+    /// unknown, malformed, misdirected, or unsafe to inspect.
+    pub fn inspect_peer_delivery(&self, delivery_id: &str) -> Result<PeerDeliveryInspection> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        let received = peer.runtime.inspect_pending(delivery_id)?;
+        let parts = received
+            .request
+            .message
+            .parts
+            .into_iter()
+            .map(|part| {
+                if let Some(text) = part.text {
+                    return PeerInspectionPart::Text(text);
+                }
+                if let Some(data) = part.data {
+                    return PeerInspectionPart::Structured(
+                        serde_json::to_string_pretty(&data)
+                            .unwrap_or_else(|_| "[invalid structured data]".to_owned()),
+                    );
+                }
+                let metadata = part.metadata.as_ref();
+                let size_bytes = metadata
+                    .and_then(|value| value.get("sizeBytes"))
+                    .and_then(serde_json::Value::as_u64);
+                let digest = metadata
+                    .and_then(|value| value.get("sha256"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(short_peer_digest);
+                PeerInspectionPart::File {
+                    filename: part.filename.unwrap_or_else(|| "unnamed file".to_owned()),
+                    media_type: part
+                        .media_type
+                        .unwrap_or_else(|| "application/octet-stream".to_owned()),
+                    size_bytes,
+                    digest,
+                }
+            })
+            .collect();
+        Ok(PeerDeliveryInspection {
+            delivery_id: received.delivery_id,
+            sender_instance_id: received.sender_instance_id,
+            enqueued_at_ms: received.enqueued_at_ms,
+            parts,
+        })
     }
 
     fn peer_runtime_for_workspace(&self, workspace: &Path) -> Option<A2aRuntime> {
@@ -1439,6 +1554,11 @@ impl AgentRuntime {
     }
 }
 
+fn short_peer_digest(value: &str) -> Option<String> {
+    (value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| format!("sha256:{}", value[..12].to_ascii_lowercase()))
+}
+
 fn select_request_route<'a>(
     config: &'a AgentConfig,
     request: &str,
@@ -2084,6 +2204,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crumb_a2a::{Message, Part, Role, SendMessageRequest};
+    use crumb_a2a_runtime::{A2aRuntime, RuntimeOptions};
     use crumb_agent::{
         AgentConfig, AgentMode, AgentSession, Modality, ModelPack, ModelRoute, SessionId,
         SessionJournal, SkillConfig,
@@ -2094,11 +2216,99 @@ mod tests {
     use crumb_profile::{ProfileDocument, ProfileReference, ProfileSelectionStore, ProfileStore};
 
     use super::{
-        AgentRuntime, NativeEventBridge, ResumeContinuity, SessionRuntimeKey, SessionRuntimeState,
-        apply_profile_effort, apply_profile_model, apply_profile_selection, apply_profile_skills,
-        attach_profile_context, attach_skill_context, load_enabled_skill_context,
-        load_request_images, request_needs_coder, select_request_route, validate_skill_path,
+        AgentRuntime, NativeEventBridge, PeerInspectionPart, ResumeContinuity, SessionRuntimeKey,
+        SessionRuntimeState, apply_profile_effort, apply_profile_model, apply_profile_selection,
+        apply_profile_skills, attach_profile_context, attach_skill_context,
+        load_enabled_skill_context, load_request_images, request_needs_coder, select_request_route,
+        short_peer_digest, validate_skill_path,
     };
+
+    #[test]
+    fn peer_digest_projection_accepts_only_exact_sha256_hex() {
+        assert_eq!(
+            short_peer_digest(&"Ab".repeat(32)).as_deref(),
+            Some("sha256:abababababab")
+        );
+        assert_eq!(short_peer_digest("abc"), None);
+        assert_eq!(short_peer_digest(&"z".repeat(64)), None);
+    }
+
+    #[test]
+    fn peer_inspection_is_read_only_and_omits_file_transport_reference() {
+        let root = tempfile::tempdir().expect("temporary A2A root");
+        let bus = root.path().join("bus");
+        let receiver_workspace = root.path().join("receiver");
+        let sender_workspace = root.path().join("sender");
+        std::fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        std::fs::create_dir(&sender_workspace).expect("sender workspace");
+
+        let mut receiver = isolated_runtime();
+        receiver
+            .initialize_peer_runtime(&receiver_workspace, &bus)
+            .expect("receiver starts");
+        let sender_identity = crumb_instance::InstanceStore::for_workspace(&sender_workspace)
+            .load_or_create_named("Sender")
+            .expect("sender identity");
+        let sender = A2aRuntime::start(
+            &bus,
+            &sender_workspace,
+            &sender_identity,
+            RuntimeOptions::default(),
+        )
+        .expect("sender starts");
+        let receiver_id = receiver
+            .peer
+            .as_ref()
+            .expect("receiver runtime")
+            .runtime
+            .own_peer()
+            .expect("receiver entry")
+            .instance_id;
+        let mut file = Part::file(
+            "artifacts/0123456789abcdef/notes.txt",
+            "notes.txt",
+            "text/plain",
+        );
+        file.metadata = Some(serde_json::json!({
+            "sha256": "ab".repeat(32),
+            "sizeBytes": 42,
+        }));
+        let request = SendMessageRequest {
+            tenant: None,
+            message: Message {
+                message_id: "msg_0123456789abcdef".to_owned(),
+                context_id: None,
+                task_id: None,
+                role: Role::User,
+                parts: vec![Part::text("hello"), file],
+                metadata: None,
+                extensions: Vec::new(),
+                reference_task_ids: Vec::new(),
+            },
+            configuration: None,
+            metadata: None,
+        };
+        let receipt = sender
+            .enqueue(&receiver_id, &request)
+            .expect("delivery enqueued");
+
+        assert_eq!(receiver.peer_inbox().expect("first inbox").len(), 1);
+        let inspected = receiver
+            .inspect_peer_delivery(&receipt.delivery_id)
+            .expect("delivery inspected");
+        assert_eq!(inspected.parts.len(), 2);
+        assert_eq!(
+            inspected.parts[1],
+            PeerInspectionPart::File {
+                filename: "notes.txt".to_owned(),
+                media_type: "text/plain".to_owned(),
+                size_bytes: Some(42),
+                digest: Some("sha256:abababababab".to_owned()),
+            }
+        );
+        assert_eq!(receiver.peer_inbox().expect("still pending").len(), 1);
+        sender.shutdown().expect("sender stops");
+    }
 
     fn route(model: &str) -> ModelRoute {
         ModelRoute {

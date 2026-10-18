@@ -78,7 +78,10 @@ use crumb_tools::{
     register_github_issue_tool, register_shell_tool_with_optimizer, register_stack_detection_tool,
     register_web_fetch_tool, register_workspace_read_tools, register_workspace_write_tool,
 };
-use crumb_ui::{GitSegment, PromptContext, Renderer, StartupContext, UiSettings};
+use crumb_ui::{
+    GitSegment, PeerActivity, PeerActivityState, PromptContext, Renderer, StartupContext,
+    UiSettings,
+};
 use directories::BaseDirs;
 use nu_ansi_term::{Color, Style};
 use reedline::{
@@ -99,7 +102,10 @@ mod provider_discovery;
 mod provider_projection;
 mod shell_completion;
 
-use agent_runtime::{AgentRuntime, ResumeContinuity, apply_selected_profile, validate_skill_path};
+use agent_runtime::{
+    AgentRuntime, PeerDeliveryInspection, PeerInspectionPart, ResumeContinuity,
+    apply_selected_profile, validate_skill_path,
+};
 use completion::{COMPLETION_PALETTE_ROWS, CompletionWorkspace, CrumbCompleter};
 use context::{parse_attachment, resolve_request_context};
 use provider_discovery::{compatibility_diagnostics, discover_models};
@@ -1006,6 +1012,14 @@ fn handle_repl_event(
     context: &mut InputContext<'_>,
 ) -> Result<Option<ReplOutcome>> {
     match event {
+        InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
+            if command == "/peer inbox"
+                || command == "/peer inspect"
+                || command.starts_with("/peer inspect ") =>
+        {
+            show_peer_read_command(&command, context)?;
+            Ok(None)
+        }
         InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
             if command == "/skill run" || command.starts_with("/skill run ") =>
         {
@@ -5424,6 +5438,7 @@ fn show_reserved(
             show_instance_command(command, cwd, runtime, writer)?;
         }
         "/peers" | "/peer status" => show_peers(cwd, runtime, writer)?,
+        "/peer inbox" => show_peer_inbox(cwd, runtime, writer)?,
         "/peer" => show_peer_help(writer)?,
         "/cost" => show_provider_usage(cwd, runtime.as_ref(), writer)?,
         _ => {
@@ -5490,6 +5505,12 @@ fn show_peer_help(writer: &mut dyn Write) -> Result<()> {
     writeln!(writer, "  /peer status show this instance and active peers")?;
     writeln!(
         writer,
+        "  /peer inbox  list pending deliveries without opening them"
+    )?;
+    writeln!(writer, "  /peer inspect <delivery-id>")?;
+    writeln!(writer, "               safely inspect a pending delivery")?;
+    writeln!(
+        writer,
         "  Ask Crumb to message a peer or share a relative workspace file; each outbound exchange is approval-gated."
     )?;
     writeln!(
@@ -5497,6 +5518,134 @@ fn show_peer_help(writer: &mut dyn Write) -> Result<()> {
         "  Received files remain quarantined until a separate import is approved."
     )?;
     Ok(())
+}
+
+fn show_peer_read_command(command: &str, context: &mut InputContext<'_>) -> Result<()> {
+    let delivery_id = if command == "/peer inbox" {
+        None
+    } else {
+        Some(
+            command
+                .strip_prefix("/peer inspect ")
+                .map(str::trim)
+                .filter(|delivery_id| {
+                    !delivery_id.is_empty() && !delivery_id.contains(char::is_whitespace)
+                })
+                .context("usage: /peer inspect <delivery-id>")?,
+        )
+    };
+    let local_name = instance_store(context.cwd).load_or_create()?.name;
+    writeln!(
+        context.writer,
+        "{}",
+        context.renderer.peer_activity(&PeerActivity {
+            local_name: &local_name,
+            remote_name: "inbox",
+            state: PeerActivityState::Waiting,
+            elapsed: Duration::ZERO,
+            artifact_count: 0,
+        })
+    )?;
+    initialize_optional_peer_runtime(context.agent_runtime, context.cwd, context.writer)?;
+    let runtime = context
+        .agent_runtime
+        .as_ref()
+        .context("local A2A runtime is unavailable")?;
+    let details = if let Some(delivery_id) = delivery_id {
+        format_peer_inspection(runtime.inspect_peer_delivery(delivery_id)?)
+    } else {
+        format_peer_inbox(runtime.peer_inbox()?)
+    };
+    let width = size().map_or(80, |(columns, _)| columns);
+    writeln!(
+        context.writer,
+        "{}",
+        context
+            .renderer
+            .peer_untrusted_text_for_width(&details, width)
+    )?;
+    Ok(())
+}
+
+fn show_peer_inbox(
+    cwd: &Path,
+    runtime: &mut Option<AgentRuntime>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    initialize_optional_peer_runtime(runtime, cwd, writer)?;
+    let pending = runtime
+        .as_ref()
+        .context("local A2A runtime is unavailable")?
+        .peer_inbox()?;
+    writeln!(writer, "{}", format_peer_inbox(pending))?;
+    Ok(())
+}
+
+fn format_peer_inbox(pending: Vec<agent_runtime::PeerInboxSummary>) -> String {
+    let mut output = String::from("Local A2A inbox · read only\n");
+    if pending.is_empty() {
+        output.push_str("pending  none");
+        return output;
+    }
+    let _ = write!(output, "pending  {}", pending.len());
+    for delivery in pending {
+        let _ = write!(
+            output,
+            "\n{} · from {} · {} parts · {} artifacts · {}",
+            delivery.delivery_id,
+            delivery.sender_instance_id,
+            delivery.part_count,
+            delivery.artifact_count,
+            peer_timestamp(delivery.enqueued_at_ms)
+        );
+    }
+    output
+}
+
+fn format_peer_inspection(delivery: PeerDeliveryInspection) -> String {
+    let mut output = format!(
+        "Pending peer delivery · read only · not accepted\ndelivery  {}\nfrom      {}\nenqueued  {}\nparts     {}",
+        delivery.delivery_id,
+        delivery.sender_instance_id,
+        peer_timestamp(delivery.enqueued_at_ms),
+        delivery.parts.len()
+    );
+    for (index, part) in delivery.parts.into_iter().enumerate() {
+        let number = index + 1;
+        match part {
+            PeerInspectionPart::Text(text) => {
+                let _ = write!(output, "\n\ntext {number}\n{text}");
+            }
+            PeerInspectionPart::Structured(data) => {
+                let _ = write!(output, "\n\nstructured data {number}\n{data}");
+            }
+            PeerInspectionPart::File {
+                filename,
+                media_type,
+                size_bytes,
+                digest,
+            } => {
+                let size = size_bytes
+                    .map_or_else(|| "size unknown".to_owned(), |bytes| format!("{bytes} B"));
+                let digest = digest.unwrap_or_else(|| "digest unavailable".to_owned());
+                let _ = write!(
+                    output,
+                    "\n\nfile {number}\n{filename} · {media_type} · {size} · {digest}"
+                );
+            }
+        }
+    }
+    output
+}
+
+fn peer_timestamp(timestamp_ms: u64) -> String {
+    i64::try_from(timestamp_ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map_or_else(
+            || format!("{timestamp_ms} ms"),
+            |timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
 }
 
 fn show_peers(
@@ -11405,19 +11554,20 @@ mod tests {
         composer_anchor_sequence, configure_permissions, configure_plugin, effort_display_name,
         effort_wire_name, ensure_single_release_skill_install, exact_skill_manifest_url,
         exact_skill_run_config, failed_command_recovery, finished_tool_activity,
-        fixed_footer_frame, handle_skill_command, initial_agent_activity,
-        install_marketplace_package, load_exact_skill_manifest, marketplace_update_blocker,
-        normalize_bundled_skill_install, openrouter_preset, parse_cli_skill_run,
-        parse_credential_reference, parse_exec_request, parse_interactive_skill_run,
-        parse_paused_submission, parse_provider_header, parse_resume_session_argument,
-        read_agent_config, read_bounded_response, register_local_skill,
-        render_skill_discovery_search, resolve_memory_keep, sanitize_transcript_output,
-        select_discovery_skill, set_skill_enabled, shell_blast_radius, shell_tool_config,
-        should_auto_enable_rtk, show_graph, show_instance, show_marketplace, show_memory,
-        show_profile_with_stores, suggestion_width, transcript_activity_row,
+        fixed_footer_frame, format_peer_inbox, format_peer_inspection, handle_skill_command,
+        initial_agent_activity, install_marketplace_package, load_exact_skill_manifest,
+        marketplace_update_blocker, normalize_bundled_skill_install, openrouter_preset,
+        parse_cli_skill_run, parse_credential_reference, parse_exec_request,
+        parse_interactive_skill_run, parse_paused_submission, parse_provider_header,
+        parse_resume_session_argument, read_agent_config, read_bounded_response,
+        register_local_skill, render_skill_discovery_search, resolve_memory_keep,
+        sanitize_transcript_output, select_discovery_skill, set_skill_enabled, shell_blast_radius,
+        shell_tool_config, should_auto_enable_rtk, show_graph, show_instance, show_marketplace,
+        show_memory, show_profile_with_stores, suggestion_width, transcript_activity_row,
         unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
         visible_tool_activity, workspace_read_host, write_bounded_response_delta_for_width,
     };
+    use crate::agent_runtime::{PeerDeliveryInspection, PeerInboxSummary, PeerInspectionPart};
 
     #[test]
     fn resume_argument_accepts_the_handoff_command() {
@@ -12722,6 +12872,45 @@ mod tests {
             "path": "private/roadmap.md"
         }));
         assert_eq!(selector.as_deref(), Some("Miso agent"));
+    }
+
+    #[test]
+    fn peer_inbox_format_contains_only_content_free_summaries() {
+        let output = format_peer_inbox(vec![PeerInboxSummary {
+            delivery_id: "delivery_0123456789abcdef".to_owned(),
+            sender_instance_id: "crumb_0123456789abcdef0123456789abcdef".to_owned(),
+            enqueued_at_ms: 1_700_000_000_000,
+            part_count: 2,
+            artifact_count: 1,
+        }]);
+
+        assert!(output.contains("Local A2A inbox · read only"));
+        assert!(output.contains("2 parts · 1 artifacts"));
+        assert!(!output.contains("message body"));
+        assert!(!output.contains("/home/"));
+    }
+
+    #[test]
+    fn peer_inspection_never_has_a_transport_url_or_path_field() {
+        let output = format_peer_inspection(PeerDeliveryInspection {
+            delivery_id: "delivery_0123456789abcdef".to_owned(),
+            sender_instance_id: "crumb_0123456789abcdef0123456789abcdef".to_owned(),
+            enqueued_at_ms: 1_700_000_000_000,
+            parts: vec![
+                PeerInspectionPart::Text("please review this".to_owned()),
+                PeerInspectionPart::File {
+                    filename: "notes.txt".to_owned(),
+                    media_type: "text/plain".to_owned(),
+                    size_bytes: Some(42),
+                    digest: Some("sha256:0123456789ab".to_owned()),
+                },
+            ],
+        });
+
+        assert!(output.contains("read only · not accepted"));
+        assert!(output.contains("notes.txt · text/plain · 42 B · sha256:0123456789ab"));
+        assert!(!output.contains("url"));
+        assert!(!output.contains("/home/"));
     }
 
     #[test]
