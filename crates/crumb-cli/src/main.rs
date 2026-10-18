@@ -1633,6 +1633,7 @@ fn read_repl_submission(
         prompt.to_owned(),
         format!("{status}  "),
         fullscreen,
+        Arc::clone(&editor.paste_artifacts),
     ))?;
     Ok(match signal {
         Signal::Success(command) => {
@@ -11243,8 +11244,8 @@ fn completion_footer_frame(
     terminal_rows: u16,
 ) -> String {
     let mut frame = String::new();
-    let status_row = composer_row.saturating_add(4);
-    let context_row = composer_row.saturating_add(5);
+    let status_row = composer_status_row(composer_row).saturating_add(1);
+    let context_row = composer_context_row(composer_row).saturating_add(1);
     let _ = write!(
         frame,
         "\x1b[{status_row};1H\x1b[2K{}",
@@ -11531,6 +11532,37 @@ struct CrumbEditMode {
     emacs: Emacs,
     dock: Option<ComposerDock>,
     paste_artifacts: Arc<Mutex<PendingComposerArtifacts>>,
+    preview_modal: Option<ArtifactPreviewModal>,
+}
+
+#[derive(Clone)]
+struct ArtifactPreviewModal {
+    target: ArtifactPreviewTarget,
+    preview: ArtifactPreview,
+    bounds: ArtifactModalBounds,
+}
+
+#[derive(Clone, Copy)]
+enum ArtifactPreviewTarget {
+    Id(u64),
+    Latest,
+}
+
+#[derive(Clone, Copy)]
+struct ArtifactModalBounds {
+    left: u16,
+    right: u16,
+    top: u16,
+    bottom: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArtifactModalAction {
+    KeepOpen,
+    Close,
+    Remove,
+    OpenFullSize,
+    Rerender,
 }
 
 impl CrumbEditMode {
@@ -11543,6 +11575,7 @@ impl CrumbEditMode {
             emacs: Emacs::new(keybindings),
             dock,
             paste_artifacts,
+            preview_modal: None,
         }
     }
 
@@ -11561,14 +11594,15 @@ impl CrumbEditMode {
 impl EditMode for CrumbEditMode {
     fn parse_event(&mut self, event: ReedlineRawEvent) -> ReedlineEvent {
         let event = TerminalEvent::from(event);
+        if self.preview_modal.is_some() {
+            return self.handle_preview_modal_event(&event);
+        }
         match event {
             TerminalEvent::Paste(paste) => self.capture_text_paste(&paste),
             TerminalEvent::Key(key)
                 if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
                     && key.code == TerminalKeyCode::Char('v')
-                    && key
-                        .modifiers
-                        .intersects(TerminalModifiers::CONTROL | TerminalModifiers::ALT) =>
+                    && key.modifiers == TerminalModifiers::CONTROL =>
             {
                 self.capture_native_clipboard()
             }
@@ -11674,13 +11708,8 @@ impl CrumbEditMode {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .preview(id);
-                if let (Some(dock), Some(preview)) = (&self.dock, preview)
-                    && show_artifact_preview_modal(dock, &preview).unwrap_or(false)
-                {
-                    self.paste_artifacts
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(id);
+                if let Some(preview) = preview {
+                    return self.open_preview_modal(ArtifactPreviewTarget::Id(id), preview);
                 }
             }
             None => {}
@@ -11694,118 +11723,256 @@ impl CrumbEditMode {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .preview_latest();
-        if let (Some(dock), Some(preview)) = (&self.dock, preview)
-            && show_artifact_preview_modal(dock, &preview).unwrap_or(false)
-        {
-            self.paste_artifacts
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove_latest();
+        if let Some(preview) = preview {
+            return self.open_preview_modal(ArtifactPreviewTarget::Latest, preview);
         }
         ReedlineEvent::Repaint
     }
-}
 
-fn show_artifact_preview_modal(dock: &ComposerDock, preview: &ArtifactPreview) -> Result<bool> {
-    let mut remove = false;
-    loop {
-        let (columns, _) = size()?;
-        let (top, bottom, _, _) = fullscreen_rows(dock.header_rows)?;
-        let available_rows = bottom.saturating_sub(top).saturating_add(1);
-        let modal_width = columns.saturating_sub(2).clamp(12, 96);
-        let left = columns.saturating_sub(modal_width) / 2;
-        let content_width = modal_width.saturating_sub(4);
-        let content_rows = available_rows.saturating_sub(4).max(1);
-        let (title, mut lines) = match preview {
-            ArtifactPreview::Text { label, body } => (
-                format!("Text artifact · {label}"),
-                text_preview_lines(body, usize::from(content_width), usize::from(content_rows)),
-            ),
-            ArtifactPreview::Image { label, png } => (
-                format!("Image artifact · {label}"),
-                image_preview_lines(
-                    png,
-                    content_width,
-                    content_rows,
-                    std::env::var_os("NO_COLOR").is_none(),
-                )?,
-            ),
+    fn open_preview_modal(
+        &mut self,
+        target: ArtifactPreviewTarget,
+        preview: ArtifactPreview,
+    ) -> ReedlineEvent {
+        let Some(dock) = &self.dock else {
+            return ReedlineEvent::Repaint;
         };
-        lines.truncate(usize::from(content_rows));
-        let modal_height = u16::try_from(lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(4)
-            .min(available_rows);
-        let modal_top = top.saturating_add(available_rows.saturating_sub(modal_height) / 2);
-        let modal_bottom = modal_top.saturating_add(modal_height.saturating_sub(1));
-        let inner_width = usize::from(modal_width.saturating_sub(2));
-        let mut writer = io::stdout();
-        for row in top..=bottom {
-            crossterm::execute!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
-        }
-        crossterm::execute!(writer, MoveTo(left, modal_top))?;
-        write!(writer, "╭{}╮", "─".repeat(inner_width))?;
-        let heading = truncate_chars(&title, inner_width.saturating_sub(2));
-        crossterm::execute!(writer, MoveTo(left, modal_top.saturating_add(1)))?;
-        write!(
-            writer,
-            "│ {:width$} │",
-            heading,
-            width = inner_width.saturating_sub(2)
-        )?;
-        for (index, line) in lines.iter().enumerate() {
-            let row = modal_top
-                .saturating_add(2)
-                .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-            if row >= modal_bottom.saturating_sub(1) {
-                break;
+        match render_artifact_preview_modal(dock, &preview) {
+            Ok(bounds) => {
+                self.preview_modal = Some(ArtifactPreviewModal {
+                    target,
+                    preview,
+                    bounds,
+                });
+                ReedlineEvent::None
             }
-            crossterm::execute!(writer, MoveTo(left, row))?;
-            write!(writer, "│ {line}")?;
-            crossterm::execute!(writer, MoveTo(left.saturating_add(modal_width - 1), row))?;
-            write!(writer, "│")?;
-        }
-        let footer = truncate_chars("Esc/Enter close · x remove", inner_width.saturating_sub(2));
-        crossterm::execute!(writer, MoveTo(left, modal_bottom.saturating_sub(1)))?;
-        write!(
-            writer,
-            "│ {:width$} │",
-            footer,
-            width = inner_width.saturating_sub(2)
-        )?;
-        crossterm::execute!(writer, MoveTo(left, modal_bottom))?;
-        write!(writer, "╰{}╯", "─".repeat(inner_width))?;
-        writer.flush()?;
-
-        let event = read_terminal_event()?;
-        match event {
-            TerminalEvent::Key(key)
-                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-            {
-                match key.code {
-                    TerminalKeyCode::Char('x' | 'X') | TerminalKeyCode::Delete => {
-                        remove = true;
-                        break;
-                    }
-                    TerminalKeyCode::Esc
-                    | TerminalKeyCode::Enter
-                    | TerminalKeyCode::Char('q' | 'Q') => break,
-                    _ => {}
-                }
+            Err(error) => {
+                self.set_artifact_notice(format!("preview unavailable: {error}"));
+                ReedlineEvent::Repaint
             }
-            TerminalEvent::Mouse(mouse)
-                if mouse.kind == MouseEventKind::Down(MouseButton::Left)
-                    && mouse.row >= modal_bottom.saturating_sub(1)
-                    && mouse.row <= modal_bottom =>
-            {
-                remove = mouse.column >= left.saturating_add(modal_width / 2);
-                break;
-            }
-            _ => {}
         }
     }
-    restore_composer_after_modal(dock)?;
-    Ok(remove)
+
+    fn handle_preview_modal_event(&mut self, event: &TerminalEvent) -> ReedlineEvent {
+        let Some(modal) = self.preview_modal.clone() else {
+            return ReedlineEvent::Repaint;
+        };
+        match artifact_modal_action(event, modal.bounds) {
+            ArtifactModalAction::KeepOpen => ReedlineEvent::None,
+            ArtifactModalAction::OpenFullSize => {
+                if let Err(error) = open_full_size_artifact_preview(&modal.preview) {
+                    self.set_artifact_notice(format!("full-size preview unavailable: {error}"));
+                }
+                ReedlineEvent::None
+            }
+            ArtifactModalAction::Rerender => {
+                if let Some(dock) = &self.dock {
+                    match render_artifact_preview_modal(dock, &modal.preview) {
+                        Ok(bounds) => {
+                            if let Some(open) = self.preview_modal.as_mut() {
+                                open.bounds = bounds;
+                            }
+                        }
+                        Err(error) => {
+                            self.set_artifact_notice(format!("preview unavailable: {error}"));
+                            self.preview_modal = None;
+                            return ReedlineEvent::Repaint;
+                        }
+                    }
+                }
+                ReedlineEvent::None
+            }
+            action @ (ArtifactModalAction::Close | ArtifactModalAction::Remove) => {
+                if action == ArtifactModalAction::Remove {
+                    let mut artifacts = self
+                        .paste_artifacts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match modal.target {
+                        ArtifactPreviewTarget::Id(id) => {
+                            artifacts.remove(id);
+                        }
+                        ArtifactPreviewTarget::Latest => {
+                            artifacts.remove_latest();
+                        }
+                    }
+                }
+                self.preview_modal = None;
+                if let Some(dock) = &self.dock {
+                    let _ = restore_composer_after_modal(dock);
+                }
+                ReedlineEvent::Repaint
+            }
+        }
+    }
+
+    fn set_artifact_notice(&self, message: String) {
+        self.paste_artifacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_notice(message);
+    }
+}
+
+fn render_artifact_preview_modal(
+    dock: &ComposerDock,
+    preview: &ArtifactPreview,
+) -> Result<ArtifactModalBounds> {
+    let (columns, _) = size()?;
+    let (top, bottom, _, _) = fullscreen_rows(dock.header_rows)?;
+    let available_rows = bottom.saturating_sub(top).saturating_add(1);
+    let modal_width = columns.saturating_sub(4).clamp(12, 160).min(columns.max(1));
+    let left = columns.saturating_sub(modal_width) / 2;
+    let content_width = modal_width.saturating_sub(4);
+    let content_rows = available_rows.saturating_sub(4).max(1);
+    let (title, mut lines) = match preview {
+        ArtifactPreview::Text { label, body } => (
+            format!("Text artifact · {label}"),
+            text_preview_lines(body, usize::from(content_width), usize::from(content_rows)),
+        ),
+        ArtifactPreview::Image { label, png } => (
+            format!("Image artifact · {label}"),
+            image_preview_lines(
+                png,
+                content_width,
+                content_rows,
+                std::env::var_os("NO_COLOR").is_none(),
+            )?,
+        ),
+    };
+    lines.truncate(usize::from(content_rows));
+    let modal_height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(4)
+        .min(available_rows);
+    let modal_top = top.saturating_add(available_rows.saturating_sub(modal_height) / 2);
+    let modal_bottom = modal_top.saturating_add(modal_height.saturating_sub(1));
+    let inner_width = usize::from(modal_width.saturating_sub(2));
+    let mut writer = io::stdout();
+    for row in top..=bottom {
+        crossterm::execute!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    }
+    crossterm::execute!(writer, MoveTo(left, modal_top))?;
+    write!(writer, "╭{}╮", "─".repeat(inner_width))?;
+    let heading = truncate_chars(&title, inner_width.saturating_sub(4));
+    crossterm::execute!(writer, MoveTo(left, modal_top.saturating_add(1)))?;
+    write!(
+        writer,
+        "│ {:width$} × │",
+        heading,
+        width = inner_width.saturating_sub(4)
+    )?;
+    for (index, line) in lines.iter().enumerate() {
+        let row = modal_top
+            .saturating_add(2)
+            .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
+        if row >= modal_bottom.saturating_sub(1) {
+            break;
+        }
+        crossterm::execute!(writer, MoveTo(left, row))?;
+        write!(writer, "│ {line}")?;
+        crossterm::execute!(writer, MoveTo(left.saturating_add(modal_width - 1), row))?;
+        write!(writer, "│")?;
+    }
+    let footer = truncate_chars(
+        "Esc/Enter/q close · x/Delete remove · o full size",
+        inner_width.saturating_sub(2),
+    );
+    crossterm::execute!(writer, MoveTo(left, modal_bottom.saturating_sub(1)))?;
+    write!(
+        writer,
+        "│ {:width$} │",
+        footer,
+        width = inner_width.saturating_sub(2)
+    )?;
+    crossterm::execute!(writer, MoveTo(left, modal_bottom))?;
+    write!(writer, "╰{}╯", "─".repeat(inner_width))?;
+    writer.flush()?;
+    Ok(ArtifactModalBounds {
+        left,
+        right: left.saturating_add(modal_width.saturating_sub(1)),
+        top: modal_top,
+        bottom: modal_bottom,
+    })
+}
+
+fn artifact_modal_action(
+    event: &TerminalEvent,
+    bounds: ArtifactModalBounds,
+) -> ArtifactModalAction {
+    match event {
+        TerminalEvent::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+        {
+            match key.code {
+                TerminalKeyCode::Esc
+                | TerminalKeyCode::Enter
+                | TerminalKeyCode::Char('q' | 'Q') => ArtifactModalAction::Close,
+                TerminalKeyCode::Char('x' | 'X') | TerminalKeyCode::Delete => {
+                    ArtifactModalAction::Remove
+                }
+                TerminalKeyCode::Char('o' | 'O') => ArtifactModalAction::OpenFullSize,
+                _ => ArtifactModalAction::KeepOpen,
+            }
+        }
+        TerminalEvent::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+            let outside = mouse.column < bounds.left
+                || mouse.column > bounds.right
+                || mouse.row < bounds.top
+                || mouse.row > bounds.bottom;
+            let close_cross = mouse.row == bounds.top.saturating_add(1)
+                && mouse.column >= bounds.right.saturating_sub(3);
+            if outside || close_cross || mouse.row >= bounds.bottom.saturating_sub(1) {
+                ArtifactModalAction::Close
+            } else {
+                ArtifactModalAction::KeepOpen
+            }
+        }
+        TerminalEvent::Resize(_, _) => ArtifactModalAction::Rerender,
+        _ => ArtifactModalAction::KeepOpen,
+    }
+}
+
+fn open_full_size_artifact_preview(preview: &ArtifactPreview) -> Result<()> {
+    let ArtifactPreview::Image { png, .. } = preview else {
+        bail!("full-size preview is available for image artifacts only");
+    };
+    let digest = format!("{:x}", Sha256::digest(png));
+    let directory = std::env::temp_dir().join("crumb-image-previews");
+    std::fs::create_dir_all(&directory).context("preview directory could not be created")?;
+    let path = directory.join(format!("sha256-{digest}.png"));
+    if !path.exists() {
+        std::fs::write(&path, png).context("preview image could not be written")?;
+    }
+    let mut command = platform_image_opener(&path);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("system image viewer could not be opened")?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn platform_image_opener(path: &Path) -> Command {
+    let mut command = Command::new("open");
+    command.arg(path);
+    command
+}
+
+#[cfg(target_os = "windows")]
+fn platform_image_opener(path: &Path) -> Command {
+    let mut command = Command::new("cmd");
+    command.args(["/C", "start", ""]).arg(path);
+    command
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_image_opener(path: &Path) -> Command {
+    let mut command = Command::new("xdg-open");
+    command.arg(path);
+    command
 }
 
 fn restore_composer_after_modal(dock: &ComposerDock) -> io::Result<()> {
@@ -11864,6 +12031,7 @@ struct CrumbPrompt {
     rendered: String,
     right: String,
     anchor_to_composer: bool,
+    paste_artifacts: Arc<Mutex<PendingComposerArtifacts>>,
 }
 
 struct CrumbHinter {
@@ -11932,17 +12100,12 @@ impl Hinter for CrumbHinter {
         cwd: &str,
     ) -> String {
         self.placeholder_visible = line.is_empty();
-        let composer_input_row = self.dock.as_ref().and_then(|dock| {
-            fullscreen_rows(dock.header_rows)
-                .ok()
-                .map(|(_, _, composer_row, _)| composer_row.saturating_add(2))
-        });
-        let artifact_hint = self
+        let has_artifacts = self
             .paste_artifacts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .composer_hint(line, pos, use_ansi_coloring, composer_input_row);
-        if self.placeholder_visible && artifact_hint.is_empty() {
+            .has_artifacts();
+        if self.placeholder_visible && !has_artifacts {
             let placeholder =
                 "Ask Crumb anything or type a command · @ context · / commands · Tab complete";
             let hint = if use_ansi_coloring {
@@ -11958,14 +12121,11 @@ impl Hinter for CrumbHinter {
         }
         if self.placeholder_visible {
             let placeholder = "Ask Crumb anything…";
-            return self.with_dock(format!("{artifact_hint}  {placeholder}"));
+            return self.with_dock(placeholder.to_owned());
         }
-        let hint = if artifact_hint.is_empty() {
-            self.history
-                .handle(line, pos, history, use_ansi_coloring, cwd)
-        } else {
-            artifact_hint
-        };
+        let hint = self
+            .history
+            .handle(line, pos, history, use_ansi_coloring, cwd);
         self.with_dock(hint)
     }
 
@@ -11987,11 +12147,17 @@ impl Hinter for CrumbHinter {
 }
 
 impl CrumbPrompt {
-    const fn new(rendered: String, right: String, anchor_to_composer: bool) -> Self {
+    const fn new(
+        rendered: String,
+        right: String,
+        anchor_to_composer: bool,
+        paste_artifacts: Arc<Mutex<PendingComposerArtifacts>>,
+    ) -> Self {
         Self {
             rendered,
             right,
             anchor_to_composer,
+            paste_artifacts,
         }
     }
 }
@@ -12014,7 +12180,21 @@ impl Prompt for CrumbPrompt {
     }
 
     fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
-        Cow::Borrowed("")
+        let composer_input_row = self.anchor_to_composer.then(|| {
+            size()
+                .map_or(FULLSCREEN_COMPOSER_ROWS, |(_, rows)| rows)
+                .saturating_sub(FULLSCREEN_COMPOSER_ROWS)
+                .saturating_add(2)
+        });
+        let mut prefix = self
+            .paste_artifacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .composer_prefix(std::env::var_os("NO_COLOR").is_none(), composer_input_row);
+        if !prefix.is_empty() {
+            prefix.push(' ');
+        }
+        Cow::Owned(prefix)
     }
 
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
@@ -12114,7 +12294,15 @@ fn context_token_budget(config: &AgentConfig, route: Option<&ModelRoute>) -> u64
     })
 }
 
-const FULLSCREEN_COMPOSER_ROWS: u16 = 6;
+const FULLSCREEN_COMPOSER_ROWS: u16 = 10;
+
+const fn composer_status_row(composer_row: u16) -> u16 {
+    composer_row.saturating_add(FULLSCREEN_COMPOSER_ROWS.saturating_sub(3))
+}
+
+const fn composer_context_row(composer_row: u16) -> u16 {
+    composer_row.saturating_add(FULLSCREEN_COMPOSER_ROWS.saturating_sub(2))
+}
 
 fn fullscreen_rows(header_rows: u16) -> io::Result<(u16, u16, u16, u16)> {
     let (_, rows) = size()?;
@@ -12156,17 +12344,20 @@ fn position_composer(renderer: Renderer, header_rows: u16) -> io::Result<()> {
     // Reedline owns cursor movement while editing. Reset margins before handing
     // it the composer so its redraw bookkeeping cannot erase transcript rows.
     write!(writer, "\x1b[r")?;
-    for row in composer_row..=composer_row.saturating_add(3) {
+    for row in composer_row..footer_row {
         crossterm::execute!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
     }
     crossterm::execute!(
         writer,
-        MoveTo(columns.saturating_sub(3), composer_row.saturating_add(2))
+        MoveTo(
+            columns.saturating_sub(3),
+            composer_status_row(composer_row).saturating_sub(1)
+        )
     )?;
     write!(writer, "{}", renderer.composer_side_border())?;
     crossterm::execute!(
         writer,
-        MoveTo(0, composer_row.saturating_add(3)),
+        MoveTo(0, composer_status_row(composer_row)),
         Clear(ClearType::CurrentLine)
     )?;
     write!(writer, "{}", renderer.composer_idle_status())?;
@@ -12304,17 +12495,17 @@ fn render_transcript_footer_with_writer(
     let (_, _, composer_row, footer_row) = fullscreen_rows(header_rows)?;
     crossterm::execute!(
         writer,
-        MoveTo(0, composer_row.saturating_add(3)),
+        MoveTo(0, composer_status_row(composer_row)),
         Clear(ClearType::CurrentLine)
     )?;
     write!(writer, "{}", renderer.composer_idle_status())?;
     if let Some((column, indicator)) = transcript_new_content_indicator(state, renderer, columns) {
-        crossterm::execute!(writer, MoveTo(column, composer_row.saturating_add(3)))?;
+        crossterm::execute!(writer, MoveTo(column, composer_status_row(composer_row)))?;
         write!(writer, "{indicator}")?;
     }
     crossterm::execute!(
         writer,
-        MoveTo(0, composer_row.saturating_add(4)),
+        MoveTo(0, composer_context_row(composer_row)),
         Clear(ClearType::CurrentLine)
     )?;
     write!(writer, "{}", state.footer_context)?;
@@ -12618,16 +12809,17 @@ mod tests {
     use crumb_profile::{ProfileSelectionStore, ProfileStore};
 
     use super::{
-        CaptureOutcome, CrumbEditMode, DiscoverySource, ExitGesture, MarketplaceContent,
-        PausedSubmission, PendingComposerArtifacts, Renderer, SessionCommandContext,
-        SteeringAction, TerminalModeTracker, TranscriptCapture, TranscriptScroll, TranscriptState,
-        UiSettings, active_scroll_direction, agent_config_location, apply_builtin_model_packs,
-        bundled_catalog, completion_footer_frame, composer_anchor_sequence, configure_permissions,
-        configure_plugin, effort_display_name, effort_wire_name,
-        ensure_single_release_skill_install, exact_skill_manifest_url, exact_skill_run_config,
-        failed_command_recovery, finished_tool_activity, fixed_footer_frame,
-        follow_up_cursor_sequence, format_peer_discarded_file, format_peer_imported_file,
-        format_peer_inbox, format_peer_inspection, format_peer_quarantined_file, format_peer_task,
+        ArtifactModalAction, ArtifactModalBounds, CaptureOutcome, CrumbEditMode, DiscoverySource,
+        ExitGesture, MarketplaceContent, PausedSubmission, PendingComposerArtifacts, Renderer,
+        SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
+        TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
+        agent_config_location, apply_builtin_model_packs, artifact_modal_action, bundled_catalog,
+        completion_footer_frame, composer_anchor_sequence, configure_permissions, configure_plugin,
+        effort_display_name, effort_wire_name, ensure_single_release_skill_install,
+        exact_skill_manifest_url, exact_skill_run_config, failed_command_recovery,
+        finished_tool_activity, fixed_footer_frame, follow_up_cursor_sequence,
+        format_peer_discarded_file, format_peer_imported_file, format_peer_inbox,
+        format_peer_inspection, format_peer_quarantined_file, format_peer_task,
         handle_skill_command, initial_agent_activity, install_marketplace_package,
         load_exact_skill_manifest, marketplace_update_blocker, normalize_bundled_skill_install,
         openrouter_preset, parse_cli_skill_run, parse_credential_reference, parse_exec_request,
@@ -13460,6 +13652,68 @@ mod tests {
     }
 
     #[test]
+    fn artifact_modal_close_and_remove_keys_are_non_blocking_actions() {
+        let bounds = ArtifactModalBounds {
+            left: 10,
+            right: 90,
+            top: 4,
+            bottom: 30,
+        };
+        for code in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('q')] {
+            assert_eq!(
+                artifact_modal_action(
+                    &TerminalEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                    bounds,
+                ),
+                ArtifactModalAction::Close
+            );
+        }
+        for code in [KeyCode::Char('x'), KeyCode::Delete] {
+            assert_eq!(
+                artifact_modal_action(
+                    &TerminalEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                    bounds,
+                ),
+                ArtifactModalAction::Remove
+            );
+        }
+        assert_eq!(
+            artifact_modal_action(&TerminalEvent::Resize(160, 48), bounds),
+            ArtifactModalAction::Rerender
+        );
+    }
+
+    #[test]
+    fn artifact_modal_mouse_cross_outside_and_footer_clicks_close() {
+        let bounds = ArtifactModalBounds {
+            left: 10,
+            right: 90,
+            top: 4,
+            bottom: 30,
+        };
+        let click = |column, row| {
+            TerminalEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        assert_eq!(
+            artifact_modal_action(&click(89, 5), bounds),
+            ArtifactModalAction::Close
+        );
+        assert_eq!(
+            artifact_modal_action(&click(70, 29), bounds),
+            ArtifactModalAction::Close
+        );
+        assert_eq!(
+            artifact_modal_action(&click(2, 2), bounds),
+            ArtifactModalAction::Close
+        );
+    }
+
+    #[test]
     fn large_terminal_paste_becomes_a_compact_content_addressed_artifact() {
         let workspace = tempfile::tempdir().expect("workspace");
         let pasted = "large pasted line\n".repeat(300);
@@ -14179,7 +14433,7 @@ mod tests {
 
     #[test]
     fn active_follow_up_cursor_is_placed_inside_the_composer() {
-        assert_eq!(follow_up_cursor_sequence(40), "\x1b[35;5H");
+        assert_eq!(follow_up_cursor_sequence(40), "\x1b[31;5H");
         assert_eq!(follow_up_cursor_sequence(4), "\x1b[1;5H");
     }
 
@@ -14196,17 +14450,17 @@ mod tests {
         assert!(frame.contains("Ready"));
         assert!(frame.contains("Model context · 3.3k / 64.0k"));
         assert!(frame.contains("Enter send"));
-        assert!(frame.contains("\x1b[34;1H\x1b[2K"));
-        assert!(frame.contains("\x1b[35;1H\x1b[2K"));
+        assert!(frame.contains("\x1b[38;1H\x1b[2K"));
+        assert!(frame.contains("\x1b[39;1H\x1b[2K"));
         assert!(frame.contains("\x1b[40;1H\x1b[2K"));
     }
 
     #[test]
     fn fullscreen_prompt_is_anchored_above_the_fixed_footer() {
-        assert_eq!(composer_anchor_sequence(40), "\x1b[35;1H");
+        assert_eq!(composer_anchor_sequence(40), "\x1b[31;1H");
         assert_eq!(composer_anchor_sequence(4), "\x1b[1;1H");
         assert_eq!(transcript_activity_row(12, 40), 12);
-        assert_eq!(transcript_activity_row(39, 40), 33);
+        assert_eq!(transcript_activity_row(39, 40), 29);
     }
 
     #[test]

@@ -294,10 +294,8 @@ impl PendingComposerArtifacts {
         })
     }
 
-    pub(crate) fn composer_hint(
+    pub(crate) fn composer_prefix(
         &mut self,
-        line: &str,
-        pos: usize,
         use_ansi_coloring: bool,
         composer_input_row: Option<u16>,
     ) -> String {
@@ -307,12 +305,10 @@ impl PendingComposerArtifacts {
         }
         let mut plain = String::new();
         let mut styled = String::new();
-        let mut visible_column = COMPOSER_INPUT_COLUMN.saturating_add(
-            u16::try_from(line.get(..pos).unwrap_or(line).chars().count()).unwrap_or(u16::MAX),
-        );
+        let mut visible_column = COMPOSER_INPUT_COLUMN;
         for artifact in &self.artifacts {
             let chip = artifact.chip();
-            let prefix = if plain.is_empty() { "  " } else { " " };
+            let prefix = if plain.is_empty() { "" } else { " " };
             plain.push_str(prefix);
             let start = visible_column.saturating_add(u16::try_from(prefix.len()).unwrap_or(0));
             plain.push('[');
@@ -501,11 +497,7 @@ mod tests {
         let pasted = "large pasted line\n".repeat(300);
 
         assert_eq!(pending.capture_text(&pasted), CaptureOutcome::Attached);
-        assert!(
-            pending
-                .composer_hint("summarize", 9, false, Some(20))
-                .contains("TXT1")
-        );
+        assert!(pending.composer_prefix(false, Some(20)).contains("TXT1"));
         assert_eq!(
             pending
                 .display_submission("summarize")
@@ -559,8 +551,8 @@ mod tests {
             pending.capture_text(&"artifact\n".repeat(700)),
             CaptureOutcome::Attached
         );
-        let hint = pending.composer_hint("ask", 3, false, Some(12));
-        let start = 4 + 3 + 2;
+        let hint = pending.composer_prefix(false, Some(12));
+        let start = 4;
         assert!(matches!(
             pending.hit_test(12, start),
             Some(ArtifactHit::Preview(1))
@@ -597,7 +589,7 @@ mod tests {
 
         assert!(
             pending
-                .composer_hint("keep my question", 16, false, None)
+                .composer_prefix(false, None)
                 .contains("clipboard image is too large")
         );
         assert_eq!(
