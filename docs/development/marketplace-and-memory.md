@@ -31,6 +31,17 @@ enabled instruction skill. Running never installs, enables, or expands tool
 permissions. The plural `/skills` namespace
 remains as a compatibility surface for local registrations.
 
+Explicit remote search downloads only the bounded, Sigstore-authenticated
+`/marketplace/discovery.json` index. An offline search may use a cached index only after rechecking
+its cached signature bundle, then the bundled index; it never downloads skill instructions. A
+reachable index with invalid authentication fails visibly instead of silently downgrading. Explicit inspection resolves
+one immutable `publisher/name@version` reference and downloads only
+`/marketplace/manifests/<publisher>/<name>/<version>.json`. The full manifest must match the byte
+length and SHA-256 digest pinned by the discovery index before it is displayed or cached. HTTP
+redirects remain disabled, every response keeps its type, time, and byte limits, and no marketplace
+network request runs during terminal startup. Remote installation retains the existing verified
+catalog and publisher-artifact Sigstore chain while its multi-package atomic installer is completed.
+
 ## Memory lifecycle
 
 Durable memory has two scopes:
