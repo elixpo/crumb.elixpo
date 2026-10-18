@@ -393,6 +393,15 @@ pub struct PeerResponseSummary {
     pub enqueued_at_ms: u64,
 }
 
+/// Verified, receiver-owned projection of one quarantined peer file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerQuarantinedFile {
+    pub delivery_id: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub relative_path: PathBuf,
+}
+
 /// Safe, URL-free projection of one peer-provided message part.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PeerInspectionPart {
@@ -820,6 +829,28 @@ impl AgentRuntime {
                 })
             }
         }
+    }
+
+    /// Verifies one exact pending peer file into receiver-owned quarantine.
+    ///
+    /// The delivery remains pending and unacknowledged, and this method does
+    /// not register any tool capable of reading the quarantined bytes.
+    pub fn quarantine_peer_file(
+        &self,
+        delivery_id: &str,
+        part_index: usize,
+    ) -> Result<PeerQuarantinedFile> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        let artifact = peer.runtime.quarantine_artifact(delivery_id, part_index)?;
+        Ok(PeerQuarantinedFile {
+            delivery_id: delivery_id.to_owned(),
+            sha256: artifact.sha256,
+            size_bytes: artifact.size_bytes,
+            relative_path: artifact.relative_path,
+        })
     }
 
     /// Explicitly rejects one exact pending inbound request without invoking a
@@ -2651,7 +2682,7 @@ mod tests {
     use crumb_a2a_runtime::{A2aRuntime, RuntimeOptions};
     use crumb_agent::{
         AgentConfig, AgentMode, AgentSession, Modality, ModelPack, ModelRoute, SessionId,
-        SessionJournal, SkillConfig,
+        SessionJournal, SkillConfig, ToolHost,
     };
     use crumb_harness::{Conversation, EventSink, HarnessEvent};
     use crumb_harness_dsh::HarnessActivity;
@@ -2811,6 +2842,86 @@ mod tests {
             }
         );
         assert_eq!(receiver.peer_inbox().expect("still pending").len(), 1);
+        sender.shutdown().expect("sender stops");
+    }
+
+    #[test]
+    fn peer_file_quarantine_keeps_delivery_pending_and_agent_inaccessible() {
+        let root = tempfile::tempdir().expect("temporary A2A root");
+        let bus = root.path().join("bus");
+        let receiver_workspace = root.path().join("receiver");
+        let sender_workspace = root.path().join("sender");
+        std::fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        std::fs::create_dir(&sender_workspace).expect("sender workspace");
+        std::fs::write(sender_workspace.join("notes.txt"), b"peer file\n").expect("peer source");
+
+        let mut receiver = isolated_runtime();
+        receiver
+            .initialize_peer_runtime(&receiver_workspace, &bus)
+            .expect("receiver starts");
+        let sender_identity = crumb_instance::InstanceStore::for_workspace(&sender_workspace)
+            .load_or_create_named("Sender")
+            .expect("sender identity");
+        let sender = A2aRuntime::start(
+            &bus,
+            &sender_workspace,
+            &sender_identity,
+            RuntimeOptions::default(),
+        )
+        .expect("sender starts");
+        let receiver_id = receiver
+            .peer
+            .as_ref()
+            .expect("receiver runtime")
+            .runtime
+            .own_peer()
+            .expect("receiver entry")
+            .instance_id;
+        let staged = sender
+            .stage_artifact(Path::new("notes.txt"))
+            .expect("stage peer file");
+        let mut file = Part::file(staged.relative_url, staged.filename, "text/plain");
+        file.metadata = Some(serde_json::json!({
+            "sha256": staged.sha256,
+            "sizeBytes": staged.size_bytes,
+        }));
+        let request = SendMessageRequest {
+            tenant: None,
+            message: Message {
+                message_id: "msg_quarantine_fixture".to_owned(),
+                context_id: None,
+                task_id: None,
+                role: Role::User,
+                parts: vec![Part::text("take this"), file],
+                metadata: None,
+                extensions: Vec::new(),
+                reference_task_ids: Vec::new(),
+            },
+            configuration: None,
+            metadata: None,
+        };
+        let receipt = sender.enqueue(&receiver_id, &request).expect("enqueue");
+
+        let quarantined = receiver
+            .quarantine_peer_file(&receipt.delivery_id, 2)
+            .expect("quarantine peer file");
+        assert!(
+            quarantined
+                .relative_path
+                .starts_with(".crumb/a2a/quarantine")
+        );
+        assert_eq!(
+            std::fs::read(receiver_workspace.join(&quarantined.relative_path))
+                .expect("quarantined bytes"),
+            b"peer file\n"
+        );
+        assert_eq!(receiver.peer_inbox().expect("still pending").len(), 1);
+        assert_eq!(
+            ToolHost::default()
+                .isolated_peer_read_only()
+                .descriptor("read_file"),
+            None
+        );
         sender.shutdown().expect("sender stops");
     }
 

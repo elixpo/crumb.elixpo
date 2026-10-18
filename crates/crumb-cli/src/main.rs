@@ -104,8 +104,8 @@ mod shell_completion;
 
 use agent_runtime::{
     AgentRuntime, PeerDeliveryInspection, PeerInspectionKind, PeerInspectionPart,
-    PeerResponseSummary, PeerTurnStatus, ResumeContinuity, apply_selected_profile,
-    validate_skill_path,
+    PeerQuarantinedFile, PeerResponseSummary, PeerTurnStatus, ResumeContinuity,
+    apply_selected_profile, validate_skill_path,
 };
 use completion::{COMPLETION_PALETTE_ROWS, CompletionWorkspace, CrumbCompleter};
 use context::{parse_attachment, resolve_request_context};
@@ -1031,6 +1031,12 @@ fn handle_repl_event(
                 || command.starts_with("/peer ack ") =>
         {
             handle_peer_action(&command, context)?;
+            Ok(None)
+        }
+        InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
+            if command == "/peer file fetch" || command.starts_with("/peer file fetch ") =>
+        {
+            handle_peer_file_fetch(&command, context)?;
             Ok(None)
         }
         InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
@@ -5452,7 +5458,7 @@ fn show_reserved(
         }
         "/peers" | "/peer status" => show_peers(cwd, runtime, writer)?,
         "/peer inbox" => show_peer_inbox(cwd, runtime, writer)?,
-        "/peer" => show_peer_help(writer)?,
+        "/peer" | "/peer file" => show_peer_help(writer)?,
         "/cost" => show_provider_usage(cwd, runtime.as_ref(), writer)?,
         _ => {
             writeln!(writer, "◇ {command}")?;
@@ -5541,6 +5547,11 @@ fn show_peer_help(writer: &mut dyn Write) -> Result<()> {
     writeln!(
         writer,
         "               acknowledge one reply without opening it"
+    )?;
+    writeln!(writer, "  /peer file fetch <delivery-id> <part-index>")?;
+    writeln!(
+        writer,
+        "               verify one 1-based file part into receiver quarantine"
     )?;
     writeln!(
         writer,
@@ -5680,6 +5691,76 @@ fn handle_peer_action(command: &str, context: &mut InputContext<'_>) -> Result<(
         context.renderer,
         context.writer,
         &terminal,
+    )
+}
+
+fn handle_peer_file_fetch(command: &str, context: &mut InputContext<'_>) -> Result<()> {
+    let arguments = command
+        .strip_prefix("/peer file fetch ")
+        .context("usage: /peer file fetch <delivery-id> <part-index>")?;
+    let mut fields = arguments.split_whitespace();
+    let delivery_id = fields
+        .next()
+        .context("usage: /peer file fetch <delivery-id> <part-index>")?;
+    let part_index = fields
+        .next()
+        .context("usage: /peer file fetch <delivery-id> <part-index>")?
+        .parse::<usize>()
+        .context("peer file part index must be a positive integer")?;
+    if fields.next().is_some() || part_index == 0 {
+        bail!("usage: /peer file fetch <delivery-id> <part-index>");
+    }
+    exact_peer_delivery_id(delivery_id)?;
+    initialize_optional_peer_runtime(context.agent_runtime, context.cwd, context.writer)?;
+    let workspace = instance_workspace(context.cwd)?;
+    let local_name = instance_store(&workspace).load_or_create()?.name;
+    writeln!(
+        context.writer,
+        "{}",
+        context.renderer.peer_activity(&PeerActivity {
+            local_name: &local_name,
+            remote_name: "quarantine",
+            state: PeerActivityState::Exchanging,
+            elapsed: Duration::ZERO,
+            artifact_count: 1,
+        })
+    )?;
+    let artifact = context
+        .agent_runtime
+        .as_ref()
+        .context("local A2A runtime is unavailable")?
+        .quarantine_peer_file(delivery_id, part_index)
+        .context("peer file could not be verified into quarantine")?;
+    writeln!(
+        context.writer,
+        "{}",
+        context.renderer.peer_activity(&PeerActivity {
+            local_name: &local_name,
+            remote_name: "quarantine",
+            state: PeerActivityState::Completed,
+            elapsed: Duration::ZERO,
+            artifact_count: 1,
+        })
+    )?;
+    let details = format_peer_quarantined_file(&artifact);
+    let width = size().map_or(80, |(columns, _)| columns);
+    writeln!(
+        context.writer,
+        "{}",
+        context
+            .renderer
+            .peer_untrusted_text_for_width(&details, width)
+    )?;
+    Ok(())
+}
+
+fn format_peer_quarantined_file(artifact: &PeerQuarantinedFile) -> String {
+    format!(
+        "delivery  {}\nsha256    {}\nsize      {} B\nquarantine {}",
+        artifact.delivery_id,
+        artifact.sha256,
+        artifact.size_bytes,
+        artifact.relative_path.display()
     )
 }
 
@@ -11873,21 +11954,23 @@ mod tests {
         composer_anchor_sequence, configure_permissions, configure_plugin, effort_display_name,
         effort_wire_name, ensure_single_release_skill_install, exact_skill_manifest_url,
         exact_skill_run_config, failed_command_recovery, finished_tool_activity,
-        fixed_footer_frame, format_peer_inbox, format_peer_inspection, handle_skill_command,
-        initial_agent_activity, install_marketplace_package, load_exact_skill_manifest,
-        marketplace_update_blocker, normalize_bundled_skill_install, openrouter_preset,
-        parse_cli_skill_run, parse_credential_reference, parse_exec_request,
-        parse_interactive_skill_run, parse_paused_submission, parse_provider_header,
-        parse_resume_session_argument, read_agent_config, read_bounded_response,
-        register_local_skill, render_skill_discovery_search, resolve_memory_keep,
-        sanitize_transcript_output, select_discovery_skill, set_skill_enabled, shell_blast_radius,
-        shell_tool_config, should_auto_enable_rtk, show_graph, show_instance, show_marketplace,
-        show_memory, show_profile_with_stores, suggestion_width, transcript_activity_row,
+        fixed_footer_frame, format_peer_inbox, format_peer_inspection,
+        format_peer_quarantined_file, handle_skill_command, initial_agent_activity,
+        install_marketplace_package, load_exact_skill_manifest, marketplace_update_blocker,
+        normalize_bundled_skill_install, openrouter_preset, parse_cli_skill_run,
+        parse_credential_reference, parse_exec_request, parse_interactive_skill_run,
+        parse_paused_submission, parse_provider_header, parse_resume_session_argument,
+        read_agent_config, read_bounded_response, register_local_skill,
+        render_skill_discovery_search, resolve_memory_keep, sanitize_transcript_output,
+        select_discovery_skill, set_skill_enabled, shell_blast_radius, shell_tool_config,
+        should_auto_enable_rtk, show_graph, show_instance, show_marketplace, show_memory,
+        show_profile_with_stores, suggestion_width, transcript_activity_row,
         unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
         visible_tool_activity, workspace_read_host, write_bounded_response_delta_for_width,
     };
     use crate::agent_runtime::{
         PeerDeliveryInspection, PeerInboxSummary, PeerInspectionKind, PeerInspectionPart,
+        PeerQuarantinedFile,
     };
 
     #[test]
@@ -13237,6 +13320,26 @@ mod tests {
         );
         assert!(!output.contains("url"));
         assert!(!output.contains("/home/"));
+    }
+
+    #[test]
+    fn quarantined_peer_file_output_contains_only_safe_receiver_fields() {
+        let output = format_peer_quarantined_file(&PeerQuarantinedFile {
+            delivery_id: "delivery_0123456789abcdef".to_owned(),
+            sha256: "ab".repeat(32),
+            size_bytes: 42,
+            relative_path: PathBuf::from(
+                ".crumb/a2a/quarantine/delivery_0123456789abcdef/abab/file.txt",
+            ),
+        });
+
+        assert!(output.contains("delivery_0123456789abcdef"));
+        assert!(output.contains(&"ab".repeat(32)));
+        assert!(output.contains("42 B"));
+        assert!(output.contains(".crumb/a2a/quarantine/"));
+        assert!(!output.contains("/home/"));
+        assert!(!output.contains("/tmp/local-a2a-bus"));
+        assert!(!output.contains("artifacts/"));
     }
 
     #[test]

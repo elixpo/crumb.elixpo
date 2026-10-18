@@ -656,12 +656,18 @@ mod tests {
     }
 
     #[test]
-    fn peer_completion_exposes_read_only_inbox_actions() {
+    fn peer_completion_exposes_inbox_and_nested_file_actions() {
         let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
 
         let nested = completer.complete("/peer ", 6);
 
-        for command in ["/peer status", "/peer inbox", "/peer inspect "] {
+        for command in [
+            "/peer status",
+            "/peer inbox",
+            "/peer inspect ",
+            "/peer file",
+            "/peer file fetch ",
+        ] {
             assert!(
                 nested
                     .suggestions()
@@ -670,6 +676,14 @@ mod tests {
                 "missing nested peer suggestion for {command}"
             );
         }
+
+        let files = completer.complete("/peer file ", 11);
+        assert!(
+            files
+                .suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "/peer file fetch ")
+        );
     }
 
     #[test]

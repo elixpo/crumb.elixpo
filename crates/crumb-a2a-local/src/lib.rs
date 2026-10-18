@@ -335,6 +335,18 @@ pub struct StagedArtifact {
     pub filename: String,
 }
 
+/// Verified receiver-owned copy of one peer artifact.
+///
+/// The path is always relative to the receiving workspace and remains under
+/// `.crumb/a2a/quarantine`. Quarantine does not make the file available to an
+/// agent turn or promote it into the normal workspace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuarantinedArtifact {
+    pub relative_path: PathBuf,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DeliveryEnvelope {
@@ -550,6 +562,81 @@ fn response_counts(response: &SendMessageResponse) -> (usize, usize) {
         .map(|artifact| artifact.parts.len())
         .sum::<usize>();
     (message_parts + artifact_parts, task.artifacts.len())
+}
+
+fn envelope_part(envelope: &DeliveryEnvelope, part_index: usize) -> Option<&crumb_a2a::Part> {
+    let index = part_index.checked_sub(1)?;
+    if let Some(request) = &envelope.request {
+        return request.message.parts.get(index);
+    }
+    let response = envelope.response.as_ref()?;
+    if let Some(message) = &response.message {
+        return message.parts.get(index);
+    }
+    let task = response.task.as_ref()?;
+    task.status
+        .message
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .chain(
+            task.artifacts
+                .iter()
+                .flat_map(|artifact| artifact.parts.iter()),
+        )
+        .nth(index)
+}
+
+fn verified_artifact_claim<'a>(
+    sender_instance_id: &str,
+    part: &'a crumb_a2a::Part,
+) -> Result<(String, u64, &'a str)> {
+    let url = part
+        .url
+        .as_deref()
+        .context("selected peer part is not a file")?;
+    if url.contains("://") {
+        bail!("remote peer file references cannot enter local quarantine");
+    }
+    let segments = url.split('/').collect::<Vec<_>>();
+    if segments.len() != 4 || segments[0] != ARTIFACT_DIRECTORY || segments[1] != sender_instance_id
+    {
+        bail!("peer artifact reference is not owned by the envelope sender");
+    }
+    let digest = segments[2]
+        .strip_prefix("sha256-")
+        .context("peer artifact reference is not content addressed")?;
+    validate_lower_hex(digest, 64, "peer artifact digest")?;
+    let filename = part
+        .filename
+        .as_deref()
+        .context("peer artifact filename is unavailable")?;
+    validate_artifact_filename(filename)?;
+    if filename != segments[3]
+        || url != format!("{ARTIFACT_DIRECTORY}/{sender_instance_id}/sha256-{digest}/{filename}")
+    {
+        bail!("peer artifact filename does not match its canonical reference");
+    }
+    let metadata = part
+        .metadata
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .context("peer artifact verification metadata is unavailable")?;
+    let metadata_digest = metadata
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .context("peer artifact SHA-256 claim is unavailable")?;
+    validate_lower_hex(metadata_digest, 64, "peer artifact SHA-256 claim")?;
+    if metadata_digest != digest {
+        bail!("peer artifact digest claims do not match");
+    }
+    let size_bytes = metadata
+        .get("sizeBytes")
+        .and_then(serde_json::Value::as_u64)
+        .context("peer artifact size claim is unavailable")?;
+    if size_bytes > MAX_ARTIFACT_BYTES {
+        bail!("peer artifact size claim exceeds the 8 MiB limit");
+    }
+    Ok((digest.to_owned(), size_bytes, filename))
 }
 
 /// Filesystem-backed local A2A bus rooted only at a caller-approved path.
@@ -934,6 +1021,123 @@ impl LocalBus {
         envelope.validate()?;
         validate_queued_envelope(&path, &envelope, recipient.instance_id())?;
         Ok(envelope.received())
+    }
+
+    /// Verifies and copies one exact file part from a pending delivery into a
+    /// receiver-owned quarantine without claiming or acknowledging delivery.
+    ///
+    /// `part_index` is one-based and follows the order shown by delivery
+    /// inspection. Only canonical local artifacts staged by the envelope
+    /// sender are accepted. HTTPS references, foreign sender roots, unsafe
+    /// paths, symlinks, non-regular files, and content mismatches are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the delivery is not pending, the selected part is
+    /// not a verified staged file, or quarantine storage is unsafe.
+    pub fn quarantine_artifact(
+        &self,
+        recipient: &Registration,
+        workspace_root: &Path,
+        delivery_id: &str,
+        part_index: usize,
+    ) -> Result<QuarantinedArtifact> {
+        self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
+        self.require_live_owner(recipient, now_ms()?)?;
+        validate_delivery_id(delivery_id)?;
+        if part_index == 0 {
+            bail!("peer file part index is one-based and must be at least 1");
+        }
+        let (pending, _processing, _acknowledged) =
+            self.queue_directories(recipient.instance_id())?;
+        let delivery_path = pending.join(delivery_filename(delivery_id)?);
+        let envelope: DeliveryEnvelope =
+            read_required_json(&delivery_path, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+        envelope.validate()?;
+        validate_queued_envelope(&delivery_path, &envelope, recipient.instance_id())?;
+        let part = envelope_part(&envelope, part_index)
+            .context("peer delivery does not contain that part index")?;
+        let (claimed_digest, claimed_size, filename) =
+            verified_artifact_claim(&envelope.sender_instance_id, part)?;
+        let source =
+            self.verified_artifact_source(&envelope.sender_instance_id, &claimed_digest, filename)?;
+
+        inspect_directory(workspace_root, "receiver workspace root")?;
+        let crumb = workspace_root.join(".crumb");
+        ensure_private_directory(&crumb)?;
+        let a2a = crumb.join("a2a");
+        ensure_private_directory(&a2a)?;
+        let quarantine = a2a.join("quarantine");
+        ensure_private_directory(&quarantine)?;
+        let delivery_directory = quarantine.join(delivery_id);
+        ensure_private_directory(&delivery_directory)?;
+        let digest_directory = delivery_directory.join(&claimed_digest);
+        ensure_private_directory(&digest_directory)?;
+        let destination = digest_directory.join(filename);
+
+        let mut source_file =
+            open_regular_file_without_replacement(&source, "staged peer artifact")?;
+        let source_metadata = source_file
+            .metadata()
+            .context("staged peer artifact could not be inspected after opening")?;
+        if !source_metadata.is_file()
+            || source_metadata.len() != claimed_size
+            || claimed_size > MAX_ARTIFACT_BYTES
+        {
+            bail!("staged peer artifact does not match its claimed size");
+        }
+        let mut temporary = tempfile::NamedTempFile::new_in(&digest_directory)
+            .context("temporary quarantine artifact could not be created")?;
+        set_private_permissions(temporary.as_file())?;
+        let (actual_digest, actual_size) = copy_and_hash(&mut source_file, &mut temporary)?;
+        if actual_digest != claimed_digest || actual_size != claimed_size {
+            bail!("staged peer artifact bytes do not match the delivery claim");
+        }
+        temporary
+            .as_file_mut()
+            .sync_all()
+            .context("temporary quarantine artifact could not sync")?;
+        match temporary.persist_noclobber(&destination) {
+            Ok(_) => sync_directory(&digest_directory)
+                .context("quarantine digest directory could not sync")?,
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                verify_existing_artifact(&destination, &claimed_digest, claimed_size)?;
+            }
+            Err(error) => {
+                return Err(error.error).context("artifact could not be atomically quarantined");
+            }
+        }
+
+        Ok(QuarantinedArtifact {
+            relative_path: PathBuf::from(".crumb")
+                .join("a2a")
+                .join("quarantine")
+                .join(delivery_id)
+                .join(&claimed_digest)
+                .join(filename),
+            sha256: claimed_digest,
+            size_bytes: claimed_size,
+        })
+    }
+
+    fn verified_artifact_source(
+        &self,
+        sender_instance_id: &str,
+        digest: &str,
+        filename: &str,
+    ) -> Result<PathBuf> {
+        let sender_root = self.artifacts.join(sender_instance_id);
+        inspect_directory(&sender_root, "staged artifact sender root")?;
+        let digest_root = sender_root.join(format!("sha256-{digest}"));
+        inspect_directory(&digest_root, "staged artifact digest root")?;
+        let source = digest_root.join(filename);
+        let metadata =
+            fs::symlink_metadata(&source).context("staged peer artifact could not be inspected")?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            bail!("staged peer artifact must be a regular file, not a symlink");
+        }
+        Ok(source)
     }
 
     /// Atomically claims one exact pending delivery for this receiver.
@@ -2221,6 +2425,35 @@ fn verify_existing_artifact(path: &Path, expected_digest: &str, expected_size: u
     Ok(())
 }
 
+fn open_regular_file_without_replacement(path: &Path, label: &str) -> Result<File> {
+    let before = fs::symlink_metadata(path).with_context(|| format!("{label} is unavailable"))?;
+    if before.file_type().is_symlink() || !before.file_type().is_file() {
+        bail!("{label} must be a regular file, not a symlink");
+    }
+    let file = File::open(path).with_context(|| format!("{label} could not be opened"))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("{label} could not be inspected after opening"))?;
+    let after = fs::symlink_metadata(path)
+        .with_context(|| format!("{label} could not be re-inspected after opening"))?;
+    if after.file_type().is_symlink() || !after.file_type().is_file() || !opened.is_file() {
+        bail!("{label} changed while it was being opened");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if before.dev() != opened.dev()
+            || before.ino() != opened.ino()
+            || after.dev() != opened.dev()
+            || after.ino() != opened.ino()
+        {
+            bail!("{label} changed while it was being opened");
+        }
+    }
+    Ok(file)
+}
+
 fn count_staged_artifacts(sender_root: &Path) -> Result<usize> {
     let mut count = 0_usize;
     for directory in fs::read_dir(sender_root).context("staged artifact root could not be read")? {
@@ -2602,6 +2835,21 @@ mod tests {
             }),
             metadata: None,
         }
+    }
+
+    fn file_request(id: &str, artifact: &StagedArtifact) -> SendMessageRequest {
+        let mut file = Part::file(
+            artifact.relative_url.clone(),
+            artifact.filename.clone(),
+            "application/octet-stream",
+        );
+        file.metadata = Some(serde_json::json!({
+            "sha256": artifact.sha256,
+            "sizeBytes": artifact.size_bytes,
+        }));
+        let mut request = request(id, "shared file");
+        request.message.parts.push(file);
+        request
     }
 
     fn response(id: &str, text: &str) -> SendMessageResponse {
@@ -3507,6 +3755,215 @@ mod tests {
     }
 
     #[test]
+    fn pending_artifact_is_verified_into_quarantine_idempotently_without_claim_or_ack() {
+        let (temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let sender_workspace = temporary.path().join("sender-artifact-source");
+        let receiver_workspace = temporary.path().join("receiver-artifact-target");
+        fs::create_dir(&sender_workspace).expect("sender workspace");
+        fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        fs::write(
+            sender_workspace.join("report.txt"),
+            b"verified peer artifact\n",
+        )
+        .expect("artifact bytes");
+        let staged = bus
+            .stage_artifact(
+                &first_registration,
+                &sender_workspace,
+                Path::new("report.txt"),
+            )
+            .expect("stage artifact");
+        let receipt = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &file_request("msg-quarantine", &staged),
+            )
+            .expect("enqueue artifact");
+
+        assert!(
+            bus.quarantine_artifact(
+                &second_registration,
+                &receiver_workspace,
+                &receipt.delivery_id,
+                1,
+            )
+            .is_err(),
+            "a text request part must not be moved or quarantined as a file"
+        );
+
+        let first = bus
+            .quarantine_artifact(
+                &second_registration,
+                &receiver_workspace,
+                &receipt.delivery_id,
+                2,
+            )
+            .expect("quarantine artifact");
+        let second_copy = bus
+            .quarantine_artifact(
+                &second_registration,
+                &receiver_workspace,
+                &receipt.delivery_id,
+                2,
+            )
+            .expect("quarantine artifact again");
+        assert_eq!(first, second_copy);
+        assert_eq!(first.sha256, staged.sha256);
+        assert_eq!(first.size_bytes, staged.size_bytes);
+        assert_eq!(
+            fs::read(receiver_workspace.join(&first.relative_path)).expect("quarantined bytes"),
+            b"verified peer artifact\n"
+        );
+        assert_eq!(
+            bus.list_pending(&second_registration)
+                .expect("pending")
+                .len(),
+            1
+        );
+        let (pending, processing, acknowledged) = bus
+            .queue_directories(second_registration.instance_id())
+            .expect("inbox");
+        assert_eq!(count_visible_entries(&pending).expect("pending count"), 1);
+        assert_eq!(
+            count_visible_entries(&processing).expect("processing count"),
+            0
+        );
+        assert_eq!(count_visible_entries(&acknowledged).expect("ack count"), 0);
+    }
+
+    #[test]
+    fn artifact_claim_rejects_https_foreign_sender_and_unsafe_references() {
+        let sender = "crumb_0123456789abcdef0123456789abcdef";
+        let digest = "ab".repeat(32);
+        let metadata = Some(serde_json::json!({
+            "sha256": digest,
+            "sizeBytes": 4,
+        }));
+        for url in [
+            "https://peer.example/file.txt".to_owned(),
+            format!("artifacts/crumb_ffffffffffffffffffffffffffffffff/sha256-{digest}/file.txt"),
+            format!("artifacts/{sender}/sha256-{digest}/../file.txt"),
+            format!("artifacts/{sender}/sha256-{digest}/nested/file.txt"),
+        ] {
+            let part = Part {
+                text: None,
+                data: None,
+                url: Some(url),
+                metadata: metadata.clone(),
+                filename: Some("file.txt".to_owned()),
+                media_type: Some("application/octet-stream".to_owned()),
+            };
+            assert!(verified_artifact_claim(sender, &part).is_err());
+        }
+    }
+
+    #[test]
+    fn quarantine_rejects_https_and_foreign_sender_deliveries() {
+        let (temporary, bus, first, _second, first_registration, second_registration) = setup();
+        let sender_workspace = temporary.path().join("ownership-source");
+        let receiver_workspace = temporary.path().join("ownership-target");
+        fs::create_dir(&sender_workspace).expect("sender workspace");
+        fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        fs::write(sender_workspace.join("file.bin"), b"owned").expect("source");
+        let staged = bus
+            .stage_artifact(
+                &first_registration,
+                &sender_workspace,
+                Path::new("file.bin"),
+            )
+            .expect("stage");
+
+        let foreign = bus
+            .enqueue(
+                &second_registration,
+                &first.instance_id,
+                &file_request("msg-foreign-owner", &staged),
+            )
+            .expect("foreign delivery");
+        assert!(
+            bus.quarantine_artifact(
+                &first_registration,
+                &receiver_workspace,
+                &foreign.delivery_id,
+                2,
+            )
+            .is_err()
+        );
+
+        let mut https = Part::file(
+            "https://peer.example/file.bin",
+            "file.bin",
+            "application/octet-stream",
+        );
+        https.metadata = Some(serde_json::json!({
+            "sha256": "ab".repeat(32),
+            "sizeBytes": 5,
+        }));
+        let mut request = request("msg-https-file", "remote file");
+        request.message.parts.push(https);
+        let https_receipt = bus
+            .enqueue(&second_registration, &first.instance_id, &request)
+            .expect("HTTPS delivery");
+        assert!(
+            bus.quarantine_artifact(
+                &first_registration,
+                &receiver_workspace,
+                &https_receipt.delivery_id,
+                2,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            bus.list_pending(&first_registration)
+                .expect("pending")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn quarantine_rejects_tampered_staged_bytes() {
+        let (temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let sender_workspace = temporary.path().join("tamper-source");
+        let receiver_workspace = temporary.path().join("tamper-target");
+        fs::create_dir(&sender_workspace).expect("sender workspace");
+        fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        fs::write(sender_workspace.join("file.bin"), b"good").expect("source");
+        let staged = bus
+            .stage_artifact(
+                &first_registration,
+                &sender_workspace,
+                Path::new("file.bin"),
+            )
+            .expect("stage");
+        let receipt = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &file_request("msg-tampered", &staged),
+            )
+            .expect("enqueue");
+        fs::write(bus.root().join(&staged.relative_url), b"evil").expect("tamper");
+
+        assert!(
+            bus.quarantine_artifact(
+                &second_registration,
+                &receiver_workspace,
+                &receipt.delivery_id,
+                2,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            bus.list_pending(&second_registration)
+                .expect("pending")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn artifact_staging_rejects_escape_absolute_non_regular_and_oversized_sources() {
         let (temporary, bus, _first, _second, first_registration, _second_registration) = setup();
         let workspace = temporary.path().join("artifact-workspace-invalid");
@@ -3628,5 +4085,61 @@ mod tests {
         symlink("missing", &lock_path).expect("lease lock symlink");
         let mut registration = second_registration;
         assert!(bus.heartbeat(&mut registration).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_rejects_symlinked_and_non_regular_staged_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let (temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let sender_workspace = temporary.path().join("unsafe-quarantine-source");
+        let receiver_workspace = temporary.path().join("unsafe-quarantine-target");
+        fs::create_dir(&sender_workspace).expect("sender workspace");
+        fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        fs::write(sender_workspace.join("file.bin"), b"good").expect("source");
+        let staged = bus
+            .stage_artifact(
+                &first_registration,
+                &sender_workspace,
+                Path::new("file.bin"),
+            )
+            .expect("stage");
+        let receipt = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &file_request("msg-unsafe-quarantine", &staged),
+            )
+            .expect("enqueue");
+        let staged_path = bus.root().join(&staged.relative_url);
+        fs::remove_file(&staged_path).expect("remove staged file");
+        symlink(&sender_workspace, &staged_path).expect("staged symlink");
+        assert!(
+            bus.quarantine_artifact(
+                &second_registration,
+                &receiver_workspace,
+                &receipt.delivery_id,
+                2,
+            )
+            .is_err()
+        );
+        fs::remove_file(&staged_path).expect("remove staged symlink");
+        fs::create_dir(&staged_path).expect("staged directory");
+        assert!(
+            bus.quarantine_artifact(
+                &second_registration,
+                &receiver_workspace,
+                &receipt.delivery_id,
+                2,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            bus.list_pending(&second_registration)
+                .expect("pending")
+                .len(),
+            1
+        );
     }
 }

@@ -228,6 +228,14 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "acknowledge one peer response without opening it",
     },
     SlashCommand {
+        usage: "/peer file",
+        description: "show verified peer file quarantine help",
+    },
+    SlashCommand {
+        usage: "/peer file fetch ",
+        description: "verify one pending file part into quarantine",
+    },
+    SlashCommand {
         usage: "/review",
         description: "review Crumb-owned edits",
     },

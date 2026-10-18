@@ -18,7 +18,7 @@ use crumb_a2a_local::{
     PeerEntry, PendingDeliverySummary, ProcessMetadata, ReceivedMessage, Registration,
     StagedArtifact,
 };
-pub use crumb_a2a_local::{DeliveryKind, ReceivedDelivery};
+pub use crumb_a2a_local::{DeliveryKind, QuarantinedArtifact, ReceivedDelivery};
 use crumb_instance::{InstanceMetadata, InstanceStore};
 
 /// Minimum lease duration that leaves useful scheduling room for a heartbeat.
@@ -321,6 +321,30 @@ impl A2aRuntime {
         self.inner.ensure_running()?;
         let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
         self.inner.bus.inspect_delivery(&registration, delivery_id)
+    }
+
+    /// Verifies one exact pending file part into this workspace's quarantine.
+    ///
+    /// This read-only inbox operation neither claims nor acknowledges the
+    /// delivery. The verified file remains unavailable to agent tools.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after shutdown begins or when delivery, artifact, or
+    /// quarantine validation fails.
+    pub fn quarantine_artifact(
+        &self,
+        delivery_id: &str,
+        part_index: usize,
+    ) -> Result<QuarantinedArtifact> {
+        self.inner.ensure_running()?;
+        let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
+        self.inner.bus.quarantine_artifact(
+            &registration,
+            &self.inner.workspace,
+            delivery_id,
+            part_index,
+        )
     }
 
     /// Atomically claims one exact pending delivery by identifier.
