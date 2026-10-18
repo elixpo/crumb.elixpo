@@ -538,6 +538,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "crumb-a2a-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crumb-a2a",
+ "crumb-a2a-local",
+ "crumb-instance",
+ "tempfile",
+]
+
+[[package]]
 name = "crumb-agent"
 version = "0.1.0"
 dependencies = [

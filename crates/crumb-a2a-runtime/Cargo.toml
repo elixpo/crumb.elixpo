@@ -1,0 +1,17 @@
+[package]
+name = "crumb-a2a-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crumb-a2a.workspace = true
+crumb-a2a-local.workspace = true
+crumb-instance.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
