@@ -113,6 +113,8 @@ use provider_discovery::{compatibility_diagnostics, discover_models};
 use shell_completion::{CompletionShell, write_completion};
 
 const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
+const LARGE_PASTE_MIN_BYTES: usize = 4 * 1024;
+const MAX_PASTE_ARTIFACT_BYTES: usize = 48 * 1024;
 const FULLSCREEN_SIDE_GUTTER: u16 = 2;
 const FULLSCREEN_TOP_GUTTER: u16 = 1;
 const MARKETPLACE_CATALOG_URL: &str = "https://crumb.elixpo.com/marketplace/catalog.json";
@@ -1622,10 +1624,17 @@ fn read_repl_submission(
     ))?;
     Ok(match signal {
         Signal::Success(command) => {
+            let command = editor.materialize_pastes(&command, cwd)?;
             ReplSubmission::Input(crumb_repl::classify_input(&command), Some(command))
         }
-        Signal::CtrlC => ReplSubmission::Interrupt,
-        Signal::CtrlD => ReplSubmission::Exit,
+        Signal::CtrlC => {
+            editor.discard_pastes();
+            ReplSubmission::Interrupt
+        }
+        Signal::CtrlD => {
+            editor.discard_pastes();
+            ReplSubmission::Exit
+        }
         Signal::HostCommand(command) if command == "crumb:transcript-up" => {
             ReplSubmission::Scroll(TranscriptScroll::Up)
         }
@@ -11057,6 +11066,129 @@ fn stdin_ready(_stdin: &io::Stdin) -> io::Result<bool> {
 struct InteractiveLineEditor {
     editor: Reedline,
     workspace: CompletionWorkspace,
+    paste_artifacts: Arc<Mutex<PendingPasteArtifacts>>,
+}
+
+impl InteractiveLineEditor {
+    fn materialize_pastes(&mut self, command: &str, workspace: &Path) -> Result<String> {
+        self.paste_artifacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .materialize(command, workspace)
+    }
+
+    fn discard_pastes(&mut self) {
+        self.paste_artifacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
+#[derive(Default)]
+struct PendingPasteArtifacts {
+    contents: BTreeMap<String, String>,
+}
+
+impl PendingPasteArtifacts {
+    fn capture(&mut self, paste: String) -> String {
+        let paste = paste.replace("\r\n", "\n").replace('\r', "\n");
+        if paste.len() < LARGE_PASTE_MIN_BYTES {
+            return paste;
+        }
+        if paste.len() > MAX_PASTE_ARTIFACT_BYTES {
+            return format!(
+                "[paste rejected: {} bytes exceeds the {} byte artifact limit]",
+                paste.len(),
+                MAX_PASTE_ARTIFACT_BYTES
+            );
+        }
+        let digest = format!("{:x}", Sha256::digest(paste.as_bytes()));
+        let marker = format!("@paste:sha256-{digest}");
+        self.contents.entry(marker.clone()).or_insert(paste);
+        marker
+    }
+
+    fn materialize(&mut self, command: &str, workspace: &Path) -> Result<String> {
+        let contents = std::mem::take(&mut self.contents);
+        let mut materialized = command.to_owned();
+        for (marker, content) in contents {
+            if !materialized.contains(&marker) {
+                continue;
+            }
+            let digest = marker
+                .strip_prefix("@paste:sha256-")
+                .context("paste artifact marker is invalid")?;
+            let relative = PathBuf::from(".crumb")
+                .join("artifacts")
+                .join("pastes")
+                .join(format!("sha256-{digest}.txt"));
+            persist_paste_artifact(workspace, &relative, content.as_bytes())?;
+            materialized =
+                materialized.replace(&marker, &format!("@file:{}", relative.to_string_lossy()));
+        }
+        Ok(materialized)
+    }
+
+    fn clear(&mut self) {
+        self.contents.clear();
+    }
+}
+
+fn persist_paste_artifact(workspace: &Path, relative: &Path, content: &[u8]) -> Result<()> {
+    let canonical_workspace = std::fs::canonicalize(workspace)
+        .with_context(|| format!("workspace `{}` is unavailable", workspace.display()))?;
+    let parent = relative
+        .parent()
+        .context("paste artifact path has no parent")?;
+    let mut canonical_parent = canonical_workspace.clone();
+    for component in parent.components() {
+        let std::path::Component::Normal(component) = component else {
+            bail!("paste artifact path must stay inside the trusted workspace");
+        };
+        canonical_parent.push(component);
+        match std::fs::symlink_metadata(&canonical_parent) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => bail!("paste artifact directories must not be symlinks or files"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                std::fs::create_dir(&canonical_parent)
+                    .context("paste artifact directory could not be created")?;
+            }
+            Err(error) => {
+                return Err(error).context("paste artifact directory could not be inspected");
+            }
+        }
+    }
+    let destination = canonical_parent.join(
+        relative
+            .file_name()
+            .context("paste artifact path has no filename")?,
+    );
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+    {
+        Ok(mut file) => {
+            file.write_all(content)
+                .context("paste artifact could not be written")?;
+            file.sync_all()
+                .context("paste artifact could not be synchronized")?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(&destination)
+                .context("existing paste artifact could not be inspected")?;
+            if !metadata.file_type().is_file()
+                || std::fs::read(&destination)
+                    .context("existing paste artifact could not be verified")?
+                    != content
+            {
+                bail!("existing paste artifact does not match its content digest");
+            }
+        }
+        Err(error) => return Err(error).context("paste artifact could not be created"),
+    }
+    Ok(())
 }
 
 struct CompletionOverlay {
@@ -11412,7 +11544,12 @@ fn create_line_editor(
         .with_cursor_offset(i16::try_from(FULLSCREEN_SIDE_GUTTER).unwrap_or(2))
         .with_correct_cursor_pos(true);
     let menu = CompletionOverlay::new(menu, renderer, header_rows, Arc::clone(&transcript));
-    let edit_mode = CrumbEditMode::new(keybindings, fullscreen.then_some(header_rows));
+    let paste_artifacts = Arc::new(Mutex::new(PendingPasteArtifacts::default()));
+    let edit_mode = CrumbEditMode::new(
+        keybindings,
+        fullscreen.then_some(header_rows),
+        Arc::clone(&paste_artifacts),
+    );
     let editor = Reedline::create()
         .with_history(Box::new(interactive_history))
         .with_hinter(Box::new(CrumbHinter::new(fullscreen.then_some(
@@ -11425,19 +11562,29 @@ fn create_line_editor(
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
         .with_persistent_menus(true)
         .with_edit_mode(Box::new(edit_mode));
-    Ok(InteractiveLineEditor { editor, workspace })
+    Ok(InteractiveLineEditor {
+        editor,
+        workspace,
+        paste_artifacts,
+    })
 }
 
 struct CrumbEditMode {
     emacs: Emacs,
     transcript_header_rows: Option<u16>,
+    paste_artifacts: Arc<Mutex<PendingPasteArtifacts>>,
 }
 
 impl CrumbEditMode {
-    const fn new(keybindings: reedline::Keybindings, transcript_header_rows: Option<u16>) -> Self {
+    fn new(
+        keybindings: reedline::Keybindings,
+        transcript_header_rows: Option<u16>,
+        paste_artifacts: Arc<Mutex<PendingPasteArtifacts>>,
+    ) -> Self {
         Self {
             emacs: Emacs::new(keybindings),
             transcript_header_rows,
+            paste_artifacts,
         }
     }
 
@@ -11455,6 +11602,12 @@ impl EditMode for CrumbEditMode {
     fn parse_event(&mut self, event: ReedlineRawEvent) -> ReedlineEvent {
         let event = TerminalEvent::from(event);
         match event {
+            TerminalEvent::Paste(paste) => ReedlineEvent::Edit(vec![EditCommand::InsertString(
+                self.paste_artifacts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .capture(paste),
+            )]),
             TerminalEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
                 ReedlineEvent::ExecuteHostCommand("crumb:transcript-up".to_owned())
             }
@@ -12177,6 +12330,7 @@ mod tests {
     use std::ffi::OsString;
     use std::io::{Cursor, Write};
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use crossterm::event::{
@@ -12193,18 +12347,18 @@ mod tests {
 
     use super::{
         CrumbEditMode, DiscoverySource, ExitGesture, MarketplaceContent, PausedSubmission,
-        Renderer, SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
-        TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
-        agent_config_location, apply_builtin_model_packs, bundled_catalog, completion_footer_frame,
-        composer_anchor_sequence, configure_permissions, configure_plugin, effort_display_name,
-        effort_wire_name, ensure_single_release_skill_install, exact_skill_manifest_url,
-        exact_skill_run_config, failed_command_recovery, finished_tool_activity,
-        fixed_footer_frame, follow_up_cursor_sequence, format_peer_discarded_file,
-        format_peer_imported_file, format_peer_inbox, format_peer_inspection,
-        format_peer_quarantined_file, format_peer_task, handle_skill_command,
-        initial_agent_activity, install_marketplace_package, load_exact_skill_manifest,
-        marketplace_update_blocker, normalize_bundled_skill_install, openrouter_preset,
-        parse_cli_skill_run, parse_credential_reference, parse_exec_request,
+        PendingPasteArtifacts, Renderer, SessionCommandContext, SteeringAction,
+        TerminalModeTracker, TranscriptCapture, TranscriptScroll, TranscriptState, UiSettings,
+        active_scroll_direction, agent_config_location, apply_builtin_model_packs, bundled_catalog,
+        completion_footer_frame, composer_anchor_sequence, configure_permissions, configure_plugin,
+        effort_display_name, effort_wire_name, ensure_single_release_skill_install,
+        exact_skill_manifest_url, exact_skill_run_config, failed_command_recovery,
+        finished_tool_activity, fixed_footer_frame, follow_up_cursor_sequence,
+        format_peer_discarded_file, format_peer_imported_file, format_peer_inbox,
+        format_peer_inspection, format_peer_quarantined_file, format_peer_task,
+        handle_skill_command, initial_agent_activity, install_marketplace_package,
+        load_exact_skill_manifest, marketplace_update_blocker, normalize_bundled_skill_install,
+        openrouter_preset, parse_cli_skill_run, parse_credential_reference, parse_exec_request,
         parse_interactive_skill_run, parse_paused_submission, parse_provider_header,
         parse_resume_session_argument, read_agent_config, read_bounded_response,
         register_local_skill, render_skill_discovery_search, resolve_memory_keep,
@@ -12948,7 +13102,11 @@ mod tests {
 
     #[test]
     fn mouse_wheel_is_reserved_for_transcript_scrolling() {
-        let mut mode = CrumbEditMode::new(reedline::default_emacs_keybindings(), Some(0));
+        let mut mode = CrumbEditMode::new(
+            reedline::default_emacs_keybindings(),
+            Some(0),
+            Arc::new(Mutex::new(PendingPasteArtifacts::default())),
+        );
         for (kind, expected) in [
             (MouseEventKind::ScrollUp, "crumb:transcript-up"),
             (MouseEventKind::ScrollDown, "crumb:transcript-down"),
@@ -12976,6 +13134,40 @@ mod tests {
             reedline::EditMode::parse_event(&mut mode, raw),
             reedline::ReedlineEvent::ExecuteHostCommand("crumb:toggle-tool-output:12".to_owned())
         );
+    }
+
+    #[test]
+    fn large_terminal_paste_becomes_a_compact_content_addressed_artifact() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let pasted = "large pasted line\n".repeat(300);
+        let mut pending = PendingPasteArtifacts::default();
+
+        let marker = pending.capture(pasted.clone());
+        let command = pending
+            .materialize(&format!("summarize {marker}"), workspace.path())
+            .expect("paste artifact materializes");
+
+        assert!(!marker.contains(&pasted));
+        assert!(!command.contains(&pasted));
+        assert!(command.starts_with("summarize @file:.crumb/artifacts/pastes/sha256-"));
+        let relative = command
+            .strip_prefix("summarize @file:")
+            .expect("artifact reference");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join(relative)).expect("artifact contents"),
+            pasted
+        );
+    }
+
+    #[test]
+    fn small_terminal_paste_stays_inline_and_oversized_paste_is_not_retained() {
+        let mut pending = PendingPasteArtifacts::default();
+
+        assert_eq!(pending.capture("short paste".to_owned()), "short paste");
+        let rejected = pending.capture("x".repeat(super::MAX_PASTE_ARTIFACT_BYTES + 1));
+
+        assert!(rejected.contains("paste rejected"));
+        assert!(pending.contents.is_empty());
     }
 
     #[test]
