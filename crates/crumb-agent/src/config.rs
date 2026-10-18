@@ -340,7 +340,7 @@ impl Default for AgentLimits {
             max_steps: 24,
             max_tool_calls: 48,
             max_wall_time_seconds: 900,
-            max_context_tokens: 64_000,
+            max_context_tokens: 256_000,
             max_output_bytes: 1_048_576,
             max_directory_entries: 4_096,
             max_harness_initialize_seconds: 30,
@@ -379,10 +379,11 @@ pub struct OptimizerConfig {
 }
 
 /// User-owned grants for tools that cross a trust boundary.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToolPermissions {
     /// Global approval behavior selected by the user.
+    #[serde(default = "default_approval_mode")]
     pub mode: ApprovalMode,
     /// Network tools allowed without an interactive approval bridge.
     pub allow_network_tools: BTreeSet<String>,
@@ -399,6 +400,23 @@ pub struct ToolPermissions {
     /// Supervised MCP tools explicitly allowed by the user.
     #[serde(alias = "allow_process_tools")]
     pub allow_mcp_tools: BTreeSet<String>,
+}
+
+impl Default for ToolPermissions {
+    fn default() -> Self {
+        Self {
+            mode: default_approval_mode(),
+            allow_network_tools: BTreeSet::new(),
+            allow_workspace_tools: BTreeSet::new(),
+            allow_execution_tools: BTreeSet::new(),
+            allow_peer_tools: BTreeSet::new(),
+            allow_mcp_tools: BTreeSet::new(),
+        }
+    }
+}
+
+const fn default_approval_mode() -> ApprovalMode {
+    ApprovalMode::SensitiveOnly
 }
 
 /// Complete live configuration. Secrets are deliberately not representable.
@@ -990,7 +1008,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        AgentConfig, AgentMode, HarnessConfig, LiveConfig, MistakePolicy, Modality, ModelRoute,
+        AgentConfig, AgentMode, ApprovalMode, HarnessConfig, LiveConfig, MistakePolicy, Modality,
+        ModelRoute,
     };
     use crate::{CodingBackend, McpTransport, ModelCapabilities};
 
@@ -1024,6 +1043,17 @@ mod tests {
     fn secrets_are_not_part_of_the_config_schema() {
         let result = serde_json::from_str::<AgentConfig>(r#"{"api_key":"secret"}"#);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn new_and_partial_configs_default_to_sensitive_only_approvals() {
+        assert_eq!(
+            AgentConfig::default().permissions.mode,
+            ApprovalMode::SensitiveOnly
+        );
+        let config = serde_json::from_str::<AgentConfig>(r#"{"permissions":{}}"#)
+            .expect("partial permissions parse");
+        assert_eq!(config.permissions.mode, ApprovalMode::SensitiveOnly);
     }
 
     #[test]

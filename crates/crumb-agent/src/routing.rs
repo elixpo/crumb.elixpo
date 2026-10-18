@@ -323,6 +323,10 @@ fn looks_like_agent_imperative(first: &str, words: &[&str]) -> bool {
             | "describe"
             | "review"
             | "create"
+            | "commit"
+            | "merge"
+            | "push"
+            | "cherry-pick"
     );
     if words.len() >= 2 && direct_lead && !looks_like_shell_arguments(&words[1..]) {
         return true;
@@ -593,6 +597,8 @@ mod tests {
             "find me the elixpo_projects folder",
             "make the default mode smarter",
             "wait for the checks to pass",
+            "merge the pull request now",
+            "commit the README update",
         ] {
             let decision = catalog().route(request, &RoutePolicy::default());
             assert_eq!(decision.route, InputRoute::Agent, "{request}");

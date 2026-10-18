@@ -46,6 +46,7 @@ const MAX_WARM_SESSION_STATES: usize = 8;
 struct TurnApprovals {
     configured: ConfiguredApprovals,
     interactive: InteractiveApprovalBroker,
+    approved: Mutex<BTreeSet<(String, String)>>,
 }
 
 struct TurnResources {
@@ -80,10 +81,25 @@ impl ApprovalBroker for TurnApprovals {
     ) -> ApprovalDecision {
         let configured = self.configured.decide(request, arguments, cancellation);
         if configured == ApprovalDecision::AllowOnce {
-            configured
-        } else {
-            self.interactive.decide(request, arguments, cancellation)
+            return configured;
         }
+        let key = (request.tool.clone(), request.arguments_digest.clone());
+        if self
+            .approved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key)
+        {
+            return ApprovalDecision::AllowOnce;
+        }
+        let decision = self.interactive.decide(request, arguments, cancellation);
+        if decision == ApprovalDecision::AllowOnce {
+            self.approved
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key);
+        }
+        decision
     }
 }
 
@@ -94,6 +110,21 @@ fn configured_approvals(config: &AgentConfig) -> ConfiguredApprovals {
         .with_process_tools(config.permissions.allow_execution_tools.clone())
         .with_peer_tools(config.permissions.allow_peer_tools.clone())
         .with_mcp_tools(config.permissions.allow_mcp_tools.clone())
+}
+
+fn turn_approvals(
+    config: &AgentConfig,
+    interactive: Option<InteractiveApprovalBroker>,
+) -> Arc<dyn ApprovalBroker> {
+    let configured = configured_approvals(config);
+    match interactive {
+        Some(interactive) => Arc::new(TurnApprovals {
+            configured,
+            interactive,
+            approved: Mutex::new(BTreeSet::new()),
+        }),
+        None => Arc::new(configured),
+    }
 }
 
 fn native_harness_limits(config: &AgentConfig) -> Result<HarnessLimits> {
@@ -1473,14 +1504,7 @@ impl AgentRuntime {
             crate::configured_pollinations_runtime_key(config),
             self.peer_runtime_for_workspace(&workspace),
         )?;
-        let configured = configured_approvals(config);
-        let approvals: Arc<dyn ApprovalBroker> = match interaction.interactive {
-            Some(interactive) => Arc::new(TurnApprovals {
-                configured,
-                interactive,
-            }),
-            None => Arc::new(configured),
-        };
+        let approvals = turn_approvals(config, interaction.interactive);
         self.ensure_session(&workspace, config.mode)?;
         let route = select_request_route(config, request)
             .context("agent config has no text model route")?;
@@ -1547,12 +1571,16 @@ impl AgentRuntime {
             Err(_) if cancellation.is_cancelled() => TurnStatus::Cancelled,
             Err(_) => TurnStatus::Failed,
         };
-        self.record_token_estimate(
+        let compacted = self.record_token_estimate(
             &prepared_request,
             result.as_ref().ok(),
             context_token_budget(config, route),
-            matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
+            matches!(
+                config.harness.as_ref(),
+                Some(HarnessConfig::Native | HarnessConfig::Process { .. })
+            ),
         );
+        self.compact_native_conversation_if(compacted && native);
         if !native {
             self.session
                 .as_mut()
@@ -1560,6 +1588,12 @@ impl AgentRuntime {
                 .record_turn_end(status, 0, 0)?;
         }
         result
+    }
+
+    fn compact_native_conversation_if(&mut self, compacted: bool) {
+        if compacted && let Some(conversation) = self.native_conversation.as_mut() {
+            conversation.compact_history();
+        }
     }
 
     fn load_skill_context_for_turn(
@@ -1634,7 +1668,7 @@ impl AgentRuntime {
         result: Option<&RunResult>,
         limit: u64,
         auto_compaction: bool,
-    ) {
+    ) -> bool {
         self.last_response = result
             .map(|result| result.final_response.trim().to_owned())
             .filter(|response| !response.is_empty());
@@ -1666,7 +1700,9 @@ impl AgentRuntime {
         if auto_compaction && threshold > 0 && self.context_tokens_estimate >= threshold {
             self.context_tokens_estimate = limit.saturating_mul(16) / 100;
             self.compactions = self.compactions.saturating_add(1);
+            return true;
         }
+        false
     }
 
     #[must_use]
