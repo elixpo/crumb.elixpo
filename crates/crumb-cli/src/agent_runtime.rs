@@ -34,6 +34,7 @@ use crate::provider_projection::project_provider;
 
 type TurnThreadResult = (AgentRuntime, Result<RunResult>);
 static ACTIVE_CANCELLATION: OnceLock<Arc<Mutex<Option<CancellationToken>>>> = OnceLock::new();
+static CANCELLATION_INSTALL_LOCK: Mutex<()> = Mutex::new(());
 const MAX_WARM_SESSION_STATES: usize = 8;
 
 struct TurnApprovals {
@@ -440,6 +441,29 @@ fn profile_effort_wire_name(effort: &str) -> Option<&'static str> {
     }
 }
 
+fn install_cancellation_handler() -> Result<Arc<Mutex<Option<CancellationToken>>>> {
+    let _install_guard = CANCELLATION_INSTALL_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("agent cancellation handler lock was poisoned"))?;
+    if let Some(slot) = ACTIVE_CANCELLATION.get() {
+        return Ok(Arc::clone(slot));
+    }
+    let slot: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+    let signal_slot = Arc::clone(&slot);
+    ctrlc::set_handler(move || {
+        if let Ok(active) = signal_slot.lock()
+            && let Some(cancellation) = active.as_ref()
+        {
+            cancellation.cancel();
+        }
+    })
+    .context("failed to install agent cancellation handler")?;
+    ACTIVE_CANCELLATION
+        .set(Arc::clone(&slot))
+        .map_err(|_| anyhow::anyhow!("agent cancellation handler initialized concurrently"))?;
+    Ok(slot)
+}
+
 fn apply_profile_skills(profile: &ProfileDocument, config: &mut AgentConfig) -> &'static str {
     if profile.skills.is_empty() {
         return "project";
@@ -464,22 +488,7 @@ impl AgentRuntime {
     /// Returns an error when the operating system signal handler cannot be
     /// installed.
     pub fn new() -> Result<Self> {
-        let active_cancellation = if let Some(slot) = ACTIVE_CANCELLATION.get() {
-            Arc::clone(slot)
-        } else {
-            let slot: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
-            let signal_slot = Arc::clone(&slot);
-            ctrlc::set_handler(move || {
-                if let Ok(active) = signal_slot.lock()
-                    && let Some(cancellation) = active.as_ref()
-                {
-                    cancellation.cancel();
-                }
-            })
-            .context("failed to install agent cancellation handler")?;
-            let _ = ACTIVE_CANCELLATION.set(Arc::clone(&slot));
-            slot
-        };
+        let active_cancellation = install_cancellation_handler()?;
         Ok(Self {
             active_cancellation,
             session: None,
