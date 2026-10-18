@@ -672,6 +672,7 @@ mod tests {
             "search ",
             "inspect ",
             "install ",
+            "run ",
             "enable ",
             "disable ",
             "update ",
