@@ -1568,17 +1568,39 @@ fn command_looks_sensitive(command: &str) -> bool {
 }
 
 fn strip_terminal_controls(input: &str) -> String {
+    sanitize_terminal_text(input, false)
+}
+
+fn sanitize_terminal_text(input: &str, preserve_sgr: bool) -> String {
     let mut output = String::with_capacity(input.len());
     let mut characters = input.chars().peekable();
     while let Some(character) = characters.next() {
-        if character == '\x1b' {
-            if characters.next_if_eq(&'[').is_some() {
-                for sequence in characters.by_ref() {
-                    if ('@'..='~').contains(&sequence) {
-                        break;
+        if character == '\x1b' && characters.next_if_eq(&'[').is_some() {
+            let mut sequence = String::from("\x1b[");
+            for sequence_character in characters.by_ref() {
+                sequence.push(sequence_character);
+                if ('@'..='~').contains(&sequence_character) {
+                    if preserve_sgr && sequence_character == 'm' {
+                        output.push_str(&sequence);
                     }
+                    break;
                 }
             }
+            continue;
+        }
+        if (character == '\x1b' && characters.next_if_eq(&']').is_some()) || character == '\u{009d}'
+        {
+            while let Some(sequence_character) = characters.next() {
+                if sequence_character == '\x07' || sequence_character == '\u{009c}' {
+                    break;
+                }
+                if sequence_character == '\x1b' && characters.next_if_eq(&'\\').is_some() {
+                    break;
+                }
+            }
+            continue;
+        }
+        if character == '\x1b' {
             continue;
         }
         if character == '\n' || character == '\t' || !character.is_control() {
@@ -9623,29 +9645,7 @@ fn transcript_new_content_indicator(
 }
 
 fn sanitize_transcript_output(output: &str) -> String {
-    let mut sanitized = String::with_capacity(output.len());
-    let mut characters = output.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '\x1b' {
-            if characters.next_if_eq(&'[').is_some() {
-                let mut sequence = String::from("\x1b[");
-                for sequence_character in characters.by_ref() {
-                    sequence.push(sequence_character);
-                    if ('@'..='~').contains(&sequence_character) {
-                        if sequence_character == 'm' {
-                            sanitized.push_str(&sequence);
-                        }
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        if character == '\n' || character == '\t' || !character.is_control() {
-            sanitized.push(character);
-        }
-    }
-    sanitized
+    sanitize_terminal_text(output, true)
 }
 
 fn terminal_username() -> String {
@@ -9996,7 +9996,12 @@ mod tests {
 
     #[test]
     fn transcript_history_keeps_color_but_drops_cursor_controls() {
-        let output = "\x1b[31mred\x1b[0m\x1b[2J\r\nnext";
+        let output = concat!(
+            "\x1b[31mred\x1b[0m\x1b[2J\r\n",
+            "\x1b]133;C\x07",
+            "\x1b]666;vte.shell.preexec;/home/elixpo\x1b\\",
+            "next"
+        );
         let sanitized = sanitize_transcript_output(output);
 
         assert_eq!(sanitized, "\x1b[31mred\x1b[0m\nnext");
