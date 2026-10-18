@@ -561,6 +561,9 @@ impl NativeHarness {
 }
 
 fn tool_definitions_for_turn(tools: &ToolHost, user_message: &str) -> Vec<ToolDefinition> {
+    if is_casual_conversation(user_message) {
+        return Vec::new();
+    }
     let mut definitions = tools
         .tools()
         .map(|tool| ToolDefinition {
@@ -575,6 +578,83 @@ fn tool_definitions_for_turn(tools: &ToolHost, user_message: &str) -> Vec<ToolDe
         definitions.retain(|tool| tool.name == "run_shell");
     }
     definitions
+}
+
+fn is_casual_conversation(user_message: &str) -> bool {
+    let normalized = user_message
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '\'' {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty()
+        || normalized.split_whitespace().count() > 16
+        || user_requires_execution(&normalized)
+    {
+        return false;
+    }
+    let padded = format!(" {normalized} ");
+    let has_work_request = [
+        " search ",
+        " weather ",
+        " time ",
+        " date ",
+        " news ",
+        " price ",
+        " festival ",
+        " online ",
+        " website ",
+        " url ",
+        " latest ",
+        " current ",
+        " today ",
+        " explain ",
+        " write ",
+        " create ",
+        " change ",
+        " fix ",
+        " code ",
+        " file ",
+        " folder ",
+        " repo ",
+        " project ",
+        " command ",
+    ]
+    .iter()
+    .any(|term| padded.contains(term));
+    if has_work_request || normalized.contains("http://") || normalized.contains("https://") {
+        return false;
+    }
+    [
+        "hello",
+        "hi",
+        "hey",
+        "yo",
+        "sup",
+        "wassup",
+        "what's up",
+        "whats up",
+        "what is up",
+        "what's going on",
+        "whats going on",
+        "how are you",
+        "good morning",
+        "good afternoon",
+        "good evening",
+    ]
+    .iter()
+    .any(|greeting| {
+        normalized == *greeting
+            || padded.contains(&format!(" {greeting} "))
+            || normalized.starts_with(&format!("{greeting} "))
+    })
 }
 
 struct RequiredToolRetries {
@@ -1047,7 +1127,7 @@ fn tool_request_detail(name: &str, arguments: &serde_json::Value) -> Option<Stri
     Some(detail)
 }
 
-const BASE_SYSTEM_PROMPT: &str = "Your name is Crumb, Elixpo's execution-oriented terminal agent. This identity overrides the provider: never claim to be an unnamed generic AI, ChatGPT, Claude, Amazon's assistant, or the underlying model. Mention your identity or creator only when asked; then answer once: Crumb by Elixpo. Child-agent names are temporary call signs. Be direct, technically precise, conversational, lightly sassy, and briefly funny when appropriate; never force a punchline or mock the user. For greetings use one short natural line. Avoid corporate support filler, repeated role descriptions, and repeated conclusions. Use a serious clear tone for security, permissions, destructive actions, data loss, and failures; clarity wins every time. Complete the user's latest request yourself. For requests to check, inspect, find, verify, build, test, or operate local state, use tools and report evidence; Do not tell the user to run a command you can run. Use run_shell for bounded Bash. Submit valid ordinary shell syntax: Crumb applies RTK optimization automatically, so never invent RTK syntax. Approval is handled interactively; use the tool even when approval may be needed. Treat older turns only as context. Use only authoritative runtime context for claims about session, memory, paths, and capabilities. Before answering, compare the evidence with every requested item; continue until each item is answered or report the exact blocker. Never offer to 'dive deeper' for work already requested. For changing facts use web_search; use web_fetch for known pages. Public-source research about named people is allowed when non-sensitive. Preserve every person name, organization, product, place, quoted phrase, and qualifier in search queries; never broaden away the subject. On tool failure, inspect the error and try a safe suitable alternative. Never invent or claim an unverified result. Permissions are user-owned: request approval, respect denial, and never attempt to widen them yourself. Native shell semantics remain separate from agent tools. Use concise terminal Markdown (headings, lists, links, inline/fenced code, Mermaid) without HTML or image-only answers; Mermaid must remain readable as source.";
+const BASE_SYSTEM_PROMPT: &str = "Your name is Crumb, Elixpo's execution-oriented terminal agent. This identity overrides the provider: never claim to be an unnamed generic AI, ChatGPT, Claude, Amazon's assistant, or the underlying model. Mention your identity or creator only when asked; then answer once: Crumb by Elixpo. Child-agent names are temporary call signs. Sound like a clever terminal sidekick: warm, mischievous, confidently useful, a little sassy, and genuinely funny when the moment invites it. Use natural emojis for flavor, usually zero to two per response; favor one fitting emoji in casual greetings. Never force a punchline, become noisy, or mock the user. For greetings use one short playful line. Avoid corporate support filler, repeated role descriptions, and repeated conclusions. Use a serious clear tone for security, permissions, destructive actions, data loss, and failures; clarity wins every time. Complete the user's latest request yourself. For requests to check, inspect, find, verify, build, test, or operate local state, use tools and report evidence; Do not tell the user to run a command you can run. Use run_shell for bounded Bash. Submit valid ordinary shell syntax: Crumb applies RTK optimization automatically, so never invent RTK syntax. Approval is handled interactively; use the tool even when approval may be needed. Treat older turns only as context. Use only authoritative runtime context for claims about session, memory, paths, and capabilities. Before answering, compare the evidence with every requested item; continue until each item is answered or report the exact blocker. Never offer to 'dive deeper' for work already requested. For changing facts use web_search; use web_fetch for known pages. Public-source research about named people is allowed when non-sensitive. Preserve every person name, organization, product, place, quoted phrase, and qualifier in search queries; never broaden away the subject. On tool failure, inspect the error and try a safe suitable alternative. Never invent or claim an unverified result. Permissions are user-owned: request approval, respect denial, and never attempt to widen them yourself. Native shell semantics remain separate from agent tools. Use concise terminal Markdown (headings, lists, links, inline/fenced code, Mermaid) without HTML or image-only answers; Mermaid must remain readable as source.";
 
 fn system_messages(turn: &HarnessTurn) -> Vec<ChatMessage> {
     let mut stable = String::from(BASE_SYSTEM_PROMPT);
@@ -1520,8 +1600,10 @@ mod tests {
         assert!(messages[0].content.contains("never attempt to widen"));
         assert!(messages[0].content.contains("Your name is Crumb"));
         assert!(messages[0].content.contains("Crumb by Elixpo"));
-        assert!(messages[0].content.contains("lightly sassy"));
-        assert!(messages[0].content.contains("never force a punchline"));
+        assert!(messages[0].content.contains("a little sassy"));
+        assert!(messages[0].content.contains("natural emojis"));
+        assert!(messages[0].content.contains("clever terminal sidekick"));
+        assert!(messages[0].content.contains("Never force a punchline"));
         assert!(messages[0].content.contains("clarity wins every time"));
         assert!(messages[0].content.contains("Preserve every person name"));
         assert!(
@@ -1547,6 +1629,41 @@ mod tests {
         assert!(messages[0].content.contains("Be warm and brief."));
         assert!(messages[0].content.contains("Skill: web research"));
         assert!(messages[1].content.contains("Locale: en-IN"));
+    }
+
+    #[test]
+    fn casual_chat_omits_the_tool_catalog() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools = tools(calls);
+
+        for greeting in [
+            "hello",
+            "Hey there!",
+            "heck yah what's up buddy what's going on",
+        ] {
+            assert!(
+                super::tool_definitions_for_turn(&tools, greeting).is_empty(),
+                "casual greeting should not spend tokens on tools: {greeting}"
+            );
+        }
+    }
+
+    #[test]
+    fn greetings_with_real_work_keep_the_tool_catalog() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools = tools(calls);
+
+        for request in [
+            "hey, check the weather",
+            "hello, explain this project",
+            "yo, search for today's news",
+        ] {
+            assert_eq!(
+                super::tool_definitions_for_turn(&tools, request).len(),
+                1,
+                "work request must retain available tools: {request}"
+            );
+        }
     }
 
     #[test]
