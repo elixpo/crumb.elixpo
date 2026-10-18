@@ -254,7 +254,9 @@ fn current_token(line: &str) -> (usize, &str) {
 fn slash_suggestions(prefix: &str, pos: usize, workspace: &Path) -> Vec<Suggestion> {
     let mut commands = crumb_repl::SLASH_COMMANDS
         .iter()
-        .filter(|command| !is_setting_command(command.usage))
+        .filter(|command| {
+            !is_setting_command(command.usage) || command.usage.starts_with("/permissions")
+        })
         .map(|command| (command.usage.to_owned(), command.description.to_owned()))
         .collect::<Vec<_>>();
     commands.push((
@@ -645,6 +647,40 @@ mod tests {
                     .iter()
                     .any(|candidate| candidate.value == format!("/pack use {id}")),
                 "missing nested pack suggestion for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn permissions_completion_exposes_root_and_nested_actions() {
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
+
+        let root = completer.complete("/per", 4);
+        assert!(
+            root.suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "/permissions")
+        );
+
+        let nested = completer.complete("/permissions ", 13);
+        for action in [
+            "always-ask",
+            "sensitive",
+            "full-access",
+            "allow-all",
+            "allow-network ",
+            "deny-network ",
+            "allow-workspace ",
+            "deny-workspace ",
+            "allow-execution ",
+            "deny-execution ",
+        ] {
+            assert!(
+                nested
+                    .suggestions()
+                    .iter()
+                    .any(|candidate| candidate.value == format!("/permissions {action}")),
+                "missing nested permission suggestion for {action}"
             );
         }
     }

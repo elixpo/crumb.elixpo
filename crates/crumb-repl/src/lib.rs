@@ -296,12 +296,32 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "run registered tools without prompts",
     },
     SlashCommand {
+        usage: "/permissions allow-all",
+        description: "grant all packaged tools and full access",
+    },
+    SlashCommand {
         usage: "/permissions allow-network ",
         description: "allow web_fetch or web_search",
     },
     SlashCommand {
         usage: "/permissions deny-network ",
         description: "remove a network-tool grant",
+    },
+    SlashCommand {
+        usage: "/permissions allow-workspace ",
+        description: "allow a workspace-write tool",
+    },
+    SlashCommand {
+        usage: "/permissions deny-workspace ",
+        description: "remove a workspace-tool grant",
+    },
+    SlashCommand {
+        usage: "/permissions allow-execution ",
+        description: "allow a process-execution tool",
+    },
+    SlashCommand {
+        usage: "/permissions deny-execution ",
+        description: "remove an execution-tool grant",
     },
     SlashCommand {
         usage: "/memory",
