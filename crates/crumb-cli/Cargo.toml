@@ -12,6 +12,8 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 crumb-agent = { path = "../crumb-agent" }
+crumb-a2a.workspace = true
+crumb-a2a-inbound.workspace = true
 crumb-a2a-runtime.workspace = true
 crumb-auth = { path = "../crumb-auth" }
 crumb-core = { path = "../crumb-core" }
@@ -50,7 +52,6 @@ url.workspace = true
 workspace = true
 
 [dev-dependencies]
-crumb-a2a.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

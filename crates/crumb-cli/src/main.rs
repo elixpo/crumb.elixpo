@@ -103,8 +103,9 @@ mod provider_projection;
 mod shell_completion;
 
 use agent_runtime::{
-    AgentRuntime, PeerDeliveryInspection, PeerInspectionPart, ResumeContinuity,
-    apply_selected_profile, validate_skill_path,
+    AgentRuntime, PeerDeliveryInspection, PeerInspectionKind, PeerInspectionPart,
+    PeerResponseSummary, PeerTurnStatus, ResumeContinuity, apply_selected_profile,
+    validate_skill_path,
 };
 use completion::{COMPLETION_PALETTE_ROWS, CompletionWorkspace, CrumbCompleter};
 use context::{parse_attachment, resolve_request_context};
@@ -1014,10 +1015,22 @@ fn handle_repl_event(
     match event {
         InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
             if command == "/peer inbox"
+                || command == "/peer responses"
                 || command == "/peer inspect"
                 || command.starts_with("/peer inspect ") =>
         {
             show_peer_read_command(&command, context)?;
+            Ok(None)
+        }
+        InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
+            if command == "/peer accept"
+                || command.starts_with("/peer accept ")
+                || command == "/peer reject"
+                || command.starts_with("/peer reject ")
+                || command == "/peer ack"
+                || command.starts_with("/peer ack ") =>
+        {
+            handle_peer_action(&command, context)?;
             Ok(None)
         }
         InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
@@ -5509,6 +5522,26 @@ fn show_peer_help(writer: &mut dyn Write) -> Result<()> {
     )?;
     writeln!(writer, "  /peer inspect <delivery-id>")?;
     writeln!(writer, "               safely inspect a pending delivery")?;
+    writeln!(writer, "  /peer accept <delivery-id>")?;
+    writeln!(
+        writer,
+        "               run one exact request in an isolated read-only turn"
+    )?;
+    writeln!(writer, "  /peer reject <delivery-id>")?;
+    writeln!(
+        writer,
+        "               reject one exact request without invoking a model"
+    )?;
+    writeln!(writer, "  /peer responses")?;
+    writeln!(
+        writer,
+        "               list correlated replies without opening them"
+    )?;
+    writeln!(writer, "  /peer ack <response-id>")?;
+    writeln!(
+        writer,
+        "               acknowledge one reply without opening it"
+    )?;
     writeln!(
         writer,
         "  Ask Crumb to message a peer or share a relative workspace file; each outbound exchange is approval-gated."
@@ -5521,7 +5554,7 @@ fn show_peer_help(writer: &mut dyn Write) -> Result<()> {
 }
 
 fn show_peer_read_command(command: &str, context: &mut InputContext<'_>) -> Result<()> {
-    let delivery_id = if command == "/peer inbox" {
+    let delivery_id = if matches!(command, "/peer inbox" | "/peer responses") {
         None
     } else {
         Some(
@@ -5534,7 +5567,8 @@ fn show_peer_read_command(command: &str, context: &mut InputContext<'_>) -> Resu
                 .context("usage: /peer inspect <delivery-id>")?,
         )
     };
-    let local_name = instance_store(context.cwd).load_or_create()?.name;
+    let workspace = instance_workspace(context.cwd)?;
+    let local_name = instance_store(&workspace).load_or_create()?.name;
     writeln!(
         context.writer,
         "{}",
@@ -5551,7 +5585,9 @@ fn show_peer_read_command(command: &str, context: &mut InputContext<'_>) -> Resu
         .agent_runtime
         .as_ref()
         .context("local A2A runtime is unavailable")?;
-    let details = if let Some(delivery_id) = delivery_id {
+    let details = if command == "/peer responses" {
+        format_peer_responses(runtime.peer_responses()?)
+    } else if let Some(delivery_id) = delivery_id {
         format_peer_inspection(runtime.inspect_peer_delivery(delivery_id)?)
     } else {
         format_peer_inbox(runtime.peer_inbox()?)
@@ -5564,6 +5600,259 @@ fn show_peer_read_command(command: &str, context: &mut InputContext<'_>) -> Resu
             .renderer
             .peer_untrusted_text_for_width(&details, width)
     )?;
+    Ok(())
+}
+
+fn handle_peer_action(command: &str, context: &mut InputContext<'_>) -> Result<()> {
+    let (action, delivery_id) = if let Some(delivery_id) = command.strip_prefix("/peer accept ") {
+        ("accept", exact_peer_delivery_id(delivery_id)?)
+    } else if let Some(delivery_id) = command.strip_prefix("/peer reject ") {
+        ("reject", exact_peer_delivery_id(delivery_id)?)
+    } else if let Some(delivery_id) = command.strip_prefix("/peer ack ") {
+        ("ack", exact_peer_delivery_id(delivery_id)?)
+    } else if command == "/peer accept" {
+        bail!("usage: /peer accept <delivery-id>");
+    } else if command == "/peer ack" {
+        bail!("usage: /peer ack <response-id>");
+    } else {
+        bail!("usage: /peer reject <delivery-id>");
+    };
+
+    initialize_optional_peer_runtime(context.agent_runtime, context.cwd, context.writer)?;
+    let workspace = instance_workspace(context.cwd)?;
+    let local_name = instance_store(&workspace).load_or_create()?.name;
+    if action == "ack" {
+        let remote = context
+            .agent_runtime
+            .as_ref()
+            .context("local A2A runtime is unavailable")?
+            .acknowledge_peer_response(delivery_id)?;
+        writeln!(
+            context.writer,
+            "{}",
+            context.renderer.peer_activity(&PeerActivity {
+                local_name: &local_name,
+                remote_name: &remote,
+                state: PeerActivityState::Completed,
+                elapsed: Duration::ZERO,
+                artifact_count: 0,
+            })
+        )?;
+        writeln!(context.writer, "  Peer response acknowledged")?;
+        return Ok(());
+    }
+    if action == "reject" {
+        let remote = context
+            .agent_runtime
+            .as_ref()
+            .context("local A2A runtime is unavailable")?
+            .reject_peer_delivery(&workspace, delivery_id)?;
+        writeln!(
+            context.writer,
+            "{}",
+            context.renderer.peer_activity(&PeerActivity {
+                local_name: &local_name,
+                remote_name: &remote,
+                state: PeerActivityState::Completed,
+                elapsed: Duration::ZERO,
+                artifact_count: 0,
+            })
+        )?;
+        writeln!(
+            context.writer,
+            "  Peer request rejected · no model was invoked"
+        )?;
+        return Ok(());
+    }
+
+    let config = load_effective_agent_config(context.cwd, context.writer)?;
+    let activity_capacity = usize::try_from(config.limits.max_activity_events)
+        .context("max_activity_events exceeds this platform's address space")?;
+    let task = context
+        .agent_runtime
+        .as_ref()
+        .context("local A2A runtime is unavailable")?
+        .spawn_peer_turn(delivery_id, config, &workspace, activity_capacity)?;
+    let terminal = AgentTerminal::from_input(context);
+    observe_peer_turn(
+        task,
+        &local_name,
+        context.renderer,
+        context.writer,
+        &terminal,
+    )
+}
+
+fn exact_peer_delivery_id(value: &str) -> Result<&str> {
+    let value = value.trim();
+    if value.is_empty() || value.contains(char::is_whitespace) {
+        bail!("peer delivery id must be one exact non-empty identifier");
+    }
+    Ok(value)
+}
+
+fn render_peer_turn_activity(
+    activity: HarnessActivity,
+    local_name: &str,
+    remote: &str,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    elapsed: Duration,
+) -> Result<()> {
+    let (remote_status, state) = match activity {
+        HarnessActivity::ToolStarted { name, .. } => {
+            (format!("{remote} · {name}"), PeerActivityState::Exchanging)
+        }
+        HarnessActivity::ToolFinished { name, success } => {
+            let result = if success { "completed" } else { "failed" };
+            (
+                format!("{remote} · {name} {result}"),
+                PeerActivityState::Waiting,
+            )
+        }
+        _ => return Ok(()),
+    };
+    writeln!(
+        writer,
+        "{}",
+        renderer.peer_activity(&PeerActivity {
+            local_name,
+            remote_name: &remote_status,
+            state,
+            elapsed,
+            artifact_count: 0,
+        })
+    )?;
+    writer.flush().context("failed to flush peer activity")
+}
+
+fn render_peer_turn_result(
+    result: &agent_runtime::PeerTurnResult,
+    local_name: &str,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    elapsed: Duration,
+) -> Result<()> {
+    let (state, summary) = match result.status {
+        PeerTurnStatus::Completed => (
+            PeerActivityState::Completed,
+            "Peer response queued securely",
+        ),
+        PeerTurnStatus::RetryableFailure => (
+            PeerActivityState::Failed,
+            "Peer turn stopped; request returned to the inbox",
+        ),
+        PeerTurnStatus::RecoveryRequired => (
+            PeerActivityState::Failed,
+            "Peer turn needs transport recovery; no peer content was exposed",
+        ),
+    };
+    writeln!(
+        writer,
+        "{}",
+        renderer.peer_activity(&PeerActivity {
+            local_name,
+            remote_name: &result.remote_instance_id,
+            state,
+            elapsed,
+            artifact_count: 0,
+        })
+    )?;
+    writeln!(writer, "  {summary}")?;
+    Ok(())
+}
+
+fn observe_peer_turn(
+    task: agent_runtime::PeerTurnTask,
+    local_name: &str,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    terminal: &AgentTerminal,
+) -> Result<()> {
+    let started = Instant::now();
+    let remote = task.remote_instance_id().to_owned();
+    writeln!(
+        writer,
+        "{}",
+        renderer.peer_activity(&PeerActivity {
+            local_name,
+            remote_name: &remote,
+            state: PeerActivityState::Connecting,
+            elapsed: started.elapsed(),
+            artifact_count: 0,
+        })
+    )?;
+    writeln!(
+        writer,
+        "  Peer turn active · Ctrl+B detach · Ctrl+C cancel · PgUp/PgDn scroll"
+    )?;
+    writer.flush()?;
+    refresh_active_footer(renderer, terminal.fullscreen)?;
+    let raw_mode = terminal
+        .interactive
+        .then(RawModeGuard::enable)
+        .transpose()?;
+    let enhanced_keys = terminal
+        .interactive
+        .then(KeyboardEnhancementGuard::enable)
+        .transpose()?;
+
+    while !task.is_finished() {
+        match task.recv_timeout(Duration::from_millis(25)) {
+            Ok(activity) => render_peer_turn_activity(
+                activity,
+                local_name,
+                &remote,
+                renderer,
+                writer,
+                started.elapsed(),
+            )?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if terminal.interactive && poll_terminal_event(Duration::ZERO)? {
+            let event = read_terminal_event()?;
+            if let Some(direction) = active_scroll_direction(&event) {
+                if terminal.fullscreen {
+                    let mut state = terminal
+                        .transcript
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.scroll(direction, terminal.header_rows);
+                    render_transcript_view(&state, renderer, terminal.header_rows)?;
+                    refresh_active_footer(renderer, true)?;
+                }
+            } else if let TerminalEvent::Key(key) = event
+                && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && key.code == TerminalKeyCode::Char('b')
+                && key.modifiers.contains(TerminalModifiers::CONTROL)
+            {
+                drop(enhanced_keys);
+                drop(raw_mode);
+                drop(task);
+                writeln!(
+                    writer,
+                    "  Peer turn detached · it will finish in the background"
+                )?;
+                refresh_active_footer(renderer, terminal.fullscreen)?;
+                return Ok(());
+            } else if let TerminalEvent::Key(key) = event
+                && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && key.code == TerminalKeyCode::Char('c')
+                && key.modifiers.contains(TerminalModifiers::CONTROL)
+            {
+                task.cancel();
+            } else if matches!(event, TerminalEvent::Resize(_, _)) {
+                refresh_active_footer(renderer, terminal.fullscreen)?;
+            }
+        }
+    }
+    while task.recv_timeout(Duration::ZERO).is_ok() {}
+    drop(enhanced_keys);
+    drop(raw_mode);
+    let result = task.finish()?;
+    render_peer_turn_result(&result, local_name, renderer, writer, started.elapsed())?;
+    refresh_active_footer(renderer, terminal.fullscreen)?;
     Ok(())
 }
 
@@ -5602,14 +5891,44 @@ fn format_peer_inbox(pending: Vec<agent_runtime::PeerInboxSummary>) -> String {
     output
 }
 
+fn format_peer_responses(responses: Vec<PeerResponseSummary>) -> String {
+    let mut output = String::from("Local A2A responses · bodies remain unopened\n");
+    if responses.is_empty() {
+        output.push_str("pending  none");
+        return output;
+    }
+    let _ = write!(output, "pending  {}", responses.len());
+    for response in responses {
+        let _ = write!(
+            output,
+            "\n{} · from {} · reply to {} · {}",
+            response.delivery_id,
+            response.sender_instance_id,
+            response.in_reply_to_delivery_id,
+            peer_timestamp(response.enqueued_at_ms)
+        );
+    }
+    output
+}
+
 fn format_peer_inspection(delivery: PeerDeliveryInspection) -> String {
+    let kind = match delivery.kind {
+        PeerInspectionKind::Request => "request",
+        PeerInspectionKind::Response => "response",
+    };
     let mut output = format!(
-        "Pending peer delivery · read only · not accepted\ndelivery  {}\nfrom      {}\nenqueued  {}\nparts     {}",
+        "Pending peer {kind} · read only · not acknowledged\ndelivery  {}\nfrom      {}\nenqueued  {}\nparts     {}",
         delivery.delivery_id,
         delivery.sender_instance_id,
         peer_timestamp(delivery.enqueued_at_ms),
         delivery.parts.len()
     );
+    if let Some(in_reply_to) = delivery.in_reply_to_delivery_id {
+        let _ = write!(output, "\nreply to  {in_reply_to}");
+    }
+    if let Some(state) = delivery.response_state {
+        let _ = write!(output, "\nstate     {state}");
+    }
     for (index, part) in delivery.parts.into_iter().enumerate() {
         let number = index + 1;
         match part {
@@ -5630,7 +5949,7 @@ fn format_peer_inspection(delivery: PeerDeliveryInspection) -> String {
                 let digest = digest.unwrap_or_else(|| "digest unavailable".to_owned());
                 let _ = write!(
                     output,
-                    "\n\nfile {number}\n{filename} · {media_type} · {size} · {digest}"
+                    "\n\nfile {number}\npeer-claimed {filename} · {media_type} · {size} · {digest}"
                 );
             }
         }
@@ -11567,7 +11886,9 @@ mod tests {
         unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
         visible_tool_activity, workspace_read_host, write_bounded_response_delta_for_width,
     };
-    use crate::agent_runtime::{PeerDeliveryInspection, PeerInboxSummary, PeerInspectionPart};
+    use crate::agent_runtime::{
+        PeerDeliveryInspection, PeerInboxSummary, PeerInspectionKind, PeerInspectionPart,
+    };
 
     #[test]
     fn resume_argument_accepts_the_handoff_command() {
@@ -12896,6 +13217,9 @@ mod tests {
             delivery_id: "delivery_0123456789abcdef".to_owned(),
             sender_instance_id: "crumb_0123456789abcdef0123456789abcdef".to_owned(),
             enqueued_at_ms: 1_700_000_000_000,
+            kind: PeerInspectionKind::Request,
+            in_reply_to_delivery_id: None,
+            response_state: None,
             parts: vec![
                 PeerInspectionPart::Text("please review this".to_owned()),
                 PeerInspectionPart::File {
@@ -12907,8 +13231,10 @@ mod tests {
             ],
         });
 
-        assert!(output.contains("read only · not accepted"));
-        assert!(output.contains("notes.txt · text/plain · 42 B · sha256:0123456789ab"));
+        assert!(output.contains("read only · not acknowledged"));
+        assert!(
+            output.contains("peer-claimed notes.txt · text/plain · 42 B · sha256:0123456789ab")
+        );
         assert!(!output.contains("url"));
         assert!(!output.contains("/home/"));
     }

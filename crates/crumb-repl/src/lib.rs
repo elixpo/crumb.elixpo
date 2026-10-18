@@ -212,6 +212,22 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "safely inspect one pending peer delivery",
     },
     SlashCommand {
+        usage: "/peer accept ",
+        description: "run one pending delivery in an isolated peer turn",
+    },
+    SlashCommand {
+        usage: "/peer reject ",
+        description: "reject one pending delivery without invoking a model",
+    },
+    SlashCommand {
+        usage: "/peer responses",
+        description: "list correlated peer responses without opening them",
+    },
+    SlashCommand {
+        usage: "/peer ack ",
+        description: "acknowledge one peer response without opening it",
+    },
+    SlashCommand {
         usage: "/review",
         description: "review Crumb-owned edits",
     },
