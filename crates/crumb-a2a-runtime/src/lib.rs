@@ -14,8 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use crumb_a2a::SendMessageRequest;
 use crumb_a2a_local::{
-    EnqueueReceipt, LocalBus, LocalBusOptions, PeerEntry, ProcessMetadata, ReceivedMessage,
-    Registration, StagedArtifact,
+    EnqueueReceipt, LocalBus, LocalBusOptions, PeerEntry, PendingDeliverySummary, ProcessMetadata,
+    ReceivedMessage, Registration, StagedArtifact,
 };
 use crumb_instance::{InstanceMetadata, InstanceStore};
 
@@ -275,6 +275,30 @@ impl A2aRuntime {
         self.inner.bus.dequeue(&registration)
     }
 
+    /// Lists this runtime's pending deliveries without exposing payload data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after shutdown begins or when registration, queue
+    /// bounds, or a pending envelope is invalid.
+    pub fn list_pending(&self) -> Result<Vec<PendingDeliverySummary>> {
+        self.inner.ensure_running()?;
+        let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
+        self.inner.bus.list_pending(&registration)
+    }
+
+    /// Atomically claims one exact pending delivery by identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after shutdown begins or for invalid/unknown/already
+    /// claimed identifiers, wrong ownership, or unsafe queue storage.
+    pub fn claim_pending(&self, delivery_id: &str) -> Result<ReceivedMessage> {
+        self.inner.ensure_running()?;
+        let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
+        self.inner.bus.claim_pending(&registration, delivery_id)
+    }
+
     /// Acknowledges one claimed delivery.
     ///
     /// # Errors
@@ -518,16 +542,19 @@ mod tests {
         assert_eq!(first.list_peers().expect("first peers").len(), 1);
         assert_eq!(second.list_peers().expect("second peers").len(), 1);
         let first_clone = first.clone();
-        first_clone
+        let receipt = first_clone
             .enqueue(
                 &second_instance.instance_id,
                 &request("msg-1", "hello peer"),
             )
             .expect("enqueue from clone");
+        let pending = second.list_pending().expect("pending summaries");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery_id, receipt.delivery_id);
+        assert_eq!(pending[0].part_count, 1);
         let received = second
-            .dequeue()
-            .expect("dequeue")
-            .expect("received message");
+            .claim_pending(&receipt.delivery_id)
+            .expect("claim exact message");
         assert_eq!(received.sender_instance_id, first_instance.instance_id);
         second
             .acknowledge(&received.delivery_id)

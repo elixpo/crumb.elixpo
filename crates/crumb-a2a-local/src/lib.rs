@@ -183,6 +183,20 @@ pub struct EnqueueReceipt {
     pub recipient_instance_id: String,
 }
 
+/// Content-free receiver view of one pending inbox delivery.
+///
+/// This intentionally omits message text, structured data, filenames, URLs,
+/// media types, metadata, and workspace paths.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingDeliverySummary {
+    pub delivery_id: String,
+    pub sender_instance_id: String,
+    pub recipient_instance_id: String,
+    pub enqueued_at_ms: u64,
+    pub part_count: usize,
+    pub artifact_count: usize,
+}
+
 /// A delivery atomically claimed from an inbox.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReceivedMessage {
@@ -260,6 +274,23 @@ impl DeliveryEnvelope {
             recipient_instance_id: self.recipient_instance_id,
             enqueued_at_ms: self.enqueued_at_ms,
             request: self.request,
+        }
+    }
+
+    fn summary(&self) -> PendingDeliverySummary {
+        PendingDeliverySummary {
+            delivery_id: self.delivery_id.clone(),
+            sender_instance_id: self.sender_instance_id.clone(),
+            recipient_instance_id: self.recipient_instance_id.clone(),
+            enqueued_at_ms: self.enqueued_at_ms,
+            part_count: self.request.message.parts.len(),
+            artifact_count: self
+                .request
+                .message
+                .parts
+                .iter()
+                .filter(|part| part.url.is_some())
+                .count(),
         }
     }
 
@@ -552,30 +583,76 @@ impl LocalBus {
                 continue;
             };
             let target = processing.join(filename);
-            if path_exists_without_following(&target)? {
-                bail!("local A2A delivery is already being processed");
+            if let Some(received) = claim_delivery_file(
+                &source,
+                &target,
+                &pending,
+                &processing,
+                recipient.instance_id(),
+            )? {
+                return Ok(Some(received));
             }
-            match fs::rename(&source, &target) {
-                Ok(()) => {
-                    sync_directory(&pending).context("local A2A pending inbox could not sync")?;
-                    sync_directory(&processing)
-                        .context("local A2A processing inbox could not sync")?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error).context("local A2A delivery could not be claimed"),
-            }
-            let envelope: DeliveryEnvelope =
-                read_required_json(&target, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
-            envelope.validate()?;
-            if target.file_name() != Some(delivery_filename(&envelope.delivery_id)?.as_ref()) {
-                bail!("local A2A delivery filename does not match its identifier");
-            }
-            if envelope.recipient_instance_id != recipient.instance_id() {
-                bail!("local A2A delivery recipient does not match inbox owner");
-            }
-            return Ok(Some(envelope.received()));
         }
         Ok(None)
+    }
+
+    /// Lists pending deliveries for this receiver without returning payloads.
+    ///
+    /// Results are ordered by enqueue timestamp and then delivery identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if ownership, queue bounds, files, identifiers, or any
+    /// queued envelope are invalid.
+    pub fn list_pending(&self, recipient: &Registration) -> Result<Vec<PendingDeliverySummary>> {
+        self.inspect_base_directories()?;
+        self.require_live_owner(recipient, now_ms()?)?;
+        let (pending, _processing, _acknowledged) =
+            self.queue_directories(recipient.instance_id())?;
+        let paths = visible_regular_entries(&pending, MAX_INBOX_MESSAGES, "pending inbox")?;
+        let mut summaries = Vec::with_capacity(paths.len());
+        for path in paths {
+            let envelope: DeliveryEnvelope =
+                read_required_json(&path, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+            envelope.validate()?;
+            validate_queued_envelope(&path, &envelope, recipient.instance_id())?;
+            summaries.push(envelope.summary());
+        }
+        summaries.sort_by(|left, right| {
+            left.enqueued_at_ms
+                .cmp(&right.enqueued_at_ms)
+                .then_with(|| left.delivery_id.cmp(&right.delivery_id))
+        });
+        Ok(summaries)
+    }
+
+    /// Atomically claims one exact pending delivery for this receiver.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid or unknown delivery identifier, wrong
+    /// ownership, unsafe/corrupt queue state, or an already-claimed delivery.
+    pub fn claim_pending(
+        &self,
+        recipient: &Registration,
+        delivery_id: &str,
+    ) -> Result<ReceivedMessage> {
+        self.inspect_base_directories()?;
+        self.require_live_owner(recipient, now_ms()?)?;
+        validate_delivery_id(delivery_id)?;
+        let (pending, processing, _acknowledged) =
+            self.queue_directories(recipient.instance_id())?;
+        let filename = delivery_filename(delivery_id)?;
+        let source = pending.join(&filename);
+        let target = processing.join(filename);
+        claim_delivery_file(
+            &source,
+            &target,
+            &pending,
+            &processing,
+            recipient.instance_id(),
+        )?
+        .context("local A2A pending delivery was not found")
     }
 
     /// Acknowledges and removes a previously claimed delivery.
@@ -802,6 +879,57 @@ impl LocalBus {
         ensure_owner(&entry, registration)?;
         Ok(entry)
     }
+}
+
+fn claim_delivery_file(
+    source: &Path,
+    target: &Path,
+    pending: &Path,
+    processing: &Path,
+    recipient_instance_id: &str,
+) -> Result<Option<ReceivedMessage>> {
+    if path_exists_without_following(target)? {
+        bail!("local A2A delivery is already being processed");
+    }
+    let expected: DeliveryEnvelope =
+        match read_optional_json(source, MAX_ENVELOPE_BYTES, "local A2A delivery")? {
+            Some(envelope) => envelope,
+            None => return Ok(None),
+        };
+    expected.validate()?;
+    validate_queued_envelope(source, &expected, recipient_instance_id)?;
+
+    match fs::rename(source, target) {
+        Ok(()) => {
+            sync_directory(pending).context("local A2A pending inbox could not sync")?;
+            sync_directory(processing).context("local A2A processing inbox could not sync")?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("local A2A delivery could not be claimed"),
+    }
+    let claimed: DeliveryEnvelope =
+        read_required_json(target, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+    claimed.validate()?;
+    validate_queued_envelope(target, &claimed, recipient_instance_id)?;
+    if claimed != expected {
+        bail!("local A2A delivery changed while being claimed");
+    }
+    Ok(Some(claimed.received()))
+}
+
+fn validate_queued_envelope(
+    path: &Path,
+    envelope: &DeliveryEnvelope,
+    recipient_instance_id: &str,
+) -> Result<()> {
+    let filename = delivery_filename(&envelope.delivery_id)?;
+    if path.file_name() != Some(filename.as_ref()) {
+        bail!("local A2A delivery filename does not match its identifier");
+    }
+    if envelope.recipient_instance_id != recipient_instance_id {
+        bail!("local A2A delivery recipient does not match inbox owner");
+    }
+    Ok(())
 }
 
 fn ensure_owner(entry: &PeerEntry, registration: &Registration) -> Result<()> {
@@ -1243,6 +1371,8 @@ fn sync_directory(_directory: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::Duration;
 
     use crumb_a2a::{Message, Part, Role, SendMessageConfiguration};
@@ -1371,6 +1501,91 @@ mod tests {
     }
 
     #[test]
+    fn pending_summaries_are_redacted_and_exact_claim_selects_one_delivery() {
+        let (_temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let first_request = request("msg-summary-1", "private body alpha");
+        let mut second_request = request("msg-summary-2", "private body beta");
+        second_request.message.parts.push(Part::file(
+            "artifacts/sha256-deadbeef/secret-plan.txt",
+            "secret-plan.txt",
+            "text/plain",
+        ));
+        let first_receipt = bus
+            .enqueue(&first_registration, &second.instance_id, &first_request)
+            .expect("first enqueue");
+        let second_receipt = bus
+            .enqueue(&first_registration, &second.instance_id, &second_request)
+            .expect("second enqueue");
+
+        let summaries = bus
+            .list_pending(&second_registration)
+            .expect("pending summaries");
+        assert_eq!(summaries.len(), 2);
+        let artifact_summary = summaries
+            .iter()
+            .find(|summary| summary.delivery_id == second_receipt.delivery_id)
+            .expect("artifact summary");
+        assert_eq!(artifact_summary.part_count, 2);
+        assert_eq!(artifact_summary.artifact_count, 1);
+        let rendered = format!("{summaries:?}");
+        assert!(!rendered.contains("private body"));
+        assert!(!rendered.contains("secret-plan"));
+        assert!(!rendered.contains("artifacts/"));
+
+        let claimed = bus
+            .claim_pending(&second_registration, &second_receipt.delivery_id)
+            .expect("claim exact delivery");
+        assert_eq!(claimed.delivery_id, second_receipt.delivery_id);
+        assert_eq!(claimed.request, second_request);
+        assert!(
+            bus.claim_pending(&second_registration, &second_receipt.delivery_id)
+                .is_err()
+        );
+        let unknown = format!("delivery_{}", "0".repeat(64));
+        assert!(bus.claim_pending(&second_registration, &unknown).is_err());
+        let remaining = bus
+            .list_pending(&second_registration)
+            .expect("remaining summary");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].delivery_id, first_receipt.delivery_id);
+    }
+
+    #[test]
+    fn concurrent_claim_allows_exactly_one_receiver() {
+        let (_temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let receipt = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &request("msg-concurrent", "claim once"),
+            )
+            .expect("enqueue");
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let worker_bus = bus.clone();
+            let worker_registration = second_registration.clone();
+            let worker_delivery = receipt.delivery_id.clone();
+            let worker_barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                worker_barrier.wait();
+                worker_bus.claim_pending(&worker_registration, &worker_delivery)
+            }));
+        }
+        barrier.wait();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("claim worker"))
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert!(
+            bus.claim_pending(&second_registration, &receipt.delivery_id)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn stale_peers_are_filtered_and_cannot_receive_new_messages() {
         let (_temporary, bus, _first, second, first_registration, _second_registration) = setup();
         let path = bus
@@ -1434,6 +1649,7 @@ mod tests {
             b"[]",
         )
         .expect("corrupt queue");
+        assert!(bus.list_pending(&second_registration).is_err());
         assert!(bus.dequeue(&second_registration).is_err());
     }
 
