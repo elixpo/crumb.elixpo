@@ -2,6 +2,11 @@
 
 ## Architecture invariants
 
+- Crumb's native Rust harness is the primary autonomous agent runtime.
+- Pollinations is the default model provider; connected inference is not
+  represented as locally self-hosted.
+- External harnesses are optional compatibility adapters and cannot own
+  Crumb's permissions, tools, memory, sessions, or execution policy.
 - Normal commands never require AI.
 - Bash, Zsh, and PowerShell retain ownership of native shell semantics.
 - The interactive shell and agent execution environments stay separate.

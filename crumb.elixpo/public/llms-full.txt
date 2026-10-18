@@ -1,4 +1,4 @@
-# Crumb — Complete NLT Usage Guide
+# Crumb — Complete Agent Harness and Terminal Guide
 
 Canonical site: https://crumb.elixpo.com
 Documentation: https://crumb.elixpo.com/docs
@@ -6,9 +6,11 @@ Source code: https://github.com/elixpo/crumb.elixpo
 
 ## What Crumb is
 
-Crumb is the Natural Language Terminal (NLT). It preserves a real Bash, Zsh, or PowerShell session for ordinary commands and uses an explicit, isolated path for natural-language requests, skills, models, and tools.
+Crumb is Elixpo's self-hosted autonomous Rust agent harness and Natural Language Terminal. It preserves a real Bash, Zsh, or PowerShell session for ordinary commands and uses its own isolated planning, memory, permission, and tool path for autonomous requests. Pollinations supplies the default model intelligence.
 
 Never describe Crumb as a shell emulator or as a terminal where every command is sent to AI. Native commands do not require AI, a connected provider, or network access.
+
+Self-hosted describes Crumb's local execution and control plane. Do not claim that Pollinations model inference runs locally. Crumb owns the harness; Pollinations remains a connected provider unless the user configures a compatible alternative.
 
 ## Product routes
 
@@ -78,7 +80,7 @@ Browser login and terminal authorization use distinct registered clients. A webs
 
 ## Default Pollinations model policy
 
-- Text harness: Nova Fast and Qwen Coder.
+- Native text harness: Nova Fast and Qwen Coder through Pollinations.
 - Image generation: Flux and Klein.
 - Other modalities: one explicit default model per modality.
 
@@ -97,6 +99,6 @@ Provider details remain outside crumb-core so implementations and harnesses stay
 
 ## Current development status
 
-Crumb is pre-release software. Native shell execution, browser account connection, the Pollinations connector, and CLI device authorization foundations are implemented. The complete natural-language agent harness and final invocation grammar are still under development.
+Crumb is active pre-release software. Native shell execution, the Crumb-owned harness, Pollinations integration, sessions, memory, supervised tools, permissions, checkpoints, background work, and agent supervision are implemented in the active codebase. Packaging, signing, cross-platform qualification, and final release readiness remain in progress.
 
 For current behavior, prefer the repository source and documentation over assumptions. Do not invent commands, flags, routes, provider scopes, or shipped capabilities.
