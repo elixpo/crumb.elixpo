@@ -113,9 +113,7 @@ fn register_shell_tool_inner(
     host.register(descriptor(), shell_tool.clone())?;
     host.register(
         diagnose_descriptor(),
-        Arc::new(DiagnoseLastFailureTool {
-            shell: shell_tool,
-        }),
+        Arc::new(DiagnoseLastFailureTool { shell: shell_tool }),
     )?;
     Ok(())
 }
@@ -346,8 +344,13 @@ fn run_shell(
         ProcessOutcome::Cancelled => bail!("tool call cancelled"),
         ProcessOutcome::TimedOut => {
             let exit_status = "timed_out".to_owned();
-            let text =
-                render_output(&exit_status, &stdout, &stderr, true, config.max_output_bytes);
+            let text = render_output(
+                &exit_status,
+                &stdout,
+                &stderr,
+                true,
+                config.max_output_bytes,
+            );
             let output = render_tool_output(
                 text,
                 true,
@@ -362,8 +365,13 @@ fn run_shell(
             let exit_status = status
                 .code()
                 .map_or_else(|| "signal".to_owned(), |code| code.to_string());
-            let text =
-                render_output(&exit_status, &stdout, &stderr, failed, config.max_output_bytes);
+            let text = render_output(
+                &exit_status,
+                &stdout,
+                &stderr,
+                failed,
+                config.max_output_bytes,
+            );
             let output = render_tool_output(
                 text,
                 failed,
