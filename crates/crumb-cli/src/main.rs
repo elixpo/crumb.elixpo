@@ -15,23 +15,25 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
 use crossterm::cursor::{MoveTo, Show, position as cursor_position};
 use crossterm::event::{
-    Event as TerminalEvent, KeyCode as TerminalKeyCode, KeyEventKind,
-    KeyModifiers as TerminalModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags, poll as poll_terminal_event, read as read_terminal_event,
+    DisableMouseCapture, EnableMouseCapture, Event as TerminalEvent, KeyCode as TerminalKeyCode,
+    KeyEventKind, KeyModifiers as TerminalModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    poll as poll_terminal_event, read as read_terminal_event,
 };
 use crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
     enable_raw_mode, size,
 };
 use crumb_agent::{
-    AgentConfig, AgentMode, BackendDiscovery, CacheRetention, CancellationToken, CommandCatalog,
-    CompatibilityFlag, ConfiguredApprovals, CredentialReference, HarnessConfig, InputRoute, JobId,
-    JobSchedule, JobState, JobStore, LiveConfig, McpServer, McpTransport, MistakePolicy, Modality,
-    ModelRoute, NewJob, OutputKind, PendingApproval, ProviderCompatibility, ProviderConfig,
-    ProviderHeader, ProviderModel, ProviderProtocol, ProviderTransport, RiskClass, RouteDecision,
-    RouteReason, SkillConfig, SteeringAction, SteeringQueue, TokenOptimizer, ToolHost, TurnStatus,
-    UnknownInputPolicy, export_session, list_sessions, search_sessions, session_summary,
-    set_session_archived, set_session_label, trash_session,
+    AgentConfig, AgentMode, ApprovalMode, BackendDiscovery, CacheRetention, CancellationToken,
+    CommandCatalog, CompatibilityFlag, ConfiguredApprovals, CredentialReference, HarnessConfig,
+    InputRoute, JobId, JobSchedule, JobState, JobStore, LiveConfig, McpServer, McpTransport,
+    MistakePolicy, Modality, ModelPack, ModelRoute, NewJob, OutputKind, PendingApproval,
+    ProviderCompatibility, ProviderConfig, ProviderHeader, ProviderModel, ProviderProtocol,
+    ProviderTransport, RiskClass, RouteDecision, RouteReason, SkillConfig, SteeringAction,
+    SteeringQueue, TokenOptimizer, ToolHost, TurnStatus, UnknownInputPolicy, export_session,
+    list_sessions, search_sessions, session_summary, set_session_archived, set_session_label,
+    tool_activity_label, trash_session,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
 use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
@@ -63,19 +65,21 @@ use crumb_profile::{ProfileDocument, ProfileSelectionStore, ProfileStore};
 use crumb_pty::{PtyInput, PtyResizer, SystemPty, TerminalSize};
 use crumb_repl::{ReplOutcome, read_classified_line};
 use crumb_tools::{
-    CheckpointDecision, CheckpointStatus, CheckpointStore, DisposableToolConfig,
+    AgentShellConfig, CheckpointDecision, CheckpointStatus, CheckpointStore, DisposableToolConfig,
     StackDetectionLimits, WebFetchLimits, WorkspaceToolLimits, WorkspaceWriteLimits,
-    register_disposable_tool, register_stack_detection_tool, register_web_fetch_tool,
-    register_workspace_read_tools, register_workspace_write_tool,
+    register_current_time_tool, register_disposable_tool, register_shell_tool_with_optimizer,
+    register_stack_detection_tool, register_web_fetch_tool, register_workspace_read_tools,
+    register_workspace_write_tool,
 };
 use crumb_ui::{GitSegment, PromptContext, Renderer, StartupContext, UiSettings};
 use directories::BaseDirs;
 use nu_ansi_term::{Color, Style};
 use reedline::{
-    Completer, DefaultHinter, EditCommand, Editor, Emacs, FileBackedHistory, Hinter, History,
-    HistoryItem, IdeMenu, KeyCode, KeyModifiers, Menu, MenuBuilder, MenuEvent, MenuSettings,
-    Painter, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
-    ReedlineEvent, ReedlineMenu, Signal, Suggestion, default_emacs_keybindings,
+    Completer, DefaultHinter, EditCommand, EditMode, Editor, Emacs, FileBackedHistory, Hinter,
+    History, HistoryItem, IdeMenu, KeyCode, KeyModifiers, Menu, MenuBuilder, MenuEvent,
+    MenuSettings, Painter, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus,
+    Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent, Signal, Suggestion,
+    default_emacs_keybindings,
 };
 
 mod agent_runtime;
@@ -328,7 +332,7 @@ fn serve_mcp() -> Result<()> {
     let workspace = current_process_dir()?;
     let mut config = read_agent_config(&workspace)?;
     enforce_graphify_pin(&workspace, &mut config);
-    let search_api_key = pollinations_runtime_key();
+    let search_api_key = configured_pollinations_runtime_key(&config);
     let mut host = workspace_read_host(&workspace, &config, search_api_key)?;
     let mut diagnostics = register_stdio_servers(
         &mut host,
@@ -365,7 +369,9 @@ fn serve_mcp() -> Result<()> {
         host,
         Arc::new(
             ConfiguredApprovals::new(config.permissions.allow_network_tools.clone())
+                .with_mode(config.permissions.mode)
                 .with_workspace_tools(config.permissions.allow_workspace_tools.clone())
+                .with_process_tools(config.permissions.allow_execution_tools.clone())
                 .with_mcp_tools(config.permissions.allow_mcp_tools.clone()),
         ),
         config.mode,
@@ -392,6 +398,7 @@ fn workspace_read_host(
     let max_file_write_bytes = usize::try_from(config.limits.max_file_write_bytes)
         .map_err(|_| anyhow!("max_file_write_bytes exceeds this platform's address space"))?;
     let mut host = ToolHost::default();
+    register_current_time_tool(&mut host)?;
     register_workspace_read_tools(
         &mut host,
         workspace,
@@ -417,6 +424,12 @@ fn workspace_read_host(
         workspace,
         disposable_tool_config(config, max_output_bytes),
     )?;
+    register_shell_tool_with_optimizer(
+        &mut host,
+        workspace,
+        shell_tool_config(config, max_output_bytes),
+        Arc::new(configured_optimization_pipeline(config)),
+    )?;
     register_web_fetch_tool(
         &mut host,
         WebFetchLimits {
@@ -424,18 +437,15 @@ fn workspace_read_host(
             max_output_bytes,
         },
     )?;
-    if let Some(route) = config
+    let search_route = config
         .models
         .get(&Modality::WebSearch)
         .and_then(|routes| routes.first())
-        && route.provider == "pollinations"
-        && let Some(api_key) = search_api_key
-        && !api_key.trim().is_empty()
-    {
-        register_web_search_tool(
-            &mut host,
-            PollinationsSearchConfig::new(api_key, max_output_bytes)?.with_model(&route.model),
-        )?;
+        .filter(|route| route.provider == "pollinations");
+    if let Some(api_key) = search_api_key.filter(|key| !key.trim().is_empty()) {
+        let search = PollinationsSearchConfig::new(api_key, max_output_bytes)?;
+        let search = search_route.map_or(search.clone(), |route| search.with_model(&route.model));
+        register_web_search_tool(&mut host, search)?;
     }
     Ok(host)
 }
@@ -463,10 +473,22 @@ fn disposable_tool_config(config: &AgentConfig, max_output_bytes: usize) -> Disp
     }
 }
 
+fn shell_tool_config(config: &AgentConfig, max_output_bytes: usize) -> AgentShellConfig {
+    let disposable = disposable_tool_config(config, max_output_bytes);
+    AgentShellConfig {
+        program: disposable.program,
+        arguments: disposable.arguments,
+        path: disposable.path,
+        command_rewriter: Some(PathBuf::from("rtk")),
+        inherit_environment: config.permissions.mode == ApprovalMode::FullAccess,
+        max_output_bytes: disposable.max_output_bytes,
+        timeout: Duration::from_secs(config.limits.max_shell_command_seconds),
+    }
+}
+
 fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
     let started_at = Instant::now();
-    let stdin = io::stdin();
-    let stdout = io::stdout();
+    let (stdin, stdout) = (io::stdin(), io::stdout());
     let interactive = stdin.is_terminal() && stdout.is_terminal();
     let renderer = Renderer::new(UiSettings::from_environment(interactive));
     let fullscreen = interactive && std::env::var_os("CRUMB_INLINE").is_none();
@@ -481,33 +503,33 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
         (None, resume_agent_runtime(&initial_cwd, resume_session)?);
     let (mut last_exit_code, mut command_context) = (None, SessionCommandContext::default());
     let history = open_history(&mut stdout.lock())?;
-    let completion_workspace = CompletionWorkspace::new(initial_cwd);
-    let header_rows = render_startup(
+    let (header_rows, transcript_state) = initialize_transcript(
         renderer,
         platform,
         interactive,
         fullscreen,
+        &initial_cwd,
+        runtime_context_tokens(agent_runtime.as_ref()),
         &mut stdout.lock(),
     )?;
-    let transcript_state = Arc::new(Mutex::new(TranscriptState::default()));
     let mut line_editor = optional_line_editor(
         interactive,
         history.as_ref(),
-        completion_workspace,
+        CompletionWorkspace::new(initial_cwd),
         renderer,
         header_rows,
         Arc::clone(&transcript_state),
+        fullscreen,
     )?;
     let mut transcript =
-        FullscreenTranscript::new(fullscreen, renderer, header_rows, transcript_state);
+        FullscreenTranscript::new(fullscreen, renderer, header_rows, transcript_state.clone());
     let mut exit_gesture = ExitGesture::default();
 
     loop {
         transcript.capture_cursor();
         let cwd = active_cwd(session.as_ref())?;
-        let terminal_width = size().map_or(80, |(columns, _)| columns);
         let status = prompt_model_status(&cwd);
-        let prompt = render_prompt(renderer, &cwd, platform, last_exit_code, terminal_width);
+        let prompt = render_repl_prompt(renderer, &cwd, platform, last_exit_code);
         transcript.position_composer()?;
         let submission = read_repl_submission(
             line_editor.as_mut(),
@@ -516,11 +538,12 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
             &cwd,
             &prompt,
             &status,
+            fullscreen,
         )?;
         let (event, submitted_input) = match next_repl_action(submission, &mut exit_gesture) {
             ReplLoopAction::Input(event, input) => (event, input),
-            ReplLoopAction::Scroll(direction) => {
-                transcript.scroll(direction)?;
+            ReplLoopAction::Transcript(action) => {
+                transcript.apply(action)?;
                 continue;
             }
             ReplLoopAction::Continue => continue,
@@ -549,11 +572,14 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
                 writer: &mut writer,
                 last_exit_code: &mut last_exit_code,
                 command_context: &mut command_context,
+                transcript: &transcript_state,
+                header_rows,
             };
             dispatch_repl_event(event, &mut context)?
         };
         writer.flush()?;
-        transcript.record_output(&writer.into_capture());
+        transcript.record_output(&writer.into_capture())?;
+        transcript.refresh_context_header(platform, &cwd, agent_runtime.as_ref())?;
         match outcome {
             Some(ReplOutcome::Exit) => {
                 return finish_managed_repl(screen, renderer, started_at, agent_runtime.as_ref());
@@ -562,6 +588,21 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
             None => {}
         }
     }
+}
+
+fn render_repl_prompt(
+    renderer: Renderer,
+    cwd: &Path,
+    platform: Platform,
+    last_exit_code: Option<i32>,
+) -> String {
+    render_prompt(
+        renderer,
+        cwd,
+        platform,
+        last_exit_code,
+        size().map_or(80, |(columns, _)| columns),
+    )
 }
 
 fn dispatch_repl_event(
@@ -574,7 +615,10 @@ fn dispatch_repl_event(
             writeln!(
                 context.writer,
                 "{}",
-                context.renderer.command_error(&error.to_string())
+                context.renderer.command_error_for_width(
+                    &error.to_string(),
+                    size().map_or(80, |(columns, _)| columns),
+                )
             )?;
             Ok(None)
         }
@@ -598,7 +642,11 @@ fn handle_repl_event(
         InputEvent::BuiltIn(command)
             if matches!(&command, BuiltInCommand::Auth(AuthAction::Login)) =>
         {
-            writeln!(context.writer, "{}", context.renderer.agent_response(""))?;
+            writeln!(
+                context.writer,
+                "{}",
+                terminal_agent_response(context.renderer, "")
+            )?;
             handle_builtin(
                 command,
                 context.session,
@@ -625,7 +673,7 @@ fn handle_repl_event(
                 writeln!(
                     context.writer,
                     "{}",
-                    context.renderer.agent_response(output.trim_end())
+                    terminal_agent_response(context.renderer, output.trim_end())
                 )?;
             }
             Ok(outcome)
@@ -638,6 +686,7 @@ fn handle_repl_event(
 enum ReplSubmission {
     Input(InputEvent, Option<String>),
     Scroll(TranscriptScroll),
+    ToggleToolOutput(u16),
     Interrupt,
     Retry,
     Exit,
@@ -645,7 +694,7 @@ enum ReplSubmission {
 
 enum ReplLoopAction {
     Input(InputEvent, Option<String>),
-    Scroll(TranscriptScroll),
+    Transcript(TranscriptAction),
     Continue,
     Exit,
 }
@@ -656,7 +705,12 @@ fn next_repl_action(submission: ReplSubmission, exit_gesture: &mut ExitGesture) 
             exit_gesture.reset();
             ReplLoopAction::Input(event, input)
         }
-        ReplSubmission::Scroll(direction) => ReplLoopAction::Scroll(direction),
+        ReplSubmission::Scroll(direction) => {
+            ReplLoopAction::Transcript(TranscriptAction::Scroll(direction))
+        }
+        ReplSubmission::ToggleToolOutput(row) => {
+            ReplLoopAction::Transcript(TranscriptAction::ToggleToolOutput(row))
+        }
         ReplSubmission::Interrupt if exit_gesture.register_interrupt() => ReplLoopAction::Exit,
         ReplSubmission::Interrupt => ReplLoopAction::Continue,
         ReplSubmission::Retry => {
@@ -671,6 +725,12 @@ fn next_repl_action(submission: ReplSubmission, exit_gesture: &mut ExitGesture) 
 enum TranscriptScroll {
     Up,
     Down,
+}
+
+#[derive(Clone, Copy)]
+enum TranscriptAction {
+    Scroll(TranscriptScroll),
+    ToggleToolOutput(u16),
 }
 
 #[derive(Default)]
@@ -729,9 +789,21 @@ impl FullscreenTranscript {
         }
     }
 
+    fn apply(&mut self, action: TranscriptAction) -> io::Result<()> {
+        match action {
+            TranscriptAction::Scroll(direction) => self.scroll(direction),
+            TranscriptAction::ToggleToolOutput(row) => self.toggle_tool_output(row),
+        }
+    }
+
     fn position_composer(&self) -> io::Result<()> {
         if self.enabled {
             position_composer(self.renderer, self.header_rows)?;
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            render_transcript_footer(&state, self.renderer, self.header_rows)?;
         }
         Ok(())
     }
@@ -748,23 +820,29 @@ impl FullscreenTranscript {
                 self.started,
             )?;
             if let Some(rendered) = rendered {
-                self.state
+                let mut state = self
+                    .state
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .append(&rendered);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.append(&rendered);
+                render_transcript_view(&state, self.renderer, self.header_rows)?;
+                position_after_transcript(&state, self.header_rows)?;
             }
             self.started = true;
         }
         Ok(())
     }
 
-    fn record_output(&mut self, output: &[u8]) {
+    fn record_output(&mut self, output: &[u8]) -> io::Result<()> {
         if self.enabled && !output.is_empty() {
-            self.state
+            let mut state = self
+                .state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .append(&String::from_utf8_lossy(output));
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.append(&String::from_utf8_lossy(output));
+            render_transcript_view(&state, self.renderer, self.header_rows)?;
         }
+        Ok(())
     }
 
     fn scroll(&mut self, direction: TranscriptScroll) -> io::Result<()> {
@@ -776,30 +854,174 @@ impl FullscreenTranscript {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.scroll(direction, self.header_rows);
-        render_transcript_view(&state, self.header_rows)
+        render_transcript_view(&state, self.renderer, self.header_rows)
+    }
+
+    fn toggle_tool_output(&mut self, row: u16) -> io::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let (top, bottom, _, _) = fullscreen_rows(self.header_rows)?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.toggle_tool_output_at(row, top, bottom) {
+            render_transcript_view(&state, self.renderer, self.header_rows)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_context_header(
+        &self,
+        platform: Platform,
+        cwd: &Path,
+        runtime: Option<&AgentRuntime>,
+    ) -> Result<()> {
+        refresh_context_footer(
+            self.renderer,
+            platform,
+            cwd,
+            runtime_context_tokens(runtime),
+            self.enabled,
+            &self.state,
+            self.header_rows,
+        )
     }
 }
 
 #[derive(Default)]
 struct TranscriptState {
-    lines: VecDeque<String>,
+    lines: VecDeque<TranscriptLine>,
+    tool_outputs: BTreeMap<u64, CollapsibleToolOutput>,
+    next_tool_output_id: u64,
     scroll_offset: usize,
+    unseen_lines: usize,
+    footer_context: String,
+}
+
+struct TranscriptLine {
+    text: String,
+    tool_output: Option<ToolOutputLine>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ToolOutputLine {
+    Header(u64),
+    Body(u64),
+}
+
+struct CollapsibleToolOutput {
+    collapsed_header: String,
+    expanded_header: String,
+    body: Vec<String>,
+    expanded: bool,
+}
+
+impl TranscriptLine {
+    fn plain(text: String) -> Self {
+        Self {
+            text,
+            tool_output: None,
+        }
+    }
 }
 
 impl TranscriptState {
     const MAX_LINES: usize = 4_096;
-    const SCROLL_STEP: usize = 1;
+    const SCROLL_STEP: usize = 8;
 
-    fn append(&mut self, output: &str) {
-        self.scroll_offset = 0;
-        self.lines.extend(
-            sanitize_transcript_output(output)
-                .split('\n')
-                .map(str::to_owned),
+    fn append(&mut self, output: &str) -> bool {
+        let appended = sanitize_transcript_output(output)
+            .split('\n')
+            .map(|line| TranscriptLine::plain(line.to_owned()))
+            .collect::<Vec<_>>();
+        self.append_lines(appended)
+    }
+
+    fn append_tool_output(
+        &mut self,
+        collapsed_header: String,
+        expanded_header: String,
+        body: Vec<String>,
+    ) -> bool {
+        let id = self.next_tool_output_id;
+        self.next_tool_output_id = self.next_tool_output_id.saturating_add(1);
+        self.tool_outputs.insert(
+            id,
+            CollapsibleToolOutput {
+                collapsed_header: collapsed_header.clone(),
+                expanded_header,
+                body,
+                expanded: false,
+            },
         );
+        self.append_lines(vec![TranscriptLine {
+            text: collapsed_header,
+            tool_output: Some(ToolOutputLine::Header(id)),
+        }])
+    }
+
+    fn append_lines(&mut self, appended: Vec<TranscriptLine>) -> bool {
+        let appended_lines = appended.len();
+        let preserve_viewport = self.scroll_offset > 0;
+        if preserve_viewport {
+            self.scroll_offset = self.scroll_offset.saturating_add(appended_lines);
+            self.unseen_lines = self.unseen_lines.saturating_add(appended_lines);
+        } else {
+            self.unseen_lines = 0;
+        }
+        self.lines.extend(appended);
         while self.lines.len() > Self::MAX_LINES {
             self.lines.pop_front();
         }
+        self.scroll_offset = self.scroll_offset.min(self.lines.len().saturating_sub(1));
+        preserve_viewport
+    }
+
+    fn toggle_tool_output_at(&mut self, row: u16, top: u16, bottom: u16) -> bool {
+        if row < top || row > bottom {
+            return false;
+        }
+        let height = bottom.saturating_sub(top) as usize + 1;
+        let end = self.lines.len().saturating_sub(self.scroll_offset);
+        let start = end.saturating_sub(height);
+        let index = start.saturating_add(usize::from(row.saturating_sub(top)));
+        let Some(ToolOutputLine::Header(id)) =
+            self.lines.get(index).and_then(|line| line.tool_output)
+        else {
+            return false;
+        };
+        let Some(block) = self.tool_outputs.get_mut(&id) else {
+            return false;
+        };
+        block.expanded = !block.expanded;
+        self.lines[index].text = if block.expanded {
+            block.expanded_header.clone()
+        } else {
+            block.collapsed_header.clone()
+        };
+        if block.expanded {
+            for (offset, text) in block.body.iter().cloned().enumerate() {
+                self.lines.insert(
+                    index.saturating_add(offset).saturating_add(1),
+                    TranscriptLine {
+                        text,
+                        tool_output: Some(ToolOutputLine::Body(id)),
+                    },
+                );
+            }
+        } else {
+            while self
+                .lines
+                .get(index + 1)
+                .is_some_and(|line| line.tool_output == Some(ToolOutputLine::Body(id)))
+            {
+                self.lines.remove(index + 1);
+            }
+        }
+        self.scroll_offset = self.scroll_offset.min(self.lines.len().saturating_sub(1));
+        true
     }
 
     fn scroll(&mut self, direction: TranscriptScroll, header_rows: u16) {
@@ -814,6 +1036,9 @@ impl TranscriptState {
                 .min(maximum),
             TranscriptScroll::Down => self.scroll_offset.saturating_sub(Self::SCROLL_STEP),
         };
+        if self.scroll_offset == 0 {
+            self.unseen_lines = 0;
+        }
     }
 }
 
@@ -902,6 +1127,7 @@ fn read_repl_submission(
     cwd: &Path,
     prompt: &str,
     status: &str,
+    fullscreen: bool,
 ) -> Result<ReplSubmission> {
     let Some(editor) = editor else {
         let mut writer = stdout.lock();
@@ -913,9 +1139,11 @@ fn read_repl_submission(
             }));
     };
     editor.workspace.set(cwd);
-    let signal = editor
-        .editor
-        .read_line(&CrumbPrompt::new(prompt.to_owned(), format!("{status}  ")))?;
+    let signal = editor.editor.read_line(&CrumbPrompt::new(
+        prompt.to_owned(),
+        format!("{status}  "),
+        fullscreen,
+    ))?;
     Ok(match signal {
         Signal::Success(command) => {
             ReplSubmission::Input(crumb_repl::classify_input(&command), Some(command))
@@ -928,6 +1156,11 @@ fn read_repl_submission(
         Signal::HostCommand(command) if command == "crumb:transcript-down" => {
             ReplSubmission::Scroll(TranscriptScroll::Down)
         }
+        Signal::HostCommand(command) if command.starts_with("crumb:toggle-tool-output:") => command
+            .rsplit(':')
+            .next()
+            .and_then(|row| row.parse::<u16>().ok())
+            .map_or(ReplSubmission::Retry, ReplSubmission::ToggleToolOutput),
         _ => ReplSubmission::Retry,
     })
 }
@@ -974,29 +1207,30 @@ fn render_startup(
     platform: Platform,
     interactive: bool,
     fullscreen: bool,
+    context_tokens: u64,
     writer: &mut dyn Write,
 ) -> Result<u16> {
     let cwd = current_process_dir()?;
     let config = read_agent_config(&cwd).unwrap_or_default();
-    let model = config
-        .models
-        .get(&Modality::Text)
-        .and_then(|routes| routes.first())
-        .map(|route| format!("{}/{}", route.provider, route.model));
     let text_route = config
         .models
         .get(&Modality::Text)
         .and_then(|routes| routes.first());
+    let pack = text_route.map(|_| active_pack_label(&config));
     let startup = StartupContext {
         version: env!("CARGO_PKG_VERSION"),
         platform,
-        model: model.as_deref(),
+        model: pack,
         mode: agent_mode_name(config.mode),
-        effort: text_route.and_then(|route| config.reasoning_effort_for(route)),
+        effort: Some(
+            text_route
+                .and_then(|route| config.reasoning_effort_for(route))
+                .map_or("default", effort_display_name),
+        ),
         session_budget_tokens: context_token_budget(&config, text_route),
-        context_tokens: 0,
+        context_tokens,
         auto_compaction: matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
-        agent_configured: config.harness.is_some() && model.is_some(),
+        agent_configured: config.harness.is_some() && text_route.is_some(),
     };
     let terminal_width = if interactive {
         size().map_or(100, |(columns, _)| columns)
@@ -1013,8 +1247,13 @@ fn render_startup(
             writeln!(writer)?;
         }
         writeln!(writer, "{welcome}")?;
-        let content_rows = u16::try_from(welcome.lines().count()).unwrap_or(u16::MAX);
-        return Ok(content_rows.saturating_add(FULLSCREEN_TOP_GUTTER));
+        writeln!(
+            writer,
+            "{}{}",
+            " ".repeat(usize::from(FULLSCREEN_SIDE_GUTTER)),
+            renderer.transcript_divider(content_width)
+        )?;
+        return Ok(0);
     }
     let branding = renderer.branding_for_width(terminal_width);
     if !branding.is_empty() {
@@ -1025,6 +1264,109 @@ fn render_startup(
         )?;
     }
     Ok(0)
+}
+
+fn initialize_transcript(
+    renderer: Renderer,
+    platform: Platform,
+    interactive: bool,
+    fullscreen: bool,
+    cwd: &Path,
+    context_tokens: u64,
+    writer: &mut dyn Write,
+) -> Result<(u16, Arc<Mutex<TranscriptState>>)> {
+    let (header_rows, startup_transcript) = if fullscreen {
+        let mut startup = Vec::new();
+        let header_rows = render_startup(
+            renderer,
+            platform,
+            interactive,
+            true,
+            context_tokens,
+            &mut startup,
+        )?;
+        writer.write_all(&startup)?;
+        (
+            header_rows,
+            Some(String::from_utf8_lossy(&startup).into_owned()),
+        )
+    } else {
+        (
+            render_startup(
+                renderer,
+                platform,
+                interactive,
+                false,
+                context_tokens,
+                writer,
+            )?,
+            None,
+        )
+    };
+    let mut state = TranscriptState {
+        footer_context: context_footer_status(renderer, platform, cwd, context_tokens),
+        ..TranscriptState::default()
+    };
+    if let Some(startup) = startup_transcript {
+        state.append(startup.trim_end_matches('\n'));
+        render_transcript_view(&state, renderer, header_rows)?;
+    }
+    Ok((header_rows, Arc::new(Mutex::new(state))))
+}
+
+fn refresh_context_footer(
+    renderer: Renderer,
+    platform: Platform,
+    cwd: &Path,
+    context_tokens: u64,
+    fullscreen: bool,
+    transcript: &Arc<Mutex<TranscriptState>>,
+    header_rows: u16,
+) -> Result<()> {
+    if !fullscreen {
+        return Ok(());
+    }
+    let footer = context_footer_status(renderer, platform, cwd, context_tokens);
+    let mut state = transcript
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.footer_context = footer;
+    render_transcript_footer(&state, renderer, header_rows)?;
+    Ok(())
+}
+
+fn context_footer_status(
+    renderer: Renderer,
+    platform: Platform,
+    cwd: &Path,
+    context_tokens: u64,
+) -> String {
+    let config = read_agent_config(cwd).unwrap_or_default();
+    let text_route = config
+        .models
+        .get(&Modality::Text)
+        .and_then(|routes| routes.first());
+    let pack = text_route.map(|_| active_pack_label(&config));
+    let startup = StartupContext {
+        version: env!("CARGO_PKG_VERSION"),
+        platform,
+        model: pack,
+        mode: agent_mode_name(config.mode),
+        effort: Some(
+            text_route
+                .and_then(|route| config.reasoning_effort_for(route))
+                .map_or("default", effort_display_name),
+        ),
+        session_budget_tokens: context_token_budget(&config, text_route),
+        context_tokens,
+        auto_compaction: matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
+        agent_configured: config.harness.is_some() && text_route.is_some(),
+    };
+    renderer.context_footer(&startup, size().map_or(100, |(columns, _)| columns))
+}
+
+fn runtime_context_tokens(runtime: Option<&AgentRuntime>) -> u64 {
+    runtime.map_or(0, |runtime| runtime.token_usage().0)
 }
 
 fn confirm_folder_trust(renderer: Renderer, workspace: &Path, fullscreen: bool) -> Result<bool> {
@@ -1183,13 +1525,25 @@ impl SessionCommandContext {
 
 fn configured_optimization_pipeline(config: &AgentConfig) -> OptimizationPipeline {
     let timeout = Duration::from_secs(2);
-    let optimizers = config
+    let mut optimizers = config
         .optimizers
         .iter()
         .filter_map(|configured| RtkOptimizer::from_config(configured, timeout))
         .map(|optimizer| Box::new(optimizer) as Box<dyn TokenOptimizer>)
-        .collect();
+        .collect::<Vec<_>>();
+    if should_auto_enable_rtk(config)
+        && let Ok(optimizer) = RtkOptimizer::new(PathBuf::from("rtk"), Vec::new(), timeout)
+    {
+        optimizers.push(Box::new(optimizer));
+    }
     OptimizationPipeline::new(optimizers)
+}
+
+fn should_auto_enable_rtk(config: &AgentConfig) -> bool {
+    !config
+        .optimizers
+        .iter()
+        .any(|optimizer| optimizer.id.eq_ignore_ascii_case("rtk"))
 }
 
 fn command_looks_sensitive(command: &str) -> bool {
@@ -1214,17 +1568,39 @@ fn command_looks_sensitive(command: &str) -> bool {
 }
 
 fn strip_terminal_controls(input: &str) -> String {
+    sanitize_terminal_text(input, false)
+}
+
+fn sanitize_terminal_text(input: &str, preserve_sgr: bool) -> String {
     let mut output = String::with_capacity(input.len());
     let mut characters = input.chars().peekable();
     while let Some(character) = characters.next() {
-        if character == '\x1b' {
-            if characters.next_if_eq(&'[').is_some() {
-                for sequence in characters.by_ref() {
-                    if ('@'..='~').contains(&sequence) {
-                        break;
+        if character == '\x1b' && characters.next_if_eq(&'[').is_some() {
+            let mut sequence = String::from("\x1b[");
+            for sequence_character in characters.by_ref() {
+                sequence.push(sequence_character);
+                if ('@'..='~').contains(&sequence_character) {
+                    if preserve_sgr && sequence_character == 'm' {
+                        output.push_str(&sequence);
                     }
+                    break;
                 }
             }
+            continue;
+        }
+        if (character == '\x1b' && characters.next_if_eq(&']').is_some()) || character == '\u{009d}'
+        {
+            while let Some(sequence_character) = characters.next() {
+                if sequence_character == '\x07' || sequence_character == '\u{009c}' {
+                    break;
+                }
+                if sequence_character == '\x1b' && characters.next_if_eq(&'\\').is_some() {
+                    break;
+                }
+            }
+            continue;
+        }
+        if character == '\x1b' {
             continue;
         }
         if character == '\n' || character == '\t' || !character.is_control() {
@@ -1311,22 +1687,36 @@ struct InputContext<'a> {
     writer: &'a mut dyn Write,
     last_exit_code: &'a mut Option<i32>,
     command_context: &'a mut SessionCommandContext,
+    transcript: &'a Arc<Mutex<TranscriptState>>,
+    header_rows: u16,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct AgentTerminal {
     interactive: bool,
     fullscreen: bool,
+    transcript: Arc<Mutex<TranscriptState>>,
+    header_rows: u16,
+}
+
+impl AgentTerminal {
+    fn from_input(context: &InputContext<'_>) -> Self {
+        Self {
+            interactive: context.interactive,
+            fullscreen: context.fullscreen,
+            transcript: Arc::clone(context.transcript),
+            header_rows: context.header_rows,
+        }
+    }
 }
 
 fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<ReplOutcome>> {
-    let agent_config = load_effective_agent_config(context.cwd, context.writer)?;
-    let mut decision = context
-        .command_catalog
-        .route(command, &agent_config.routing);
+    let mut agent_config = load_effective_agent_config(context.cwd, context.writer)?;
+    let mut decision = route_with_conversation_context(command, context, &mut agent_config)?;
     if !matches!(decision.route, InputRoute::Native) {
         prepare_agent_context(&mut decision, context, &agent_config)?;
         let decision = context.command_context.attach_to(decision, &agent_config);
+        let terminal = AgentTerminal::from_input(context);
         handle_agent_boundary(
             &decision,
             &agent_config,
@@ -1334,10 +1724,7 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
             context.agent_runtime,
             context.renderer,
             context.writer,
-            AgentTerminal {
-                interactive: context.interactive,
-                fullscreen: context.fullscreen,
-            },
+            &terminal,
         )?;
         record_history(
             context.history,
@@ -1390,6 +1777,7 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
                     failed_command_recovery(command, completion.exit_code),
                     &agent_config,
                 );
+                let terminal = AgentTerminal::from_input(context);
                 handle_agent_boundary(
                     &recovery,
                     &agent_config,
@@ -1397,10 +1785,7 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
                     context.agent_runtime,
                     context.renderer,
                     context.writer,
-                    AgentTerminal {
-                        interactive: context.interactive,
-                        fullscreen: context.fullscreen,
-                    },
+                    &terminal,
                 )?;
             }
             Ok(None)
@@ -1418,6 +1803,77 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
             Ok(Some(ReplOutcome::Exit))
         }
     }
+}
+
+fn route_with_conversation_context(
+    command: &str,
+    context: &mut InputContext<'_>,
+    agent_config: &mut AgentConfig,
+) -> Result<RouteDecision> {
+    let confirmation_reply = context
+        .agent_runtime
+        .as_ref()
+        .and_then(AgentRuntime::last_response)
+        .is_some_and(response_requests_confirmation)
+        && is_confirmation_reply(command);
+    if confirmation_reply
+        && is_affirmative_reply(command)
+        && matches!(agent_config.mode, AgentMode::Plan)
+    {
+        update_agent_config(context.cwd, |config| {
+            config.mode = AgentMode::Auto;
+            Ok(())
+        })?;
+        agent_config.mode = AgentMode::Auto;
+        writeln!(context.writer, "◆ Mode · execution (auto)")?;
+    }
+    let routed_input = if confirmation_reply {
+        format!(": {command}")
+    } else {
+        command.to_owned()
+    };
+    Ok(context
+        .command_catalog
+        .route(&routed_input, &agent_config.routing))
+}
+
+fn is_confirmation_reply(input: &str) -> bool {
+    matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+            | "n"
+            | "no"
+            | "continue"
+            | "proceed"
+            | "go ahead"
+            | "do it"
+            | "run it"
+            | "execute it"
+    )
+}
+
+fn is_affirmative_reply(input: &str) -> bool {
+    matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes" | "continue" | "proceed" | "go ahead" | "do it" | "run it" | "execute it"
+    )
+}
+
+fn response_requests_confirmation(response: &str) -> bool {
+    let response = response.to_ascii_lowercase();
+    [
+        "should i proceed",
+        "shall i proceed",
+        "would you like me to proceed",
+        "do you want me to proceed",
+        "would you like me to continue",
+        "do you want me to continue",
+        "would you like me to run",
+        "do you want me to run",
+        "ready to proceed",
+    ]
+    .iter()
+    .any(|phrase| response.contains(phrase))
 }
 
 fn prepare_agent_context(
@@ -1491,6 +1947,8 @@ fn load_effective_agent_config(cwd: &Path, writer: &mut dyn Write) -> Result<Age
 fn read_agent_config(cwd: &Path) -> Result<AgentConfig> {
     let (path, config_root) = agent_config_location(cwd);
     let mut config = LiveConfig::new(path).load_or_default()?;
+    bundled_skills::apply_defaults(&mut config);
+    apply_builtin_model_packs(&mut config);
     if let Some(HarnessConfig::Process {
         command, cordis, ..
     }) = &mut config.harness
@@ -1529,7 +1987,7 @@ fn handle_agent_boundary(
     runtime: &mut Option<AgentRuntime>,
     renderer: Renderer,
     writer: &mut dyn Write,
-    terminal: AgentTerminal,
+    terminal: &AgentTerminal,
 ) -> Result<()> {
     if matches!(decision.route, InputRoute::Native) {
         unreachable!("native input is handled by the shell path");
@@ -1538,28 +1996,26 @@ fn handle_agent_boundary(
         .models
         .get(&Modality::Text)
         .and_then(|routes| routes.first());
-    let model = route.map_or("not configured".to_owned(), |route| {
-        format!("{}/{}", route.provider, route.model)
-    });
-    let effort = route.and_then(|route| config.reasoning_effort_for(route));
-    let loaded_skills = config
-        .skills
-        .iter()
-        .filter(|skill| skill.enabled)
-        .map(|skill| skill.id.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let pack = active_pack_label(config);
+    let effort = Some(
+        route
+            .and_then(|route| config.reasoning_effort_for(route))
+            .map_or("default", effort_display_name),
+    );
+    write!(writer, "\r\x1b[2K")?;
     writeln!(
         writer,
         "{}",
-        renderer.agent_header(
-            &model,
+        renderer.agent_header_for_width(
+            pack,
             effort,
             agent_mode_name(config.mode),
-            (!loaded_skills.is_empty()).then_some(loaded_skills.as_str()),
+            None,
+            size().map_or(80, |(columns, _)| columns),
         )
     )?;
     writer.flush()?;
+    refresh_active_footer(renderer, terminal.fullscreen)?;
     if runtime.is_none() {
         match AgentRuntime::new() {
             Ok(created) => *runtime = Some(created),
@@ -1567,7 +2023,11 @@ fn handle_agent_boundary(
                 writeln!(
                     writer,
                     "{}",
-                    renderer.agent_error(&error.to_string(), false)
+                    renderer.agent_error_for_width(
+                        &error.to_string(),
+                        false,
+                        size().map_or(80, |(columns, _)| columns),
+                    )
                 )?;
                 return Ok(());
             }
@@ -1600,25 +2060,81 @@ fn render_agent_result(
                 matches!(reason, "error" | "failed" | "cancelled" | "canceled")
             }) =>
         {
-            writeln!(writer, "{}", renderer.agent_response(""))?;
+            writeln!(writer, "{}", terminal_agent_response(renderer, ""))?;
         }
         Ok(_) if visible.as_deref().is_none_or(str::is_empty) => {
             writeln!(
                 writer,
                 "{}",
-                renderer.agent_response("Turn completed without a text response.")
+                terminal_agent_response(renderer, "Turn completed without a text response.")
             )?;
         }
         Ok(_) => writeln!(
             writer,
             "{}",
-            renderer.agent_response(visible.as_deref().unwrap_or_default())
+            terminal_agent_response(renderer, visible.as_deref().unwrap_or_default())
         )?,
         Err(error) => {
             let message = error.to_string();
             let cancelled = message.to_ascii_lowercase().contains("cancel");
-            writeln!(writer, "{}", renderer.agent_error(&message, cancelled))?;
+            writeln!(
+                writer,
+                "{}",
+                renderer.agent_error_for_width(
+                    &message,
+                    cancelled,
+                    size().map_or(80, |(columns, _)| columns),
+                )
+            )?;
         }
+    }
+    Ok(())
+}
+
+fn terminal_agent_response(renderer: Renderer, response: &str) -> String {
+    let terminal_width = size().map_or(80, |(columns, _)| columns);
+    renderer.agent_response_for_width(response, terminal_width)
+}
+
+fn terminal_tool_output(renderer: Renderer, content: &str) -> String {
+    let terminal_width = size().map_or(80, |(columns, _)| columns);
+    renderer.agent_tool_output_for_width(content, terminal_width)
+}
+
+fn write_bounded_response_delta(
+    writer: &mut dyn Write,
+    text: &str,
+    column: &mut usize,
+) -> io::Result<()> {
+    let terminal_width = size().map_or(80, |(columns, _)| columns);
+    write_bounded_response_delta_for_width(writer, text, column, terminal_width)
+}
+
+fn write_bounded_response_delta_for_width(
+    writer: &mut dyn Write,
+    text: &str,
+    column: &mut usize,
+    terminal_width: u16,
+) -> io::Result<()> {
+    const RESPONSE_INDENT: &str = "        ";
+    let right_boundary = usize::from(terminal_width.saturating_sub(2)).max(9);
+    for character in text.chars() {
+        if character == '\n' {
+            write!(writer, "\n{RESPONSE_INDENT}")?;
+            *column = RESPONSE_INDENT.len();
+            continue;
+        }
+        let width = if character == '\t' { 4 } else { 1 };
+        if column.saturating_add(width) > right_boundary {
+            write!(writer, "\n{RESPONSE_INDENT}")?;
+            *column = RESPONSE_INDENT.len();
+        }
+        if character == '\t' {
+            write!(writer, "    ")?;
+        } else {
+            write!(writer, "{character}")?;
+        }
+        *column = column.saturating_add(width);
     }
     Ok(())
 }
@@ -1630,7 +2146,7 @@ fn execute_agent_sequence(
     runtime: &mut Option<AgentRuntime>,
     renderer: Renderer,
     writer: &mut dyn Write,
-    terminal: AgentTerminal,
+    terminal: &AgentTerminal,
 ) -> Result<()> {
     let activity_capacity = usize::try_from(config.limits.max_activity_events)
         .context("max_activity_events exceeds this platform's address space")?;
@@ -1641,6 +2157,7 @@ fn execute_agent_sequence(
     let mut steering = SteeringQueue::new(steering_messages, steering_bytes)?;
     let mut request = initial_request;
     let mut active_runtime = runtime.take().context("agent runtime is unavailable")?;
+    let mut live_context_tokens = active_runtime.token_usage().0;
     loop {
         let session_id = active_runtime.prepare_local_job(config.mode, workspace)?;
         let persisted_request = request.clone();
@@ -1651,18 +2168,23 @@ fn execute_agent_sequence(
             workspace.to_path_buf(),
             activity_capacity,
         )?;
-        let (returned_runtime, result, interruption) = loop {
+        let (returned_runtime, result, interruption, streamed_response) = loop {
+            let mut active_context = ActiveTurnContext {
+                terminal,
+                workspace,
+                live_context_tokens: &mut live_context_tokens,
+            };
             match observe_agent_turn(
                 task,
                 &mut steering,
                 steering_bytes,
                 renderer,
                 writer,
-                terminal,
-                initial_activity,
+                &initial_activity,
+                &mut active_context,
             )? {
-                TurnObservation::Finished(runtime, result, interruption) => {
-                    break (*runtime, result, interruption);
+                TurnObservation::Finished(runtime, result, interruption, streamed_response) => {
+                    break (*runtime, result, interruption, streamed_response);
                 }
                 TurnObservation::Backgrounded(returned_task) => {
                     match promote_agent_turn(
@@ -1689,9 +2211,11 @@ fn execute_agent_sequence(
             }
         };
         active_runtime = returned_runtime;
+        live_context_tokens = active_runtime.token_usage().0;
         match finish_agent_turn(
             &result,
             interruption,
+            streamed_response,
             &persisted_request,
             &mut AgentTurnUi {
                 steering: &mut steering,
@@ -1736,12 +2260,13 @@ struct AgentTurnUi<'a> {
     steering_bytes: usize,
     renderer: Renderer,
     writer: &'a mut dyn Write,
-    terminal: AgentTerminal,
+    terminal: &'a AgentTerminal,
 }
 
 fn finish_agent_turn(
     result: &Result<crumb_harness_dsh::RunResult>,
     interruption: TurnInterruption,
+    streamed_response: bool,
     persisted_request: &str,
     ui: &mut AgentTurnUi<'_>,
 ) -> Result<AgentSequenceStep> {
@@ -1750,8 +2275,7 @@ fn finish_agent_turn(
             writeln!(
                 ui.writer,
                 "{}",
-                ui.renderer
-                    .agent_response("Steering to your latest instruction.")
+                terminal_agent_response(ui.renderer, "Steering to your latest instruction.")
             )?;
             Ok(AgentSequenceStep::RunFollowUps)
         }
@@ -1769,7 +2293,11 @@ fn finish_agent_turn(
             PausedTurnAction::Cancel => Ok(AgentSequenceStep::Stop),
         },
         TurnInterruption::None | TurnInterruption::Paused => {
-            render_agent_result(result, ui.renderer, ui.writer)?;
+            if streamed_response && result.is_ok() && !ui.terminal.fullscreen {
+                writeln!(ui.writer)?;
+            } else {
+                render_agent_result(result, ui.renderer, ui.writer)?;
+            }
             Ok(if result.is_ok() {
                 AgentSequenceStep::RunFollowUps
             } else {
@@ -1784,8 +2312,23 @@ enum TurnObservation {
         Box<AgentRuntime>,
         Result<crumb_harness_dsh::RunResult>,
         TurnInterruption,
+        bool,
     ),
     Backgrounded(agent_runtime::AgentTurnTask),
+}
+
+struct ActiveTurnContext<'a> {
+    terminal: &'a AgentTerminal,
+    workspace: &'a Path,
+    live_context_tokens: &'a mut u64,
+}
+
+#[derive(Default)]
+struct HarnessRenderState {
+    streamed_response: bool,
+    streamed_column: usize,
+    active_tool: Option<(String, Option<String>)>,
+    file_edits: BTreeMap<String, (u64, u64)>,
 }
 
 fn promote_agent_turn(
@@ -1847,15 +2390,18 @@ fn observe_agent_turn(
     steering_bytes: usize,
     renderer: Renderer,
     writer: &mut dyn Write,
-    terminal: AgentTerminal,
     initial_activity: &str,
+    context: &mut ActiveTurnContext<'_>,
 ) -> Result<TurnObservation> {
+    let terminal = context.terminal;
+    refresh_active_footer(renderer, terminal.fullscreen)?;
     let mut activity = Some(start_activity(
         renderer,
         initial_activity,
         terminal.fullscreen,
     ));
-    let mut input = SteeringInput::new(renderer, steering_bytes);
+    let mut render_state = HarnessRenderState::default();
+    let mut input = SteeringInput::new(renderer, steering_bytes, terminal.fullscreen);
     let raw_mode = terminal
         .interactive
         .then(RawModeGuard::enable)
@@ -1870,51 +2416,67 @@ fn observe_agent_turn(
             if let Some(indicator) = activity.take() {
                 indicator.finish();
             }
-            resolve_tool_approval(pending, renderer, writer, terminal.interactive)?;
+            resolve_tool_approval(
+                pending,
+                renderer,
+                writer,
+                terminal.interactive,
+                terminal.fullscreen,
+                context.workspace,
+            )?;
+            refresh_active_footer(renderer, terminal.fullscreen)?;
             activity = Some(start_activity(renderer, "Thinking", terminal.fullscreen));
-            input.redraw(writer)?;
+            restore_steering_input(&mut input, &mut activity, writer)?;
         }
         match task.recv_timeout(Duration::from_millis(15)) {
             Ok(event) => {
-                input.clear_line(writer)?;
-                render_harness_activity(
+                render_observed_activity(
                     &event,
+                    &mut input,
                     &mut activity,
+                    &mut render_state,
                     renderer,
                     writer,
-                    terminal.fullscreen,
+                    terminal,
+                    context.workspace,
+                    context.live_context_tokens,
                 )?;
-                input.redraw(writer)?;
+                preserve_active_scroll(context, renderer, &mut activity)?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        if terminal.interactive
-            && poll_terminal_event(Duration::from_millis(10))?
-            && let TerminalEvent::Key(key) = read_terminal_event()?
-            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-        {
-            if let Some(indicator) = activity.take() {
-                indicator.finish();
-            }
-            if input.handle_key(key.code, key.modifiers, &task, steering, writer)?
-                == SteeringInputAction::Background
-            {
+        if terminal.interactive && poll_terminal_event(Duration::from_millis(10))? {
+            let background = handle_active_terminal_event(
+                &read_terminal_event()?,
+                &mut input,
+                &mut activity,
+                &task,
+                steering,
+                writer,
+                terminal,
+            )?;
+            if background {
                 input.clear_line(writer)?;
                 drop(enhanced_keys);
                 drop(raw_mode);
-                if let Some(indicator) = activity.take() {
-                    indicator.finish();
-                }
                 task.detach_interrupt();
                 return Ok(TurnObservation::Backgrounded(task));
             }
         }
     }
     while let Ok(event) = task.recv_timeout(Duration::ZERO) {
-        input.clear_line(writer)?;
-        render_harness_activity(&event, &mut activity, renderer, writer, terminal.fullscreen)?;
-        input.redraw(writer)?;
+        render_observed_activity(
+            &event,
+            &mut input,
+            &mut activity,
+            &mut render_state,
+            renderer,
+            writer,
+            terminal,
+            context.workspace,
+            context.live_context_tokens,
+        )?;
     }
     let interruption = input.interruption;
     input.clear_line(writer)?;
@@ -1923,12 +2485,361 @@ fn observe_agent_turn(
     if let Some(indicator) = activity.take() {
         indicator.complete();
     }
+    render_coding_summary(&render_state.file_edits, renderer, writer, terminal)?;
     let (runtime, result) = task.finish()?;
     Ok(TurnObservation::Finished(
         Box::new(runtime),
         result,
         interruption,
+        render_state.streamed_response,
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_observed_activity(
+    event: &HarnessActivity,
+    input: &mut SteeringInput,
+    activity: &mut Option<crumb_ui::ActivityIndicator>,
+    render_state: &mut HarnessRenderState,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    terminal: &AgentTerminal,
+    workspace: &Path,
+    live_context_tokens: &mut u64,
+) -> Result<()> {
+    input.clear_line(writer)?;
+    if terminal.fullscreen
+        && let HarnessActivity::ToolOutput {
+            content: Some(content),
+            ..
+        } = event
+    {
+        render_fullscreen_tool_output(
+            content,
+            activity,
+            renderer,
+            &terminal.transcript,
+            terminal.header_rows,
+        )?;
+    } else if terminal.fullscreen
+        && let HarnessActivity::ToolFinished { name, success } = event
+    {
+        render_fullscreen_finished_tool(
+            (name, *success),
+            activity,
+            render_state,
+            renderer,
+            &terminal.transcript,
+            terminal.header_rows,
+        )?;
+    } else if terminal.fullscreen
+        && let HarnessActivity::FileChanged {
+            path,
+            additions,
+            deletions,
+        } = event
+    {
+        render_fullscreen_file_change(
+            path,
+            *additions,
+            *deletions,
+            activity,
+            render_state,
+            renderer,
+            &terminal.transcript,
+            terminal.header_rows,
+        )?;
+    } else if let HarnessActivity::Usage {
+        input_tokens,
+        output_tokens,
+    } = event
+    {
+        if let Some(indicator) = activity.take() {
+            indicator.finish();
+        }
+        *live_context_tokens =
+            (*live_context_tokens).max(input_tokens.saturating_add(*output_tokens));
+        refresh_context_footer(
+            renderer,
+            Platform::current(),
+            workspace,
+            *live_context_tokens,
+            terminal.fullscreen,
+            &terminal.transcript,
+            terminal.header_rows,
+        )?;
+        *activity = Some(start_activity(renderer, "Thinking", terminal.fullscreen));
+    } else {
+        render_harness_activity(
+            event,
+            activity,
+            render_state,
+            renderer,
+            writer,
+            terminal.fullscreen,
+        )?;
+    }
+    restore_steering_input(input, activity, writer)?;
+    // The guide owns the final terminal row. Paint it after every composer
+    // redraw so wrapped steering input and resize recovery cannot cover it.
+    refresh_active_footer(renderer, terminal.fullscreen)?;
+    Ok(())
+}
+
+fn render_fullscreen_tool_output(
+    content: &str,
+    activity: &mut Option<crumb_ui::ActivityIndicator>,
+    renderer: Renderer,
+    transcript: &Arc<Mutex<TranscriptState>>,
+    header_rows: u16,
+) -> io::Result<()> {
+    if let Some(indicator) = activity.take() {
+        indicator.finish();
+    }
+    let terminal_width = size().map_or(80, |(columns, _)| columns);
+    let line_count = content.trim_end().lines().count();
+    let collapsed = renderer.agent_tool_output_toggle(false, line_count, content.len());
+    let expanded = renderer.agent_tool_output_toggle(true, line_count, content.len());
+    let body = renderer.agent_tool_output_body_for_width(content, terminal_width);
+    let mut state = transcript
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.append_tool_output(collapsed, expanded, body);
+    render_transcript_view(&state, renderer, header_rows)?;
+    if state.scroll_offset == 0 {
+        position_after_transcript(&state, header_rows)?;
+        *activity = Some(start_activity(renderer, "Thinking", true));
+    }
+    Ok(())
+}
+
+fn render_fullscreen_finished_tool(
+    tool: (&str, bool),
+    indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    render_state: &mut HarnessRenderState,
+    renderer: Renderer,
+    transcript: &Arc<Mutex<TranscriptState>>,
+    header_rows: u16,
+) -> io::Result<()> {
+    let (name, success) = tool;
+    let elapsed = indicator
+        .as_ref()
+        .map_or(Duration::ZERO, crumb_ui::ActivityIndicator::elapsed);
+    if let Some(indicator) = indicator.take() {
+        indicator.finish();
+    }
+    let detail = render_state
+        .active_tool
+        .take()
+        .filter(|(active_name, _)| active_name == name)
+        .and_then(|(_, detail)| detail);
+    let line = if name == "spawn_agents" {
+        renderer.agent_tool_result(name, success)
+    } else {
+        renderer.agent_activity(&finished_tool_activity(
+            name,
+            detail.as_deref(),
+            success,
+            elapsed,
+        ))
+    };
+    let mut state = transcript
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.append(&line);
+    render_transcript_view(&state, renderer, header_rows)?;
+    if state.scroll_offset == 0 {
+        position_after_transcript(&state, header_rows)?;
+        if success {
+            *indicator = Some(start_activity(renderer, "Thinking", true));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_fullscreen_file_change(
+    path: &str,
+    additions: u64,
+    deletions: u64,
+    indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    render_state: &mut HarnessRenderState,
+    renderer: Renderer,
+    transcript: &Arc<Mutex<TranscriptState>>,
+    header_rows: u16,
+) -> io::Result<()> {
+    if let Some(indicator) = indicator.take() {
+        indicator.finish();
+    }
+    record_file_change(render_state, path, additions, deletions);
+    let line = renderer.agent_activity(&format!("Edited · {path} · +{additions} -{deletions}"));
+    let mut state = transcript
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.append(&line);
+    render_transcript_view(&state, renderer, header_rows)?;
+    if state.scroll_offset == 0 {
+        position_after_transcript(&state, header_rows)?;
+        *indicator = Some(start_activity(renderer, "Thinking", true));
+    }
+    Ok(())
+}
+
+fn restore_steering_input(
+    input: &mut SteeringInput,
+    activity: &mut Option<crumb_ui::ActivityIndicator>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    if input.is_editing()
+        && let Some(indicator) = activity.take()
+    {
+        indicator.finish();
+    }
+    input.redraw(writer)
+}
+
+fn handle_active_terminal_event(
+    event: &TerminalEvent,
+    input: &mut SteeringInput,
+    activity: &mut Option<crumb_ui::ActivityIndicator>,
+    task: &agent_runtime::AgentTurnTask,
+    steering: &mut SteeringQueue,
+    writer: &mut dyn Write,
+    terminal: &AgentTerminal,
+) -> Result<bool> {
+    if let TerminalEvent::Mouse(mouse) = event
+        && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+        && terminal.fullscreen
+    {
+        let activity_label = activity.as_ref().map(|active| active.label().to_owned());
+        if let Some(active) = activity.take() {
+            active.finish();
+        }
+        let (top, bottom, _, _) = fullscreen_rows(terminal.header_rows)?;
+        let mut state = terminal
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.toggle_tool_output_at(mouse.row, top, bottom) {
+            render_transcript_view(&state, input.renderer, terminal.header_rows)?;
+        }
+        if state.scroll_offset == 0
+            && let Some(label) = activity_label
+        {
+            position_after_transcript(&state, terminal.header_rows)?;
+            *activity = Some(start_activity(input.renderer, &label, true));
+        }
+        refresh_active_footer(input.renderer, true)?;
+        return Ok(false);
+    }
+    if let Some(direction) = active_scroll_direction(event) {
+        if terminal.fullscreen {
+            let activity_label = activity.as_ref().map(|active| active.label().to_owned());
+            if let Some(active) = activity.take() {
+                active.finish();
+            }
+            let mut state = terminal
+                .transcript
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.scroll(direction, terminal.header_rows);
+            render_transcript_view(&state, input.renderer, terminal.header_rows)?;
+            if state.scroll_offset == 0
+                && let Some(label) = activity_label
+            {
+                position_after_transcript(&state, terminal.header_rows)?;
+                *activity = Some(start_activity(input.renderer, &label, true));
+            }
+            refresh_active_footer(input.renderer, true)?;
+        }
+        return Ok(false);
+    }
+    match event {
+        TerminalEvent::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+        {
+            if let Some(indicator) = activity.take() {
+                indicator.finish();
+            }
+            Ok(
+                input.handle_key(key.code, key.modifiers, task, steering, writer)?
+                    == SteeringInputAction::Background,
+            )
+        }
+        TerminalEvent::Resize(_, _) => {
+            input.clear_line(writer)?;
+            input.redraw(writer)?;
+            refresh_active_footer(input.renderer, terminal.fullscreen)?;
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn active_scroll_direction(event: &TerminalEvent) -> Option<TranscriptScroll> {
+    match event {
+        TerminalEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
+            Some(TranscriptScroll::Up)
+        }
+        TerminalEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => {
+            Some(TranscriptScroll::Down)
+        }
+        TerminalEvent::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && key.code == TerminalKeyCode::PageUp =>
+        {
+            Some(TranscriptScroll::Up)
+        }
+        TerminalEvent::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && key.code == TerminalKeyCode::PageDown =>
+        {
+            Some(TranscriptScroll::Down)
+        }
+        _ => None,
+    }
+}
+
+fn preserve_active_scroll(
+    context: &ActiveTurnContext<'_>,
+    renderer: Renderer,
+    activity: &mut Option<crumb_ui::ActivityIndicator>,
+) -> io::Result<()> {
+    if !context.terminal.fullscreen {
+        return Ok(());
+    }
+    let mut state = context
+        .terminal
+        .transcript
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.scroll_offset == 0 {
+        return Ok(());
+    }
+    if let Some(active) = activity.take() {
+        active.finish();
+    }
+    // Live activity is captured as a batch when the turn settles. Until then,
+    // advertise that content exists below without counting provider chunks as
+    // transcript lines.
+    state.unseen_lines = state.unseen_lines.max(1);
+    render_transcript_view(&state, renderer, context.terminal.header_rows)?;
+    refresh_active_footer(renderer, true)
+}
+
+fn refresh_active_footer(renderer: Renderer, fullscreen: bool) -> io::Result<()> {
+    if !fullscreen {
+        return Ok(());
+    }
+    let (columns, rows) = size()?;
+    let frame = fixed_footer_frame(rows, &renderer.composer_active_hotkeys(columns));
+    let mut terminal = io::stderr();
+    terminal.write_all(frame.as_bytes())?;
+    terminal.flush()
+}
+
+fn fixed_footer_frame(row: u16, content: &str) -> String {
+    format!("\x1b7\x1b[{row};1H\x1b[2K{content}\x1b8")
 }
 
 fn resolve_tool_approval(
@@ -1936,8 +2847,11 @@ fn resolve_tool_approval(
     renderer: Renderer,
     writer: &mut dyn Write,
     interactive: bool,
+    fullscreen: bool,
+    workspace: &Path,
 ) -> Result<()> {
-    let request = pending.request();
+    let request = pending.request().clone();
+    let detail = trusted_tool_detail(&request.tool, pending.arguments());
     writeln!(
         writer,
         "{}",
@@ -1945,6 +2859,7 @@ fn resolve_tool_approval(
             &request.tool,
             approval_risk_label(request.risk),
             &request.arguments_digest,
+            detail.as_deref(),
         )
     )?;
     writer.flush()?;
@@ -1954,7 +2869,12 @@ fn resolve_tool_approval(
         return Ok(());
     }
     loop {
-        let TerminalEvent::Key(key) = read_terminal_event()? else {
+        let event = read_terminal_event()?;
+        if matches!(event, TerminalEvent::Resize(_, _)) {
+            refresh_active_footer(renderer, fullscreen)?;
+            continue;
+        }
+        let TerminalEvent::Key(key) = event else {
             continue;
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -1971,6 +2891,41 @@ fn resolve_tool_approval(
                     } else {
                         "request expired"
                     }
+                )?;
+                return Ok(());
+            }
+            TerminalKeyCode::Char('a') => {
+                persist_tool_permission(workspace, &request)?;
+                let accepted = pending.allow_once();
+                writeln!(
+                    writer,
+                    "◇ {} · {}",
+                    if accepted {
+                        "Tool allowed"
+                    } else {
+                        "Request expired"
+                    },
+                    request.tool
+                )?;
+                return Ok(());
+            }
+            TerminalKeyCode::Char('s') => {
+                persist_permission_mode(workspace, ApprovalMode::SensitiveOnly)?;
+                let accepted = pending.allow_once();
+                writeln!(
+                    writer,
+                    "◇ Permission level · ask on sensitive commands{}",
+                    if accepted { "" } else { " · request expired" }
+                )?;
+                return Ok(());
+            }
+            TerminalKeyCode::Char('f') => {
+                persist_permission_mode(workspace, ApprovalMode::FullAccess)?;
+                let accepted = pending.allow_once();
+                writeln!(
+                    writer,
+                    "◇ Permission level · full access{}",
+                    if accepted { "" } else { " · request expired" }
                 )?;
                 return Ok(());
             }
@@ -1993,6 +2948,69 @@ fn resolve_tool_approval(
     }
 }
 
+fn persist_permission_mode(workspace: &Path, mode: ApprovalMode) -> Result<()> {
+    update_agent_config(workspace, |config| {
+        config.permissions.mode = mode;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn persist_tool_permission(workspace: &Path, request: &crumb_agent::ApprovalRequest) -> Result<()> {
+    update_agent_config(workspace, |config| {
+        let tool = request.tool.clone();
+        if tool.starts_with("mcp__") {
+            config.permissions.allow_mcp_tools.insert(tool);
+        } else {
+            match request.risk {
+                RiskClass::NetworkAccess => {
+                    config.permissions.allow_network_tools.insert(tool);
+                }
+                RiskClass::WriteWorkspace => {
+                    config.permissions.allow_workspace_tools.insert(tool);
+                }
+                RiskClass::ProcessExecution => {
+                    config.permissions.allow_execution_tools.insert(tool);
+                }
+                _ => bail!("this permission can only be granted once"),
+            }
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn trusted_tool_detail(name: &str, arguments: &serde_json::Value) -> Option<String> {
+    let field = match name {
+        "run_shell" => "command",
+        "web_search" => "query",
+        "web_fetch" => "url",
+        _ => return None,
+    };
+    let raw = arguments.get(field)?.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut detail = String::with_capacity(raw.len().min(512));
+    for character in raw.chars() {
+        if detail.len() >= 512 {
+            detail.push('…');
+            break;
+        }
+        if character == '\n' || character == '\r' || character == '\t' {
+            detail.push(' ');
+        } else if !character.is_control() {
+            detail.push(character);
+        }
+    }
+    Some(match name {
+        "run_shell" => format!("$ {detail}"),
+        "web_search" => format!("search: {detail}"),
+        "web_fetch" => format!("fetch: {detail}"),
+        _ => detail,
+    })
+}
+
 const fn approval_risk_label(risk: RiskClass) -> &'static str {
     match risk {
         RiskClass::ReadOnly => "read only",
@@ -2005,16 +3023,20 @@ const fn approval_risk_label(risk: RiskClass) -> &'static str {
     }
 }
 
-fn initial_agent_activity(request: &str, config: &AgentConfig) -> &'static str {
-    if config.skills.iter().any(|skill| skill.enabled) {
-        "Loading skills"
+fn initial_agent_activity(request: &str, config: &AgentConfig) -> String {
+    let enabled_skills = config.skills.iter().filter(|skill| skill.enabled).count();
+    if enabled_skills > 0 {
+        format!(
+            "Loading {enabled_skills} skill{}",
+            if enabled_skills == 1 { "" } else { "s" }
+        )
     } else if request
         .split_whitespace()
         .any(|token| token.starts_with('@') && token.len() > 1)
     {
-        "Attaching context"
+        "Attaching context".to_owned()
     } else {
-        "Thinking"
+        "Thinking".to_owned()
     }
 }
 
@@ -2052,16 +3074,18 @@ struct SteeringInput {
     buffer: String,
     max_bytes: usize,
     visible: bool,
+    fullscreen: bool,
     interruption: TurnInterruption,
 }
 
 impl SteeringInput {
-    const fn new(renderer: Renderer, max_bytes: usize) -> Self {
+    const fn new(renderer: Renderer, max_bytes: usize, fullscreen: bool) -> Self {
         Self {
             renderer,
             buffer: String::new(),
             max_bytes,
             visible: false,
+            fullscreen,
             interruption: TurnInterruption::None,
         }
     }
@@ -2107,7 +3131,6 @@ impl SteeringInput {
                     && self.buffer.len().saturating_add(character.len_utf8()) <= self.max_bytes =>
             {
                 self.buffer.push(character);
-                self.visible = true;
                 self.redraw(writer)?;
             }
             _ => {}
@@ -2214,7 +3237,21 @@ impl SteeringInput {
 
     fn clear_line(&mut self, writer: &mut dyn Write) -> Result<()> {
         if self.visible {
-            self.redraw_composer(None, writer)?;
+            if self.fullscreen {
+                let (columns, rows) = size()?;
+                let composer_row = rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
+                let available_width = columns.saturating_sub(7);
+                let mut frame = Vec::new();
+                crossterm::execute!(frame, MoveTo(4, composer_row))?;
+                write!(frame, "{}", " ".repeat(usize::from(available_width)))?;
+                write!(frame, "\x1b8")?;
+                let mut terminal = io::stderr();
+                terminal.write_all(&frame)?;
+                terminal.flush()?;
+            } else {
+                write!(writer, "\r\x1b[2K")?;
+                writer.flush()?;
+            }
             self.visible = false;
         }
         Ok(())
@@ -2224,26 +3261,37 @@ impl SteeringInput {
         if self.buffer.is_empty() {
             return self.clear_line(writer);
         }
-        self.redraw_composer(Some(&self.buffer), writer)?;
+        self.redraw_composer(&self.buffer, writer)?;
         self.visible = true;
         Ok(())
     }
 
-    fn redraw_composer(&self, input: Option<&str>, writer: &mut dyn Write) -> Result<()> {
+    fn redraw_composer(&self, input: &str, writer: &mut dyn Write) -> Result<()> {
         let (columns, rows) = size()?;
         let available_width = columns.saturating_sub(7);
-        let input_row = rows.saturating_sub(3).saturating_add(1);
-        let rendered = input.map_or_else(
-            || self.renderer.composer_placeholder(available_width),
-            |input| self.renderer.composer_follow_up(input, available_width),
-        );
-        write!(writer, "\x1b7\x1b[{input_row};5H")?;
-        write!(writer, "{}", " ".repeat(usize::from(available_width)))?;
-        write!(writer, "\x1b[{input_row};5H")?;
-        write!(writer, "{rendered}")?;
-        write!(writer, "\x1b8")?;
-        writer.flush()?;
+        let rendered = self.renderer.composer_follow_up(input, available_width);
+        if self.fullscreen {
+            let composer_row = rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
+            let mut frame = Vec::new();
+            if !self.visible {
+                write!(frame, "\x1b7")?;
+            }
+            crossterm::execute!(frame, MoveTo(4, composer_row))?;
+            write!(frame, "{}", " ".repeat(usize::from(available_width)))?;
+            crossterm::execute!(frame, MoveTo(4, composer_row))?;
+            write!(frame, "{rendered}")?;
+            let mut terminal = io::stderr();
+            terminal.write_all(&frame)?;
+            terminal.flush()?;
+        } else {
+            write!(writer, "\r\x1b[2K{rendered}")?;
+            writer.flush()?;
+        }
         Ok(())
+    }
+
+    fn is_editing(&self) -> bool {
+        !self.buffer.is_empty()
     }
 }
 
@@ -2252,14 +3300,15 @@ fn wait_for_paused_turn(
     steering_bytes: usize,
     renderer: Renderer,
     writer: &mut dyn Write,
-    terminal: AgentTerminal,
+    terminal: &AgentTerminal,
 ) -> Result<PausedTurnAction> {
     writeln!(
         writer,
         "◇ Turn paused · /resume continue · Enter steer · Ctrl+Enter queue · /cancel stop"
     )?;
     writer.flush()?;
-    let mut input = SteeringInput::new(renderer, steering_bytes);
+    refresh_active_footer(renderer, terminal.fullscreen)?;
+    let mut input = SteeringInput::new(renderer, steering_bytes, terminal.fullscreen);
     let raw_mode = terminal
         .interactive
         .then(RawModeGuard::enable)
@@ -2275,7 +3324,14 @@ fn wait_for_paused_turn(
         if !poll_terminal_event(Duration::from_millis(100))? {
             continue;
         }
-        let TerminalEvent::Key(key) = read_terminal_event()? else {
+        let event = read_terminal_event()?;
+        if matches!(event, TerminalEvent::Resize(_, _)) {
+            input.clear_line(writer)?;
+            input.redraw(writer)?;
+            refresh_active_footer(renderer, terminal.fullscreen)?;
+            continue;
+        }
+        let TerminalEvent::Key(key) = event else {
             continue;
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -2376,7 +3432,6 @@ impl SteeringInput {
                     && self.buffer.len().saturating_add(character.len_utf8()) <= self.max_bytes =>
             {
                 self.buffer.push(character);
-                self.visible = true;
                 self.redraw(writer)?;
                 Ok(None)
             }
@@ -2447,16 +3502,20 @@ impl SteeringInput {
 fn harness_activity_label(activity: &HarnessActivity) -> String {
     match activity {
         HarnessActivity::RequestAccepted => "request accepted".to_owned(),
+        HarnessActivity::ResponseDelta { .. } => "responding".to_owned(),
+        HarnessActivity::Usage { .. } => "updating context".to_owned(),
         HarnessActivity::Status { state } => format!("session {state}"),
-        HarnessActivity::ToolStarted { name } if name == "spawn_agents" => {
+        HarnessActivity::ToolStarted { name, .. } if name == "spawn_agents" => {
             "coordinating parallel agent team".to_owned()
         }
-        HarnessActivity::ToolStarted { name } => format!("tool started · {name}"),
+        HarnessActivity::ToolStarted { name, detail } => {
+            visible_tool_activity(name, detail.as_deref())
+        }
         HarnessActivity::ApprovalRequired { name } if name == "spawn_agents" => {
             "approval required · parallel agent team".to_owned()
         }
         HarnessActivity::ApprovalRequired { name } => format!("approval required · {name}"),
-        HarnessActivity::ToolOutput { name, bytes } => bytes.map_or_else(
+        HarnessActivity::ToolOutput { name, bytes, .. } => bytes.map_or_else(
             || format!("tool output · {name}"),
             |bytes| format!("tool output · {name} · {bytes} bytes"),
         ),
@@ -2464,6 +3523,11 @@ fn harness_activity_label(activity: &HarnessActivity) -> String {
             "tool {} · {name}",
             if *success { "completed" } else { "failed" }
         ),
+        HarnessActivity::FileChanged {
+            path,
+            additions,
+            deletions,
+        } => format!("edited · {path} · +{additions} -{deletions}"),
         HarnessActivity::Completed { reason } => format!("completed · {reason}"),
         HarnessActivity::Failed { reason } => format!("failed · {reason}"),
         HarnessActivity::Cancelled => "cancelled".to_owned(),
@@ -2474,22 +3538,35 @@ fn harness_activity_label(activity: &HarnessActivity) -> String {
 fn render_harness_activity(
     activity: &HarnessActivity,
     indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    state: &mut HarnessRenderState,
     renderer: Renderer,
     writer: &mut dyn Write,
     fullscreen: bool,
 ) -> Result<()> {
     match activity {
-        HarnessActivity::ToolStarted { name } if name == "spawn_agents" => {
-            replace_activity(
-                indicator,
-                renderer,
-                "Coordinating Koi · Nyx · Rune · Echo",
-                fullscreen,
-            );
+        HarnessActivity::ResponseDelta { text } => {
+            if fullscreen {
+                state.streamed_response = true;
+                replace_activity(indicator, renderer, "Writing response", fullscreen);
+                return Ok(());
+            }
+            finish_activity_line(indicator, writer)?;
+            if !state.streamed_response {
+                write!(writer, "{} ", terminal_agent_response(renderer, ""))?;
+                state.streamed_response = true;
+                state.streamed_column = 8;
+            }
+            write_bounded_response_delta(writer, text, &mut state.streamed_column)?;
+            writer.flush()?;
         }
-        HarnessActivity::ToolStarted { name } => {
-            replace_activity(indicator, renderer, &format!("Using {name}"), fullscreen);
-        }
+        HarnessActivity::ToolStarted { name, detail } => render_tool_started(
+            name,
+            detail.as_deref(),
+            indicator,
+            state,
+            renderer,
+            fullscreen,
+        ),
         HarnessActivity::ToolOutput { name, .. } if name == "spawn_agents" => {
             replace_activity(
                 indicator,
@@ -2498,27 +3575,41 @@ fn render_harness_activity(
                 fullscreen,
             );
         }
-        HarnessActivity::ToolOutput { name, bytes } => {
-            let label = bytes.map_or_else(
-                || format!("Using {name}"),
-                |bytes| format!("Using {name} · {bytes} bytes"),
-            );
-            replace_activity(indicator, renderer, &label, fullscreen);
-        }
+        HarnessActivity::ToolOutput {
+            name,
+            bytes,
+            content,
+        } => render_tool_output_activity(
+            (name, *bytes, content.as_deref()),
+            indicator,
+            renderer,
+            writer,
+            fullscreen,
+        )?,
         HarnessActivity::ToolFinished { name, success } => {
-            finish_activity_line(indicator, writer)?;
-            writeln!(writer, "{}", renderer.agent_tool_result(name, *success))?;
-            writer.flush()?;
-            if *success {
-                replace_activity(indicator, renderer, "Thinking", fullscreen);
-            }
+            render_finished_tool(
+                name, *success, indicator, state, renderer, writer, fullscreen,
+            )?;
         }
+        HarnessActivity::FileChanged {
+            path,
+            additions,
+            deletions,
+        } => render_file_change_activity(
+            (path, *additions, *deletions),
+            indicator,
+            state,
+            renderer,
+            writer,
+            fullscreen,
+        )?,
         HarnessActivity::ApprovalRequired { name } => {
             finish_activity_line(indicator, writer)?;
             writeln!(writer, "{}", renderer.agent_approval_required(name))?;
             writer.flush()?;
         }
         HarnessActivity::Failed { .. } | HarnessActivity::Cancelled => {
+            state.active_tool = None;
             finish_activity_line(indicator, writer)?;
             writeln!(
                 writer,
@@ -2528,7 +3619,9 @@ fn render_harness_activity(
             writer.flush()?;
         }
         HarnessActivity::Completed { .. } => {
-            replace_activity(indicator, renderer, "Thinking", fullscreen);
+            if !state.streamed_response {
+                replace_activity(indicator, renderer, "Thinking", fullscreen);
+            }
         }
         HarnessActivity::Progress { label } => {
             replace_activity(indicator, renderer, label, fullscreen);
@@ -2539,8 +3632,198 @@ fn render_harness_activity(
         HarnessActivity::RequestAccepted => {
             replace_activity(indicator, renderer, "Request accepted", fullscreen);
         }
+        HarnessActivity::Usage { .. } => {}
     }
     Ok(())
+}
+
+fn render_tool_started(
+    name: &str,
+    detail: Option<&str>,
+    indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    state: &mut HarnessRenderState,
+    renderer: Renderer,
+    fullscreen: bool,
+) {
+    state.active_tool = Some((name.to_owned(), detail.map(str::to_owned)));
+    let label = if name == "spawn_agents" {
+        "Coordinating Koi · Nyx · Rune · Echo".to_owned()
+    } else {
+        visible_tool_activity(name, detail)
+    };
+    replace_activity(indicator, renderer, &label, fullscreen);
+}
+
+fn render_file_change_activity(
+    change: (&str, u64, u64),
+    indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    state: &mut HarnessRenderState,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    fullscreen: bool,
+) -> Result<()> {
+    let (path, additions, deletions) = change;
+    record_file_change(state, path, additions, deletions);
+    finish_activity_line(indicator, writer)?;
+    writeln!(
+        writer,
+        "{}",
+        renderer.agent_activity(&format!("Edited · {path} · +{additions} -{deletions}"))
+    )?;
+    writer.flush()?;
+    replace_activity(indicator, renderer, "Thinking", fullscreen);
+    Ok(())
+}
+
+fn record_file_change(state: &mut HarnessRenderState, path: &str, additions: u64, deletions: u64) {
+    let totals = state.file_edits.entry(path.to_owned()).or_default();
+    totals.0 = totals.0.saturating_add(additions);
+    totals.1 = totals.1.saturating_add(deletions);
+}
+
+fn render_tool_output_activity(
+    tool: (&str, Option<u64>, Option<&str>),
+    indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    fullscreen: bool,
+) -> Result<()> {
+    let (name, bytes, content) = tool;
+    if let Some(content) = content {
+        finish_activity_line(indicator, writer)?;
+        writeln!(writer, "{}", terminal_tool_output(renderer, content))?;
+        writer.flush()?;
+        replace_activity(indicator, renderer, "Thinking", fullscreen);
+    } else {
+        let label = bytes.map_or_else(
+            || tool_activity_label(name),
+            |bytes| format!("{} · {bytes} bytes", tool_activity_label(name)),
+        );
+        replace_activity(indicator, renderer, &label, fullscreen);
+    }
+    Ok(())
+}
+
+fn render_finished_tool(
+    name: &str,
+    success: bool,
+    indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    state: &mut HarnessRenderState,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    fullscreen: bool,
+) -> Result<()> {
+    let elapsed = indicator
+        .as_ref()
+        .map_or(Duration::ZERO, crumb_ui::ActivityIndicator::elapsed);
+    finish_activity_line(indicator, writer)?;
+    let detail = state
+        .active_tool
+        .take()
+        .filter(|(active_name, _)| active_name == name)
+        .and_then(|(_, detail)| detail);
+    if name == "spawn_agents" {
+        writeln!(writer, "{}", renderer.agent_tool_result(name, success))?;
+    } else {
+        writeln!(
+            writer,
+            "{}",
+            renderer.agent_activity(&finished_tool_activity(
+                name,
+                detail.as_deref(),
+                success,
+                elapsed,
+            ))
+        )?;
+    }
+    writer.flush()?;
+    if success {
+        replace_activity(indicator, renderer, "Thinking", fullscreen);
+    }
+    Ok(())
+}
+
+fn visible_tool_activity(name: &str, detail: Option<&str>) -> String {
+    match (name, detail) {
+        ("run_shell", Some(command)) => format!("Running command · $ {command}"),
+        ("write_file", Some(path)) => format!("Editing file · {path}"),
+        ("web_search", Some(query)) => format!("Searching web · {query}"),
+        ("web_fetch", Some(url)) => format!("Fetching page · {url}"),
+        (_, Some(detail)) => format!("{} · {detail}", tool_activity_label(name)),
+        (_, None) => tool_activity_label(name),
+    }
+}
+
+fn finished_tool_activity(
+    name: &str,
+    detail: Option<&str>,
+    success: bool,
+    elapsed: Duration,
+) -> String {
+    let verb = match (name, success) {
+        ("run_shell", true) => "Ran command",
+        ("run_shell", false) => "Command failed",
+        ("web_search", true) => "Searched the web",
+        ("web_search", false) => "Web search failed",
+        ("web_fetch", true) => "Fetched page",
+        ("web_fetch", false) => "Page fetch failed",
+        ("write_file", true) => "Edited file",
+        ("write_file", false) => "Edit failed",
+        (_, true) => "Tool completed",
+        (_, false) => "Tool failed",
+    };
+    let elapsed = format_activity_elapsed(elapsed);
+    match (name, detail) {
+        ("run_shell", Some(command)) => format!("{verb} · {elapsed} · $ {command}"),
+        (_, Some(detail)) => format!("{verb} · {elapsed} · {detail}"),
+        (_, None) => format!("{verb} · {elapsed} · {name}"),
+    }
+}
+
+fn render_coding_summary(
+    edits: &BTreeMap<String, (u64, u64)>,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    terminal: &AgentTerminal,
+) -> Result<()> {
+    if edits.is_empty() {
+        return Ok(());
+    }
+    let additions = edits.values().map(|counts| counts.0).sum::<u64>();
+    let deletions = edits.values().map(|counts| counts.1).sum::<u64>();
+    let noun = if edits.len() == 1 { "file" } else { "files" };
+    let mut summary = format!(
+        "Changes · {} {noun} · +{additions} -{deletions}",
+        edits.len()
+    );
+    for (path, (added, deleted)) in edits {
+        let _ = write!(summary, "\n  {path}  +{added} -{deleted}");
+    }
+    let activity_line = renderer.agent_activity(&summary);
+    if terminal.fullscreen {
+        let mut state = terminal
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.append(&activity_line);
+        render_transcript_view(&state, renderer, terminal.header_rows)?;
+        if state.scroll_offset == 0 {
+            position_after_transcript(&state, terminal.header_rows)?;
+        }
+    } else {
+        writeln!(writer, "{activity_line}")?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+fn format_activity_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs_f32();
+    if seconds < 10.0 {
+        format!("{seconds:.1}s")
+    } else {
+        format!("{seconds:.0}s")
+    }
 }
 
 fn finish_activity_line(
@@ -2572,11 +3855,22 @@ fn start_activity(
     fullscreen: bool,
 ) -> crumb_ui::ActivityIndicator {
     if fullscreen {
-        let row = size().map_or(0, |(_, rows)| rows.saturating_sub(2));
+        let row = size().map_or(0, |(_, rows)| {
+            let cursor_row = cursor_position().map_or(0, |(_, row)| row);
+            transcript_activity_row(cursor_row, rows)
+        });
         renderer.activity_at(label, row)
     } else {
         renderer.activity(label)
     }
+}
+
+fn transcript_activity_row(cursor_row: u16, terminal_rows: u16) -> u16 {
+    cursor_row.min(
+        terminal_rows
+            .saturating_sub(FULLSCREEN_COMPOSER_ROWS)
+            .saturating_sub(1),
+    )
 }
 
 const fn agent_mode_name(mode: AgentMode) -> &'static str {
@@ -2622,7 +3916,7 @@ fn offer_ai_recovery(
 fn prompt_for_ai_recovery(exit_code: i32, writer: &mut dyn Write) -> Result<bool> {
     write!(
         writer,
-        "help: command exited {exit_code} · [A] Ask AI  [Enter] Continue"
+        "help: command exited {exit_code} · [A] Ask AI  [Enter] Continue  [^C] Cancel"
     )?;
     writer.flush()?;
     let _raw_mode = RawModeGuard::enable()?;
@@ -2776,6 +4070,7 @@ fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
             &[
                 "/mode",
                 "/model",
+                "/pack",
                 "/effort",
                 "/session",
                 "/review",
@@ -2907,6 +4202,7 @@ fn show_reserved(
             )?;
         }
         "/model" => show_models(cwd, writer)?,
+        "/pack" => show_model_packs(cwd, writer)?,
         "/effort" => {
             let config = read_agent_config(cwd)?;
             let text_route = config
@@ -2926,6 +4222,9 @@ fn show_reserved(
         }
         command if command.starts_with("/model use ") => {
             set_text_model(command, cwd, writer)?;
+        }
+        command if command.starts_with("/pack use ") => {
+            set_model_pack(command, cwd, writer)?;
         }
         command if command.starts_with("/effort use ") => {
             set_reasoning_effort(command, cwd, writer)?;
@@ -2984,11 +4283,48 @@ fn show_reserved(
         command if command == "/session" || command.starts_with("/session ") => {
             show_sessions(command, cwd, runtime, writer)?;
         }
+        "/cost" => show_provider_usage(cwd, runtime.as_ref(), writer)?,
         _ => {
             writeln!(writer, "◇ {command}")?;
             writeln!(writer, "  Reserved by Crumb; not available in this build.")?;
         }
     }
+    Ok(())
+}
+
+fn show_provider_usage(
+    cwd: &Path,
+    runtime: Option<&AgentRuntime>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    let provider = config
+        .models
+        .get(&Modality::Text)
+        .and_then(|routes| routes.first())
+        .map_or("provider", |route| route.provider.as_str());
+    let (input, cached, output) = runtime.map_or((0, 0, 0), AgentRuntime::provider_token_usage);
+    let uncached = input.saturating_sub(cached);
+    let (_, estimated, _) = runtime.map_or((0, 0, 0), AgentRuntime::token_usage);
+    writeln!(writer, "◆ Session usage · {provider}")?;
+    writeln!(
+        writer,
+        "  processed {} input · {} output · {} total tokens",
+        compact_token_count(input),
+        compact_token_count(output),
+        compact_token_count(input.saturating_add(output))
+    )?;
+    writeln!(
+        writer,
+        "  cache     {} hit · {} uncached input",
+        compact_token_count(cached),
+        compact_token_count(uncached)
+    )?;
+    writeln!(
+        writer,
+        "  estimated {} session tokens (used only when provider usage is absent)",
+        compact_token_count(estimated)
+    )?;
     Ok(())
 }
 
@@ -3009,11 +4345,13 @@ fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     let config = read_agent_config(cwd)?;
     writeln!(writer, "◆ Agent tools")?;
     for (name, risk, available) in [
+        ("current_time", "local time", true),
         ("read_file", "workspace read", true),
         ("list_directory", "workspace read", true),
         ("detect_stack", "workspace read", true),
         ("write_file", "workspace write", true),
         ("run_disposable", "one-shot process", true),
+        ("run_shell", "workspace process", true),
         ("spawn_agents", "parallel analysis", true),
         ("web_fetch", "network", true),
         (
@@ -3025,74 +4363,192 @@ fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
                 .is_some_and(|routes| !routes.is_empty()),
         ),
     ] {
-        let granted = matches!(name, "read_file" | "list_directory" | "detect_stack")
-            || config.permissions.allow_network_tools.contains(name)
-            || config.permissions.allow_workspace_tools.contains(name);
+        let explicitly_granted = matches!(
+            name,
+            "current_time" | "read_file" | "list_directory" | "detect_stack"
+        ) || config.permissions.allow_network_tools.contains(name)
+            || config.permissions.allow_workspace_tools.contains(name)
+            || config.permissions.allow_execution_tools.contains(name);
+        let (marker, policy) =
+            if explicitly_granted || config.permissions.mode == ApprovalMode::FullAccess {
+                ("●", "")
+            } else if config.permissions.mode == ApprovalMode::SensitiveOnly {
+                ("◐", " · asks if sensitive")
+            } else {
+                ("○", "")
+            };
         writeln!(
             writer,
-            "  {} {name:<18} {risk}{}",
-            if granted { "●" } else { "○" },
+            "  {marker} {name:<18} {risk}{policy}{}",
             if available { "" } else { " · unavailable" }
         )?;
     }
-    writeln!(writer, "  ● granted · ○ approval required/denied")?;
+    writeln!(
+        writer,
+        "  ● allowed · ◐ ask if sensitive · ○ always ask/denied"
+    )?;
     Ok(())
 }
 
 fn configure_permissions(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     let arguments = command.split_whitespace().skip(1).collect::<Vec<_>>();
     if arguments.is_empty() {
-        let config = read_agent_config(cwd)?;
-        writeln!(writer, "◆ Agent permissions")?;
-        writeln!(
-            writer,
-            "  network    {}",
-            joined_or_none(&config.permissions.allow_network_tools)
-        )?;
-        writeln!(
-            writer,
-            "  workspace  {}",
-            joined_or_none(&config.permissions.allow_workspace_tools)
-        )?;
-        writeln!(
-            writer,
-            "  MCP        {}",
-            joined_or_none(&config.permissions.allow_mcp_tools)
-        )?;
-        writeln!(
-            writer,
-            "  Grants are user-owned; models cannot add or widen them."
-        )?;
+        show_permissions(cwd, writer)?;
+        return Ok(());
+    }
+    if select_permission_mode(&arguments, cwd, writer)? {
+        return Ok(());
+    }
+    if arguments.as_slice() == ["allow-all"] {
+        grant_all_permissions(cwd, writer)?;
         return Ok(());
     }
     let [action, tool] = arguments.as_slice() else {
-        bail!("usage: /permissions [allow-network|deny-network <tool>]");
+        bail!(
+            "usage: /permissions [always-ask|sensitive|full-access|allow-network|deny-network|allow-workspace|deny-workspace|allow-execution|deny-execution <tool>]"
+        );
     };
-    if !matches!(*tool, "web_fetch" | "web_search" | "spawn_agents") {
-        bail!("network permission tool must be web_fetch, web_search, or spawn_agents");
+    let (scope, allow) = match *action {
+        "allow-network" => ("network", true),
+        "deny-network" => ("network", false),
+        "allow-workspace" => ("workspace", true),
+        "deny-workspace" => ("workspace", false),
+        "allow-execution" => ("execution", true),
+        "deny-execution" => ("execution", false),
+        _ => bail!("unknown permission action `{action}`"),
+    };
+    match scope {
+        "network" if !matches!(*tool, "web_fetch" | "web_search" | "spawn_agents") => {
+            bail!("network permission tool must be web_fetch, web_search, or spawn_agents");
+        }
+        "workspace" if *tool != "write_file" => {
+            bail!("workspace permission tool must be write_file");
+        }
+        "execution" if !matches!(*tool, "run_disposable" | "run_shell") => {
+            bail!("execution permission tool must be run_disposable or run_shell");
+        }
+        _ => {}
     }
-    let allow = match *action {
-        "allow-network" => true,
-        "deny-network" => false,
-        _ => bail!("usage: /permissions [allow-network|deny-network <tool>]"),
-    };
     update_agent_config(cwd, |config| {
+        let grants = match scope {
+            "network" => &mut config.permissions.allow_network_tools,
+            "workspace" => &mut config.permissions.allow_workspace_tools,
+            "execution" => &mut config.permissions.allow_execution_tools,
+            _ => unreachable!("validated permission scope"),
+        };
         if allow {
-            config
-                .permissions
-                .allow_network_tools
-                .insert((*tool).to_owned());
+            grants.insert((*tool).to_owned());
         } else {
-            config.permissions.allow_network_tools.remove(*tool);
+            grants.remove(*tool);
         }
         Ok(())
     })?;
     writeln!(
         writer,
-        "◆ Network permission · {tool} {}",
+        "◆ {scope} permission · {tool} {}",
         if allow { "allowed" } else { "denied" }
     )?;
     Ok(())
+}
+
+fn select_permission_mode(arguments: &[&str], cwd: &Path, writer: &mut dyn Write) -> Result<bool> {
+    let selected_mode = match arguments {
+        ["always-ask"] | ["mode", "always-ask"] => Some(ApprovalMode::AlwaysAsk),
+        ["sensitive"] | ["mode", "sensitive"] => Some(ApprovalMode::SensitiveOnly),
+        ["full-access"] | ["mode", "full-access"] => Some(ApprovalMode::FullAccess),
+        _ => None,
+    };
+    let Some(mode) = selected_mode else {
+        return Ok(false);
+    };
+    update_agent_config(cwd, |config| {
+        config.permissions.mode = mode;
+        config.permissions.allow_network_tools.clear();
+        config.permissions.allow_workspace_tools.clear();
+        config.permissions.allow_execution_tools.clear();
+        config.permissions.allow_mcp_tools.clear();
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Permission level · {}", approval_mode_name(mode))?;
+    writeln!(
+        writer,
+        "  {}",
+        match mode {
+            ApprovalMode::AlwaysAsk => "Crumb asks before every privileged tool.",
+            ApprovalMode::SensitiveOnly => {
+                "Ordinary tools run directly; sensitive commands still require approval."
+            }
+            ApprovalMode::FullAccess => {
+                "All registered tools and shell commands run without prompting."
+            }
+        }
+    )?;
+    Ok(true)
+}
+
+fn grant_all_permissions(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    update_agent_config(cwd, |config| {
+        config.permissions.mode = ApprovalMode::FullAccess;
+        config
+            .permissions
+            .allow_network_tools
+            .extend(["spawn_agents", "web_fetch", "web_search"].map(str::to_owned));
+        config
+            .permissions
+            .allow_workspace_tools
+            .insert("write_file".to_owned());
+        config
+            .permissions
+            .allow_execution_tools
+            .extend(["run_disposable", "run_shell"].map(str::to_owned));
+        Ok(())
+    })?;
+    writeln!(writer, "◆ Packaged agent tools allowed")?;
+    writeln!(writer, "  Network · workspace writes · execution")?;
+    Ok(())
+}
+
+fn show_permissions(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    writeln!(writer, "◆ Agent permissions")?;
+    writeln!(
+        writer,
+        "  level      {}",
+        approval_mode_name(config.permissions.mode)
+    )?;
+    writeln!(
+        writer,
+        "  network    {}",
+        joined_or_none(&config.permissions.allow_network_tools)
+    )?;
+    writeln!(
+        writer,
+        "  workspace  {}",
+        joined_or_none(&config.permissions.allow_workspace_tools)
+    )?;
+    writeln!(
+        writer,
+        "  execution  {}",
+        joined_or_none(&config.permissions.allow_execution_tools)
+    )?;
+    writeln!(
+        writer,
+        "  MCP        {}",
+        joined_or_none(&config.permissions.allow_mcp_tools)
+    )?;
+    writeln!(
+        writer,
+        "  Grants are user-owned; models cannot add or widen them."
+    )?;
+    Ok(())
+}
+
+const fn approval_mode_name(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::AlwaysAsk => "always ask",
+        ApprovalMode::SensitiveOnly => "ask on sensitive commands",
+        ApprovalMode::FullAccess => "full access",
+    }
 }
 
 fn joined_or_none(values: &std::collections::BTreeSet<String>) -> String {
@@ -3300,10 +4756,90 @@ fn set_text_model(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<(
                 reasoning_effort: None,
             },
         );
+        config.active_model_pack = None;
         Ok(())
     })?;
     writeln!(writer, "◆ Text model · {provider_id}/{model_id}")?;
     Ok(())
+}
+
+fn show_model_packs(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    writeln!(writer, "◆ Model packs")?;
+    if config.model_packs.is_empty() {
+        writeln!(writer, "  No packs configured")?;
+        return Ok(());
+    }
+    for (id, pack) in &config.model_packs {
+        let marker = if config.active_model_pack.as_deref() == Some(id) {
+            "●"
+        } else {
+            "○"
+        };
+        writeln!(
+            writer,
+            "  {marker} {} ({id}) · {}",
+            pack.label,
+            model_pack_summary(id)
+        )?;
+    }
+    writeln!(writer, "  Switch with `/pack use <id>`")?;
+    Ok(())
+}
+
+fn set_model_pack(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let id = command
+        .strip_prefix("/pack use ")
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .context("usage: /pack use <id>")?;
+    let selected = update_agent_config(cwd, |config| {
+        let pack = config
+            .model_packs
+            .get(id)
+            .cloned()
+            .with_context(|| format!("model pack `{id}` is not configured"))?;
+        promote_model_route(&mut config.models, Modality::Text, pack.coder.clone());
+        promote_model_route(&mut config.models, Modality::Text, pack.router.clone());
+        promote_model_route(
+            &mut config.models,
+            Modality::Image,
+            pack.image_generation.clone(),
+        );
+        config.active_model_pack = Some(id.to_owned());
+        Ok(())
+    })?;
+    let pack = selected
+        .model_packs
+        .get(id)
+        .context("selected model pack disappeared")?;
+    writeln!(writer, "◆ Model pack · {}", pack.label)?;
+    writeln!(writer, "  {}", model_pack_summary(id))?;
+    writeln!(
+        writer,
+        "  Router, coder, vision, and image roles switch automatically."
+    )?;
+    Ok(())
+}
+
+fn model_pack_summary(id: &str) -> &'static str {
+    match id {
+        "quick" => "lowest latency and cost",
+        "balanced" => "balanced quality and cost",
+        "deep" => "strongest reasoning, higher cost",
+        _ => "custom capability mix",
+    }
+}
+
+fn promote_model_route(
+    routes: &mut BTreeMap<Modality, Vec<ModelRoute>>,
+    modality: Modality,
+    route: ModelRoute,
+) {
+    let candidates = routes.entry(modality).or_default();
+    candidates
+        .retain(|candidate| candidate.provider != route.provider || candidate.model != route.model);
+    candidates.insert(0, route);
 }
 
 fn set_reasoning_effort(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
@@ -3317,12 +4853,13 @@ fn set_reasoning_effort(command: &str, cwd: &Path, writer: &mut dyn Write) -> Re
     let selected = effort_wire_name(value)?;
     let display = selected.as_deref().map_or("default", effort_display_name);
     update_agent_config(cwd, |config| {
-        let route = config
-            .models
-            .get_mut(&Modality::Text)
-            .and_then(|routes| routes.first_mut())
-            .context("select a text model before setting reasoning effort")?;
-        route.reasoning_effort.clone_from(&selected);
+        if !config.models.contains_key(&Modality::Text) {
+            bail!("select a text model before setting reasoning effort");
+        }
+        config.reasoning_effort.clone_from(&selected);
+        for route in config.models.values_mut().flatten() {
+            route.reasoning_effort = None;
+        }
         Ok(())
     })?;
     writeln!(writer, "◆ Reasoning effort · {display}")?;
@@ -3340,7 +4877,7 @@ fn effort_wire_name(value: &str) -> Result<Option<String>> {
         ["ultra" | "max"] => "max",
         _ => {
             return Err(anyhow!(
-                "effort must be light, medium, high, extra high, ultra, or default"
+                "effort must be light, medium, high, extra high, or default"
             ));
         }
     };
@@ -4275,7 +5812,69 @@ fn update_agent_config<F>(cwd: &Path, mutate: F) -> Result<AgentConfig>
 where
     F: FnOnce(&mut AgentConfig) -> Result<()>,
 {
-    raw_agent_config(cwd).update(mutate)
+    raw_agent_config(cwd).update(|config| {
+        bundled_skills::apply_defaults(config);
+        apply_builtin_model_packs(config);
+        mutate(config)
+    })
+}
+
+fn apply_builtin_model_packs(config: &mut AgentConfig) {
+    let has_model = |model: &str| {
+        config
+            .providers
+            .get("pollinations")
+            .is_some_and(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .any(|candidate| candidate.id == model)
+            })
+    };
+    if ![
+        "nova-fast",
+        "qwen-coder",
+        "Circuit-Overtime/OreoLook",
+        "flux",
+        "klein",
+    ]
+    .into_iter()
+    .all(has_model)
+    {
+        return;
+    }
+    let route = |model: &str| ModelRoute {
+        provider: "pollinations".to_owned(),
+        model: model.to_owned(),
+        reasoning_effort: None,
+    };
+    let balanced_router = if has_model("nova") {
+        "nova"
+    } else {
+        "qwen-coder"
+    };
+    for (id, label, router, image) in [
+        ("quick", "Quick Crumb", "nova-fast", "flux"),
+        ("balanced", "Balanced Crumb", balanced_router, "klein"),
+        ("deep", "Deep Crumb", "Circuit-Overtime/OreoLook", "klein"),
+    ] {
+        config
+            .model_packs
+            .entry(id.to_owned())
+            .or_insert_with(|| ModelPack {
+                label: label.to_owned(),
+                router: route(router),
+                vision: route("Circuit-Overtime/OreoLook"),
+                image_generation: route(image),
+                coder: route("qwen-coder"),
+                voice: None,
+                transcription: has_model("whisper").then(|| route("whisper")),
+                text_to_speech: has_model("elevenflash").then(|| route("elevenflash")),
+            });
+    }
+    if config.active_model_pack.is_none() {
+        config.active_model_pack = Some("balanced".to_owned());
+    }
 }
 
 fn show_jobs(
@@ -4487,13 +6086,10 @@ fn show_doctor(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         }
     }
     writeln!(writer, "◆ Token optimizers")?;
-    if config.optimizers.is_empty() {
-        writeln!(
-            writer,
-            "  none configured · native filtering remains active"
-        )?;
-        return Ok(());
-    }
+    writeln!(
+        writer,
+        "  native  enabled   redaction · filtering · clipping"
+    )?;
     let timeout = Duration::from_secs(2);
     for configured in &config.optimizers {
         let state = RtkOptimizer::from_config(configured, timeout).map_or("unsupported", |rtk| {
@@ -4513,6 +6109,15 @@ fn show_doctor(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
                 "disabled"
             },
             state
+        )?;
+    }
+    if should_auto_enable_rtk(&config) {
+        let automatic = RtkOptimizer::new(PathBuf::from("rtk"), Vec::new(), timeout)
+            .is_ok_and(|rtk| rtk.available());
+        writeln!(
+            writer,
+            "  rtk     automatic {}",
+            if automatic { "available" } else { "missing" }
         )?;
     }
     writeln!(
@@ -7302,6 +8907,17 @@ fn pollinations_runtime_key() -> Option<String> {
     })
 }
 
+fn configured_pollinations_runtime_key(config: &AgentConfig) -> Option<String> {
+    config
+        .providers
+        .get("pollinations")
+        .and_then(|provider| provider.credential.as_ref())
+        .and_then(|reference| provider_projection::resolve_credential_secret(reference).ok())
+        .map(|secret| secret.expose().to_owned())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(pollinations_runtime_key)
+}
+
 fn execute_and_capture(
     shell: &mut ShellSession,
     command: &str,
@@ -7429,6 +9045,11 @@ impl CompletionOverlay {
 
     fn paint_overlay(&self, body: &str) -> String {
         let (columns, top, composer_row) = self.overlay_rows();
+        let terminal_rows = size().map_or(24, |(_, rows)| rows);
+        let transcript = self
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut frame = String::new();
         let mut lines = body.lines();
         for row in top..composer_row {
@@ -7437,18 +9058,13 @@ impl CompletionOverlay {
                 frame.push_str(line);
             }
         }
-        let _ = write!(
-            frame,
-            "\x1b[{};1H\x1b[2K{}",
-            composer_row.saturating_add(4),
-            self.renderer.composer_idle_status()
-        );
-        let _ = write!(
-            frame,
-            "\x1b[{};1H\x1b[2K{}",
-            size().map_or(24, |(_, rows)| rows),
-            self.renderer.composer_hotkeys(columns)
-        );
+        frame.push_str(&completion_footer_frame(
+            &transcript,
+            self.renderer,
+            columns,
+            composer_row,
+            terminal_rows,
+        ));
         frame
     }
 
@@ -7457,11 +9073,12 @@ impl CompletionOverlay {
             .transcript
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = render_transcript_view(&transcript, self.header_rows);
+        let _ = render_transcript_view(&transcript, self.renderer, self.header_rows);
     }
 
     fn restore_overlay_frame(&self) -> String {
-        let (_, top, composer_row) = self.overlay_rows();
+        let (columns, top, composer_row) = self.overlay_rows();
+        let terminal_rows = size().map_or(24, |(_, rows)| rows);
         let transcript = self
             .transcript
             .lock()
@@ -7480,11 +9097,54 @@ impl CompletionOverlay {
             if index < end
                 && let Some(line) = transcript.lines.get(index)
             {
-                frame.push_str(line);
+                frame.push_str(&line.text);
             }
         }
+        frame.push_str(&completion_footer_frame(
+            &transcript,
+            self.renderer,
+            columns,
+            composer_row,
+            terminal_rows,
+        ));
         frame
     }
+}
+
+fn completion_footer_frame(
+    state: &TranscriptState,
+    renderer: Renderer,
+    columns: u16,
+    composer_row: u16,
+    terminal_rows: u16,
+) -> String {
+    let mut frame = String::new();
+    let status_row = composer_row.saturating_add(4);
+    let context_row = composer_row.saturating_add(5);
+    let _ = write!(
+        frame,
+        "\x1b[{status_row};1H\x1b[2K{}",
+        renderer.composer_idle_status()
+    );
+    if let Some((column, indicator)) = transcript_new_content_indicator(state, renderer, columns) {
+        let _ = write!(
+            frame,
+            "\x1b[{status_row};{}H{}",
+            column.saturating_add(1),
+            indicator
+        );
+    }
+    let _ = write!(
+        frame,
+        "\x1b[{context_row};1H\x1b[2K{}",
+        state.footer_context
+    );
+    let _ = write!(
+        frame,
+        "\x1b[{terminal_rows};1H\x1b[2K{}",
+        renderer.composer_hotkeys(columns)
+    );
+    frame
 }
 
 impl Menu for CompletionOverlay {
@@ -7603,9 +9263,19 @@ fn optional_line_editor(
     renderer: Renderer,
     header_rows: u16,
     transcript: Arc<Mutex<TranscriptState>>,
+    fullscreen: bool,
 ) -> Result<Option<InteractiveLineEditor>> {
     interactive
-        .then(|| create_line_editor(history, workspace, renderer, header_rows, transcript))
+        .then(|| {
+            create_line_editor(
+                history,
+                workspace,
+                renderer,
+                header_rows,
+                transcript,
+                fullscreen,
+            )
+        })
         .transpose()
 }
 
@@ -7615,6 +9285,7 @@ fn create_line_editor(
     renderer: Renderer,
     header_rows: u16,
     transcript: Arc<Mutex<TranscriptState>>,
+    fullscreen: bool,
 ) -> Result<InteractiveLineEditor> {
     let mut interactive_history = FileBackedHistory::new(INTERACTIVE_HISTORY_CAPACITY)?;
     if let Some(history) = history {
@@ -7637,14 +9308,6 @@ fn create_line_editor(
             ]),
         );
     }
-    keybindings.add_binding(
-        KeyModifiers::NONE,
-        KeyCode::Char(' '),
-        ReedlineEvent::Multiple(vec![
-            ReedlineEvent::Edit(vec![EditCommand::InsertChar(' ')]),
-            ReedlineEvent::Esc,
-        ]),
-    );
     keybindings.add_binding(
         KeyModifiers::NONE,
         KeyCode::Tab,
@@ -7701,15 +9364,70 @@ fn create_line_editor(
         .with_padding(0)
         .with_cursor_offset(i16::try_from(FULLSCREEN_SIDE_GUTTER).unwrap_or(2))
         .with_correct_cursor_pos(true);
-    let menu = CompletionOverlay::new(menu, renderer, header_rows, transcript);
+    let menu = CompletionOverlay::new(menu, renderer, header_rows, Arc::clone(&transcript));
+    let edit_mode = CrumbEditMode::new(keybindings, fullscreen.then_some(header_rows));
     let editor = Reedline::create()
         .with_history(Box::new(interactive_history))
-        .with_hinter(Box::new(CrumbHinter::default()))
+        .with_hinter(Box::new(CrumbHinter::new(fullscreen.then_some(
+            ComposerDock {
+                renderer,
+                transcript,
+            },
+        ))))
         .with_completer(Box::new(CrumbCompleter::new(workspace.clone())))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
         .with_persistent_menus(true)
-        .with_edit_mode(Box::new(Emacs::new(keybindings)));
+        .with_edit_mode(Box::new(edit_mode));
     Ok(InteractiveLineEditor { editor, workspace })
+}
+
+struct CrumbEditMode {
+    emacs: Emacs,
+    transcript_header_rows: Option<u16>,
+}
+
+impl CrumbEditMode {
+    const fn new(keybindings: reedline::Keybindings, transcript_header_rows: Option<u16>) -> Self {
+        Self {
+            emacs: Emacs::new(keybindings),
+            transcript_header_rows,
+        }
+    }
+
+    fn is_transcript_row(&self, row: u16) -> bool {
+        self.transcript_header_rows
+            .map(|header_rows| {
+                fullscreen_rows(header_rows)
+                    .unwrap_or_else(|_| fullscreen_rows_for_height(header_rows, 24))
+            })
+            .is_some_and(|(top, bottom, _, _)| row >= top && row <= bottom)
+    }
+}
+
+impl EditMode for CrumbEditMode {
+    fn parse_event(&mut self, event: ReedlineRawEvent) -> ReedlineEvent {
+        let event = TerminalEvent::from(event);
+        match event {
+            TerminalEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
+                ReedlineEvent::ExecuteHostCommand("crumb:transcript-up".to_owned())
+            }
+            TerminalEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => {
+                ReedlineEvent::ExecuteHostCommand("crumb:transcript-down".to_owned())
+            }
+            TerminalEvent::Mouse(mouse)
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                    && self.is_transcript_row(mouse.row) =>
+            {
+                ReedlineEvent::ExecuteHostCommand(format!("crumb:toggle-tool-output:{}", mouse.row))
+            }
+            event => ReedlineRawEvent::try_from(event)
+                .map_or(ReedlineEvent::None, |event| self.emacs.parse_event(event)),
+        }
+    }
+
+    fn edit_mode(&self) -> PromptEditMode {
+        self.emacs.edit_mode()
+    }
 }
 
 fn suggestion_width(terminal_columns: u16) -> usize {
@@ -7719,19 +9437,44 @@ fn suggestion_width(terminal_columns: u16) -> usize {
 struct CrumbPrompt {
     rendered: String,
     right: String,
+    anchor_to_composer: bool,
 }
 
 struct CrumbHinter {
     history: DefaultHinter,
     placeholder_visible: bool,
+    dock: Option<ComposerDock>,
 }
 
-impl Default for CrumbHinter {
-    fn default() -> Self {
+struct ComposerDock {
+    renderer: Renderer,
+    transcript: Arc<Mutex<TranscriptState>>,
+}
+
+impl CrumbHinter {
+    fn new(dock: Option<ComposerDock>) -> Self {
         Self {
             history: DefaultHinter::default().with_style(Style::new().fg(Color::DarkGray)),
             placeholder_visible: false,
+            dock,
         }
+    }
+
+    fn with_dock(&self, hint: String) -> String {
+        let Some(dock) = &self.dock else {
+            return hint;
+        };
+        let columns = size().map_or(80, |(columns, _)| columns);
+        let state = dock
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        format!(
+            "{hint}\n{}\n{}\n{}",
+            dock.renderer.composer_idle_status(),
+            state.footer_context,
+            dock.renderer.composer_hotkeys(columns)
+        )
     }
 }
 
@@ -7748,7 +9491,7 @@ impl Hinter for CrumbHinter {
         if self.placeholder_visible {
             let placeholder =
                 "Ask Crumb anything or type a command · @ context · / commands · Tab complete";
-            return if use_ansi_coloring {
+            let hint = if use_ansi_coloring {
                 Style::new()
                     .fg(Color::DarkGray)
                     .bold()
@@ -7757,9 +9500,12 @@ impl Hinter for CrumbHinter {
             } else {
                 placeholder.to_owned()
             };
+            return self.with_dock(hint);
         }
-        self.history
-            .handle(line, pos, history, use_ansi_coloring, cwd)
+        let hint = self
+            .history
+            .handle(line, pos, history, use_ansi_coloring, cwd);
+        self.with_dock(hint)
     }
 
     fn complete_hint(&self) -> String {
@@ -7780,14 +9526,26 @@ impl Hinter for CrumbHinter {
 }
 
 impl CrumbPrompt {
-    const fn new(rendered: String, right: String) -> Self {
-        Self { rendered, right }
+    const fn new(rendered: String, right: String, anchor_to_composer: bool) -> Self {
+        Self {
+            rendered,
+            right,
+            anchor_to_composer,
+        }
     }
 }
 
 impl Prompt for CrumbPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
-        Cow::Borrowed(&self.rendered)
+        if !self.anchor_to_composer {
+            return Cow::Borrowed(&self.rendered);
+        }
+        let rows = size().map_or(FULLSCREEN_COMPOSER_ROWS, |(_, rows)| rows);
+        Cow::Owned(format!(
+            "{}{}",
+            composer_anchor_sequence(rows),
+            self.rendered
+        ))
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
@@ -7829,8 +9587,8 @@ fn prompt_model_status(cwd: &Path) -> String {
                     .reasoning_effort_for(route)
                     .map_or("default", effort_display_name);
                 format!(
-                    "{} · {} · {effort}",
-                    route.model,
+                    "pack {} · {} · effort {effort}",
+                    active_pack_label(&config),
                     agent_mode_name(config.mode)
                 )
             },
@@ -7840,6 +9598,14 @@ fn prompt_model_status(cwd: &Path) -> String {
         status.push_str(&profile);
     }
     status
+}
+
+fn active_pack_label(config: &AgentConfig) -> &str {
+    config
+        .active_model_pack
+        .as_ref()
+        .and_then(|id| config.model_packs.get(id))
+        .map_or("Custom", |pack| pack.label.as_str())
 }
 
 fn selected_profile_id(cwd: &Path) -> Option<String> {
@@ -7877,19 +9643,23 @@ fn context_token_budget(config: &AgentConfig, route: Option<&ModelRoute>) -> u64
     })
 }
 
-const FULLSCREEN_COMPOSER_ROWS: u16 = 5;
+const FULLSCREEN_COMPOSER_ROWS: u16 = 6;
 
 fn fullscreen_rows(header_rows: u16) -> io::Result<(u16, u16, u16, u16)> {
     let (_, rows) = size()?;
+    Ok(fullscreen_rows_for_height(header_rows, rows))
+}
+
+fn fullscreen_rows_for_height(header_rows: u16, rows: u16) -> (u16, u16, u16, u16) {
     let composer_row = rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
     let transcript_bottom = composer_row.saturating_sub(1);
     let transcript_top = header_rows.min(transcript_bottom);
-    Ok((
+    (
         transcript_top,
         transcript_bottom,
         composer_row,
         rows.saturating_sub(1),
-    ))
+    )
 }
 
 fn set_transcript_scroll_region(
@@ -7915,10 +9685,11 @@ fn position_composer(renderer: Renderer, header_rows: u16) -> io::Result<()> {
     // Reedline owns cursor movement while editing. Reset margins before handing
     // it the composer so its redraw bookkeeping cannot erase transcript rows.
     write!(writer, "\x1b[r")?;
+    for row in composer_row..=composer_row.saturating_add(3) {
+        crossterm::execute!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    }
     crossterm::execute!(
         writer,
-        MoveTo(0, composer_row),
-        Clear(ClearType::FromCursorDown),
         MoveTo(columns.saturating_sub(3), composer_row.saturating_add(2))
     )?;
     write!(writer, "{}", renderer.composer_side_border())?;
@@ -7930,8 +9701,13 @@ fn position_composer(renderer: Renderer, header_rows: u16) -> io::Result<()> {
     write!(writer, "{}", renderer.composer_idle_status())?;
     crossterm::execute!(writer, MoveTo(0, footer_row), Clear(ClearType::CurrentLine))?;
     write!(writer, "{}", renderer.composer_hotkeys(columns))?;
-    writer.flush()?;
-    crossterm::execute!(writer, MoveTo(0, composer_row))
+    crossterm::execute!(writer, MoveTo(0, composer_row))?;
+    writer.flush()
+}
+
+fn composer_anchor_sequence(terminal_rows: u16) -> String {
+    let composer_row = terminal_rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
+    format!("\x1b[{};1H", composer_row.saturating_add(1))
 }
 
 fn render_idle_composer(
@@ -7986,49 +9762,105 @@ fn prepare_fullscreen_submission(
     Ok(None)
 }
 
-fn render_transcript_view(state: &TranscriptState, header_rows: u16) -> io::Result<()> {
+fn render_transcript_view(
+    state: &TranscriptState,
+    renderer: Renderer,
+    header_rows: u16,
+) -> io::Result<()> {
     let (top, bottom, _, _) = fullscreen_rows(header_rows)?;
     let height = bottom.saturating_sub(top) as usize + 1;
     let end = state.lines.len().saturating_sub(state.scroll_offset);
     let start = end.saturating_sub(height);
     let visible = state.lines.range(start..end);
-    let mut writer = io::stdout();
-    write!(writer, "\x1b7\x1b[r")?;
+    let mut frame = Vec::new();
+    write!(frame, "\x1b7\x1b[r")?;
     for row in top..=bottom {
-        crossterm::execute!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+        crossterm::execute!(frame, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
     }
     for (row, line) in (top..=bottom).zip(visible) {
-        crossterm::execute!(writer, MoveTo(0, row))?;
-        write!(writer, "{line}")?;
+        crossterm::execute!(frame, MoveTo(0, row))?;
+        write!(frame, "{}", line.text)?;
     }
+    render_transcript_footer_with_writer(&mut frame, state, renderer, header_rows)?;
+    write!(frame, "\x1b8")?;
+    let mut writer = io::stdout();
+    writer.write_all(&frame)?;
+    writer.flush()
+}
+
+fn position_after_transcript(state: &TranscriptState, header_rows: u16) -> io::Result<()> {
+    let (top, bottom, _, _) = fullscreen_rows(header_rows)?;
+    let height = bottom.saturating_sub(top) as usize + 1;
+    let end = state.lines.len().saturating_sub(state.scroll_offset);
+    let start = end.saturating_sub(height);
+    let visible_lines = end.saturating_sub(start);
+    let mut writer = io::stdout();
+    set_transcript_scroll_region(&mut writer, top, bottom)?;
+    if visible_lines < height {
+        let row = top.saturating_add(u16::try_from(visible_lines).unwrap_or(u16::MAX));
+        crossterm::execute!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    } else {
+        crossterm::execute!(writer, MoveTo(0, bottom))?;
+        writeln!(writer)?;
+    }
+    writer.flush()
+}
+
+fn render_transcript_footer(
+    state: &TranscriptState,
+    renderer: Renderer,
+    header_rows: u16,
+) -> io::Result<()> {
+    let mut writer = io::stdout();
+    write!(writer, "\x1b7")?;
+    render_transcript_footer_with_writer(&mut writer, state, renderer, header_rows)?;
     write!(writer, "\x1b8")?;
     writer.flush()
 }
 
-fn sanitize_transcript_output(output: &str) -> String {
-    let mut sanitized = String::with_capacity(output.len());
-    let mut characters = output.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '\x1b' {
-            if characters.next_if_eq(&'[').is_some() {
-                let mut sequence = String::from("\x1b[");
-                for sequence_character in characters.by_ref() {
-                    sequence.push(sequence_character);
-                    if ('@'..='~').contains(&sequence_character) {
-                        if sequence_character == 'm' {
-                            sanitized.push_str(&sequence);
-                        }
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        if character == '\n' || character == '\t' || !character.is_control() {
-            sanitized.push(character);
-        }
+fn render_transcript_footer_with_writer(
+    writer: &mut impl Write,
+    state: &TranscriptState,
+    renderer: Renderer,
+    header_rows: u16,
+) -> io::Result<()> {
+    let (columns, _) = size()?;
+    let (_, _, composer_row, footer_row) = fullscreen_rows(header_rows)?;
+    crossterm::execute!(
+        writer,
+        MoveTo(0, composer_row.saturating_add(3)),
+        Clear(ClearType::CurrentLine)
+    )?;
+    write!(writer, "{}", renderer.composer_idle_status())?;
+    if let Some((column, indicator)) = transcript_new_content_indicator(state, renderer, columns) {
+        crossterm::execute!(writer, MoveTo(column, composer_row.saturating_add(3)))?;
+        write!(writer, "{indicator}")?;
     }
-    sanitized
+    crossterm::execute!(
+        writer,
+        MoveTo(0, composer_row.saturating_add(4)),
+        Clear(ClearType::CurrentLine)
+    )?;
+    write!(writer, "{}", state.footer_context)?;
+    crossterm::execute!(writer, MoveTo(0, footer_row), Clear(ClearType::CurrentLine))?;
+    write!(writer, "{}", renderer.composer_hotkeys(columns))
+}
+
+fn transcript_new_content_indicator(
+    state: &TranscriptState,
+    renderer: Renderer,
+    columns: u16,
+) -> Option<(u16, String)> {
+    (state.scroll_offset > 0 && state.unseen_lines > 0).then(|| {
+        let label = format!("↓ {} new below", state.unseen_lines);
+        let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+        let column = columns.saturating_sub(width.saturating_add(2));
+        (column, renderer.composer_status(&label))
+    })
+}
+
+fn sanitize_transcript_output(output: &str) -> String {
+    sanitize_terminal_text(output, true)
 }
 
 fn terminal_username() -> String {
@@ -8215,6 +10047,7 @@ impl AlternateScreenGuard {
             crossterm::execute!(
                 io::stdout(),
                 EnterAlternateScreen,
+                EnableMouseCapture,
                 Clear(ClearType::All),
                 MoveTo(0, 0),
                 Show
@@ -8229,7 +10062,7 @@ impl Drop for AlternateScreenGuard {
         if self.active {
             let mut writer = io::stdout();
             let _ = write!(writer, "\x1b[r");
-            let _ = crossterm::execute!(writer, Show, LeaveAlternateScreen);
+            let _ = crossterm::execute!(writer, DisableMouseCapture, Show, LeaveAlternateScreen);
         }
     }
 }
@@ -8272,24 +10105,33 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use crossterm::event::{
+        Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
     use crumb_agent::{
-        AgentConfig, CredentialReference, HarnessConfig, ProviderHeader, ProviderProtocol,
-        RiskClass,
+        AgentConfig, ApprovalMode, CredentialReference, HarnessConfig, OptimizerConfig,
+        ProviderConfig, ProviderHeader, ProviderModel, ProviderProtocol, RiskClass, SkillConfig,
     };
     use crumb_marketplace::UpdateStatus;
     use crumb_memory::{MemoryScope, MemorySet, MemoryStore};
     use crumb_profile::{ProfileSelectionStore, ProfileStore};
 
     use super::{
-        ExitGesture, MarketplaceContent, PausedSubmission, SessionCommandContext, SteeringAction,
-        TerminalModeTracker, TranscriptCapture, agent_config_location, configure_plugin,
-        effort_display_name, effort_wire_name, failed_command_recovery, initial_agent_activity,
-        marketplace_update_blocker, openrouter_preset, parse_credential_reference,
-        parse_paused_submission, parse_provider_header, parse_resume_session_argument,
-        read_agent_config, read_bounded_response, register_local_skill, resolve_memory_keep,
-        sanitize_transcript_output, set_skill_enabled, show_graph, show_marketplace, show_memory,
-        show_profile_with_stores, suggestion_width, unregister_local_skill,
-        validate_marketplace_path, validate_marketplace_response, workspace_read_host,
+        CrumbEditMode, ExitGesture, MarketplaceContent, PausedSubmission, Renderer,
+        SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
+        TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
+        agent_config_location, apply_builtin_model_packs, completion_footer_frame,
+        composer_anchor_sequence, configure_permissions, configure_plugin, effort_display_name,
+        effort_wire_name, failed_command_recovery, finished_tool_activity, fixed_footer_frame,
+        initial_agent_activity, marketplace_update_blocker, openrouter_preset,
+        parse_credential_reference, parse_paused_submission, parse_provider_header,
+        parse_resume_session_argument, read_agent_config, read_bounded_response,
+        register_local_skill, resolve_memory_keep, sanitize_transcript_output, set_skill_enabled,
+        shell_tool_config, should_auto_enable_rtk, show_graph, show_marketplace, show_memory,
+        show_profile_with_stores, suggestion_width, transcript_activity_row,
+        unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
+        visible_tool_activity, workspace_read_host, write_bounded_response_delta_for_width,
     };
 
     #[test]
@@ -8301,6 +10143,41 @@ mod tests {
             Some("crumb-session-1")
         );
         assert!(parse_resume_session_argument(&["--resume".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn builtin_model_packs_default_to_the_stronger_balanced_router() {
+        let mut config = AgentConfig::default();
+        let mut provider = ProviderConfig::new(
+            "Pollinations",
+            ProviderProtocol::OpenAiCompletions,
+            "https://example.invalid/v1",
+        );
+        provider.models = [
+            "nova-fast",
+            "nova",
+            "qwen-coder",
+            "Circuit-Overtime/OreoLook",
+            "flux",
+            "klein",
+        ]
+        .into_iter()
+        .map(ProviderModel::new)
+        .collect();
+        config.providers.insert("pollinations".to_owned(), provider);
+
+        apply_builtin_model_packs(&mut config);
+
+        assert_eq!(config.active_model_pack.as_deref(), Some("balanced"));
+        assert_eq!(
+            config
+                .model_packs
+                .get("balanced")
+                .expect("balanced pack")
+                .router
+                .model,
+            "nova"
+        );
     }
 
     #[test]
@@ -8334,7 +10211,12 @@ mod tests {
 
     #[test]
     fn transcript_history_keeps_color_but_drops_cursor_controls() {
-        let output = "\x1b[31mred\x1b[0m\x1b[2J\r\nnext";
+        let output = concat!(
+            "\x1b[31mred\x1b[0m\x1b[2J\r\n",
+            "\x1b]133;C\x07",
+            "\x1b]666;vte.shell.preexec;/home/elixpo\x1b\\",
+            "next"
+        );
         let sanitized = sanitize_transcript_output(output);
 
         assert_eq!(sanitized, "\x1b[31mred\x1b[0m\nnext");
@@ -8370,12 +10252,13 @@ mod tests {
         register_local_skill("/skills add review external skill", &workspace, &mut output)
             .expect("skill registers");
         let config = read_agent_config(&workspace).expect("config loads");
-        assert_eq!(config.skills.len(), 1);
-        assert!(!config.skills[0].enabled);
-        assert_eq!(
-            config.skills[0].path,
-            skill_path.canonicalize().expect("path")
-        );
+        let review = config
+            .skills
+            .iter()
+            .find(|skill| skill.id == "review")
+            .expect("local skill is registered");
+        assert!(!review.enabled);
+        assert_eq!(review.path, skill_path.canonicalize().expect("path"));
 
         set_skill_enabled("/skills load review", &workspace, true, &mut output)
             .expect("skill loads");
@@ -8384,12 +10267,12 @@ mod tests {
             .expect("skill unloads");
         unregister_local_skill("/skills remove review", &workspace, &mut output)
             .expect("skill registration is removed");
-        assert_eq!(
+        assert!(
             read_agent_config(&workspace)
                 .expect("config loads")
                 .skills
-                .len(),
-            0
+                .iter()
+                .all(|skill| skill.id != "review")
         );
         assert!(skill_path.is_file());
         std::fs::remove_dir_all(workspace).expect("workspace removed");
@@ -8413,11 +10296,13 @@ mod tests {
         )
         .expect("bundled skill loads");
         let config = read_agent_config(&workspace).expect("config loads");
-        assert!(config.skills[0].enabled);
-        assert_eq!(
-            config.skills[0].path,
-            crate::bundled_skills::path("failure-autopsy")
-        );
+        let skill = config
+            .skills
+            .iter()
+            .find(|skill| skill.id == "failure-autopsy")
+            .expect("bundled skill is configured");
+        assert!(skill.enabled);
+        assert_eq!(skill.path, crate::bundled_skills::path("failure-autopsy"));
 
         std::fs::remove_dir_all(workspace).expect("workspace removed");
     }
@@ -8439,6 +10324,89 @@ mod tests {
             Some(HarnessConfig::Native)
         ));
         std::fs::remove_dir_all(workspace).expect("workspace removed");
+    }
+
+    #[test]
+    fn packaged_tools_can_be_explicitly_granted_by_the_user() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-tool-grants-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace is created");
+        let mut output = Vec::new();
+
+        configure_permissions("/permissions allow-all", &workspace, &mut output)
+            .expect("packaged tools are granted");
+        let permissions = read_agent_config(&workspace)
+            .expect("config loads")
+            .permissions;
+
+        assert!(permissions.allow_network_tools.contains("web_search"));
+        assert!(permissions.allow_workspace_tools.contains("write_file"));
+        assert!(permissions.allow_execution_tools.contains("run_shell"));
+        assert!(permissions.allow_execution_tools.contains("run_disposable"));
+        assert_eq!(permissions.mode, ApprovalMode::FullAccess);
+
+        configure_permissions("/permissions sensitive", &workspace, &mut output)
+            .expect("sensitive approval mode is selected");
+        let permissions = read_agent_config(&workspace)
+            .expect("config reloads")
+            .permissions;
+        assert_eq!(permissions.mode, ApprovalMode::SensitiveOnly);
+        assert!(permissions.allow_network_tools.is_empty());
+        assert!(permissions.allow_workspace_tools.is_empty());
+        assert!(permissions.allow_execution_tools.is_empty());
+        std::fs::remove_dir_all(workspace).expect("workspace removed");
+    }
+
+    #[test]
+    fn approval_prompt_choices_persist_user_owned_elevation() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-inline-grant-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace is created");
+        let request = crumb_agent::ApprovalRequest {
+            tool: "run_shell".to_owned(),
+            risk: RiskClass::ProcessExecution,
+            arguments_digest: "digest".to_owned(),
+        };
+
+        super::persist_tool_permission(&workspace, &request).expect("tool grant persists");
+        assert!(
+            read_agent_config(&workspace)
+                .expect("config reloads")
+                .permissions
+                .allow_execution_tools
+                .contains("run_shell")
+        );
+
+        super::persist_permission_mode(&workspace, ApprovalMode::FullAccess)
+            .expect("permission mode persists");
+        assert_eq!(
+            read_agent_config(&workspace)
+                .expect("config reloads")
+                .permissions
+                .mode,
+            ApprovalMode::FullAccess
+        );
+        std::fs::remove_dir_all(workspace).expect("workspace removed");
+    }
+
+    #[test]
+    fn prose_confirmation_replies_are_detected_without_matching_unrelated_shell_input() {
+        assert!(super::response_requests_confirmation(
+            "The change is ready. Should I proceed?"
+        ));
+        assert!(super::is_confirmation_reply("yes"));
+        assert!(super::is_confirmation_reply("go ahead"));
+        assert!(super::is_affirmative_reply("execute it"));
+        assert!(!super::is_confirmation_reply("yes --help"));
+        assert!(!super::response_requests_confirmation(
+            "The command completed successfully."
+        ));
     }
 
     #[test]
@@ -8474,6 +10442,16 @@ mod tests {
         assert_eq!(
             initial_agent_activity("review the project", &AgentConfig::default()),
             "Thinking"
+        );
+        let mut config = AgentConfig::default();
+        config.skills.push(SkillConfig {
+            id: "code-review".to_owned(),
+            path: PathBuf::from("skills/code-review/SKILL.md"),
+            enabled: true,
+        });
+        assert_eq!(
+            initial_agent_activity("review the project", &config),
+            "Loading 1 skill"
         );
     }
 
@@ -8540,12 +10518,14 @@ mod tests {
         let host = workspace_read_host(&workspace, &AgentConfig::default(), None)
             .expect("workspace tools are registered");
         let tools = host.tools().collect::<Vec<_>>();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 8);
         for (name, risk) in [
+            ("current_time", RiskClass::ReadOnly),
             ("detect_stack", RiskClass::ReadOnly),
             ("list_directory", RiskClass::ReadOnly),
             ("read_file", RiskClass::ReadOnly),
             ("run_disposable", RiskClass::ProcessExecution),
+            ("run_shell", RiskClass::ProcessExecution),
             ("web_fetch", RiskClass::NetworkAccess),
             ("write_file", RiskClass::WriteWorkspace),
         ] {
@@ -8557,6 +10537,125 @@ mod tests {
                 Some(risk)
             );
         }
+    }
+
+    #[test]
+    fn pollinations_key_registers_web_search_without_an_explicit_search_route() {
+        let workspace = std::env::current_dir().expect("current directory is available");
+        let host = workspace_read_host(
+            &workspace,
+            &AgentConfig::default(),
+            Some("fixture-key".to_owned()),
+        )
+        .expect("workspace tools are registered");
+
+        assert!(host.tools().any(|tool| tool.name == "web_search"));
+    }
+
+    #[test]
+    fn mouse_wheel_is_reserved_for_transcript_scrolling() {
+        let mut mode = CrumbEditMode::new(reedline::default_emacs_keybindings(), Some(0));
+        for (kind, expected) in [
+            (MouseEventKind::ScrollUp, "crumb:transcript-up"),
+            (MouseEventKind::ScrollDown, "crumb:transcript-down"),
+        ] {
+            let raw = reedline::ReedlineRawEvent::try_from(TerminalEvent::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .expect("mouse event is accepted");
+            assert_eq!(
+                reedline::EditMode::parse_event(&mut mode, raw),
+                reedline::ReedlineEvent::ExecuteHostCommand(expected.to_owned())
+            );
+        }
+        let raw = reedline::ReedlineRawEvent::try_from(TerminalEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 8,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .expect("mouse event is accepted");
+        assert_eq!(
+            reedline::EditMode::parse_event(&mut mode, raw),
+            reedline::ReedlineEvent::ExecuteHostCommand("crumb:toggle-tool-output:12".to_owned())
+        );
+    }
+
+    #[test]
+    fn active_turn_reserves_mouse_and_page_keys_for_transcript_scrolling() {
+        let scroll_up = TerminalEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(
+            active_scroll_direction(&scroll_up),
+            Some(TranscriptScroll::Up)
+        ));
+        let page_down = TerminalEvent::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert!(matches!(
+            active_scroll_direction(&page_down),
+            Some(TranscriptScroll::Down)
+        ));
+    }
+
+    #[test]
+    fn streamed_agent_text_stays_inside_the_ui_margin() {
+        let mut output = Vec::new();
+        let mut column = 8;
+        write_bounded_response_delta_for_width(&mut output, &"word ".repeat(40), &mut column, 80)
+            .expect("response delta renders");
+        let output = String::from_utf8(output).expect("terminal output is utf-8");
+
+        assert!(output.lines().all(|line| line.chars().count() <= 78));
+        assert!(output.lines().count() > 1);
+    }
+
+    #[test]
+    fn appended_transcript_lines_preserve_a_scrolled_viewport() {
+        let mut transcript = TranscriptState::default();
+        assert!(!transcript.append("one\ntwo\nthree"));
+        transcript.scroll_offset = 2;
+
+        assert!(transcript.append("four\nfive"));
+        assert_eq!(transcript.scroll_offset, 4);
+        assert_eq!(transcript.unseen_lines, 2);
+
+        for _ in 0..4 {
+            transcript.scroll(TranscriptScroll::Down, 0);
+        }
+        assert_eq!(transcript.scroll_offset, 0);
+        assert_eq!(transcript.unseen_lines, 0);
+    }
+
+    #[test]
+    fn tool_output_is_collapsed_by_default_and_toggles_in_place() {
+        let mut transcript = TranscriptState::default();
+        transcript.append_tool_output(
+            "▶ Tool output · 2 lines".to_owned(),
+            "▼ Tool output · 2 lines".to_owned(),
+            vec!["folder-a".to_owned(), "folder-b".to_owned()],
+        );
+
+        assert_eq!(transcript.lines.len(), 1);
+        assert_eq!(transcript.lines[0].text, "▶ Tool output · 2 lines");
+        assert!(transcript.toggle_tool_output_at(0, 0, 5));
+        assert_eq!(transcript.lines.len(), 3);
+        assert_eq!(transcript.lines[0].text, "▼ Tool output · 2 lines");
+        assert_eq!(transcript.lines[1].text, "folder-a");
+        assert_eq!(transcript.lines[2].text, "folder-b");
+        assert!(transcript.toggle_tool_output_at(0, 0, 5));
+        assert_eq!(transcript.lines.len(), 1);
+        assert_eq!(transcript.lines[0].text, "▶ Tool output · 2 lines");
+    }
+
+    #[test]
+    fn transcript_scroll_moves_eight_lines_per_step() {
+        assert_eq!(TranscriptState::SCROLL_STEP, 8);
     }
 
     #[test]
@@ -8761,7 +10860,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_commands_are_local_bounded_and_disabled_by_default() {
+    fn graph_commands_are_local_bounded_and_enabled_by_default() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is valid")
@@ -8782,16 +10881,12 @@ mod tests {
         .expect("graph can be created");
         let mut output = Vec::new();
         show_graph("/graph status", &workspace, &mut output).expect("status is available");
-        assert!(String::from_utf8_lossy(&output).contains("disabled"));
+        assert!(String::from_utf8_lossy(&output).contains("enabled"));
         output.clear();
         show_graph("/graph query alpha", &workspace, &mut output)
-            .expect("disabled graph uses native fallback");
-        assert!(String::from_utf8_lossy(&output).contains("Native project evidence"));
+            .expect("enabled graph uses local evidence");
+        assert!(String::from_utf8_lossy(&output).contains("alpha [alpha]"));
 
-        let store = crumb_graph::GraphSettingsStore::for_workspace(&workspace);
-        let mut settings = store.load_or_default().expect("default settings");
-        settings.enabled = true;
-        store.save(&settings).expect("settings save");
         output.clear();
         show_graph("/graph query alpha", &workspace, &mut output).expect("local query");
         let rendered = String::from_utf8(output).expect("UTF-8 output");
@@ -8978,5 +11073,113 @@ mod tests {
             assert!(width >= 1);
             assert!(width <= usize::from(columns.max(1)));
         }
+    }
+
+    #[test]
+    fn file_edits_have_coding_specific_activity_labels() {
+        assert_eq!(
+            visible_tool_activity("write_file", Some("src/main.rs")),
+            "Editing file · src/main.rs"
+        );
+        assert_eq!(
+            finished_tool_activity(
+                "write_file",
+                Some("src/main.rs"),
+                true,
+                Duration::from_millis(1200),
+            ),
+            "Edited file · 1.2s · src/main.rs"
+        );
+    }
+
+    #[test]
+    fn active_help_is_pinned_to_the_last_terminal_row() {
+        let frame = fixed_footer_frame(
+            40,
+            "  Type a follow-up · Enter steer · Ctrl+Enter queue · /pause · Ctrl+C cancel",
+        );
+
+        assert_eq!(
+            frame,
+            "\x1b7\x1b[40;1H\x1b[2K  Type a follow-up · Enter steer · Ctrl+Enter queue · /pause · Ctrl+C cancel\x1b8"
+        );
+    }
+
+    #[test]
+    fn completion_palette_preserves_every_fixed_footer_row() {
+        let renderer = Renderer::new(UiSettings::from_environment(false));
+        let state = TranscriptState {
+            footer_context: "Model context · 3.3k / 64.0k".to_owned(),
+            ..TranscriptState::default()
+        };
+
+        let frame = completion_footer_frame(&state, renderer, 120, 30, 40);
+
+        assert!(frame.contains("Ready"));
+        assert!(frame.contains("Model context · 3.3k / 64.0k"));
+        assert!(frame.contains("Enter send"));
+        assert!(frame.contains("\x1b[34;1H\x1b[2K"));
+        assert!(frame.contains("\x1b[35;1H\x1b[2K"));
+        assert!(frame.contains("\x1b[40;1H\x1b[2K"));
+    }
+
+    #[test]
+    fn fullscreen_prompt_is_anchored_above_the_fixed_footer() {
+        assert_eq!(composer_anchor_sequence(40), "\x1b[35;1H");
+        assert_eq!(composer_anchor_sequence(4), "\x1b[1;1H");
+        assert_eq!(transcript_activity_row(12, 40), 12);
+        assert_eq!(transcript_activity_row(39, 40), 33);
+    }
+
+    #[test]
+    fn shell_activity_displays_the_exact_command() {
+        assert_eq!(
+            visible_tool_activity("run_shell", Some("command -v g++ && g++ --version")),
+            "Running command · $ command -v g++ && g++ --version"
+        );
+        assert_eq!(
+            finished_tool_activity(
+                "run_shell",
+                Some("command -v g++ && g++ --version"),
+                true,
+                Duration::from_millis(30_120),
+            ),
+            "Ran command · 30s · $ command -v g++ && g++ --version"
+        );
+        assert_eq!(
+            finished_tool_activity(
+                "web_search",
+                Some("Crumb terminal agent"),
+                true,
+                Duration::from_millis(850),
+            ),
+            "Searched the web · 0.9s · Crumb terminal agent"
+        );
+    }
+
+    #[test]
+    fn only_full_access_shell_inherits_the_terminal_environment() {
+        let mut config = AgentConfig::default();
+        assert!(!shell_tool_config(&config, 1024).inherit_environment);
+
+        config.permissions.mode = ApprovalMode::SensitiveOnly;
+        assert!(!shell_tool_config(&config, 1024).inherit_environment);
+
+        config.permissions.mode = ApprovalMode::FullAccess;
+        assert!(shell_tool_config(&config, 1024).inherit_environment);
+    }
+
+    #[test]
+    fn rtk_is_automatic_unless_the_user_explicitly_configures_it() {
+        let mut config = AgentConfig::default();
+        assert!(should_auto_enable_rtk(&config));
+
+        config.optimizers.push(OptimizerConfig {
+            id: "RTK".to_owned(),
+            command: PathBuf::from("rtk"),
+            arguments: Vec::new(),
+            enabled: false,
+        });
+        assert!(!should_auto_enable_rtk(&config));
     }
 }

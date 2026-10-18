@@ -205,36 +205,58 @@ impl TerminalControl {
         self.pending.extend_from_slice(input);
         let mut visible = Vec::with_capacity(self.pending.len());
         let mut cursor_queries = 0;
-
-        loop {
-            let Some(start) = find_subslice(&self.pending, CURSOR_QUERY) else {
-                let retained = matching_suffix_len(&self.pending, CURSOR_QUERY);
-                let visible_end = self.pending.len() - retained;
-                visible.extend(self.pending.drain(..visible_end));
+        let mut consumed = 0;
+        while consumed < self.pending.len() {
+            let remaining = &self.pending[consumed..];
+            if remaining.starts_with(CURSOR_QUERY) {
+                consumed += CURSOR_QUERY.len();
+                cursor_queries += 1;
+                continue;
+            }
+            if CURSOR_QUERY.starts_with(remaining) {
                 break;
-            };
-
-            visible.extend(self.pending.drain(..start));
-            self.pending.drain(..CURSOR_QUERY.len());
-            cursor_queries += 1;
+            }
+            if remaining.starts_with(b"\x1b]") {
+                let Some((payload_end, sequence_end)) = osc_boundaries(remaining) else {
+                    break;
+                };
+                let payload = &remaining[2..payload_end];
+                if !is_shell_integration_osc(payload) {
+                    visible.extend_from_slice(&remaining[..sequence_end]);
+                }
+                consumed += sequence_end;
+                continue;
+            }
+            visible.push(self.pending[consumed]);
+            consumed += 1;
         }
+        self.pending.drain(..consumed);
 
         (visible, cursor_queries)
     }
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+fn osc_boundaries(sequence: &[u8]) -> Option<(usize, usize)> {
+    for index in 2..sequence.len() {
+        if sequence[index] == b'\x07' || sequence[index] == 0x9c {
+            return Some((index, index + 1));
+        }
+        if sequence[index] == b'\x1b' && sequence.get(index + 1) == Some(&b'\\') {
+            return Some((index, index + 2));
+        }
+    }
+    None
 }
 
-fn matching_suffix_len(input: &[u8], prefix: &[u8]) -> usize {
-    let maximum = input.len().min(prefix.len().saturating_sub(1));
-    (1..=maximum)
-        .rev()
-        .find(|length| input.ends_with(&prefix[..*length]))
-        .unwrap_or(0)
+fn is_shell_integration_osc(payload: &[u8]) -> bool {
+    [b"133".as_slice(), b"666".as_slice()]
+        .into_iter()
+        .any(|code| {
+            payload == code
+                || payload
+                    .strip_prefix(code)
+                    .is_some_and(|suffix| suffix.starts_with(b";"))
+        })
 }
 
 fn no_op_command(kind: ShellKind) -> &'static str {
@@ -266,5 +288,27 @@ mod tests {
         assert_eq!(first_queries, 0);
         assert_eq!(second, b"after");
         assert_eq!(second_queries, 2);
+    }
+
+    #[test]
+    fn shell_integration_markers_are_hidden_across_chunks() {
+        let mut control = TerminalControl::default();
+
+        let (first, first_queries) = control.filter(b"before\x1b]133;C\x07\x1b]666;vte.shell.pre");
+        let (second, second_queries) = control.filter(b"exec;/home/elixpo\x1b\\after");
+
+        assert_eq!(first, b"before");
+        assert_eq!(second, b"after");
+        assert_eq!(first_queries + second_queries, 0);
+    }
+
+    #[test]
+    fn unrelated_osc_sequences_remain_visible() {
+        let mut control = TerminalControl::default();
+
+        let (visible, queries) = control.filter(b"\x1b]0;useful title\x07text");
+
+        assert_eq!(visible, b"\x1b]0;useful title\x07text");
+        assert_eq!(queries, 0);
     }
 }

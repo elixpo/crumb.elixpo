@@ -69,15 +69,47 @@ pub struct Notification {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HarnessActivity {
     RequestAccepted,
-    Status { state: String },
-    ToolStarted { name: String },
-    ApprovalRequired { name: String },
-    ToolOutput { name: String, bytes: Option<u64> },
-    ToolFinished { name: String, success: bool },
-    Completed { reason: String },
-    Failed { reason: String },
+    ResponseDelta {
+        text: String,
+    },
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    Status {
+        state: String,
+    },
+    ToolStarted {
+        name: String,
+        detail: Option<String>,
+    },
+    ApprovalRequired {
+        name: String,
+    },
+    ToolOutput {
+        name: String,
+        bytes: Option<u64>,
+        content: Option<String>,
+    },
+    ToolFinished {
+        name: String,
+        success: bool,
+    },
+    FileChanged {
+        path: String,
+        additions: u64,
+        deletions: u64,
+    },
+    Completed {
+        reason: String,
+    },
+    Failed {
+        reason: String,
+    },
     Cancelled,
-    Progress { label: String },
+    Progress {
+        label: String,
+    },
 }
 
 impl Notification {
@@ -99,7 +131,7 @@ impl Notification {
         match event_type {
             "agent/inbox/spliced" => Some(HarnessActivity::RequestAccepted),
             "tool/start" | "tool/call" | "tool/requested" => {
-                Some(HarnessActivity::ToolStarted { name })
+                Some(HarnessActivity::ToolStarted { name, detail: None })
             }
             "approval/requested" | "tool/approval" => {
                 Some(HarnessActivity::ApprovalRequired { name })
@@ -107,6 +139,7 @@ impl Notification {
             "tool/output" | "tool/result" => Some(HarnessActivity::ToolOutput {
                 name,
                 bytes: data.get("outputBytes").and_then(Value::as_u64),
+                content: None,
             }),
             "tool/end" | "tool/completed" => Some(HarnessActivity::ToolFinished {
                 name,
@@ -371,7 +404,8 @@ mod tests {
         assert_eq!(
             notification.activity(),
             Some(HarnessActivity::ToolStarted {
-                name: "shell31m run".to_owned()
+                name: "shell31m run".to_owned(),
+                detail: None,
             })
         );
         assert!(!format!("{:?}", notification.activity()).contains("secret command"));

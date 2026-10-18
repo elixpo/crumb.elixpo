@@ -56,9 +56,10 @@ platform-specific runtime path is stored in Git.
 
 ## Web search permission
 
-The MCP server exposes `web_search` only when a Pollinations web-search model
-and a process-scoped credential are available. The tool is always classified as
-`network_access`. It runs only when the user-owned agent configuration includes
+The MCP server exposes `web_search` whenever a process-scoped Pollinations
+credential is available. It uses the bounded `perplexity` search model by
+default; an explicit web-search route may select another compatible model. The
+tool is always classified as `network_access`. It runs only when the user-owned agent configuration includes
 `"permissions": {"allow_network_tools": ["web_search"]}`; model output cannot
 add or widen that grant. Requests, response bytes, and execution time are
 bounded, and Ctrl+C cancels the in-flight HTTP future.

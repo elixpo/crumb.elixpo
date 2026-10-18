@@ -25,6 +25,13 @@ pub struct AgentShellConfig {
     pub program: PathBuf,
     pub arguments: Vec<OsString>,
     pub path: Option<OsString>,
+    /// Optional local command proxy used to rewrite supported commands before
+    /// approval and execution (for example, `rtk rewrite`).
+    pub command_rewriter: Option<PathBuf>,
+    /// Preserve the launching terminal's environment for explicitly selected
+    /// full-access sessions. Safer permission modes keep the isolated
+    /// PATH-only environment.
+    pub inherit_environment: bool,
     pub max_output_bytes: usize,
     pub timeout: Duration,
 }
@@ -101,6 +108,15 @@ struct ShellTool {
 }
 
 impl ToolHandler for ShellTool {
+    fn prepare(&self, arguments: &Value, cancellation: &CancellationToken) -> Result<Value> {
+        Ok(rewrite_arguments(
+            &self.workspace,
+            &self.config,
+            arguments,
+            cancellation,
+        ))
+    }
+
     fn call(&self, arguments: &Value, cancellation: &CancellationToken) -> Result<ToolOutput> {
         match run_shell(
             &self.workspace,
@@ -114,6 +130,72 @@ impl ToolHandler for ShellTool {
             Err(error) => Ok(ToolOutput::error(error.to_string())),
         }
     }
+}
+
+fn rewrite_arguments(
+    workspace: &Path,
+    config: &AgentShellConfig,
+    arguments: &Value,
+    cancellation: &CancellationToken,
+) -> Value {
+    let Some(command) = arguments.get("command").and_then(Value::as_str) else {
+        return arguments.clone();
+    };
+    let normalized = normalize_shell_command(command);
+    let mut prepared = arguments.clone();
+    if normalized != command {
+        prepared["command"] = Value::String(normalized.clone());
+    }
+    let Some(rewriter) = config.command_rewriter.as_ref() else {
+        return prepared;
+    };
+    if cancellation.is_cancelled() {
+        return prepared;
+    }
+    let mut process = Command::new(rewriter);
+    process
+        .args(["rewrite", &normalized])
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if !config.inherit_environment {
+        process.env_clear();
+    }
+    if let Some(path) = &config.path {
+        process.env("PATH", path);
+    }
+    let Ok(output) = process.output() else {
+        return prepared;
+    };
+    let Some(rewritten) = accepted_rewrite(&normalized, &output.stdout) else {
+        return prepared;
+    };
+    prepared["command"] = Value::String(rewritten);
+    prepared
+}
+
+fn normalize_shell_command(command: &str) -> String {
+    let trimmed = command.trim();
+    if let Some(expression) = trimmed.strip_prefix("find -") {
+        return format!("find . -{expression}");
+    }
+    command.to_owned()
+}
+
+fn accepted_rewrite(original: &str, output: &[u8]) -> Option<String> {
+    const MAX_REWRITE_BYTES: usize = 4 * 1024;
+    if output.len() > MAX_REWRITE_BYTES {
+        return None;
+    }
+    let rewritten = std::str::from_utf8(output).ok()?.trim();
+    if rewritten.is_empty()
+        || rewritten == original.trim()
+        || rewritten.contains(['\n', '\r', '\0'])
+    {
+        return None;
+    }
+    Some(rewritten.to_owned())
 }
 
 fn run_shell(
@@ -137,10 +219,12 @@ fn run_shell(
         .args(&config.arguments)
         .arg(command)
         .current_dir(workspace)
-        .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if !config.inherit_environment {
+        process.env_clear();
+    }
     if let Some(path) = &config.path {
         process.env("PATH", path);
     }
@@ -249,6 +333,7 @@ fn optimization_metadata(result: &OptimizationResult) -> Value {
 
 fn classify_output(command: &str) -> OutputKind {
     let command = command.trim_start();
+    let command = command.strip_prefix("rtk ").unwrap_or(command);
     if command.starts_with("cargo ") {
         OutputKind::Cargo
     } else if command.starts_with("git diff") {
@@ -403,7 +488,8 @@ fn terminate(child: &mut Child) {
 fn descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: RUN_SHELL.to_owned(),
-        description: "Run a bounded command in Crumb's isolated agent shell.".to_owned(),
+        description: "Run bounded Bash from the workspace. Parent/absolute paths, pipelines, installed programs, authenticated CLIs, builds, tests, Git, and system inspection are supported; user policy gates approval."
+            .to_owned(),
         input_schema: json!({
             "type":"object",
             "properties":{
@@ -433,7 +519,10 @@ mod tests {
     use crumb_optimize::OptimizationPipeline;
     use serde_json::json;
 
-    use super::{AgentShellConfig, register_shell_tool, register_shell_tool_with_optimizer};
+    use super::{
+        AgentShellConfig, accepted_rewrite, normalize_shell_command, register_shell_tool,
+        register_shell_tool_with_optimizer,
+    };
 
     struct AllowOnce;
 
@@ -487,6 +576,8 @@ mod tests {
             program,
             arguments,
             path,
+            command_rewriter: None,
+            inherit_environment: false,
             max_output_bytes: 256,
             timeout,
         }
@@ -532,6 +623,32 @@ mod tests {
         assert_eq!(error.kind, ToolCallErrorKind::Denied);
     }
 
+    #[test]
+    fn rtk_rewrites_are_bounded_and_never_nested() {
+        assert_eq!(
+            accepted_rewrite("find . -name Cargo.toml", b"rtk find . -name Cargo.toml\n"),
+            Some("rtk find . -name Cargo.toml".to_owned())
+        );
+        assert_eq!(accepted_rewrite("pwd", b""), None);
+        assert_eq!(accepted_rewrite("pwd", b"rtk read x\nsecond line"), None);
+        assert_eq!(
+            accepted_rewrite("rtk git status", b"rtk git status\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn rootless_find_gets_an_explicit_search_root() {
+        assert_eq!(
+            normalize_shell_command("find -path 'elixpo_projects' -type d"),
+            "find . -path 'elixpo_projects' -type d"
+        );
+        assert_eq!(
+            normalize_shell_command("find /home/user -type d -name projects"),
+            "find /home/user -type d -name projects"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn approved_shell_is_isolated_and_returns_bounded_output() {
@@ -549,6 +666,30 @@ mod tests {
         assert!(output.text.contains("PATH=/usr/bin:/bin"));
         assert!(!output.text.contains("HOME="));
         assert!(output.text.len() <= 256);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_access_shell_can_inherit_the_terminal_environment() {
+        let mut config = config(Duration::from_secs(1));
+        config.inherit_environment = true;
+        let mut host = ToolHost::default();
+        register_shell_tool(
+            &mut host,
+            &std::env::current_dir().expect("current directory is available"),
+            config,
+        )
+        .expect("shell tool is registered");
+        let output = host
+            .call(
+                "run_shell",
+                &json!({"command":"printf %s \"${HOME:+available}\""}),
+                AgentMode::Auto,
+                &AllowOnce,
+                &CancellationToken::default(),
+            )
+            .expect("approved shell call succeeds");
+        assert!(output.text.contains("stdout:\navailable\n"));
     }
 
     #[cfg(unix)]

@@ -62,6 +62,8 @@ fn exercise_lifecycle() -> Result<String> {
     )?;
     let failed = completed(session.execute("false", &mut output)?);
     assert_eq!(failed.exit_code, 1);
+    let syntax_error = completed(session.execute("echo (broken)", &mut output)?);
+    assert_ne!(syntax_error.exit_code, 0);
     assert_eq!(
         session.execute("exit", &mut output)?,
         CommandOutcome::ShellExited

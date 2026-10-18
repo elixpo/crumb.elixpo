@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 crumb-agent = { path = "../crumb-agent" }
 crumb-optimize = { path = "../crumb-optimize" }
 serde.workspace = true

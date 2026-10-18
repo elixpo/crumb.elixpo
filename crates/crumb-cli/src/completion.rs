@@ -254,18 +254,61 @@ fn current_token(line: &str) -> (usize, &str) {
 fn slash_suggestions(prefix: &str, pos: usize, workspace: &Path) -> Vec<Suggestion> {
     let mut commands = crumb_repl::SLASH_COMMANDS
         .iter()
-        .filter(|command| !is_setting_command(command.usage))
+        .filter(|command| {
+            !is_setting_command(command.usage) || command.usage.starts_with("/permissions")
+        })
         .map(|command| (command.usage.to_owned(), command.description.to_owned()))
         .collect::<Vec<_>>();
     commands.push((
         "/skills add".to_owned(),
         "register a local SKILL.md file; starts disabled".to_owned(),
     ));
+    commands.extend(configured_pack_actions(workspace));
     commands.extend(configured_skill_actions(workspace));
     commands
         .into_iter()
         .filter(|(usage, _)| usage.starts_with(prefix))
         .map(|(usage, description)| suggestion(&usage, &description, Span::new(0, pos)))
+        .collect()
+}
+
+fn configured_pack_actions(workspace: &Path) -> Vec<(String, String)> {
+    let config = config_path(workspace)
+        .and_then(|path| LiveConfig::new(path).load().ok())
+        .unwrap_or_default();
+    let mut packs = config
+        .model_packs
+        .iter()
+        .map(|(id, pack)| {
+            (
+                id.clone(),
+                (
+                    pack.label.clone(),
+                    config.active_model_pack.as_deref() == Some(id),
+                ),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for (id, label) in [
+        ("quick", "Quick Crumb"),
+        ("balanced", "Balanced Crumb"),
+        ("deep", "Deep Crumb"),
+    ] {
+        packs.entry(id.to_owned()).or_insert_with(|| {
+            (
+                label.to_owned(),
+                config.active_model_pack.as_deref() == Some(id),
+            )
+        });
+    }
+    packs
+        .into_iter()
+        .map(|(id, (label, selected))| {
+            (
+                format!("/pack use {id}"),
+                selection_description(&label, selected),
+            )
+        })
         .collect()
 }
 
@@ -365,8 +408,16 @@ fn reference_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Sugges
 }
 
 fn native_path_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Suggestion> {
+    if line.trim_start().starts_with([':', '?']) {
+        return Vec::new();
+    }
     let (start, token) = current_token(line);
-    if start == 0 || token.starts_with('-') || token.contains('=') || token.contains('\n') {
+    if start == 0
+        || token.is_empty()
+        || token.starts_with('-')
+        || token.contains('=')
+        || token.contains('\n')
+    {
         return Vec::new();
     }
     let typed_path = Path::new(token);
@@ -555,6 +606,83 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.value == "/help")
         );
+    }
+
+    #[test]
+    fn slash_completion_refilters_after_pack_prefix_is_shortened() {
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
+
+        let result = completer.complete("/pac", 4);
+
+        assert!(
+            result
+                .suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "/pack")
+        );
+        assert!(
+            result
+                .suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "/pack use ")
+        );
+    }
+
+    #[test]
+    fn pack_completion_exposes_nested_commands_and_pack_ids() {
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
+
+        let root = completer.complete("/pack", 5);
+        assert!(
+            root.suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "/pack use ")
+        );
+
+        let nested = completer.complete("/pack use ", 10);
+        for id in ["quick", "balanced", "deep"] {
+            assert!(
+                nested
+                    .suggestions()
+                    .iter()
+                    .any(|candidate| candidate.value == format!("/pack use {id}")),
+                "missing nested pack suggestion for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn permissions_completion_exposes_root_and_nested_actions() {
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
+
+        let root = completer.complete("/per", 4);
+        assert!(
+            root.suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "/permissions")
+        );
+
+        let nested = completer.complete("/permissions ", 13);
+        for action in [
+            "always-ask",
+            "sensitive",
+            "full-access",
+            "allow-all",
+            "allow-network ",
+            "deny-network ",
+            "allow-workspace ",
+            "deny-workspace ",
+            "allow-execution ",
+            "deny-execution ",
+        ] {
+            assert!(
+                nested
+                    .suggestions()
+                    .iter()
+                    .any(|candidate| candidate.value == format!("/permissions {action}")),
+                "missing nested permission suggestion for {action}"
+            );
+        }
     }
 
     #[test]
@@ -748,6 +876,40 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.value == "docs/")
         );
+    }
+
+    #[test]
+    fn forced_agent_text_does_not_offer_native_paths() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(workspace));
+        let line = ": what's todays ";
+        let result = completer.complete(line, line.len());
+
+        assert_eq!(result.suggestions(), []);
+    }
+
+    #[test]
+    fn help_queries_do_not_fall_through_to_native_paths() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(workspace));
+        for line in ["? when ", "? when w"] {
+            let result = completer.complete(line, line.len());
+            assert_eq!(
+                result.suggestions(),
+                [],
+                "unexpected suggestions for {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_space_does_not_list_the_workspace() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(workspace));
+        let line = "say something ";
+        let result = completer.complete(line, line.len());
+
+        assert_eq!(result.suggestions(), []);
     }
 
     #[test]

@@ -117,7 +117,7 @@ engines remain replaceable; none may bypass Crumb's permission, credential, or s
 - [x] [Add graph-grounded project context with an optional Graphify adapter](https://github.com/elixpo/crumb.elixpo/issues/45).
   - [x] [WP-024: provider-neutral graph core and pinned Graphify adapter](https://github.com/elixpo/crumb.elixpo/issues/100).
   - [x] [WP-032: qualify Graphify retrieval and native fallback](https://github.com/elixpo/crumb.elixpo/issues/122).
-  - Keep Graphify opt-in, local-first, pinned, and replaceable.
+  - Keep Graphify local-first, enabled by default, pinned, and replaceable.
   - Require source/edge provenance, freshness detection, bounded retrieval, and native-search fallback.
   - Route its MCP surface through Crumb's approval and supervision boundary.
 

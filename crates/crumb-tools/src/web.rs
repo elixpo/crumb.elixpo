@@ -1,5 +1,6 @@
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -66,11 +67,20 @@ impl ToolHandler for WebFetch {
             bail!("web fetch URL exceeds the byte limit");
         }
         let url = Url::parse(url).context("web fetch URL is invalid")?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to start web fetch runtime")?;
-        runtime.block_on(self.fetch(url, cancellation))
+        let limits = self.limits;
+        let cancellation = cancellation.clone();
+        thread::Builder::new()
+            .name("crumb-web-fetch".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("failed to start web fetch runtime")?;
+                runtime.block_on(WebFetch { limits }.fetch(url, &cancellation))
+            })
+            .context("failed to start web fetch worker")?
+            .join()
+            .map_err(|_| anyhow!("web fetch worker failed"))?
     }
 }
 
@@ -277,9 +287,16 @@ fn remove_tagged_blocks(html: &str, tags: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::time::Duration;
 
-    use super::{html_to_text, is_public_ip};
+    use crumb_agent::{
+        AgentMode, CancellationToken, ConfiguredApprovals, ToolCallErrorKind, ToolHost,
+    };
+    use serde_json::json;
+
+    use super::{WebFetchLimits, html_to_text, is_public_ip, register_web_fetch_tool};
 
     #[test]
     fn private_and_metadata_addresses_are_blocked() {
@@ -295,5 +312,31 @@ mod tests {
             html_to_text("<style>body{display:none}</style><h1>Crumb</h1><p>A &amp; B</p>"),
             "Crumb A & B"
         );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_is_safe_when_called_from_the_harness_runtime() {
+        let mut host = ToolHost::default();
+        register_web_fetch_tool(
+            &mut host,
+            WebFetchLimits {
+                timeout: Duration::from_secs(1),
+                max_output_bytes: 1024,
+            },
+        )
+        .expect("web fetch registers");
+        let approvals = ConfiguredApprovals::new(BTreeSet::from(["web_fetch".to_owned()]));
+
+        let error = host
+            .call(
+                "web_fetch",
+                &json!({"url":"https://127.0.0.1/private"}),
+                AgentMode::Auto,
+                &approvals,
+                &CancellationToken::default(),
+            )
+            .expect_err("private address is rejected without a nested-runtime panic");
+
+        assert_eq!(error.kind, ToolCallErrorKind::Internal);
     }
 }

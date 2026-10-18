@@ -1,6 +1,8 @@
 //! Lightweight terminal presentation for crumb.
 
+use std::collections::VecDeque;
 use std::env;
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -222,18 +224,17 @@ impl Renderer {
         } else {
             WORDMARK
         };
-        let model = context.model.unwrap_or("model not configured");
+        let pack = context.model.unwrap_or("not configured");
         let state = if context.agent_configured {
-            format!("Ready · {model} · {}", context.mode)
+            format!("Ready · pack {pack} · {}", context.mode)
         } else {
             "Native shell ready · run /auth login for AI".to_owned()
         };
         let copy = format!(
-            "{wordmark}\nCrumb CLI v{} · Native commands stay native.\n{} · effort {}\n{}\nTip: type naturally · : forces AI · / opens actions",
+            "{wordmark}\nCrumb CLI v{} · Native commands stay native.\n{} · effort {}\nTip: type naturally · : forces AI · / opens actions",
             context.version,
             state,
             context.effort.unwrap_or("default"),
-            context_meter(context),
         );
         if terminal_width < 96 {
             let panda = format!("  {}", trim_art(panda).replace('\n', "\n  "));
@@ -295,11 +296,28 @@ impl Renderer {
     /// Renders the persistent keyboard guide below the full-screen composer.
     #[must_use]
     pub fn composer_hotkeys(&self, terminal_width: u16) -> String {
-        let guide = if terminal_width < 80 {
-            "Enter send · Tab complete · PgUp/PgDn scroll · / commands"
+        let guide = if terminal_width < 52 {
+            "↵ send · Tab complete · / commands"
+        } else if terminal_width < 80 {
+            "Enter send · Tab complete · PgUp/PgDn · / commands"
         } else {
-            "Enter send/steer · Ctrl+Enter queue · PgUp/PgDn scroll · Tab complete · @ context · / commands · ? help"
+            "Enter send · Ctrl+Enter queue · PgUp/PgDn scroll · Tab · @ · / · ?"
         };
+        let guide = fit_terminal_text(guide, usize::from(terminal_width.saturating_sub(2)));
+        self.paint(&format!("  {guide}"), "2")
+    }
+
+    /// Renders the fixed keyboard guide while an agent turn is active.
+    #[must_use]
+    pub fn composer_active_hotkeys(&self, terminal_width: u16) -> String {
+        let guide = if terminal_width < 52 {
+            "↵ steer · ^↵ queue · ^C cancel"
+        } else if terminal_width < 80 {
+            "Enter steer · PgUp/PgDn scroll · Ctrl+C cancel"
+        } else {
+            "Type a follow-up · Enter steer · Ctrl+Enter queue · PgUp/PgDn scroll · /pause · Ctrl+C cancel"
+        };
+        let guide = fit_terminal_text(guide, usize::from(terminal_width.saturating_sub(2)));
         self.paint(&format!("  {guide}"), "2")
     }
 
@@ -309,11 +327,31 @@ impl Renderer {
         format!("  {} {}", self.paint("●", "36"), self.paint("Ready", "2"))
     }
 
+    /// Renders compact, non-secret model and context state for the fixed footer.
+    #[must_use]
+    pub fn context_footer(&self, context: &StartupContext<'_>, terminal_width: u16) -> String {
+        let pack = context.model.unwrap_or("native");
+        let text = format!(
+            "effort {} · pack {pack} · {} · {}",
+            context.effort.unwrap_or("default"),
+            context_meter(context),
+            context.mode
+        );
+        let text = fit_terminal_text(&text, usize::from(terminal_width.saturating_sub(2)));
+        self.paint(&format!("  {text}"), "2")
+    }
+
     /// Renders the bottom edge of the full-width composer.
     #[must_use]
     pub fn composer_bottom_border(&self, terminal_width: u16) -> String {
         let inner = usize::from(terminal_width.saturating_sub(6));
         self.paint(&format!("  ╰{}╯", "─".repeat(inner)), "2")
+    }
+
+    /// Renders the fixed divider between startup context and the transcript.
+    #[must_use]
+    pub fn transcript_divider(&self, available_width: u16) -> String {
+        self.paint(&"─".repeat(usize::from(available_width)), "2")
     }
 
     /// Renders one vertical composer edge.
@@ -367,7 +405,13 @@ impl Renderer {
         let content_width = card_width.saturating_sub(2);
         let timestamp = timestamp.unwrap_or_default();
         let mut body = vec![String::new()];
-        for line in input.lines().take(TRANSCRIPT_INPUT_MAX_ROWS) {
+        let mut pending = input.lines().map(str::to_owned).collect::<VecDeque<_>>();
+        if pending.is_empty() {
+            pending.push_back(String::new());
+        }
+        while body.len() <= TRANSCRIPT_INPUT_MAX_ROWS
+            && let Some(line) = pending.pop_front()
+        {
             let first = body.len() == 1;
             let marker = if first { "◆ >" } else { "  │" };
             let timestamp_width = if first && !timestamp.is_empty() {
@@ -375,17 +419,14 @@ impl Renderer {
             } else {
                 0
             };
-            let line = if content_width == 0 {
-                line.to_owned()
-            } else {
-                fit_terminal_text(
-                    line,
-                    content_width
-                        .saturating_sub(marker.chars().count())
-                        .saturating_sub(timestamp_width)
-                        .saturating_sub(1),
-                )
-            };
+            let available = content_width
+                .saturating_sub(marker.chars().count())
+                .saturating_sub(timestamp_width)
+                .saturating_sub(1);
+            let (line, remainder) = split_terminal_line(&line, available);
+            if let Some(remainder) = remainder {
+                pending.push_front(remainder);
+            }
             let mut row = format!("{marker} {line}");
             if first && !timestamp.is_empty() {
                 let padding = content_width
@@ -397,7 +438,7 @@ impl Renderer {
             }
             body.push(row);
         }
-        if input.lines().count() > TRANSCRIPT_INPUT_MAX_ROWS
+        if !pending.is_empty()
             && let Some(last) = body.last_mut()
         {
             if content_width == 0 {
@@ -437,7 +478,7 @@ impl Renderer {
     /// Renders a compact, non-blocking startup readiness summary.
     #[must_use]
     pub fn startup_status(&self, context: &StartupContext<'_>) -> String {
-        let model = context.model.unwrap_or("not configured");
+        let pack = context.model.unwrap_or("not configured");
         let state = if context.agent_configured {
             "agent ready"
         } else {
@@ -445,7 +486,7 @@ impl Renderer {
         };
         if self.settings.output == OutputMode::ScreenReader {
             return format!(
-                "crumb {} on {}\n{state}; model {model}; mode {}",
+                "crumb {} on {}\n{state}; pack {pack}; mode {}",
                 context.version, context.platform, context.mode
             );
         }
@@ -464,7 +505,7 @@ impl Renderer {
                 },
                 "36;1"
             ),
-            self.paint(&format!("{state} · {model} · {}", context.mode), "2")
+            self.paint(&format!("{state} · pack {pack} · {}", context.mode), "2")
         )
     }
 
@@ -477,7 +518,20 @@ impl Renderer {
         mode: &str,
         skill: Option<&str>,
     ) -> String {
-        let mut details = vec![format!("model {model}"), format!("mode {mode}")];
+        self.agent_header_for_width(model, effort, mode, skill, u16::MAX)
+    }
+
+    /// Renders Harness context without crossing the terminal UI margins.
+    #[must_use]
+    pub fn agent_header_for_width(
+        &self,
+        model: &str,
+        effort: Option<&str>,
+        mode: &str,
+        skill: Option<&str>,
+        terminal_width: u16,
+    ) -> String {
+        let mut details = vec![format!("pack {model}"), format!("mode {mode}")];
         if let Some(effort) = effort {
             details.push(format!("effort {effort}"));
         }
@@ -487,18 +541,42 @@ impl Renderer {
         if self.settings.output == OutputMode::ScreenReader {
             format!("Crumb agent\n{}", details.join(", "))
         } else {
-            format!(
-                "  {}  {}",
-                self.paint(CRUMB_BADGE, "38;2;255;255;204;48;5;53;1"),
-                self.paint(&details.join(" · "), "2")
-            )
+            let prefix = format!(
+                "  {}  ",
+                self.paint(CRUMB_BADGE, "38;2;255;255;204;48;5;53;1")
+            );
+            let prefix_width = 2 + CRUMB_BADGE.chars().count() + 2;
+            let content_width = usize::from(terminal_width.saturating_sub(2))
+                .saturating_sub(prefix_width)
+                .max(1);
+            wrap_terminal_line(&details.join(" · "), content_width)
+                .into_iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    let prefix = if index == 0 {
+                        prefix.clone()
+                    } else {
+                        " ".repeat(prefix_width)
+                    };
+                    format!("{prefix}{}", self.paint(&line, "2"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         }
     }
 
     /// Renders one committed Harness response without protocol metadata.
     #[must_use]
     pub fn agent_response(&self, response: &str) -> String {
+        self.agent_response_for_width(response, u16::MAX)
+    }
+
+    /// Renders one committed Harness response inside the terminal UI margins.
+    #[must_use]
+    pub fn agent_response_for_width(&self, response: &str, terminal_width: u16) -> String {
         let response = visible_agent_text(response);
+        let content_width = usize::from(terminal_width.saturating_sub(10)).max(1);
+        let response = render_terminal_markdown(*self, &response, content_width);
         if self.settings.output == OutputMode::ScreenReader {
             return response;
         }
@@ -517,15 +595,32 @@ impl Renderer {
     /// Renders a recoverable command failure without ending the terminal session.
     #[must_use]
     pub fn command_error(&self, message: &str) -> String {
+        self.command_error_for_width(message, u16::MAX)
+    }
+
+    /// Renders a recoverable command failure inside the terminal UI margins.
+    #[must_use]
+    pub fn command_error_for_width(&self, message: &str, terminal_width: u16) -> String {
         if self.settings.output == OutputMode::ScreenReader {
             return format!("Crumb command failed: {message}");
         }
-        format!(
-            "  {}  {}\n  {} {message}",
+        let mut output = format!(
+            "  {}  {}",
             self.paint("[ CRUMB ]", "38;2;255;255;204;48;5;53;1"),
-            self.paint("Command failed", "31;1"),
-            self.paint("╰──▶", "31;1")
-        )
+            self.paint("Command failed", "31;1")
+        );
+        let content_width = usize::from(terminal_width.saturating_sub(9)).max(1);
+        for (index, line) in wrap_terminal_line(message, content_width)
+            .into_iter()
+            .enumerate()
+        {
+            if index == 0 {
+                let _ = write!(output, "\n  {} {line}", self.paint("╰──▶", "31;1"));
+            } else {
+                let _ = write!(output, "\n        {line}");
+            }
+        }
+        output
     }
 
     /// Renders the persistent handoff shown after leaving the alternate screen.
@@ -578,6 +673,17 @@ impl Renderer {
     /// Renders a Harness failure without conflating it with native shell output.
     #[must_use]
     pub fn agent_error(&self, message: &str, cancelled: bool) -> String {
+        self.agent_error_for_width(message, cancelled, u16::MAX)
+    }
+
+    /// Renders a Harness failure inside the terminal UI margins.
+    #[must_use]
+    pub fn agent_error_for_width(
+        &self,
+        message: &str,
+        cancelled: bool,
+        terminal_width: u16,
+    ) -> String {
         let (marker, title) = if cancelled {
             ("■", "Agent cancelled")
         } else {
@@ -586,15 +692,23 @@ impl Renderer {
         if self.settings.output == OutputMode::ScreenReader {
             return format!("{title}: {message}");
         }
-        format!(
-            "  {} {} {}\n  {} {}\n  {}",
+        let mut output = format!(
+            "  {} {} {}",
             self.paint("│", "35"),
             self.paint(marker, if cancelled { "33;1" } else { "31;1" }),
-            self.paint(title, "1"),
-            self.paint("│", "35"),
-            self.paint(message, "2"),
-            self.paint("╰─", "35")
-        )
+            self.paint(title, "1")
+        );
+        let content_width = usize::from(terminal_width.saturating_sub(6)).max(1);
+        for line in wrap_terminal_line(message, content_width) {
+            let _ = write!(
+                output,
+                "\n  {} {}",
+                self.paint("│", "35"),
+                self.paint(&line, "2")
+            );
+        }
+        let _ = write!(output, "\n  {}", self.paint("╰─", "35"));
+        output
     }
 
     /// Renders one transient Harness activity update.
@@ -603,8 +717,75 @@ impl Renderer {
         if self.settings.output == OutputMode::ScreenReader {
             format!("Activity: {label}")
         } else {
-            format!("  {}  ↳ {label}", self.paint("│", "35"))
+            format!(
+                "  {}  ↳ {}",
+                self.paint("│", "35"),
+                self.paint(label, "38;5;245")
+            )
         }
+    }
+
+    /// Renders bounded tool output as a distinct transcript block.
+    #[must_use]
+    pub fn agent_tool_output_for_width(&self, content: &str, terminal_width: u16) -> String {
+        let content = content.trim_end();
+        if self.settings.output == OutputMode::ScreenReader {
+            return format!("Tool output:\n{content}");
+        }
+        let content_width = usize::from(terminal_width.saturating_sub(10)).max(1);
+        let mut output = format!(
+            "  {}    {}",
+            self.paint("│", "35"),
+            self.paint("tool output", "38;5;245")
+        );
+        for source_line in content.lines() {
+            for line in wrap_terminal_line(source_line, content_width) {
+                let _ = write!(
+                    output,
+                    "\n  {}    {}",
+                    self.paint("│", "35"),
+                    self.paint(&line, "2")
+                );
+            }
+        }
+        output
+    }
+
+    /// Renders the clickable summary row for captured tool output.
+    #[must_use]
+    pub fn agent_tool_output_toggle(&self, expanded: bool, lines: usize, bytes: usize) -> String {
+        let marker = if expanded { "▼" } else { "▶" };
+        let label = format!("{marker} Tool output · {lines} lines · {bytes} B");
+        if self.settings.output == OutputMode::ScreenReader {
+            return label;
+        }
+        format!(
+            "  {}    {}",
+            self.paint("│", "35"),
+            self.paint(&label, "38;5;245")
+        )
+    }
+
+    /// Renders only the body of an expanded tool-output block.
+    #[must_use]
+    pub fn agent_tool_output_body_for_width(
+        &self,
+        content: &str,
+        terminal_width: u16,
+    ) -> Vec<String> {
+        let content_width = usize::from(terminal_width.saturating_sub(10)).max(1);
+        content
+            .trim_end()
+            .lines()
+            .flat_map(|source_line| wrap_terminal_line(source_line, content_width))
+            .map(|line| {
+                if self.settings.output == OutputMode::ScreenReader {
+                    line
+                } else {
+                    format!("  {}    {}", self.paint("│", "35"), self.paint(&line, "2"))
+                }
+            })
+            .collect()
     }
 
     /// Renders a durable tool outcome in the scrolling transcript.
@@ -637,13 +818,13 @@ impl Renderer {
                 format!("Tool {name} {state}")
             };
         }
-        let color = if success { "32;1" } else { "31;1" };
+        let color = if success { "38;5;245" } else { "31;1" };
         format!(
-            "  {}  {}\n  {} {}",
+            "  {}  {} {} {}",
             self.paint(CRUMB_BADGE, "38;2;255;255;204;48;5;53;1"),
             self.paint(title, color),
-            self.paint("╰──▶", color),
-            self.paint(detail, "1")
+            self.paint("·", "2"),
+            self.paint(detail, if success { "38;5;245" } else { "1" })
         )
     }
 
@@ -674,23 +855,40 @@ impl Renderer {
         )
     }
 
-    /// Renders a trusted allow-once decision without exposing raw arguments.
+    /// Renders a trusted allow-once decision with an optional bounded summary.
     #[must_use]
-    pub fn agent_approval_prompt(&self, name: &str, risk: &str, digest: &str) -> String {
+    pub fn agent_approval_prompt(
+        &self,
+        name: &str,
+        risk: &str,
+        digest: &str,
+        detail: Option<&str>,
+    ) -> String {
         let short_digest = digest.get(..12).unwrap_or(digest);
         if self.settings.output == OutputMode::ScreenReader {
-            return format!(
-                "Approval required for {name}, risk {risk}, request {short_digest}. Enter or y allows once; n or escape denies."
+            let mut prompt = format!(
+                "Approval required for {name}, risk {risk}, request {short_digest}. Enter or y allows once; a always allows this tool; s selects sensitive-only mode; f selects full access; n or escape denies."
             );
+            if let Some(detail) = detail {
+                let _ = write!(prompt, " Requested action: {detail}.");
+            }
+            return prompt;
         }
+        let detail_line = detail.map_or_else(String::new, |detail| {
+            format!("\n     {}", self.paint(detail, "36;1"))
+        });
         format!(
-            "  {}  {}\n  {} {}\n     {}\n     {}",
+            "  {}  {}\n  {} {}{}\n     {}\n     {}",
             self.paint("[ CRUMB ]", "38;2;255;255;204;48;5;53;1"),
             self.paint("Allow this tool once?", "33;1"),
             self.paint("╰──▶", "33;1"),
             self.paint(name, "1"),
+            detail_line,
             self.paint(&format!("risk {risk} · request {short_digest}"), "2"),
-            self.paint("Enter/y allow once · n/Esc deny", "2")
+            self.paint(
+                "Enter/y once · a always allow tool · s sensitive · f full access · n/Esc deny",
+                "2",
+            )
         )
     }
 
@@ -847,14 +1045,9 @@ fn context_meter(context: &StartupContext<'_>) -> String {
     );
     let percent = used.saturating_mul(100) / budget;
     format!(
-        "Context [{meter}] {percent:>3}% · {} / {}{}",
+        "Model context [{meter}] {percent:>3}% · {} / {}",
         compact_tokens(used),
-        compact_tokens(context.session_budget_tokens),
-        if context.auto_compaction {
-            " · compact 80%"
-        } else {
-            ""
-        }
+        compact_tokens(context.session_budget_tokens)
     )
 }
 
@@ -865,6 +1058,23 @@ fn fit_terminal_text(text: &str, width: usize) -> String {
         fitted.push('…');
     }
     fitted
+}
+
+fn split_terminal_line(text: &str, width: usize) -> (String, Option<String>) {
+    if width == 0 || text.chars().count() <= width {
+        return (text.to_owned(), None);
+    }
+    let prefix = text.chars().take(width).collect::<String>();
+    let split = prefix
+        .char_indices()
+        .filter(|(_, character)| character.is_whitespace())
+        .map(|(index, _)| index)
+        .next_back()
+        .filter(|index| *index > 0)
+        .unwrap_or(prefix.len());
+    let head = prefix[..split].trim_end().to_owned();
+    let remainder = text[split..].trim_start().to_owned();
+    (head, Some(remainder))
 }
 
 fn compose_styled_art(renderer: Renderer, left: &str, right: &str, gap: usize) -> String {
@@ -962,6 +1172,7 @@ pub struct ActivityIndicator {
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     started: Instant,
+    label: String,
     visible: bool,
     color: bool,
     row: Option<u16>,
@@ -979,10 +1190,24 @@ impl ActivityIndicator {
             running,
             thread,
             started: Instant::now(),
+            label: label.to_owned(),
             visible: animated,
             color,
             row,
         }
+    }
+
+    /// Returns the stable activity label so a fullscreen caller can relocate
+    /// the animation after repainting a scrollable viewport.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Returns how long the current activity phase has been running.
+    #[must_use]
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
     }
 
     /// Stops and clears the activity line before another message is rendered.
@@ -1022,14 +1247,14 @@ impl Drop for ActivityIndicator {
 
 fn animate_activity(label: &str, color: bool, running: &AtomicBool, row: Option<u16>) {
     let mut frame = 0_usize;
+    let started = Instant::now();
     while running.load(Ordering::Acquire) {
         let cookie = COOKIE_SPINNER[frame];
+        let elapsed = started.elapsed().as_secs_f32();
         let line = if color {
-            format!(
-                "\x1b[35;1m{cookie}\x1b[0m \x1b[90m{label} · Enter steer · Ctrl+Enter queue · /pause · Ctrl+C cancel\x1b[0m"
-            )
+            format!("\x1b[35;1m{cookie}\x1b[0m \x1b[90m{label} · {elapsed:.1}s\x1b[0m")
         } else {
-            format!("{cookie} {label} · Enter steer · Ctrl+Enter queue · /pause · Ctrl+C cancel")
+            format!("{cookie} {label} · {elapsed:.1}s")
         };
         write_activity_line(&line, row);
         let _ = io::stderr().flush();
@@ -1039,15 +1264,12 @@ fn animate_activity(label: &str, color: bool, running: &AtomicBool, row: Option<
 }
 
 fn write_activity_line(line: &str, row: Option<u16>) {
-    if let Some(row) = row {
-        let _ = write!(
-            io::stderr(),
-            "\x1b7\x1b[{};1H\x1b[2K  {line}\x1b8",
-            row.saturating_add(1)
-        );
+    let rendered = if let Some(row) = row {
+        format!("\x1b7\x1b[{};1H\x1b[2K  {line}\x1b8", row.saturating_add(1))
     } else {
-        let _ = write!(io::stderr(), "\r\x1b[2K{line}");
-    }
+        format!("\r\x1b[2K{line}")
+    };
+    let _ = io::stderr().write_all(rendered.as_bytes());
 }
 
 fn clear_activity_line(row: Option<u16>) {
@@ -1073,6 +1295,210 @@ pub fn visible_agent_text(response: &str) -> String {
         .strip_prefix("<response>")
         .and_then(|body| body.strip_suffix("</response>"))
         .map_or_else(|| visible.to_owned(), |body| body.trim().to_owned())
+}
+
+fn render_terminal_markdown(ui: Renderer, markdown: &str, content_width: usize) -> String {
+    let mut output_lines = Vec::new();
+    let mut fence: Option<String> = None;
+
+    for line in markdown.lines() {
+        let trimmed = line.trim_start();
+        if let Some(info) = trimmed.strip_prefix("```") {
+            if fence.is_some() {
+                output_lines.push(ui.paint("└─", "2"));
+                fence = None;
+            } else {
+                let language = info.trim();
+                let label = if language.eq_ignore_ascii_case("mermaid") {
+                    "mermaid diagram · source".to_owned()
+                } else if language.is_empty() {
+                    "code".to_owned()
+                } else {
+                    format!("code · {language}")
+                };
+                output_lines.push(format!(
+                    "{} {}",
+                    ui.paint("┌─", "2"),
+                    ui.paint(&label, "35;1")
+                ));
+                fence = Some(language.to_owned());
+            }
+            continue;
+        }
+
+        if fence.is_some() {
+            for chunk in wrap_terminal_line(line, content_width.saturating_sub(2).max(1)) {
+                output_lines.push(format!("{} {chunk}", ui.paint("│", "2")));
+            }
+            continue;
+        }
+
+        for line in wrap_markdown_source_line(line, content_width) {
+            output_lines.push(render_markdown_line(ui, &line));
+        }
+    }
+
+    if fence.is_some() {
+        output_lines.push(ui.paint("└─", "2"));
+    }
+    output_lines.join("\n")
+}
+
+fn wrap_markdown_source_line(line: &str, width: usize) -> Vec<String> {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+    let indent_width = indent.chars().count();
+    let available = width.saturating_sub(indent_width).max(1);
+
+    for marker in ["- ", "* ", "+ ", "> "] {
+        if let Some(body) = trimmed.strip_prefix(marker) {
+            let chunks = wrap_terminal_line(body, available.saturating_sub(2).max(1));
+            return chunks
+                .into_iter()
+                .enumerate()
+                .map(|(index, chunk)| {
+                    let continuation = if index == 0 || marker == "> " {
+                        marker
+                    } else {
+                        "  "
+                    };
+                    format!("{indent}{continuation}{chunk}")
+                })
+                .collect();
+        }
+    }
+
+    if let Some((level, heading)) = markdown_heading(trimmed) {
+        let chunks = wrap_terminal_line(heading, available);
+        return chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, chunk)| {
+                if index == 0 {
+                    format!("{indent}{} {chunk}", "#".repeat(level))
+                } else {
+                    format!("{indent}{chunk}")
+                }
+            })
+            .collect();
+    }
+
+    wrap_terminal_line(trimmed, available)
+        .into_iter()
+        .map(|chunk| format!("{indent}{chunk}"))
+        .collect()
+}
+
+fn wrap_terminal_line(line: &str, width: usize) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+    let mut wrapped = Vec::new();
+    let mut pending = line.to_owned();
+    loop {
+        let (head, remainder) = split_terminal_line(&pending, width);
+        wrapped.push(head);
+        let Some(remainder) = remainder else {
+            break;
+        };
+        pending = remainder;
+    }
+    wrapped
+}
+
+fn render_markdown_line(renderer: Renderer, line: &str) -> String {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+
+    if let Some((level, heading)) = markdown_heading(trimmed) {
+        let color = if level <= 2 {
+            "38;2;255;255;204;1"
+        } else {
+            "1"
+        };
+        return format!("{indent}{}", renderer.paint(heading, color));
+    }
+    if let Some(quote) = trimmed.strip_prefix("> ") {
+        return format!(
+            "{indent}{} {}",
+            renderer.paint("│", "2"),
+            render_inline_markdown(renderer, quote)
+        );
+    }
+    if let Some(item) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+    {
+        return format!(
+            "{indent}{} {}",
+            renderer.paint("•", "35;1"),
+            render_inline_markdown(renderer, item)
+        );
+    }
+    if matches!(trimmed, "---" | "***" | "___") {
+        return format!("{indent}{}", renderer.paint("────────────────", "2"));
+    }
+    format!("{indent}{}", render_inline_markdown(renderer, trimmed))
+}
+
+fn markdown_heading(line: &str) -> Option<(usize, &str)> {
+    let hashes = line.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    line.get(hashes..)?
+        .strip_prefix(' ')
+        .map(|text| (hashes, text))
+}
+
+fn render_inline_markdown(renderer: Renderer, text: &str) -> String {
+    let mut output = String::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(code) = rest.strip_prefix('`')
+            && let Some(end) = code.find('`')
+        {
+            output.push_str(&renderer.paint(&code[..end], "36"));
+            rest = &code[end + 1..];
+            continue;
+        }
+        if let Some(bold) = rest.strip_prefix("**")
+            && let Some(end) = bold.find("**")
+        {
+            output.push_str(&renderer.paint(&bold[..end], "1"));
+            rest = &bold[end + 2..];
+            continue;
+        }
+        if let Some(label) = rest.strip_prefix('[')
+            && let Some(label_end) = label.find("](")
+            && let Some(url_end) = label[label_end + 2..].find(')')
+        {
+            let url_start = label_end + 2;
+            let url_end = url_start + url_end;
+            output.push_str(&renderer.paint(&label[..label_end], "36;4"));
+            output.push_str(" (");
+            output.push_str(&label[url_start..url_end]);
+            output.push(')');
+            rest = &label[url_end + 1..];
+            continue;
+        }
+
+        let next = rest
+            .char_indices()
+            .find_map(|(index, character)| matches!(character, '`' | '*' | '[').then_some(index))
+            .filter(|index| *index > 0)
+            .unwrap_or(rest.len());
+        if next == 0 {
+            let character = rest.chars().next().expect("non-empty markdown text");
+            output.push(character);
+            rest = &rest[character.len_utf8()..];
+        } else {
+            output.push_str(&rest[..next]);
+            rest = &rest[next..];
+        }
+    }
+    output
 }
 
 fn append_optional_segments(segments: &mut Vec<String>, context: &PromptContext<'_>) {
@@ -1225,8 +1651,8 @@ mod tests {
         });
 
         assert_eq!(
-            renderer.agent_header("qwen-coder", Some("high"), "auto", None),
-            "  [ CRUMB ]  model qwen-coder · mode auto · effort high"
+            renderer.agent_header("Balanced Crumb", Some("high"), "auto", None),
+            "  [ CRUMB ]  pack Balanced Crumb · mode auto · effort high"
         );
         assert_eq!(renderer.agent_response("done\n"), "\n  ╰──▶ done");
         assert_eq!(
@@ -1260,6 +1686,43 @@ mod tests {
     }
 
     #[test]
+    fn agent_output_renders_terminal_markdown_and_mermaid_source() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let response = "# Result\n**Ready** after `cargo test`.\n- checks passed\n```rust\nfn main() {}\n```\n```mermaid\ngraph TD\n  A --> B\n```";
+        let output = renderer.agent_response(response);
+
+        assert!(output.contains("╰──▶ Result"));
+        assert!(output.contains("Ready after cargo test."));
+        assert!(output.contains("• checks passed"));
+        assert!(output.contains("┌─ code · rust"));
+        assert!(output.contains("│ fn main() {}"));
+        assert!(output.contains("┌─ mermaid diagram · source"));
+        assert!(output.contains("│ graph TD"));
+        assert!(!output.contains("```"));
+    }
+
+    #[test]
+    fn agent_output_wraps_inside_terminal_ui_margins() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let response = "A deliberately long response line that must remain inside the UI margins.\n- A similarly long list item that also wraps cleanly.\n```text\nlong code output that must remain bounded too\n```";
+        let output = renderer.agent_response_for_width(response, 44);
+
+        assert!(output.lines().all(|line| line.chars().count() <= 42));
+        assert_eq!(output.matches("• ").count(), 1);
+        assert!(output.matches("│ ").count() >= 2);
+    }
+
+    #[test]
     fn transcript_card_uses_the_requested_neutral_grey_fill() {
         let renderer = Renderer::new(UiSettings {
             color: true,
@@ -1273,6 +1736,28 @@ mod tests {
                 .transcript_input_at("you", "pwd", None, 80)
                 .contains("\x1b[1;48;2;85;85;85m")
         );
+    }
+
+    #[test]
+    fn transcript_card_wraps_long_submissions_inside_its_width() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+
+        let card = renderer.transcript_input_at(
+            "you",
+            "Use parallel agents to inspect authentication flow and reconcile findings clearly",
+            Some("21:34"),
+            44,
+        );
+
+        assert!(!card.contains('…'));
+        assert!(card.contains("authentication"));
+        assert!(card.contains("reconcile findings"));
+        assert!(card.lines().all(|line| line.chars().count() <= 42));
     }
 
     #[test]
@@ -1290,6 +1775,98 @@ mod tests {
     }
 
     #[test]
+    fn active_footer_keeps_steering_controls_visible() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+
+        let wide = renderer.composer_active_hotkeys(120);
+        assert!(wide.contains("Enter steer"));
+        assert!(wide.contains("Ctrl+Enter queue"));
+        assert!(wide.contains("PgUp/PgDn scroll"));
+        assert!(wide.contains("/pause"));
+        assert!(wide.contains("Ctrl+C cancel"));
+        let narrow = renderer.composer_active_hotkeys(60);
+        assert!(narrow.contains("Enter steer"));
+        assert!(narrow.contains("Ctrl+C cancel"));
+    }
+
+    #[test]
+    fn context_footer_keeps_live_usage_and_compact_model_identity() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let footer = renderer.context_footer(
+            &StartupContext {
+                version: "0.1.0",
+                platform: Platform::Linux,
+                model: Some("Quick Crumb"),
+                mode: "auto",
+                effort: Some("high"),
+                session_budget_tokens: 64_000,
+                context_tokens: 12_800,
+                auto_compaction: true,
+                agent_configured: true,
+            },
+            100,
+        );
+
+        assert!(footer.contains("Model context"));
+        assert!(footer.contains("12.8k / 64.0k"));
+        assert!(footer.contains("effort high"));
+        assert!(footer.contains("pack Quick Crumb"));
+        assert!(footer.contains("auto"));
+        assert!(footer.chars().count() <= 100);
+    }
+
+    #[test]
+    fn context_footer_always_labels_default_effort() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let footer = renderer.context_footer(
+            &StartupContext {
+                version: "0.1.0",
+                platform: Platform::Linux,
+                model: Some("Quick Crumb"),
+                mode: "auto",
+                effort: None,
+                session_budget_tokens: 64_000,
+                context_tokens: 0,
+                auto_compaction: false,
+                agent_configured: true,
+            },
+            100,
+        );
+
+        assert!(footer.contains("effort default"));
+        let narrow = renderer.context_footer(
+            &StartupContext {
+                version: "0.1.0",
+                platform: Platform::Linux,
+                model: Some("Quick Crumb"),
+                mode: "auto",
+                effort: Some("extra high"),
+                session_budget_tokens: 64_000,
+                context_tokens: 0,
+                auto_compaction: false,
+                agent_configured: true,
+            },
+            38,
+        );
+        assert!(narrow.contains("effort extra high"));
+    }
+
+    #[test]
     fn agent_events_distinguish_tool_results_and_user_owned_approval() {
         let renderer = Renderer::new(UiSettings {
             color: false,
@@ -1300,28 +1877,71 @@ mod tests {
 
         assert_eq!(
             renderer.agent_tool_result("web_fetch", true),
-            "  [ CRUMB ]  Tool completed\n  ╰──▶ web_fetch"
+            "  [ CRUMB ]  Tool completed · web_fetch"
         );
         assert_eq!(
             renderer.agent_tool_result("write_file", false),
-            "  [ CRUMB ]  Tool failed\n  ╰──▶ write_file"
+            "  [ CRUMB ]  Tool failed · write_file"
+        );
+        assert_eq!(
+            renderer.agent_tool_output_for_width("folder-a\nfolder-b", 80),
+            "  │    tool output\n  │    folder-a\n  │    folder-b"
+        );
+        assert_eq!(
+            renderer.agent_tool_output_toggle(false, 2, 17),
+            "  │    ▶ Tool output · 2 lines · 17 B"
+        );
+        assert_eq!(
+            renderer.agent_tool_output_toggle(true, 2, 17),
+            "  │    ▼ Tool output · 2 lines · 17 B"
         );
         assert_eq!(
             renderer.agent_approval_required("write_file"),
             "  [ CRUMB ]  Approval required\n  ╰──▶ write_file · user permission required"
         );
         assert_eq!(
-            renderer.agent_approval_prompt("write_file", "workspace write", "0123456789abcdef"),
-            "  [ CRUMB ]  Allow this tool once?\n  ╰──▶ write_file\n     risk workspace write · request 0123456789ab\n     Enter/y allow once · n/Esc deny"
+            renderer.agent_approval_prompt(
+                "write_file",
+                "workspace write",
+                "0123456789abcdef",
+                None
+            ),
+            "  [ CRUMB ]  Allow this tool once?\n  ╰──▶ write_file\n     risk workspace write · request 0123456789ab\n     Enter/y once · a always allow tool · s sensitive · f full access · n/Esc deny"
+        );
+        assert_eq!(
+            renderer.agent_approval_prompt(
+                "run_shell",
+                "process execution",
+                "0123456789abcdef",
+                Some("$ cargo test --workspace")
+            ),
+            "  [ CRUMB ]  Allow this tool once?\n  ╰──▶ run_shell\n     $ cargo test --workspace\n     risk process execution · request 0123456789ab\n     Enter/y once · a always allow tool · s sensitive · f full access · n/Esc deny"
         );
         assert_eq!(
             renderer.agent_tool_result("spawn_agents", true),
-            "  [ CRUMB ]  Agent team reported\n  ╰──▶ parallel findings returned to the parent Harness"
+            "  [ CRUMB ]  Agent team reported · parallel findings returned to the parent Harness"
         );
         assert_eq!(
             renderer.agent_approval_required("spawn_agents"),
             "  [ CRUMB ]  Allow a parallel agent team?\n  ╰──▶ Koi · Nyx · Rune · Echo · user permission required"
         );
+    }
+
+    #[test]
+    fn successful_tool_status_uses_subdued_grey() {
+        let renderer = Renderer::new(UiSettings {
+            color: true,
+            output: OutputMode::Rich,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+
+        let searching = renderer.agent_activity("Searching web · weather Kolkata tomorrow");
+        let completed = renderer.agent_tool_result("web_search", true);
+
+        assert!(searching.contains("\x1b[38;5;245mSearching web"));
+        assert!(completed.contains("\x1b[38;5;245mTool completed"));
+        assert!(!completed.contains("\x1b[32;1m"));
     }
 
     #[test]
@@ -1342,8 +1962,13 @@ mod tests {
             "Approval required for tool write_file"
         );
         assert_eq!(
-            renderer.agent_approval_prompt("write_file", "workspace write", "0123456789abcdef"),
-            "Approval required for write_file, risk workspace write, request 0123456789ab. Enter or y allows once; n or escape denies."
+            renderer.agent_approval_prompt(
+                "write_file",
+                "workspace write",
+                "0123456789abcdef",
+                None
+            ),
+            "Approval required for write_file, risk workspace write, request 0123456789ab. Enter or y allows once; a always allows this tool; s selects sensitive-only mode; f selects full access; n or escape denies."
         );
     }
 
@@ -1372,7 +1997,7 @@ mod tests {
         let status = renderer.startup_status(&StartupContext {
             version: "0.1.0",
             platform: Platform::Linux,
-            model: Some("pollinations/nova-fast"),
+            model: Some("Balanced Crumb"),
             mode: "auto",
             effort: Some("medium"),
             session_budget_tokens: 64_000,
@@ -1383,13 +2008,13 @@ mod tests {
 
         assert_eq!(
             status,
-            " SESSION   crumb 0.1.0 · linux\n●  agent ready · pollinations/nova-fast · auto"
+            " SESSION   crumb 0.1.0 · linux\n●  agent ready · pack Balanced Crumb · auto"
         );
         let welcome = renderer.welcome(
             &StartupContext {
                 version: "0.1.0",
                 platform: Platform::Linux,
-                model: Some("pollinations/nova-fast"),
+                model: Some("Balanced Crumb"),
                 mode: "auto",
                 effort: Some("medium"),
                 session_budget_tokens: 64_000,
@@ -1400,8 +2025,9 @@ mod tests {
             120,
         );
         assert!(welcome.contains("Crumb CLI v0.1.0 · Native commands stay native."));
-        assert!(welcome.contains("Ready · pollinations/nova-fast · auto"));
-        assert!(welcome.contains("Context [────────────]   0% · 0 / 64.0k · compact 80%"));
+        assert!(welcome.contains("Ready · pack Balanced Crumb · auto"));
+        assert!(!welcome.contains("Model context"));
+        assert!(!welcome.contains("compact"));
         assert!(welcome.contains("╭▄█▄╮"));
     }
 
@@ -1416,7 +2042,7 @@ mod tests {
         let context = StartupContext {
             version: "0.1.0",
             platform: Platform::Linux,
-            model: Some("pollinations/nova-fast"),
+            model: Some("Deep Crumb"),
             mode: "auto",
             effort: Some("extra high"),
             session_budget_tokens: 64_000,
@@ -1488,8 +2114,8 @@ mod tests {
         });
 
         assert_eq!(
-            renderer.agent_header("qwen-coder", None, "plan", None),
-            "Crumb agent\nmodel qwen-coder, mode plan"
+            renderer.agent_header("Deep Crumb", None, "plan", None),
+            "Crumb agent\npack Deep Crumb, mode plan"
         );
         assert_eq!(
             renderer.agent_error("stopped", true),

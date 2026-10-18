@@ -23,6 +23,19 @@ pub enum AgentMode {
     Plan,
 }
 
+/// User-selected approval policy for tools that cross a trust boundary.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalMode {
+    /// Ask before every network, write, process, MCP, or privileged operation.
+    #[default]
+    AlwaysAsk,
+    /// Run ordinary operations automatically and ask before sensitive ones.
+    SensitiveOnly,
+    /// Run every registered tool without prompting. The model cannot select this mode.
+    FullAccess,
+}
+
 /// Controls optional AI assistance after a native command fails.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -282,6 +295,26 @@ pub struct ModelRoute {
     pub reasoning_effort: Option<String>,
 }
 
+/// A named set of models selected together for the agent's distinct jobs.
+///
+/// Packs keep vision and generation explicit: `vision` understands image
+/// inputs, while `image_generation` creates images.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPack {
+    pub label: String,
+    pub router: ModelRoute,
+    pub vision: ModelRoute,
+    pub image_generation: ModelRoute,
+    pub coder: ModelRoute,
+    #[serde(default)]
+    pub voice: Option<ModelRoute>,
+    #[serde(default)]
+    pub transcription: Option<ModelRoute>,
+    #[serde(default)]
+    pub text_to_speech: Option<ModelRoute>,
+}
+
 /// Hard runtime ceilings enforced outside model prompts.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
@@ -349,10 +382,14 @@ pub struct OptimizerConfig {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToolPermissions {
+    /// Global approval behavior selected by the user.
+    pub mode: ApprovalMode,
     /// Network tools allowed without an interactive approval bridge.
     pub allow_network_tools: BTreeSet<String>,
     /// Workspace-write tools explicitly enabled by the user.
     pub allow_workspace_tools: BTreeSet<String>,
+    /// Process-execution tools explicitly enabled by the user.
+    pub allow_execution_tools: BTreeSet<String>,
     /// Supervised MCP tools explicitly allowed by the user.
     #[serde(alias = "allow_process_tools")]
     pub allow_mcp_tools: BTreeSet<String>,
@@ -373,6 +410,10 @@ pub struct AgentConfig {
     pub harness: Option<HarnessConfig>,
     pub providers: BTreeMap<String, ProviderConfig>,
     pub models: BTreeMap<Modality, Vec<ModelRoute>>,
+    /// User-selectable capability bundles. The active pack supplies the
+    /// primary text and generation routes without hiding the full route list.
+    pub model_packs: BTreeMap<String, ModelPack>,
+    pub active_model_pack: Option<String>,
     pub skills: Vec<SkillConfig>,
     pub mcp_servers: Vec<crate::tools::McpServer>,
     pub optimizers: Vec<OptimizerConfig>,
@@ -407,6 +448,7 @@ impl AgentConfig {
                             )
                         })?;
                     if let Some(effort) = self.reasoning_effort_for(route)
+                        && !model.reasoning_efforts.is_empty()
                         && !model.reasoning_efforts.contains_key(effort)
                     {
                         bail!(
@@ -419,6 +461,11 @@ impl AgentConfig {
             }
         }
         validate_effort(self.reasoning_effort.as_deref())?;
+        self.validate_model_packs()?;
+        self.validate_runtime_settings()
+    }
+
+    fn validate_runtime_settings(&self) -> Result<()> {
         if self.limits.max_output_bytes == 0
             || self.limits.max_directory_entries == 0
             || self.limits.max_wall_time_seconds == 0
@@ -457,6 +504,7 @@ impl AgentConfig {
             .allow_network_tools
             .iter()
             .chain(&self.permissions.allow_workspace_tools)
+            .chain(&self.permissions.allow_execution_tools)
             .any(|tool| !valid_identifier(tool))
             || self
                 .permissions
@@ -469,6 +517,45 @@ impl AgentConfig {
         Ok(())
     }
 
+    fn validate_model_packs(&self) -> Result<()> {
+        for (id, pack) in &self.model_packs {
+            if !valid_identifier(id) || pack.label.trim().is_empty() {
+                bail!("model packs require a valid ID and non-empty label");
+            }
+            self.validate_pack_route(&pack.router, &[Modality::Text], "router")?;
+            self.validate_pack_route(&pack.vision, &[Modality::Text, Modality::Image], "vision")?;
+            self.validate_pack_route(
+                &pack.image_generation,
+                &[Modality::Image],
+                "image generation",
+            )?;
+            self.validate_pack_route(&pack.coder, &[Modality::Text], "coder")?;
+            for (role, route, input) in [
+                ("voice", pack.voice.as_ref(), Modality::Audio),
+                (
+                    "transcription",
+                    pack.transcription.as_ref(),
+                    Modality::Transcription,
+                ),
+                (
+                    "text to speech",
+                    pack.text_to_speech.as_ref(),
+                    Modality::Audio,
+                ),
+            ] {
+                if let Some(route) = route {
+                    self.validate_pack_route(route, &[input], role)?;
+                }
+            }
+        }
+        if let Some(active) = &self.active_model_pack
+            && !self.model_packs.contains_key(active)
+        {
+            bail!("active model pack `{active}` is not configured");
+        }
+        Ok(())
+    }
+
     /// Resolves a per-model override before the session default.
     #[must_use]
     pub fn reasoning_effort_for<'a>(&'a self, route: &'a ModelRoute) -> Option<&'a str> {
@@ -476,6 +563,41 @@ impl AgentConfig {
             .reasoning_effort
             .as_deref()
             .or(self.reasoning_effort.as_deref())
+    }
+
+    fn validate_pack_route(
+        &self,
+        route: &ModelRoute,
+        required_input: &[Modality],
+        role: &str,
+    ) -> Result<()> {
+        let provider = self.providers.get(&route.provider).with_context(|| {
+            format!(
+                "model pack {role} provider `{}` is not configured",
+                route.provider
+            )
+        })?;
+        let model = provider
+            .models
+            .iter()
+            .find(|model| model.id == route.model)
+            .with_context(|| {
+                format!(
+                    "model pack {role} model `{}/{}` is not configured",
+                    route.provider, route.model
+                )
+            })?;
+        if !required_input
+            .iter()
+            .all(|input| model.input.contains(input))
+        {
+            bail!(
+                "model pack {role} route `{}/{}` lacks the required input capability",
+                route.provider,
+                route.model
+            );
+        }
+        validate_effort(route.reasoning_effort.as_deref())
     }
 
     fn validate_coding_cli(

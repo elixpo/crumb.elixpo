@@ -183,6 +183,7 @@ fn provider_maps_models_chat_and_embeddings_over_http() {
                 ChatEvent::TextDelta("hello".to_owned()),
                 ChatEvent::Usage(TokenUsage {
                     input_tokens: 2,
+                    cached_input_tokens: 0,
                     output_tokens: 1,
                 }),
                 ChatEvent::Finished(FinishReason::Stop),

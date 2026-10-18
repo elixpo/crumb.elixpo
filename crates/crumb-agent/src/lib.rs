@@ -17,10 +17,11 @@ pub mod tools;
 pub use approvals::{ApprovalInbox, InteractiveApprovalBroker, PendingApproval, approval_channel};
 pub use backend::{BackendDiscovery, CodingBackend};
 pub use config::{
-    AgentConfig, AgentLimits, AgentMode, CacheRetention, CompatibilityFlag, CredentialReference,
-    HarnessConfig, LiveConfig, MistakePolicy, Modality, ModelRoute, OptimizerConfig,
-    ProviderCompatibility, ProviderConfig, ProviderHeader, ProviderModel, ProviderProtocol,
-    ProviderRetryPolicy, ProviderTransport, SkillConfig, StructuredEncoding, ToolPermissions,
+    AgentConfig, AgentLimits, AgentMode, ApprovalMode, CacheRetention, CompatibilityFlag,
+    CredentialReference, HarnessConfig, LiveConfig, MistakePolicy, Modality, ModelPack, ModelRoute,
+    OptimizerConfig, ProviderCompatibility, ProviderConfig, ProviderHeader, ProviderModel,
+    ProviderProtocol, ProviderRetryPolicy, ProviderTransport, SkillConfig, StructuredEncoding,
+    ToolPermissions,
 };
 pub use harness::{HarnessTurnRequest, ModelCapabilities};
 pub use jobs::{
@@ -40,5 +41,5 @@ pub use tools::{
     ApprovalBroker, ApprovalDecision, ApprovalRequest, ConfiguredApprovals, DenyAllApprovals,
     McpServer, McpTransport, OutputKind, RiskClass, TokenOptimizer, ToolCallError,
     ToolCallErrorKind, ToolDescriptor, ToolHandler, ToolHost, ToolOutput, ToolRegistry,
-    ToolTransport,
+    ToolTransport, tool_activity_label,
 };

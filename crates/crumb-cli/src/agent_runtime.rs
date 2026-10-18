@@ -25,6 +25,7 @@ use crumb_harness_dsh::{
     HarnessActivity, HarnessEnvironment, HarnessIdentity, HarnessLaunch, HarnessSupervisor,
     Notification, RunResult, SupervisorLimits,
 };
+use crumb_llm::ImageInput;
 use crumb_memory::{MemorySet, RetrievalPolicy};
 use crumb_pollinations::{PollinationsConfig, PollinationsProvider};
 use crumb_profile::{ProfileDocument, ProfileSelectionStore, ProfileStore};
@@ -55,6 +56,9 @@ struct PreparedTurn<'a> {
     effort: Option<String>,
     session_id: &'a str,
     request: &'a str,
+    persona: Option<&'a str>,
+    static_context: &'a [String],
+    trusted_context: &'a [String],
     cancellation: &'a CancellationToken,
 }
 
@@ -76,7 +80,9 @@ impl ApprovalBroker for TurnApprovals {
 
 fn configured_approvals(config: &AgentConfig) -> ConfiguredApprovals {
     ConfiguredApprovals::new(config.permissions.allow_network_tools.clone())
+        .with_mode(config.permissions.mode)
         .with_workspace_tools(config.permissions.allow_workspace_tools.clone())
+        .with_process_tools(config.permissions.allow_execution_tools.clone())
         .with_mcp_tools(config.permissions.allow_mcp_tools.clone())
 }
 
@@ -158,14 +164,35 @@ impl EventSink for NativeEventBridge<'_> {
         }
         let activity = match event {
             HarnessEvent::TurnStarted => Some(HarnessActivity::RequestAccepted),
-            HarnessEvent::ToolRequested { name, .. } => Some(HarnessActivity::ToolStarted { name }),
+            HarnessEvent::TextDelta(text) => Some(HarnessActivity::ResponseDelta { text }),
+            HarnessEvent::ToolRequested { name, detail, .. } => {
+                Some(HarnessActivity::ToolStarted { name, detail })
+            }
+            HarnessEvent::ToolProgress { label, .. } => Some(HarnessActivity::Progress { label }),
             HarnessEvent::ToolFinished { name, success, .. } => {
                 Some(HarnessActivity::ToolFinished { name, success })
             }
+            HarnessEvent::ToolOutput { name, content, .. } => Some(HarnessActivity::ToolOutput {
+                name,
+                bytes: u64::try_from(content.len()).ok(),
+                content: Some(content),
+            }),
+            HarnessEvent::FileChanged {
+                path,
+                additions,
+                deletions,
+            } => Some(HarnessActivity::FileChanged {
+                path,
+                additions,
+                deletions,
+            }),
             HarnessEvent::TurnFinished => Some(HarnessActivity::Completed {
                 reason: "stop".to_owned(),
             }),
-            HarnessEvent::TextDelta(_) | HarnessEvent::Usage(_) => None,
+            HarnessEvent::Usage(usage) => Some(HarnessActivity::Usage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            }),
         };
         if let Some(activity) = activity
             && let Err(error) = (self.on_activity)(activity)
@@ -254,6 +281,10 @@ pub struct AgentRuntime {
     environment_revision: u64,
     context_tokens_estimate: u64,
     session_tokens_estimate: u64,
+    provider_input_tokens: u64,
+    provider_cached_input_tokens: u64,
+    provider_output_tokens: u64,
+    last_response: Option<String>,
     compactions: u32,
     review_notes: Vec<ReviewNote>,
     review_note_bytes: usize,
@@ -421,6 +452,10 @@ impl AgentRuntime {
             environment_revision: 1,
             context_tokens_estimate: 0,
             session_tokens_estimate: 0,
+            provider_input_tokens: 0,
+            provider_cached_input_tokens: 0,
+            provider_output_tokens: 0,
+            last_response: None,
             compactions: 0,
             review_notes: Vec::new(),
             review_note_bytes: 0,
@@ -484,6 +519,7 @@ impl AgentRuntime {
         self.supervisor = None;
         self.supervisor_limits = None;
         self.native_conversation = None;
+        self.last_response = None;
         self.environment_revision = self.environment_revision.saturating_add(1);
         let journal = SessionJournal::open(&root, &summary.id)?;
         self.session = Some(AgentSession::resume(
@@ -547,6 +583,16 @@ impl AgentRuntime {
             self.context_tokens_estimate,
             self.session_tokens_estimate,
             self.compactions,
+        )
+    }
+
+    /// Returns provider-reported input and output tokens for this process.
+    #[must_use]
+    pub const fn provider_token_usage(&self) -> (u64, u64, u64) {
+        (
+            self.provider_input_tokens,
+            self.provider_cached_input_tokens,
+            self.provider_output_tokens,
         )
     }
 
@@ -668,18 +714,15 @@ impl AgentRuntime {
     ) -> Result<RunResult> {
         let workspace = std::fs::canonicalize(workspace)
             .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
-        let application =
-            apply_selected_profile(config, &workspace).unwrap_or_else(|_| ProfileApplication {
-                profile: None,
-                config: config.clone(),
-                model_source: "project",
-                effort_source: "project",
-                skill_source: "project",
-            });
+        let application = apply_selected_profile(config, &workspace)
+            .context("selected persona profile could not be applied")?;
         let config = &application.config;
         config.validate()?;
-        let tools =
-            crate::workspace_read_host(&workspace, config, crate::pollinations_runtime_key())?;
+        let tools = crate::workspace_read_host(
+            &workspace,
+            config,
+            crate::configured_pollinations_runtime_key(config),
+        )?;
         let configured = configured_approvals(config);
         let approvals: Arc<dyn ApprovalBroker> = match interaction.interactive {
             Some(interactive) => Arc::new(TurnApprovals {
@@ -689,10 +732,7 @@ impl AgentRuntime {
             None => Arc::new(configured),
         };
         self.ensure_session(&workspace, config.mode)?;
-        let route = config
-            .models
-            .get(&Modality::Text)
-            .and_then(|routes| routes.first())
+        let route = select_request_route(config, request)
             .context("agent config has no text model route")?;
         let effort = config.reasoning_effort_for(route).map(str::to_owned);
         let native = matches!(config.harness, Some(HarnessConfig::Native));
@@ -701,6 +741,7 @@ impl AgentRuntime {
         } else {
             self.start_turn(config.mode, route, effort.clone(), request)?
         };
+        let persona = application.profile.as_ref().map(profile_persona_context);
         let profiled_request = application.profile.as_ref().map_or_else(
             || request.to_owned(),
             |profile| attach_profile_context(request, profile),
@@ -717,7 +758,20 @@ impl AgentRuntime {
                 .context("agent session is unavailable")?
                 .record_memory_retrieval(audit.record_ids, audit.conflict_topics, audit.omitted)?;
         }
-        let prepared_request = attach_enabled_skills(&memory.request, &config.skills, &workspace)?;
+        let skill_context = load_enabled_skill_context(&config.skills, &workspace, request)?;
+        let prepared_request = attach_skill_context(&memory.request, &skill_context);
+        let trusted_context = runtime_context(
+            memory.context,
+            request,
+            self.token_usage(),
+            context_token_budget(config, route),
+            &workspace,
+        );
+        let dispatched_request = if native {
+            request
+        } else {
+            prepared_request.as_str()
+        };
         let cancellation_slot = Arc::clone(&self.active_cancellation);
         let _active = ActiveCancellation::new(&cancellation_slot, cancellation.clone())?;
         let mut on_activity = on_activity;
@@ -728,7 +782,10 @@ impl AgentRuntime {
                 route,
                 effort,
                 session_id: &session_id,
-                request: &prepared_request,
+                request: dispatched_request,
+                persona: persona.as_deref(),
+                static_context: &skill_context,
+                trusted_context: &trusted_context,
                 cancellation,
             },
             TurnResources { tools, approvals },
@@ -795,6 +852,9 @@ impl AgentRuntime {
                 turn.route,
                 turn.session_id,
                 turn.request,
+                turn.persona,
+                turn.static_context,
+                turn.trusted_context,
                 resources.tools,
                 resources.approvals,
                 turn.cancellation,
@@ -810,15 +870,43 @@ impl AgentRuntime {
         limit: u64,
         auto_compaction: bool,
     ) {
+        self.last_response = result
+            .map(|result| result.final_response.trim().to_owned())
+            .filter(|response| !response.is_empty());
         let response = result.map_or("", |result| result.final_response.as_str());
-        let tokens = estimate_tokens(request).saturating_add(estimate_tokens(response));
-        self.session_tokens_estimate = self.session_tokens_estimate.saturating_add(tokens);
-        self.context_tokens_estimate = self.context_tokens_estimate.saturating_add(tokens);
+        let estimated = estimate_tokens(request).saturating_add(estimate_tokens(response));
+        let reported = result.map_or(0, |result| {
+            result.input_tokens.saturating_add(result.output_tokens)
+        });
+        if let Some(result) = result {
+            self.provider_input_tokens = self
+                .provider_input_tokens
+                .saturating_add(result.input_tokens);
+            self.provider_cached_input_tokens = self
+                .provider_cached_input_tokens
+                .saturating_add(result.cached_input_tokens);
+            self.provider_output_tokens = self
+                .provider_output_tokens
+                .saturating_add(result.output_tokens);
+        }
+        let turn_tokens = estimated.max(reported);
+        self.session_tokens_estimate = self.session_tokens_estimate.saturating_add(turn_tokens);
+        let reported_context = result.map_or(0, |result| result.context_tokens);
+        self.context_tokens_estimate = if reported_context > 0 {
+            self.context_tokens_estimate.max(reported_context)
+        } else {
+            self.context_tokens_estimate.saturating_add(estimated)
+        };
         let threshold = limit.saturating_mul(4) / 5;
         if auto_compaction && threshold > 0 && self.context_tokens_estimate >= threshold {
             self.context_tokens_estimate = limit.saturating_mul(16) / 100;
             self.compactions = self.compactions.saturating_add(1);
         }
+    }
+
+    #[must_use]
+    pub fn last_response(&self) -> Option<&str> {
+        self.last_response.as_deref()
     }
 
     fn start_turn(
@@ -858,6 +946,9 @@ impl AgentRuntime {
         route: &crumb_agent::ModelRoute,
         session_id: &str,
         request: &str,
+        persona: Option<&str>,
+        static_context: &[String],
+        trusted_context: &[String],
         mut tools: ToolHost,
         approvals: Arc<dyn ApprovalBroker>,
         cancellation: &CancellationToken,
@@ -869,11 +960,11 @@ impl AgentRuntime {
                 route.provider
             );
         }
-        let provider = config
+        let provider_config = config
             .providers
             .get(&route.provider)
             .context("native Harness provider is not configured")?;
-        let credential = provider
+        let credential = provider_config
             .credential
             .as_ref()
             .map(crate::provider_projection::resolve_credential_secret)
@@ -882,11 +973,11 @@ impl AgentRuntime {
                 Some(secret.expose().to_owned())
             })
             .context("Pollinations credential is unavailable")?;
-        let base_url = provider
+        let base_url = provider_config
             .base_url
             .trim_end_matches('/')
             .strip_suffix("/v1")
-            .unwrap_or(provider.base_url.trim_end_matches('/'));
+            .unwrap_or(provider_config.base_url.trim_end_matches('/'));
         let provider: Arc<dyn crumb_llm::LlmProvider> = Arc::new(PollinationsProvider::new(
             PollinationsConfig::new(credential)?.with_base_url(base_url)?,
         )?);
@@ -907,7 +998,7 @@ impl AgentRuntime {
             Arc::clone(&provider),
             ParallelAgentConfig {
                 journal_root: session_root(&workspace).join("agents"),
-                workspace,
+                workspace: workspace.clone(),
                 model: route.model.clone(),
                 max_output_tokens: child_output_tokens,
                 harness_limits: parallel_harness_limits(harness_limits),
@@ -921,8 +1012,14 @@ impl AgentRuntime {
         let turn = HarnessTurn {
             model: route.model.clone(),
             user_message: request.to_owned(),
-            persona: None,
-            trusted_context: Vec::new(),
+            images: load_request_images(
+                &workspace,
+                request,
+                provider_config.max_request_image_bytes,
+            )?,
+            persona: persona.map(str::to_owned),
+            static_context: static_context.to_vec(),
+            trusted_context: trusted_context.to_vec(),
             max_output_tokens,
         };
         let mut events = NativeEventBridge::new(on_activity);
@@ -947,6 +1044,10 @@ impl AgentRuntime {
             session_id: session_id.to_owned(),
             final_response: outcome.text,
             finish_reason: Some("stop".to_owned()),
+            input_tokens: outcome.usage.input_tokens,
+            cached_input_tokens: outcome.usage.cached_input_tokens,
+            output_tokens: outcome.usage.output_tokens,
+            context_tokens: outcome.context_tokens,
             events: Vec::new(),
             notifications: Vec::new(),
         })
@@ -1038,6 +1139,7 @@ impl AgentRuntime {
             self.supervisor = None;
             self.supervisor_limits = None;
             self.native_conversation = None;
+            self.last_response = None;
             self.session = None;
             self.environment_revision = self.environment_revision.saturating_add(1);
         }
@@ -1072,6 +1174,174 @@ impl AgentRuntime {
         self.supervisor_limits = None;
         Ok(())
     }
+}
+
+fn select_request_route<'a>(
+    config: &'a AgentConfig,
+    request: &str,
+) -> Option<&'a crumb_agent::ModelRoute> {
+    if matches!(config.harness, Some(HarnessConfig::Native))
+        && request_has_image_reference(request)
+        && let Some(pack) = config
+            .active_model_pack
+            .as_ref()
+            .and_then(|id| config.model_packs.get(id))
+    {
+        return Some(&pack.vision);
+    }
+    if let Some(pack) = config
+        .active_model_pack
+        .as_ref()
+        .and_then(|id| config.model_packs.get(id))
+    {
+        return Some(if request_needs_coder(request) {
+            &pack.coder
+        } else {
+            &pack.router
+        });
+    }
+    config
+        .models
+        .get(&Modality::Text)
+        .and_then(|routes| routes.first())
+}
+
+fn request_needs_coder(request: &str) -> bool {
+    let request = request.to_ascii_lowercase();
+    [
+        "implement",
+        "refactor",
+        "debug",
+        "fix ",
+        "fix the test",
+        "fix this test",
+        "compile",
+        "write code",
+        "edit code",
+        "patch code",
+        "run the tests",
+        "run tests",
+    ]
+    .iter()
+    .any(|term| request.contains(term))
+}
+
+fn request_has_image_reference(request: &str) -> bool {
+    request.split_whitespace().any(|token| {
+        token
+            .strip_prefix("@file:")
+            .map(|path| path.trim_matches(['\'', '"', ',', ';']))
+            .and_then(|path| Path::new(path).extension())
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "webp" | "gif"
+                )
+            })
+    })
+}
+
+fn load_request_images(
+    workspace: &Path,
+    request: &str,
+    configured_limit: Option<u64>,
+) -> Result<Vec<ImageInput>> {
+    let canonical_workspace = std::fs::canonicalize(workspace)
+        .with_context(|| format!("workspace `{}` is unavailable", workspace.display()))?;
+    let limit = usize::try_from(configured_limit.unwrap_or(10 * 1024 * 1024)).unwrap_or(usize::MAX);
+    let mut images = Vec::new();
+    let mut total = 0_usize;
+    let mut seen = BTreeSet::new();
+    for token in request.split_whitespace() {
+        let Some(path) = token.strip_prefix("@file:") else {
+            continue;
+        };
+        let path = path.trim_matches(['\'', '"', ',', ';']);
+        let Some((media_type, _)) = image_media_type(Path::new(path)) else {
+            continue;
+        };
+        let candidate = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            canonical_workspace.join(path)
+        };
+        let canonical = std::fs::canonicalize(&candidate).with_context(|| {
+            format!("image attachment `{}` is unavailable", candidate.display())
+        })?;
+        if !canonical.starts_with(&canonical_workspace) {
+            bail!("image attachments must stay inside the trusted workspace");
+        }
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        let data = std::fs::read(&canonical)
+            .with_context(|| format!("failed to read image attachment `{path}`"))?;
+        total = total.saturating_add(data.len());
+        if total > limit {
+            bail!("image attachments exceed the configured {limit}-byte request limit");
+        }
+        images.push(ImageInput {
+            media_type: media_type.to_owned(),
+            data,
+        });
+    }
+    Ok(images)
+}
+
+fn image_media_type(path: &Path) -> Option<(&'static str, &'static str)> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => Some(("image/png", "png")),
+        "jpg" | "jpeg" => Some(("image/jpeg", "jpeg")),
+        "webp" => Some(("image/webp", "webp")),
+        "gif" => Some(("image/gif", "gif")),
+        _ => None,
+    }
+}
+
+fn runtime_session_context(
+    (context_tokens, session_tokens, compactions): (u64, u64, u32),
+    context_limit: u64,
+) -> String {
+    format!(
+        "Runtime session (authoritative): conversation retains completed turns; context ~{context_tokens}/{context_limit} tokens; session usage ~{session_tokens}; compactions {compactions}. Attachments and approved memory are separate. Never claim every interaction starts fresh."
+    )
+}
+
+fn runtime_workspace_context(workspace: &Path) -> String {
+    format!(
+        "Runtime workspace (authoritative): cwd=`{}`. run_shell may inspect ancestors, home, absolute paths, and installed programs when policy permits; file tools stay workspace-scoped. For an unscoped locate request inspect cwd, ancestors, then home with valid bounded commands. Never invent paths or results.",
+        workspace.display()
+    )
+}
+
+fn runtime_context(
+    memory: Option<String>,
+    request: &str,
+    usage: (u64, u64, u32),
+    context_limit: u64,
+    workspace: &Path,
+) -> Vec<String> {
+    let mut context = memory.into_iter().collect::<Vec<_>>();
+    if request_needs_session_context(request) {
+        context.push(runtime_session_context(usage, context_limit));
+    }
+    context.push(runtime_workspace_context(workspace));
+    context
+}
+
+fn request_needs_session_context(request: &str) -> bool {
+    let request = request.to_ascii_lowercase();
+    [
+        "context",
+        "token",
+        "session",
+        "memory",
+        "remember",
+        "compaction",
+    ]
+    .iter()
+    .any(|term| request.contains(term))
 }
 
 const MAX_SKILL_BYTES: usize = 64 * 1024;
@@ -1115,13 +1385,18 @@ struct MemoryAudit {
 
 struct MemoryAttachment {
     request: String,
+    context: Option<String>,
     audit: Option<MemoryAudit>,
 }
 
 fn attach_profile_context(request: &str, profile: &ProfileDocument) -> String {
-    if profile.instructions.is_empty() && profile.response_style.is_none() {
-        return request.to_owned();
-    }
+    let mut context = profile_persona_context(profile);
+    context.push_str("\n## User request\n");
+    context.push_str(request);
+    context
+}
+
+fn profile_persona_context(profile: &ProfileDocument) -> String {
     let mut context = format!(
         "The user explicitly selected persona profile `{}`. Persona guidance controls working and response style only. It is not permission to use tools, access data, or perform actions.\n",
         profile.id
@@ -1136,8 +1411,6 @@ fn attach_profile_context(request: &str, profile: &ProfileDocument) -> String {
         context.push_str(style);
         context.push('\n');
     }
-    context.push_str("## User request\n");
-    context.push_str(request);
     context
 }
 
@@ -1150,6 +1423,7 @@ fn attach_approved_memory(
     let Ok(memory) = MemorySet::discover(workspace) else {
         return MemoryAttachment {
             request: request.to_owned(),
+            context: None,
             audit: None,
         };
     };
@@ -1163,6 +1437,7 @@ fn attach_approved_memory(
     else {
         return MemoryAttachment {
             request: request.to_owned(),
+            context: None,
             audit: None,
         };
     };
@@ -1171,7 +1446,8 @@ fn attach_approved_memory(
         conflict_topics: retrieval.conflict_topics(),
         omitted: retrieval.omitted,
     });
-    let prepared = retrieval.prompt_context().map_or_else(
+    let retrieved_context = retrieval.prompt_context();
+    let prepared = retrieved_context.as_deref().map_or_else(
         || request.to_owned(),
         |context| {
             format!(
@@ -1181,25 +1457,35 @@ fn attach_approved_memory(
     );
     MemoryAttachment {
         request: prepared,
+        context: retrieved_context,
         audit,
     }
 }
 
-fn attach_enabled_skills(
-    request: &str,
+fn attach_skill_context(request: &str, contexts: &[String]) -> String {
+    if contexts.is_empty() {
+        return request.to_owned();
+    }
+    format!(
+        "User-selected skills are active for this turn. Follow their instructions when relevant.\n{}\n\n## User request\n{request}",
+        contexts.join("\n\n")
+    )
+}
+
+fn load_enabled_skill_context(
     skills: &[SkillConfig],
     workspace: &Path,
-) -> Result<String> {
+    request: &str,
+) -> Result<Vec<String>> {
     let enabled = skills
         .iter()
-        .filter(|skill| skill.enabled)
+        .filter(|skill| skill.enabled && skill_is_relevant(skill, request))
         .collect::<Vec<_>>();
     if enabled.is_empty() {
-        return Ok(request.to_owned());
+        return Ok(Vec::new());
     }
-    let mut context = String::from(
-        "User-selected skills are active for this turn. Follow their instructions when relevant.\n",
-    );
+    let mut contexts = Vec::with_capacity(enabled.len());
+    let mut context_bytes = 0_usize;
     for skill in enabled {
         let instructions =
             if let Some(instructions) = crate::bundled_skills::instructions(&skill.path) {
@@ -1210,8 +1496,7 @@ fn attach_enabled_skills(
                 std::fs::read_to_string(&path)
                     .with_context(|| format!("loaded skill `{}` must be UTF-8", skill.id))?
             };
-        let projected = context
-            .len()
+        let projected = context_bytes
             .saturating_add(instructions.len())
             .saturating_add(skill.id.len())
             .saturating_add(32);
@@ -1223,15 +1508,125 @@ fn attach_enabled_skills(
             .chars()
             .filter(|character| !character.is_control())
             .collect::<String>();
-        context.push_str("\n## Skill: ");
-        context.push_str(&label);
-        context.push('\n');
-        context.push_str(&instructions);
-        context.push('\n');
+        contexts.push(format!("## Skill: {label}\n{instructions}"));
+        context_bytes = projected;
     }
-    context.push_str("\n## User request\n");
-    context.push_str(request);
-    Ok(context)
+    Ok(contexts)
+}
+
+fn skill_is_relevant(skill: &SkillConfig, request: &str) -> bool {
+    if crate::bundled_skills::id_from_path(&skill.path).is_none() {
+        return true;
+    }
+    let request = request.to_ascii_lowercase();
+    let words = request
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    let padded_words = format!(" {words} ");
+    let contains_any = |terms: &[&str]| {
+        terms.iter().any(|term| {
+            if term.contains(' ') {
+                request.contains(term)
+            } else {
+                padded_words.contains(&format!(" {term} "))
+            }
+        })
+    };
+    match skill.id.as_str() {
+        "codebase-map" => contains_any(&[
+            "repo",
+            "repository",
+            "project",
+            "codebase",
+            "source",
+            "cargo",
+            "project structure",
+            "source tree",
+        ]),
+        "failure-autopsy" => contains_any(&[
+            "fail", "error", "broken", "crash", "bug", "wrong", "diagnose", "debug",
+        ]),
+        "test-repair" => contains_any(&["test", "spec", "ci", "assert"]),
+        "safe-refactor" => contains_any(&["refactor", "cleanup", "restructure", "rename"]),
+        "security-review" => contains_any(&[
+            "security",
+            "secure",
+            "vulnerability",
+            "permission",
+            "secret",
+            "auth",
+            "oauth",
+        ]),
+        "plan-execute" => contains_any(&[
+            "build",
+            "implement",
+            "create",
+            "change",
+            "add",
+            "fix",
+            "plan",
+            "multiple",
+        ]),
+        "web-research" => contains_any(&[
+            "search", "web", "online", "current", "latest", "today", "weather", "news", "price",
+            "festival", "who is", "what is",
+        ]),
+        "karpathy-guidelines" => contains_any(&[
+            "code",
+            "coding",
+            "implement",
+            "review",
+            "refactor",
+            "debug",
+            "fix",
+            "change",
+            "simplify",
+            "karpathy",
+        ]),
+        "skill-authoring" => contains_any(&[
+            "create skill",
+            "make skill",
+            "write skill",
+            "update skill",
+            "custom skill",
+            "skill file",
+            "skill.md",
+        ]),
+        "crumb-commands" => crumb_command_skill_relevant(&request),
+        _ => true,
+    }
+}
+
+fn crumb_command_skill_relevant(request: &str) -> bool {
+    [
+        "crumb command",
+        "slash command",
+        "shortcut",
+        "what does",
+        "how do i use",
+        "question mark",
+        "permissions",
+        "model pack",
+        "session command",
+        "memory command",
+        "/help",
+        "/pack",
+        "/model",
+        "/effort",
+        "/session",
+        "/memory",
+        "/permissions",
+        "? config",
+    ]
+    .iter()
+    .any(|term| request.contains(term))
 }
 
 fn estimate_tokens(text: &str) -> u64 {
@@ -1389,13 +1784,191 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crumb_agent::{AgentConfig, Modality, ModelRoute, SkillConfig};
+    use crumb_agent::{AgentConfig, Modality, ModelPack, ModelRoute, SkillConfig};
+    use crumb_harness::{EventSink, HarnessEvent};
+    use crumb_harness_dsh::HarnessActivity;
+    use crumb_llm::TokenUsage;
     use crumb_profile::{ProfileDocument, ProfileReference, ProfileSelectionStore, ProfileStore};
 
     use super::{
-        AgentRuntime, apply_profile_effort, apply_profile_model, apply_profile_selection,
-        apply_profile_skills, attach_enabled_skills, attach_profile_context, validate_skill_path,
+        AgentRuntime, NativeEventBridge, apply_profile_effort, apply_profile_model,
+        apply_profile_selection, apply_profile_skills, attach_profile_context,
+        attach_skill_context, load_enabled_skill_context, load_request_images, request_needs_coder,
+        select_request_route, validate_skill_path,
     };
+
+    fn route(model: &str) -> ModelRoute {
+        ModelRoute {
+            provider: "pollinations".to_owned(),
+            model: model.to_owned(),
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn active_pack_routes_code_and_images_to_specialists() {
+        let mut config = AgentConfig {
+            harness: Some(crumb_agent::HarnessConfig::Native),
+            active_model_pack: Some("balanced".to_owned()),
+            ..AgentConfig::default()
+        };
+        config
+            .models
+            .insert(Modality::Text, vec![route("fallback")]);
+        config.model_packs.insert(
+            "balanced".to_owned(),
+            ModelPack {
+                label: "Balanced".to_owned(),
+                router: route("router"),
+                vision: route("vision"),
+                image_generation: route("image"),
+                coder: route("coder"),
+                voice: None,
+                transcription: None,
+                text_to_speech: None,
+            },
+        );
+
+        assert_eq!(
+            select_request_route(&config, "hello")
+                .expect("router")
+                .model,
+            "router"
+        );
+        assert_eq!(
+            select_request_route(&config, "explain this Rust code")
+                .expect("cheap router")
+                .model,
+            "router"
+        );
+        assert_eq!(
+            select_request_route(&config, "fix this Rust code")
+                .expect("coder")
+                .model,
+            "coder"
+        );
+        assert_eq!(
+            select_request_route(&config, "describe @file:screenshot.png")
+                .expect("vision")
+                .model,
+            "vision"
+        );
+        assert!(request_needs_coder("implement the parser"));
+    }
+
+    #[test]
+    fn image_attachments_are_loaded_as_bounded_binary_inputs() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("screen.png"), [0, 1, 2]).expect("image fixture");
+
+        let images = load_request_images(workspace.path(), "inspect @file:screen.png", Some(16))
+            .expect("image loads");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].media_type, "image/png");
+        assert_eq!(images[0].data, [0, 1, 2]);
+    }
+
+    #[test]
+    fn native_bridge_forwards_safe_tool_progress() {
+        let mut activities = Vec::new();
+        let mut capture = |activity| {
+            activities.push(activity);
+            Ok(())
+        };
+        let mut bridge = NativeEventBridge::new(&mut capture);
+
+        bridge.emit(HarnessEvent::ToolProgress {
+            id: "call-1".to_owned(),
+            name: "spawn_agents".to_owned(),
+            label: "Koi · Reading · read_file".to_owned(),
+        });
+        bridge.finish().expect("activity callback succeeds");
+
+        assert_eq!(
+            activities,
+            vec![HarnessActivity::Progress {
+                label: "Koi · Reading · read_file".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn native_bridge_forwards_bounded_tool_output_for_rendering() {
+        let mut activities = Vec::new();
+        let mut capture = |activity| {
+            activities.push(activity);
+            Ok(())
+        };
+        let mut bridge = NativeEventBridge::new(&mut capture);
+
+        bridge.emit(HarnessEvent::ToolOutput {
+            id: "call-1".to_owned(),
+            name: "run_shell".to_owned(),
+            content: "folder-a\nfolder-b".to_owned(),
+        });
+        bridge.finish().expect("activity callback succeeds");
+
+        assert_eq!(
+            activities,
+            vec![HarnessActivity::ToolOutput {
+                name: "run_shell".to_owned(),
+                bytes: Some(17),
+                content: Some("folder-a\nfolder-b".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn native_bridge_forwards_trusted_file_change_metadata() {
+        let mut activities = Vec::new();
+        let mut capture = |activity| {
+            activities.push(activity);
+            Ok(())
+        };
+        let mut bridge = NativeEventBridge::new(&mut capture);
+
+        bridge.emit(HarnessEvent::FileChanged {
+            path: "src/main.rs".to_owned(),
+            additions: 7,
+            deletions: 2,
+        });
+        bridge.finish().expect("activity callback succeeds");
+
+        assert_eq!(
+            activities,
+            vec![HarnessActivity::FileChanged {
+                path: "src/main.rs".to_owned(),
+                additions: 7,
+                deletions: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn native_bridge_forwards_usage_for_the_live_context_meter() {
+        let mut activities = Vec::new();
+        let mut capture = |activity| {
+            activities.push(activity);
+            Ok(())
+        };
+        let mut bridge = NativeEventBridge::new(&mut capture);
+
+        bridge.emit(HarnessEvent::Usage(TokenUsage {
+            input_tokens: 1_200,
+            cached_input_tokens: 0,
+            output_tokens: 80,
+        }));
+        bridge.finish().expect("activity callback succeeds");
+
+        assert_eq!(
+            activities,
+            vec![HarnessActivity::Usage {
+                input_tokens: 1_200,
+                output_tokens: 80,
+            }]
+        );
+    }
 
     #[test]
     fn enabled_skills_are_loaded_before_the_user_request() {
@@ -1417,10 +1990,12 @@ mod tests {
             enabled: true,
         }];
 
-        let prompt = attach_enabled_skills("inspect this", &skills, &workspace)
+        let context = load_enabled_skill_context(&skills, &workspace, "inspect this")
             .expect("skill context can be loaded");
+        let prompt = attach_skill_context("inspect this", &context);
 
-        assert!(prompt.contains("## Skill: review\nReview changes carefully."));
+        assert!(prompt.contains("## Skill: review"));
+        assert!(prompt.contains("Review changes carefully."));
         assert!(prompt.ends_with("## User request\ninspect this"));
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
     }
@@ -1433,11 +2008,77 @@ mod tests {
             enabled: true,
         }];
 
-        let prompt = attach_enabled_skills("diagnose this", &skills, Path::new("."))
+        let context = load_enabled_skill_context(&skills, Path::new("."), "diagnose this failure")
             .expect("bundled skill context loads");
+        let prompt = attach_skill_context("diagnose this", &context);
 
         assert!(prompt.contains("## Skill: failure-autopsy"));
         assert!(prompt.contains("first causal error"));
+    }
+
+    #[test]
+    fn bundled_skills_only_load_for_semantically_relevant_requests() {
+        let skills = [
+            SkillConfig {
+                id: "codebase-map".to_owned(),
+                path: crate::bundled_skills::path("codebase-map"),
+                enabled: true,
+            },
+            SkillConfig {
+                id: "web-research".to_owned(),
+                path: crate::bundled_skills::path("web-research"),
+                enabled: true,
+            },
+        ];
+
+        let filesystem_context = load_enabled_skill_context(
+            &skills,
+            Path::new("."),
+            "find the elixpo_projects folder on my computer",
+        )
+        .expect("relevant bundled skills load");
+        let code_context =
+            load_enabled_skill_context(&skills, Path::new("."), "map this repository source tree")
+                .expect("codebase skill loads");
+
+        assert_eq!(filesystem_context.len(), 0);
+        assert_eq!(code_context.len(), 1);
+        assert!(code_context[0].contains("codebase-map"));
+        assert!(!code_context[0].contains("web-research"));
+    }
+
+    #[test]
+    fn community_and_authoring_skills_are_discovered_on_demand() {
+        let skills = [
+            SkillConfig {
+                id: "karpathy-guidelines".to_owned(),
+                path: crate::bundled_skills::path("karpathy-guidelines"),
+                enabled: true,
+            },
+            SkillConfig {
+                id: "skill-authoring".to_owned(),
+                path: crate::bundled_skills::path("skill-authoring"),
+                enabled: true,
+            },
+        ];
+
+        let coding = load_enabled_skill_context(
+            &skills,
+            Path::new("."),
+            "refactor this code with a surgical change",
+        )
+        .expect("coding skill routes");
+        let authoring = load_enabled_skill_context(
+            &skills,
+            Path::new("."),
+            "create a custom skill for database migrations",
+        )
+        .expect("authoring skill routes");
+
+        assert_eq!(coding.len(), 1);
+        assert!(coding[0].contains("Karpathy Guidelines"));
+        assert_eq!(authoring.len(), 1);
+        assert!(authoring[0].contains("Skill Authoring"));
     }
 
     #[test]
@@ -1480,6 +2121,59 @@ mod tests {
         let mut unmanaged = AgentRuntime::new().expect("runtime");
         unmanaged.record_token_estimate(&"x".repeat(400), None, 100, false);
         assert_eq!(unmanaged.token_usage(), (100, 100, 0));
+    }
+
+    #[test]
+    fn reported_context_never_moves_backwards_without_compaction() {
+        let mut runtime = AgentRuntime::new().expect("runtime");
+        runtime.context_tokens_estimate = 5_700;
+        let result = crumb_harness_dsh::RunResult {
+            session_id: "fixture".to_owned(),
+            final_response: "done".to_owned(),
+            finish_reason: Some("stop".to_owned()),
+            input_tokens: 4_300,
+            cached_input_tokens: 0,
+            output_tokens: 100,
+            context_tokens: 4_400,
+            events: Vec::new(),
+            notifications: Vec::new(),
+        };
+
+        runtime.record_token_estimate("request", Some(&result), 64_000, false);
+
+        assert_eq!(runtime.token_usage().0, 5_700);
+        assert_eq!(runtime.last_response(), Some("done"));
+    }
+
+    #[test]
+    fn runtime_context_truthfully_describes_live_conversation_state() {
+        let context = super::runtime_session_context((1_250, 4_800, 2), 64_000);
+
+        assert!(context.contains("~1250/64000 tokens"));
+        assert!(context.contains("session usage ~4800"));
+        assert!(context.contains("compactions 2"));
+        assert!(context.contains("conversation retains completed turns"));
+        assert!(context.contains("Never claim every interaction starts fresh"));
+    }
+
+    #[test]
+    fn runtime_context_identifies_the_shell_starting_directory() {
+        let context = super::runtime_workspace_context(Path::new("/home/user/projects/crumb"));
+
+        assert!(context.contains("`/home/user/projects/crumb`"));
+        assert!(context.contains("inspect ancestors"));
+        assert!(context.contains("then home"));
+        assert!(context.contains("Never invent paths"));
+    }
+
+    #[test]
+    fn session_metrics_are_only_sent_when_the_user_asks_about_them() {
+        assert!(!super::request_needs_session_context(
+            "find the project folder"
+        ));
+        assert!(super::request_needs_session_context(
+            "how many context tokens are left?"
+        ));
     }
 
     #[test]

@@ -705,6 +705,7 @@ name = "crumb-pollinations"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "crumb-agent",
  "crumb-llm",
@@ -747,6 +748,7 @@ name = "crumb-tools"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "crumb-agent",
  "crumb-optimize",
  "reqwest",

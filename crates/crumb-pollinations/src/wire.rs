@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use crumb_llm::{
     ChatEvent, ChatRequest, ChatRole, EmbeddingRequest, EmbeddingResponse, FinishReason,
     ModelCapability, ModelInfo, ProviderError, ProviderErrorKind, ProviderResult, TokenUsage,
@@ -22,12 +23,34 @@ pub(crate) struct ChatCompletionRequest<'a> {
 
 impl<'a> From<&'a ChatRequest> for ChatCompletionRequest<'a> {
     fn from(request: &'a ChatRequest) -> Self {
+        let prompt_cache_supported =
+            supports_prompt_cache(&request.model, request.tools.is_empty());
+        let cacheable_user_messages = if prompt_cache_supported {
+            request
+                .messages
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(|(index, message)| (message.role == ChatRole::User).then_some(index))
+                .take(2)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         Self {
             model: &request.model,
             messages: request
                 .messages
                 .iter()
-                .map(ChatCompletionMessage::from)
+                .enumerate()
+                .map(|(index, message)| {
+                    ChatCompletionMessage::new(
+                        message,
+                        prompt_cache_supported
+                            && ((index < 2 && message.role == ChatRole::System)
+                                || cacheable_user_messages.contains(&index)),
+                    )
+                })
                 .collect(),
             stream: true,
             max_tokens: request.max_output_tokens,
@@ -43,18 +66,45 @@ impl<'a> From<&'a ChatRequest> for ChatCompletionRequest<'a> {
 #[derive(Debug, Serialize)]
 struct ChatCompletionMessage<'a> {
     role: &'static str,
-    content: &'a str,
+    content: ChatCompletionContent<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<AssistantToolCall<'a>>,
 }
 
-impl<'a> From<&'a crumb_llm::ChatMessage> for ChatCompletionMessage<'a> {
-    fn from(message: &'a crumb_llm::ChatMessage) -> Self {
+impl<'a> ChatCompletionMessage<'a> {
+    fn new(message: &'a crumb_llm::ChatMessage, cacheable: bool) -> Self {
         Self {
             role: role_name(message.role),
-            content: &message.content,
+            content: if !message.images.is_empty() {
+                let mut parts = vec![ChatContentBlock::Text {
+                    text: &message.content,
+                }];
+                parts.extend(
+                    message
+                        .images
+                        .iter()
+                        .map(|image| ChatContentBlock::ImageUrl {
+                            image_url: ImageUrl {
+                                url: format!(
+                                    "data:{};base64,{}",
+                                    image.media_type,
+                                    base64::engine::general_purpose::STANDARD.encode(&image.data)
+                                ),
+                            },
+                        }),
+                );
+                ChatCompletionContent::Parts(parts)
+            } else if cacheable {
+                ChatCompletionContent::Cached([CachedTextBlock {
+                    kind: "text",
+                    text: &message.content,
+                    cache_control: CacheControl { kind: "ephemeral" },
+                }])
+            } else {
+                ChatCompletionContent::Text(&message.content)
+            },
             tool_call_id: message.tool_call_id.as_deref(),
             tool_calls: message
                 .tool_calls
@@ -63,6 +113,51 @@ impl<'a> From<&'a crumb_llm::ChatMessage> for ChatCompletionMessage<'a> {
                 .collect(),
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ChatCompletionContent<'a> {
+    Text(&'a str),
+    Cached([CachedTextBlock<'a>; 1]),
+    Parts(Vec<ChatContentBlock<'a>>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ChatContentBlock<'a> {
+    Text { text: &'a str },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Serialize)]
+struct ImageUrl {
+    url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CachedTextBlock<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+    cache_control: CacheControl,
+}
+
+#[derive(Debug, Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+fn supports_prompt_cache(model: &str, tools_empty: bool) -> bool {
+    let model = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    matches!(model.as_str(), "nova" | "nova-fast")
+        || model.starts_with("claude")
+        || (tools_empty && model.starts_with("gemini"))
 }
 
 #[derive(Debug, Serialize)]
@@ -186,6 +281,14 @@ struct PendingToolCall {
 struct WireUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<WirePromptTokenDetails>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WirePromptTokenDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -234,6 +337,7 @@ impl From<WireEmbeddingResponse> for EmbeddingResponse {
                 .collect(),
             usage: TokenUsage {
                 input_tokens: response.usage.prompt_tokens,
+                cached_input_tokens: 0,
                 output_tokens: 0,
             },
         }
@@ -387,6 +491,9 @@ impl SseDecoder {
         if let Some(usage) = chunk.usage {
             output.push(ChatEvent::Usage(TokenUsage {
                 input_tokens: usage.prompt_tokens,
+                cached_input_tokens: usage
+                    .prompt_tokens_details
+                    .map_or(0, |details| details.cached_tokens),
                 output_tokens: usage.completion_tokens,
             }));
         }
@@ -445,8 +552,8 @@ fn protocol_error(message: &'static str) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use crumb_llm::{
-        ChatEvent, ChatMessage, ChatRequest, ChatRole, FinishReason, ProviderErrorKind, TokenUsage,
-        ToolChoice, ToolDefinition,
+        ChatEvent, ChatMessage, ChatRequest, ChatRole, FinishReason, ImageInput, ProviderErrorKind,
+        TokenUsage, ToolChoice, ToolDefinition,
     };
 
     use super::{ChatCompletionRequest, SseDecoder};
@@ -472,6 +579,90 @@ mod tests {
         assert_eq!(json["max_tokens"], 64);
         assert!(json.get("tools").is_none());
         assert!(json.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn nova_request_caches_the_system_prefix_and_latest_user_turn() {
+        let request = ChatRequest {
+            model: "nova-fast".to_owned(),
+            messages: vec![
+                ChatMessage::text(ChatRole::System, "stable"),
+                ChatMessage::text(ChatRole::System, "dynamic"),
+                ChatMessage::text(ChatRole::User, "hello"),
+            ],
+            tools: vec![ToolDefinition {
+                name: "run_shell".to_owned(),
+                description: "run a bounded command".to_owned(),
+                input_schema: serde_json::json!({"type":"object"}),
+            }],
+            tool_choice: ToolChoice::Auto,
+            max_output_tokens: None,
+        };
+
+        let json = serde_json::to_value(ChatCompletionRequest::from(&request))
+            .expect("request should serialize");
+
+        assert_eq!(json["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(json["messages"][0]["content"][0]["text"], "stable");
+        assert_eq!(
+            json["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(json["messages"][1]["content"][0]["text"], "dynamic");
+        assert_eq!(
+            json["messages"][1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(json["messages"][2]["content"][0]["text"], "hello");
+        assert_eq!(
+            json["messages"][2]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(json["tools"][0]["function"]["name"], "run_shell");
+    }
+
+    #[test]
+    fn unsupported_model_keeps_plain_string_messages() {
+        let request = ChatRequest {
+            model: "openai".to_owned(),
+            messages: vec![ChatMessage::text(ChatRole::System, "stable")],
+            tools: Vec::new(),
+            tool_choice: ToolChoice::None,
+            max_output_tokens: None,
+        };
+
+        let json = serde_json::to_value(ChatCompletionRequest::from(&request))
+            .expect("request should serialize");
+
+        assert_eq!(json["messages"][0]["content"], "stable");
+    }
+
+    #[test]
+    fn vision_request_serializes_text_and_data_url_parts() {
+        let request = ChatRequest {
+            model: "vision".to_owned(),
+            messages: vec![ChatMessage::user_with_images(
+                "describe this",
+                vec![ImageInput {
+                    media_type: "image/png".to_owned(),
+                    data: vec![0, 1, 2],
+                }],
+            )],
+            tools: Vec::new(),
+            tool_choice: ToolChoice::None,
+            max_output_tokens: None,
+        };
+
+        let json = serde_json::to_value(ChatCompletionRequest::from(&request))
+            .expect("vision request should serialize");
+
+        assert_eq!(json["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(json["messages"][0]["content"][0]["text"], "describe this");
+        assert_eq!(json["messages"][0]["content"][1]["type"], "image_url");
+        assert_eq!(
+            json["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AAEC"
+        );
     }
 
     #[test]
@@ -555,7 +746,7 @@ mod tests {
         let payload = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"hé\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],",
-            "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n",
+            "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":2}}}\n\n",
             "data: [DONE]\n\n"
         );
         let split = payload.find("é").expect("unicode text should exist") + 1;
@@ -577,6 +768,7 @@ mod tests {
                 ChatEvent::TextDelta("hé".to_owned()),
                 ChatEvent::Usage(TokenUsage {
                     input_tokens: 3,
+                    cached_input_tokens: 2,
                     output_tokens: 1,
                 }),
                 ChatEvent::Finished(FinishReason::Stop),

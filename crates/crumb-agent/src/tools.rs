@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentMode, CancellationToken, CredentialReference};
+use crate::{AgentMode, ApprovalMode, CancellationToken, CredentialReference};
 
 /// Deterministic risk assigned by Rust-owned tool metadata.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -105,6 +105,36 @@ impl ToolOutput {
     }
 }
 
+/// Converts a tool identifier into a stable, non-secret terminal activity label.
+#[must_use]
+pub fn tool_activity_label(name: &str) -> String {
+    let normalized = name.to_ascii_lowercase();
+    let action = if normalized.contains("write")
+        || normalized.contains("edit")
+        || normalized.contains("patch")
+    {
+        "Editing"
+    } else if normalized.contains("search")
+        || normalized.contains("find")
+        || normalized.contains("query")
+    {
+        "Searching"
+    } else if normalized.contains("read") || normalized.contains("list") {
+        "Reading"
+    } else if normalized.contains("run")
+        || normalized.contains("shell")
+        || normalized.contains("process")
+        || normalized.contains("test")
+    {
+        "Running"
+    } else if normalized.contains("web") || normalized.contains("fetch") {
+        "Fetching"
+    } else {
+        "Inspecting"
+    };
+    format!("{action} · {name}")
+}
+
 /// Metadata shown to a trusted approval UI. Raw arguments are deliberately
 /// replaced with a digest.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,6 +178,7 @@ impl ApprovalBroker for DenyAllApprovals {
 /// Approval policy derived only from explicit user configuration.
 #[derive(Clone, Debug, Default)]
 pub struct ConfiguredApprovals {
+    mode: ApprovalMode,
     network: BTreeSet<String>,
     workspace: BTreeSet<String>,
     processes: BTreeSet<String>,
@@ -158,11 +189,18 @@ impl ConfiguredApprovals {
     #[must_use]
     pub fn new(network_tools: BTreeSet<String>) -> Self {
         Self {
+            mode: ApprovalMode::AlwaysAsk,
             network: network_tools,
             workspace: BTreeSet::new(),
             processes: BTreeSet::new(),
             mcp: BTreeSet::new(),
         }
+    }
+
+    #[must_use]
+    pub const fn with_mode(mut self, mode: ApprovalMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     #[must_use]
@@ -188,24 +226,120 @@ impl ApprovalBroker for ConfiguredApprovals {
     fn decide(
         &self,
         request: &ApprovalRequest,
-        _arguments: &serde_json::Value,
+        arguments: &serde_json::Value,
         _cancellation: &CancellationToken,
     ) -> ApprovalDecision {
-        if (request.tool.starts_with("mcp__") && self.mcp.contains(&request.tool))
+        let explicitly_allowed = (request.tool.starts_with("mcp__")
+            && self.mcp.contains(&request.tool))
             || (request.risk == RiskClass::NetworkAccess && self.network.contains(&request.tool))
-            || (request.risk == RiskClass::WriteWorkspace && self.workspace.contains(&request.tool))
+            || (request.risk == RiskClass::WriteWorkspace
+                && self.workspace.contains(&request.tool))
             || (request.risk == RiskClass::ProcessExecution
-                && self.processes.contains(&request.tool))
-        {
-            ApprovalDecision::AllowOnce
-        } else {
-            ApprovalDecision::Deny
+                && self.processes.contains(&request.tool));
+        if explicitly_allowed {
+            return ApprovalDecision::AllowOnce;
+        }
+        match self.mode {
+            ApprovalMode::AlwaysAsk => ApprovalDecision::Deny,
+            ApprovalMode::FullAccess => ApprovalDecision::AllowOnce,
+            ApprovalMode::SensitiveOnly => {
+                if sensitive_request(request, arguments) {
+                    ApprovalDecision::Deny
+                } else {
+                    ApprovalDecision::AllowOnce
+                }
+            }
         }
     }
 }
 
+fn sensitive_request(request: &ApprovalRequest, arguments: &serde_json::Value) -> bool {
+    match request.risk {
+        RiskClass::ReadOnly | RiskClass::NetworkAccess | RiskClass::WriteWorkspace => false,
+        RiskClass::ProcessExecution => match request.tool.as_str() {
+            "run_shell" => arguments
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(sensitive_shell_command),
+            "run_disposable" => arguments
+                .get("script")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(sensitive_shell_command),
+            _ => true,
+        },
+        RiskClass::SystemMutation | RiskClass::CredentialSensitive | RiskClass::Destructive => true,
+    }
+}
+
+fn sensitive_shell_command(command: &str) -> bool {
+    let command = format!(" {} ", command.to_ascii_lowercase());
+    [
+        " sudo ",
+        " su ",
+        " rm ",
+        " rmdir ",
+        " shred ",
+        " chmod ",
+        " chown ",
+        " kill ",
+        " pkill ",
+        " killall ",
+        " dd ",
+        " mkfs",
+        " mount ",
+        " umount ",
+        " passwd ",
+        " useradd ",
+        " userdel ",
+        " systemctl ",
+        " service ",
+        " shutdown ",
+        " reboot ",
+        " poweroff ",
+        " apt install",
+        " apt remove",
+        " apt purge",
+        " dnf install",
+        " yum install",
+        " pacman -s",
+        " brew install",
+        " npm publish",
+        " cargo publish",
+        " git push",
+        " git reset --hard",
+        " git clean ",
+        " curl ",
+        " wget ",
+        " .ssh/",
+        " .aws/",
+        " .config/gcloud",
+        " /etc/",
+        " /usr/",
+        " /bin/",
+        " /sbin/",
+    ]
+    .iter()
+    .any(|marker| command.contains(marker))
+}
+
 /// Native implementation of one registered tool.
 pub trait ToolHandler: Send + Sync {
+    /// Normalizes arguments before approval, activity reporting, and execution.
+    /// The default preserves the provider request exactly. Implementations may
+    /// apply deterministic, non-mutating optimizations such as command proxy
+    /// rewriting, but must safely fall back to the original arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when arguments cannot be prepared safely.
+    fn prepare(
+        &self,
+        arguments: &serde_json::Value,
+        _cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value> {
+        Ok(arguments.clone())
+    }
+
     /// Executes with already-authorized arguments.
     ///
     /// # Errors
@@ -217,6 +351,21 @@ pub trait ToolHandler: Send + Sync {
         arguments: &serde_json::Value,
         cancellation: &CancellationToken,
     ) -> Result<ToolOutput>;
+
+    /// Executes while optionally publishing bounded, non-secret activity labels.
+    /// Implementations that do not expose intermediate work use the regular call.
+    ///
+    /// # Errors
+    ///
+    /// Returns only redacted internal failures, matching [`Self::call`].
+    fn call_with_progress(
+        &self,
+        arguments: &serde_json::Value,
+        cancellation: &CancellationToken,
+        _progress: &mut dyn FnMut(&str),
+    ) -> Result<ToolOutput> {
+        self.call(arguments, cancellation)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -303,6 +452,33 @@ impl ToolHost {
         self.registry.get(name)
     }
 
+    /// Prepares one tool request using its registered implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the tool is unknown, cancelled, or argument
+    /// preparation fails internally.
+    pub fn prepare_arguments(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<serde_json::Value, ToolCallError> {
+        if cancellation.is_cancelled() {
+            return Err(ToolCallError::new(
+                ToolCallErrorKind::Cancelled,
+                "tool call cancelled",
+            ));
+        }
+        let handler = self
+            .handlers
+            .get(name)
+            .ok_or_else(|| ToolCallError::new(ToolCallErrorKind::UnknownTool, "unknown tool"))?;
+        handler
+            .prepare(arguments, cancellation)
+            .map_err(|_| ToolCallError::new(ToolCallErrorKind::Internal, "tool preparation failed"))
+    }
+
     /// Authorizes and executes one tool call.
     ///
     /// # Errors
@@ -316,6 +492,24 @@ impl ToolHost {
         mode: AgentMode,
         approvals: &dyn ApprovalBroker,
         cancellation: &CancellationToken,
+    ) -> std::result::Result<ToolOutput, ToolCallError> {
+        self.call_with_progress(name, arguments, mode, approvals, cancellation, &mut |_| {})
+    }
+
+    /// Authorizes and executes one tool call while forwarding safe progress labels.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed, redacted error when the tool is unknown, denied,
+    /// cancelled, or fails internally.
+    pub fn call_with_progress(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        mode: AgentMode,
+        approvals: &dyn ApprovalBroker,
+        cancellation: &CancellationToken,
+        progress: &mut dyn FnMut(&str),
     ) -> std::result::Result<ToolOutput, ToolCallError> {
         let descriptor = self
             .registry
@@ -334,7 +528,7 @@ impl ToolHost {
                 "tool implementation unavailable",
             )
         })?;
-        let output = match handler.call(arguments, cancellation) {
+        let output = match handler.call_with_progress(arguments, cancellation, progress) {
             Ok(output) => output,
             Err(_) if cancellation.is_cancelled() => {
                 return Err(ToolCallError::new(
@@ -461,13 +655,24 @@ mod tests {
 
     use anyhow::Result;
 
-    use crate::{AgentMode, CancellationToken};
+    use crate::{AgentMode, ApprovalMode, CancellationToken};
 
     use super::{
         ApprovalBroker, ApprovalDecision, ApprovalRequest, ConfiguredApprovals, DenyAllApprovals,
         RiskClass, ToolCallErrorKind, ToolDescriptor, ToolHandler, ToolHost, ToolOutput,
-        ToolRegistry, ToolTransport,
+        ToolRegistry, ToolTransport, tool_activity_label,
     };
+
+    #[test]
+    fn tool_activity_terms_are_stable_and_human_readable() {
+        assert_eq!(tool_activity_label("read_file"), "Reading · read_file");
+        assert_eq!(tool_activity_label("web_search"), "Searching · web_search");
+        assert_eq!(tool_activity_label("write_file"), "Editing · write_file");
+        assert_eq!(
+            tool_activity_label("detect_stack"),
+            "Inspecting · detect_stack"
+        );
+    }
 
     #[test]
     fn duplicate_tools_are_rejected_deterministically() {
@@ -625,6 +830,53 @@ mod tests {
         );
         assert_eq!(
             ConfiguredApprovals::default().decide(&request, &serde_json::json!({}), &cancellation),
+            ApprovalDecision::Deny
+        );
+    }
+
+    #[test]
+    fn approval_modes_distinguish_safe_and_sensitive_shell_commands() {
+        let request = ApprovalRequest {
+            tool: "run_shell".to_owned(),
+            risk: RiskClass::ProcessExecution,
+            arguments_digest: "digest".to_owned(),
+        };
+        let cancellation = CancellationToken::default();
+        let sensitive = ConfiguredApprovals::default().with_mode(ApprovalMode::SensitiveOnly);
+        assert_eq!(
+            sensitive.decide(
+                &request,
+                &serde_json::json!({"command":"cargo test --workspace"}),
+                &cancellation,
+            ),
+            ApprovalDecision::AllowOnce
+        );
+        assert_eq!(
+            sensitive.decide(
+                &request,
+                &serde_json::json!({"command":"sudo rm -rf /tmp/example"}),
+                &cancellation,
+            ),
+            ApprovalDecision::Deny
+        );
+        assert_eq!(
+            ConfiguredApprovals::default()
+                .with_mode(ApprovalMode::FullAccess)
+                .decide(
+                    &request,
+                    &serde_json::json!({"command":"sudo rm -rf /tmp/example"}),
+                    &cancellation,
+                ),
+            ApprovalDecision::AllowOnce
+        );
+        assert_eq!(
+            ConfiguredApprovals::default()
+                .with_mode(ApprovalMode::AlwaysAsk)
+                .decide(
+                    &request,
+                    &serde_json::json!({"command":"pwd"}),
+                    &cancellation,
+                ),
             ApprovalDecision::Deny
         );
     }
