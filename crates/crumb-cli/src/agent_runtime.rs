@@ -1602,8 +1602,10 @@ impl AgentRuntime {
         workspace: &Path,
         request: &str,
     ) -> Result<LoadedSkillContext> {
-        let mut context = load_enabled_skill_context(&config.skills, workspace, request)?;
-        if let Some(selected) = self.take_selected_skills_for_turn() {
+        let selected = self.take_selected_skills_for_turn();
+        let mut context =
+            load_skill_context(&config.skills, workspace, request, selected.is_some())?;
+        if let Some(selected) = selected {
             context.selected = selected;
         }
         Ok(context)
@@ -2323,6 +2325,8 @@ fn request_has_image_reference(request: &str) -> bool {
     })
 }
 
+const MAX_REQUEST_IMAGES: usize = 5;
+
 fn load_request_images(
     workspace: &Path,
     request: &str,
@@ -2355,6 +2359,9 @@ fn load_request_images(
         }
         if !seen.insert(canonical.clone()) {
             continue;
+        }
+        if images.len() == MAX_REQUEST_IMAGES {
+            bail!("a request can include at most {MAX_REQUEST_IMAGES} image attachments");
         }
         let data = std::fs::read(&canonical)
             .with_context(|| format!("failed to read image attachment `{path}`"))?;
@@ -2564,9 +2571,33 @@ fn load_enabled_skill_context(
     workspace: &Path,
     request: &str,
 ) -> Result<LoadedSkillContext> {
+    load_skill_context(skills, workspace, request, false)
+}
+
+fn load_skill_context(
+    skills: &[SkillConfig],
+    workspace: &Path,
+    request: &str,
+    exact_run: bool,
+) -> Result<LoadedSkillContext> {
+    let referenced = referenced_skill_ids(request)?;
+    for id in &referenced {
+        let configured = skills
+            .iter()
+            .find(|skill| skill.id == *id)
+            .with_context(|| format!("referenced skill `{id}` is not configured"))?;
+        if !configured.enabled {
+            bail!("referenced skill `{id}` is disabled; run `/skill enable {id}` first");
+        }
+    }
     let enabled = skills
         .iter()
-        .filter(|skill| skill.enabled && skill_is_relevant(skill, request))
+        .filter(|skill| {
+            skill.enabled
+                && (exact_run
+                    || referenced.contains(&skill.id)
+                    || (is_bundled_skill(skill) && skill_is_relevant(skill, request)))
+        })
         .collect::<Vec<_>>();
     if enabled.is_empty() {
         return Ok(LoadedSkillContext::default());
@@ -2621,10 +2652,29 @@ fn load_enabled_skill_context(
     })
 }
 
-fn skill_is_relevant(skill: &SkillConfig, request: &str) -> bool {
-    if crate::bundled_skills::id_from_path(&skill.path).is_none() {
-        return true;
+fn referenced_skill_ids(request: &str) -> Result<BTreeSet<String>> {
+    let mut referenced = BTreeSet::new();
+    for token in request.match_indices("@skill:").map(|(offset, _)| offset) {
+        let value = &request[token + "@skill:".len()..];
+        let id = value
+            .chars()
+            .take_while(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '/')
+            })
+            .collect::<String>();
+        if id.is_empty() {
+            bail!("skill reference requires an ID after `@skill:`");
+        }
+        referenced.insert(id);
     }
+    Ok(referenced)
+}
+
+fn is_bundled_skill(skill: &SkillConfig) -> bool {
+    crate::bundled_skills::id_from_path(&skill.path).is_some()
+}
+
+fn skill_is_relevant(skill: &SkillConfig, request: &str) -> bool {
     let request = request.to_ascii_lowercase();
     let words = request
         .chars()
@@ -2915,12 +2965,12 @@ mod tests {
     use crumb_profile::{ProfileDocument, ProfileReference, ProfileSelectionStore, ProfileStore};
 
     use super::{
-        AgentRuntime, NativeEventBridge, PeerEventBridge, PeerInspectionKind, PeerInspectionPart,
-        ResumeContinuity, SessionRuntimeKey, SessionRuntimeState, apply_profile_effort,
-        apply_profile_model, apply_profile_selection, apply_profile_skills, attach_profile_context,
-        attach_skill_context, load_enabled_skill_context, load_request_images,
-        peer_task_state_label, request_needs_coder, select_request_route, short_peer_digest,
-        validate_skill_path,
+        AgentRuntime, MAX_REQUEST_IMAGES, NativeEventBridge, PeerEventBridge, PeerInspectionKind,
+        PeerInspectionPart, ResumeContinuity, SessionRuntimeKey, SessionRuntimeState,
+        apply_profile_effort, apply_profile_model, apply_profile_selection, apply_profile_skills,
+        attach_profile_context, attach_skill_context, load_enabled_skill_context,
+        load_request_images, peer_task_state_label, request_needs_coder, select_request_route,
+        short_peer_digest, validate_skill_path,
     };
 
     #[test]
@@ -3373,6 +3423,33 @@ mod tests {
     }
 
     #[test]
+    fn image_attachments_are_limited_to_five_unique_inputs() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut request = String::from("inspect");
+        for index in 0..=MAX_REQUEST_IMAGES {
+            let filename = format!("screen-{index}.png");
+            std::fs::write(workspace.path().join(&filename), [index as u8]).expect("image fixture");
+            request.push_str(&format!(" @file:{filename}"));
+        }
+
+        let error = load_request_images(workspace.path(), &request, None)
+            .expect_err("sixth unique image must be rejected");
+
+        assert!(error.to_string().contains("at most 5 image attachments"));
+    }
+
+    #[test]
+    fn repeated_image_reference_only_counts_once() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("screen.png"), [0, 1, 2]).expect("image fixture");
+        let request = "inspect @file:screen.png @file:screen.png";
+
+        let images = load_request_images(workspace.path(), request, None).expect("image loads");
+
+        assert_eq!(images.len(), 1);
+    }
+
+    #[test]
     fn native_bridge_forwards_safe_tool_progress() {
         let mut activities = Vec::new();
         let mut capture = |activity| {
@@ -3493,14 +3570,15 @@ mod tests {
             enabled: true,
         }];
 
-        let context = load_enabled_skill_context(&skills, &workspace, "inspect this")
-            .expect("skill context can be loaded");
-        let prompt = attach_skill_context("inspect this", &context.instructions);
+        let context =
+            load_enabled_skill_context(&skills, &workspace, "inspect this with @skill:review")
+                .expect("skill context can be loaded");
+        let prompt = attach_skill_context("inspect this with @skill:review", &context.instructions);
 
         assert!(prompt.contains("## Skill: review"));
         assert!(prompt.contains("Review changes carefully."));
         assert!(prompt.contains("cannot grant permissions"));
-        assert!(prompt.ends_with("## User request\ninspect this"));
+        assert!(prompt.ends_with("## User request\ninspect this with @skill:review"));
         assert_eq!(context.selected.len(), 1);
         assert_eq!(context.selected[0].identity, "review");
         assert_eq!(context.selected[0].version, None);
@@ -3542,6 +3620,59 @@ mod tests {
         assert_eq!(explicit.instructions.len(), 1);
         assert_eq!(explicit.selected, vec![exact]);
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
+    }
+
+    #[test]
+    fn external_skills_only_load_from_explicit_references() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-skill-routing-{suffix}"));
+        let skill_directory = workspace.join("skills/review");
+        std::fs::create_dir_all(&skill_directory).expect("skill directory can be created");
+        std::fs::write(
+            skill_directory.join("SKILL.md"),
+            "Review only when selected.",
+        )
+        .expect("skill can be written");
+        let skills = [SkillConfig {
+            id: "review".to_owned(),
+            path: PathBuf::from("skills/review"),
+            enabled: true,
+        }];
+
+        let ordinary = load_enabled_skill_context(&skills, &workspace, "inspect this change")
+            .expect("ordinary request is accepted");
+        let explicit =
+            load_enabled_skill_context(&skills, &workspace, "inspect this change @skill:review")
+                .expect("explicit skill reference loads");
+
+        assert_eq!(ordinary, super::LoadedSkillContext::default());
+        assert_eq!(explicit.instructions.len(), 1);
+        assert_eq!(explicit.selected[0].identity, "review");
+        std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
+    }
+
+    #[test]
+    fn explicit_skill_references_fail_closed() {
+        let disabled = [SkillConfig {
+            id: "review".to_owned(),
+            path: PathBuf::from("skills/review"),
+            enabled: false,
+        }];
+
+        let missing = load_enabled_skill_context(&disabled, Path::new("."), "use @skill:missing")
+            .expect_err("missing skill is rejected");
+        let unavailable =
+            load_enabled_skill_context(&disabled, Path::new("."), "use @skill:review")
+                .expect_err("disabled skill is rejected");
+        let malformed = load_enabled_skill_context(&disabled, Path::new("."), "use @skill:")
+            .expect_err("blank skill reference is rejected");
+
+        assert!(missing.to_string().contains("not configured"));
+        assert!(unavailable.to_string().contains("disabled"));
+        assert!(malformed.to_string().contains("requires an ID"));
     }
 
     #[test]
