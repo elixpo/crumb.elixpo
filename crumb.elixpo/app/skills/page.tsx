@@ -17,7 +17,7 @@ export const metadata = pageMetadata({
 const skillExamples = [
   { icon: 'code' as const, title: 'Rust maintainer', copy: 'Find test failures, explain compiler errors, and prepare small fixes that follow the project’s rules.', state: 'Foundation' },
   { icon: 'database' as const, title: 'Database debugger', copy: 'Check schemas and migrations, spot likely mistakes, and keep every database change reviewable.', state: 'Planned' },
-  { icon: 'repository' as const, title: 'Repository operator', copy: 'Help with issues, pull requests, releases, and CI after you connect a GitHub account.', state: 'Planned' },
+  { icon: 'repository' as const, title: 'Repository operator', copy: 'Help with local branches, commits, releases, and CI evidence while service connectors remain disabled.', state: 'Planned' },
   { icon: 'incident' as const, title: 'Incident investigator', copy: 'Gather useful diagnostics, build a timeline, and suggest safe recovery steps.', state: 'Planned' },
 ]
 

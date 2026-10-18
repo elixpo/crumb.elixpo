@@ -16,7 +16,7 @@ const features = [
   { icon: '◆', title: 'Crumb-owned agent harness', copy: 'Use the native Rust planning and tool loop for autonomous work, with optional compatibility adapters kept outside the terminal core.', tag: 'Autonomous' },
   { icon: '⌃C', title: 'Stop everything with Ctrl+C', copy: 'One shortcut stops the answer, its tools, and the command currently running underneath it.', tag: 'Control' },
   { icon: '◇', title: 'Reusable skills', copy: 'Skills give Crumb clear instructions for jobs such as fixing tests, reviewing code, or investigating an incident.', tag: 'Expertise' },
-  { icon: '⌁', title: 'Safer account connections', copy: 'Connect services in your browser so private keys do not end up in prompts, files, logs, or terminal history.', tag: 'Secure' },
+  { icon: '⌁', title: 'Safer Pollinations connection', copy: 'Authorize Pollinations in your browser so its private key does not end up in prompts, files, logs, or terminal history.', tag: 'Secure' },
   { icon: '◫', title: 'Work you can return to', copy: 'Sessions keep enough safe context to continue a task later without saving every secret or line of output.', tag: 'Sessions' },
   { icon: '⚑', title: 'Permissions you control', copy: 'Crumb can ask to use a tool, but the model cannot approve that request for itself.', tag: 'Approval' },
   { icon: '⊘', title: 'Still useful without AI', copy: 'If a model, network, plugin, or connector fails, the native terminal keeps working.', tag: 'Reliable' },
