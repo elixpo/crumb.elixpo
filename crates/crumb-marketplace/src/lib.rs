@@ -29,6 +29,14 @@ pub const MAX_CATALOG_SEARCH_QUERY_BYTES: usize = 256;
 pub const MAX_CATALOG_SEARCH_TERMS: usize = 16;
 /// Maximum number of releases returned by one catalog search page.
 pub const MAX_CATALOG_SEARCH_PAGE_SIZE: usize = 100;
+/// Maximum accepted size for one compact discovery index.
+pub const MAX_DISCOVERY_INDEX_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum serialized size for one full release manifest referenced by discovery.
+pub const MAX_PACKAGE_MANIFEST_BYTES: usize = 512 * 1024;
+const DISCOVERY_INDEX_SCHEMA_VERSION: u32 = 1;
+const MAX_DISCOVERY_DISPLAY_NAME_BYTES: usize = 128;
+const MAX_DISCOVERY_DESCRIPTION_BYTES: usize = 512;
+const MAX_DISCOVERY_LICENSE_BYTES: usize = 64;
 const BUNDLED_CATALOG: &[u8] = include_bytes!("../../../marketplace/catalog.json");
 #[cfg(test)]
 const PUBLIC_CATALOG: &[u8] =
@@ -72,7 +80,7 @@ pub enum PackageClass {
 ///
 /// Phase-A dependencies intentionally use exact semantic versions. Ranges
 /// would make the same request resolve differently as releases are added.
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackageDependency {
     pub id: String,
@@ -283,6 +291,47 @@ pub struct CatalogSearchPage<'catalog> {
     pub next_offset: Option<usize>,
 }
 
+/// Immutable reference from compact discovery metadata to one exact full manifest.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageReleaseRef {
+    pub id: String,
+    pub version: String,
+    pub manifest_sha256: String,
+    pub manifest_size_bytes: u64,
+}
+
+/// Compact metadata sufficient for local discovery without loading a full package manifest.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryEntry {
+    pub release: PackageReleaseRef,
+    pub publisher: String,
+    pub package_class: PackageClass,
+    pub display_name: String,
+    pub description: String,
+    pub license: String,
+    pub compatibility: Compatibility,
+    pub trust: ReleaseTrust,
+    pub revoked: bool,
+    pub deprecated: bool,
+}
+
+/// Versioned compact discovery index, intentionally separate from full package manifests.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryIndex {
+    pub schema_version: u32,
+    pub name: String,
+    pub releases: Vec<DiscoveryEntry>,
+}
+
+/// One bounded page of compact discovery results.
+pub struct DiscoverySearchPage<'index> {
+    pub hits: Vec<&'index DiscoveryEntry>,
+    pub next_offset: Option<usize>,
+}
+
 impl Catalog {
     /// Parses and validates a marketplace catalog.
     ///
@@ -380,6 +429,74 @@ impl Catalog {
             hits: packages,
             next_offset,
         })
+    }
+
+    /// Builds a compact discovery index without retaining package bodies.
+    ///
+    /// Each entry binds its package identity to the SHA-256 digest and exact byte length of the
+    /// serialized schema-v3 manifest. The resulting index can therefore be stored, searched, and
+    /// paged independently while an exact full manifest remains verifiable at inspection time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog or generated compact index violates its bounds.
+    pub fn discovery_index(&self) -> Result<DiscoveryIndex> {
+        self.validate()?;
+        let mut releases = self
+            .packages
+            .iter()
+            .map(|package| {
+                let manifest = package_manifest_bytes(package)?;
+                Ok(DiscoveryEntry {
+                    release: PackageReleaseRef {
+                        id: package.id.clone(),
+                        version: package.version.clone(),
+                        manifest_sha256: format!("{:x}", Sha256::digest(&manifest)),
+                        manifest_size_bytes: u64::try_from(manifest.len()).unwrap_or(u64::MAX),
+                    },
+                    publisher: package.publisher.clone(),
+                    package_class: package.package_class,
+                    display_name: package.display_name.clone(),
+                    description: package.description.clone(),
+                    license: package.license.clone(),
+                    compatibility: package.compatibility.clone(),
+                    trust: package.provenance.trust.clone(),
+                    revoked: self.is_revoked(package),
+                    deprecated: package.deprecation.is_some(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        releases.sort_by(|left, right| compare_release_refs(&left.release, &right.release));
+        let index = DiscoveryIndex {
+            schema_version: DISCOVERY_INDEX_SCHEMA_VERSION,
+            name: self.name.clone(),
+            releases,
+        };
+        index.to_bytes()?;
+        Ok(index)
+    }
+
+    /// Resolves an exact discovery reference to a matching, digest-verified full manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the release is missing or its full manifest no longer matches the
+    /// compact discovery reference.
+    pub fn package_for_release(&self, release: &PackageReleaseRef) -> Result<&Package> {
+        release.validate()?;
+        let package = self
+            .packages
+            .iter()
+            .find(|package| package.id == release.id && package.version == release.version)
+            .with_context(|| {
+                format!(
+                    "marketplace release `{}@{}` was not found",
+                    release.id, release.version
+                )
+            })?;
+        let manifest = package_manifest_bytes(package)?;
+        Package::parse_referenced_manifest(&manifest, release)?;
+        Ok(package)
     }
 
     fn validate(&self) -> Result<()> {
@@ -606,6 +723,151 @@ impl Catalog {
     }
 }
 
+impl DiscoveryIndex {
+    /// Parses and validates one bounded compact discovery index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty, oversized, malformed, unsorted, or invalid metadata.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() || bytes.len() > MAX_DISCOVERY_INDEX_BYTES {
+            bail!("marketplace discovery index exceeds the size limit");
+        }
+        let index: Self =
+            serde_json::from_slice(bytes).context("invalid marketplace discovery index")?;
+        index.validate()?;
+        Ok(index)
+    }
+
+    /// Serializes a validated compact discovery index within its storage limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when metadata is invalid or the encoded index exceeds its byte limit.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self)?;
+        if bytes.len() > MAX_DISCOVERY_INDEX_BYTES {
+            bail!("marketplace discovery index exceeds the size limit");
+        }
+        Ok(bytes)
+    }
+
+    /// Searches compact metadata and returns at most one bounded result page.
+    ///
+    /// `offset` counts matching releases. Results borrow only compact entries; no full package
+    /// manifest is loaded or copied by this operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query or page size exceeds the public search limits.
+    pub fn search(
+        &self,
+        query: &str,
+        offset: usize,
+        page_size: usize,
+    ) -> Result<DiscoverySearchPage<'_>> {
+        if query.len() > MAX_CATALOG_SEARCH_QUERY_BYTES {
+            bail!(
+                "marketplace search query exceeds the {MAX_CATALOG_SEARCH_QUERY_BYTES}-byte limit"
+            );
+        }
+        if page_size == 0 || page_size > MAX_CATALOG_SEARCH_PAGE_SIZE {
+            bail!(
+                "marketplace search page size must be between 1 and {MAX_CATALOG_SEARCH_PAGE_SIZE}"
+            );
+        }
+        let terms = query
+            .split_whitespace()
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        if terms.len() > MAX_CATALOG_SEARCH_TERMS {
+            bail!("marketplace search query exceeds the {MAX_CATALOG_SEARCH_TERMS}-term limit");
+        }
+
+        let mut skipped = 0_usize;
+        let mut hits = Vec::with_capacity(page_size.saturating_add(1));
+        for entry in &self.releases {
+            if !discovery_entry_matches_search(entry, &terms) {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            hits.push(entry);
+            if hits.len() > page_size {
+                break;
+            }
+        }
+        let has_more = hits.len() > page_size;
+        hits.truncate(page_size);
+        let next_offset = if has_more {
+            Some(
+                offset
+                    .checked_add(hits.len())
+                    .context("marketplace discovery offset overflowed")?,
+            )
+        } else {
+            None
+        };
+        Ok(DiscoverySearchPage { hits, next_offset })
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != DISCOVERY_INDEX_SCHEMA_VERSION || !valid_slug(&self.name) {
+            bail!("unsupported marketplace discovery schema or invalid index name");
+        }
+        for entry in &self.releases {
+            entry.validate()?;
+        }
+        if self.releases.windows(2).any(|pair| {
+            compare_release_refs(&pair[0].release, &pair[1].release) != std::cmp::Ordering::Less
+        }) {
+            bail!("marketplace discovery releases must be unique and stably sorted");
+        }
+        Ok(())
+    }
+}
+
+impl DiscoveryEntry {
+    fn validate(&self) -> Result<()> {
+        self.release.validate()?;
+        if self
+            .release
+            .id
+            .split_once('/')
+            .map(|(publisher, _)| publisher)
+            != Some(self.publisher.as_str())
+            || !valid_slug(&self.publisher)
+            || !bounded_discovery_text(&self.display_name, MAX_DISCOVERY_DISPLAY_NAME_BYTES)
+            || !bounded_discovery_text(&self.description, MAX_DISCOVERY_DESCRIPTION_BYTES)
+            || !bounded_discovery_text(&self.license, MAX_DISCOVERY_LICENSE_BYTES)
+        {
+            bail!("marketplace discovery entry metadata is invalid");
+        }
+        self.compatibility.validate()
+    }
+}
+
+impl PackageReleaseRef {
+    fn validate(&self) -> Result<()> {
+        if !valid_package_id(&self.id)
+            || Version::parse(&self.version).is_err()
+            || self.manifest_sha256.len() != 64
+            || !self
+                .manifest_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.manifest_size_bytes == 0
+            || self.manifest_size_bytes > MAX_PACKAGE_MANIFEST_BYTES as u64
+        {
+            bail!("marketplace discovery release reference is invalid");
+        }
+        Ok(())
+    }
+}
+
 fn package_matches_search(package: &Package, terms: &[String]) -> bool {
     let compact_metadata = [
         package.id.as_str(),
@@ -618,6 +880,40 @@ fn package_matches_search(package: &Package, terms: &[String]) -> bool {
     .join(" ")
     .to_ascii_lowercase();
     terms.iter().all(|term| compact_metadata.contains(term))
+}
+
+fn discovery_entry_matches_search(entry: &DiscoveryEntry, terms: &[String]) -> bool {
+    let compact_metadata = [
+        entry.release.id.as_str(),
+        entry.publisher.as_str(),
+        entry.release.version.as_str(),
+        entry.display_name.as_str(),
+        entry.description.as_str(),
+        entry.license.as_str(),
+    ]
+    .join(" ")
+    .to_ascii_lowercase();
+    terms.iter().all(|term| compact_metadata.contains(term))
+}
+
+fn compare_release_refs(left: &PackageReleaseRef, right: &PackageReleaseRef) -> std::cmp::Ordering {
+    left.id.cmp(&right.id).then_with(|| {
+        Version::parse(&left.version)
+            .expect("validated release version")
+            .cmp(&Version::parse(&right.version).expect("validated release version"))
+    })
+}
+
+fn package_manifest_bytes(package: &Package) -> Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(package).context("marketplace manifest could not be encoded")?;
+    if bytes.is_empty() || bytes.len() > MAX_PACKAGE_MANIFEST_BYTES {
+        bail!("marketplace package manifest exceeds the size limit");
+    }
+    Ok(bytes)
+}
+
+fn bounded_discovery_text(value: &str, max_bytes: usize) -> bool {
+    !value.trim().is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
 }
 
 /// Returns the public catalog shipped with this Crumb build.
@@ -813,6 +1109,43 @@ fn set_private_permissions(_path: &Path) -> Result<()> {
 }
 
 impl Package {
+    /// Parses one bounded full manifest and verifies it against an exact discovery reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an oversized, malformed, invalid, mismatched, or digest-changed
+    /// manifest. This function performs no network or filesystem access.
+    pub fn parse_referenced_manifest(bytes: &[u8], release: &PackageReleaseRef) -> Result<Self> {
+        release.validate()?;
+        if bytes.is_empty()
+            || bytes.len() > MAX_PACKAGE_MANIFEST_BYTES
+            || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != release.manifest_size_bytes
+            || !format!("{:x}", Sha256::digest(bytes))
+                .eq_ignore_ascii_case(&release.manifest_sha256)
+        {
+            bail!(
+                "marketplace release `{}@{}` does not match its discovery reference",
+                release.id,
+                release.version
+            );
+        }
+        let package: Self =
+            serde_json::from_slice(bytes).context("invalid marketplace package manifest")?;
+        package.validate()?;
+        if package.id != release.id
+            || package.version != release.version
+            || package.id.split_once('/').map(|(publisher, _)| publisher)
+                != Some(package.publisher.as_str())
+        {
+            bail!(
+                "marketplace release `{}@{}` does not match its manifest identity",
+                release.id,
+                release.version
+            );
+        }
+        Ok(package)
+    }
+
     fn validate(&self) -> Result<()> {
         if !valid_package_id(&self.id)
             || !valid_slug(&self.publisher)
@@ -1915,9 +2248,9 @@ fn current_platform() -> MarketplacePlatform {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTRIBUTOR_SCHEMA, Catalog, InstallationStore, InstalledRelease, Installer,
-        MAX_CATALOG_BYTES, PUBLIC_CATALOG, PUBLIC_SCHEMA, RemoteCatalogCache, Revocation,
-        UpdateStatus, bundled_catalog,
+        CONTRIBUTOR_SCHEMA, Catalog, DiscoveryIndex, InstallationStore, InstalledRelease,
+        Installer, MAX_CATALOG_BYTES, MAX_DISCOVERY_INDEX_BYTES, PUBLIC_CATALOG, PUBLIC_SCHEMA,
+        RemoteCatalogCache, Revocation, UpdateStatus, bundled_catalog,
     };
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -1986,6 +2319,80 @@ mod tests {
         assert!(catalog.search("review", 0, 0).is_err());
         assert!(catalog.search("review", 0, 101).is_err());
         assert!(catalog.search(&vec!["x"; 17].join(" "), 0, 20).is_err());
+    }
+
+    #[test]
+    fn compact_discovery_scales_to_ten_thousand_versions_without_full_bodies() {
+        const BODY_MARKER: &str = "FULL-BODY-MARKER";
+        let hash = format!("{:x}", Sha256::digest(b"# Review\n"));
+        let mut catalog = catalog(&hash, "SKILL.md");
+        let mut template = catalog.packages.remove(0);
+        template.source = format!("./packages/review/{BODY_MARKER}{}", "x".repeat(2_048));
+        catalog.packages = (0..10_000)
+            .map(|patch| {
+                let mut package = template.clone();
+                package.version = format!("1.0.{patch}");
+                package
+            })
+            .collect();
+
+        let full_catalog_bytes = serde_json::to_vec(&catalog).expect("full catalog serializes");
+        let index = catalog
+            .discovery_index()
+            .expect("compact discovery index is generated");
+        let index_bytes = index.to_bytes().expect("compact index serializes");
+        assert!(index_bytes.len() < MAX_DISCOVERY_INDEX_BYTES);
+        assert!(full_catalog_bytes.len() > index_bytes.len().saturating_mul(4));
+        assert!(
+            !index_bytes
+                .windows(BODY_MARKER.len())
+                .any(|window| { window == BODY_MARKER.as_bytes() })
+        );
+
+        let parsed = DiscoveryIndex::parse(&index_bytes).expect("compact index parses");
+        let page = parsed
+            .search("review code", 9_990, 7)
+            .expect("compact index search succeeds");
+        assert_eq!(page.hits.len(), 7);
+        assert_eq!(page.hits[0].release.version, "1.0.9990");
+        assert_eq!(page.next_offset, Some(9_997));
+        let final_page = parsed
+            .search("review code", page.next_offset.expect("continuation"), 7)
+            .expect("final compact page succeeds");
+        assert_eq!(final_page.hits.len(), 3);
+        assert_eq!(final_page.hits[2].release.version, "1.0.9999");
+        assert_eq!(final_page.next_offset, None);
+
+        let release = page.hits[0].release.clone();
+        let package = catalog
+            .package_for_release(&release)
+            .expect("exact release reference resolves");
+        assert_eq!(package.version, "1.0.9990");
+        let manifest = serde_json::to_vec(package).expect("full manifest serializes");
+        let parsed_manifest = super::Package::parse_referenced_manifest(&manifest, &release)
+            .expect("separately supplied manifest verifies");
+        assert_eq!(parsed_manifest.id, release.id);
+        let mut tampered_manifest = manifest;
+        tampered_manifest.push(b' ');
+        assert!(super::Package::parse_referenced_manifest(&tampered_manifest, &release).is_err());
+        catalog.packages[9_990].source.push('!');
+        assert!(catalog.package_for_release(&release).is_err());
+    }
+
+    #[test]
+    fn discovery_parse_and_search_fail_closed_at_bounds() {
+        let hash = format!("{:x}", Sha256::digest(b"# Review\n"));
+        let catalog = catalog(&hash, "SKILL.md");
+        let mut index = catalog.discovery_index().expect("discovery index");
+
+        assert!(DiscoveryIndex::parse(&[]).is_err());
+        assert!(DiscoveryIndex::parse(&vec![b'x'; MAX_DISCOVERY_INDEX_BYTES + 1]).is_err());
+        assert!(index.search(&"x".repeat(257), 0, 20).is_err());
+        assert!(index.search("review", 0, 0).is_err());
+        assert!(index.search("review", 0, 101).is_err());
+
+        index.releases[0].release.manifest_sha256 = "0".repeat(63);
+        assert!(index.to_bytes().is_err());
     }
 
     #[test]
