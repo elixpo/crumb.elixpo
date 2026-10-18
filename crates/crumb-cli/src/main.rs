@@ -3136,6 +3136,7 @@ fn render_observed_activity(
         output_tokens,
     } = event
     {
+        let activity_row = activity.as_ref().and_then(crumb_ui::ActivityIndicator::row);
         if let Some(indicator) = activity.take() {
             indicator.finish();
         }
@@ -3150,7 +3151,12 @@ fn render_observed_activity(
             &terminal.transcript,
             terminal.header_rows,
         )?;
-        *activity = Some(start_activity(renderer, "Thinking", terminal.fullscreen));
+        *activity = Some(start_activity_at(
+            renderer,
+            "Thinking",
+            terminal.fullscreen,
+            activity_row,
+        ));
     } else {
         render_harness_activity(
             event,
@@ -4526,10 +4532,13 @@ fn replace_activity(
     label: &str,
     fullscreen: bool,
 ) {
+    let row = indicator
+        .as_ref()
+        .and_then(crumb_ui::ActivityIndicator::row);
     if let Some(active) = indicator.take() {
         active.finish();
     }
-    *indicator = Some(start_activity(renderer, label, fullscreen));
+    *indicator = Some(start_activity_at(renderer, label, fullscreen, row));
 }
 
 fn start_activity(
@@ -4537,10 +4546,21 @@ fn start_activity(
     label: &str,
     fullscreen: bool,
 ) -> crumb_ui::ActivityIndicator {
+    start_activity_at(renderer, label, fullscreen, None)
+}
+
+fn start_activity_at(
+    renderer: Renderer,
+    label: &str,
+    fullscreen: bool,
+    pinned_row: Option<u16>,
+) -> crumb_ui::ActivityIndicator {
     if fullscreen {
-        let row = size().map_or(0, |(_, rows)| {
-            let cursor_row = cursor_position().map_or(0, |(_, row)| row);
-            transcript_activity_row(cursor_row, rows)
+        let row = pinned_row.unwrap_or_else(|| {
+            size().map_or(0, |(_, rows)| {
+                let cursor_row = cursor_position().map_or(0, |(_, row)| row);
+                transcript_activity_row(cursor_row, rows)
+            })
         });
         renderer.activity_at(label, row)
     } else {
@@ -12483,8 +12503,11 @@ fn render_idle_composer(
     status: &str,
 ) -> io::Result<()> {
     position_composer(renderer, header_rows)?;
-    let (columns, _) = size()?;
-    let (_, _, composer_row, _) = fullscreen_rows(header_rows)?;
+    let (columns, rows) = size()?;
+    // Reedline anchors a one-line idle composer here as well. Reuse that row
+    // after submission so switching into an active turn cannot grow the dock
+    // or move the placeholder by two terminal rows.
+    let composer_row = follow_up_composer_row(rows);
     let mut writer = io::stdout();
     crossterm::execute!(writer, MoveTo(0, composer_row))?;
     write!(
@@ -12914,12 +12937,13 @@ mod tests {
         TerminalModeTracker, TranscriptCapture, TranscriptScroll, TranscriptState, UiSettings,
         active_scroll_direction, agent_config_location, aligned_composer_prompt,
         apply_builtin_model_packs, artifact_modal_action, bundled_catalog, completion_footer_frame,
-        composer_anchor_sequence, composer_placeholder_hint, composer_visual_rows,
-        configure_permissions, configure_plugin, effort_display_name, effort_wire_name,
-        ensure_single_release_skill_install, exact_skill_manifest_url, exact_skill_run_config,
-        failed_command_recovery, finished_tool_activity, fixed_footer_frame,
-        follow_up_cursor_sequence, format_peer_discarded_file, format_peer_imported_file,
-        format_peer_inbox, format_peer_inspection, format_peer_quarantined_file, format_peer_task,
+        composer_anchor_row, composer_anchor_sequence, composer_placeholder_hint,
+        composer_visual_rows, configure_permissions, configure_plugin, effort_display_name,
+        effort_wire_name, ensure_single_release_skill_install, exact_skill_manifest_url,
+        exact_skill_run_config, failed_command_recovery, finished_tool_activity,
+        fixed_footer_frame, follow_up_composer_row, follow_up_cursor_sequence,
+        format_peer_discarded_file, format_peer_imported_file, format_peer_inbox,
+        format_peer_inspection, format_peer_quarantined_file, format_peer_task,
         handle_skill_command, initial_agent_activity, install_marketplace_package,
         load_exact_skill_manifest, marketplace_update_blocker, normalize_bundled_skill_install,
         openrouter_preset, parse_cli_skill_run, parse_credential_reference, parse_exec_request,
@@ -14535,6 +14559,7 @@ mod tests {
     fn active_follow_up_cursor_is_placed_inside_the_composer() {
         assert_eq!(follow_up_cursor_sequence(40), "\x1b[35;5H");
         assert_eq!(follow_up_cursor_sequence(4), "\x1b[1;5H");
+        assert_eq!(follow_up_composer_row(40), composer_anchor_row(40, 1));
     }
 
     #[test]

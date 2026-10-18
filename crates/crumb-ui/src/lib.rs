@@ -1405,6 +1405,15 @@ impl ActivityIndicator {
         self.started.elapsed()
     }
 
+    /// Returns the pinned terminal row used by a fullscreen activity.
+    ///
+    /// Replacements reuse this row so moving the input cursor into the
+    /// composer cannot make an in-flight status jump to the footer.
+    #[must_use]
+    pub const fn row(&self) -> Option<u16> {
+        self.row
+    }
+
     /// Stops and clears the activity line before another message is rendered.
     pub fn finish(mut self) {
         self.stop();
