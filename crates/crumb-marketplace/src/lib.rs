@@ -23,6 +23,12 @@ const MAX_INSTALLED_RELEASES: usize = 512;
 pub const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum accepted size for one Sigstore bundle.
 pub const MAX_SIGSTORE_BUNDLE_BYTES: usize = 256 * 1024;
+/// Maximum accepted byte length for one catalog search query.
+pub const MAX_CATALOG_SEARCH_QUERY_BYTES: usize = 256;
+/// Maximum number of terms evaluated for one catalog search query.
+pub const MAX_CATALOG_SEARCH_TERMS: usize = 16;
+/// Maximum number of releases returned by one catalog search page.
+pub const MAX_CATALOG_SEARCH_PAGE_SIZE: usize = 100;
 const BUNDLED_CATALOG: &[u8] = include_bytes!("../../../marketplace/catalog.json");
 #[cfg(test)]
 const PUBLIC_CATALOG: &[u8] =
@@ -48,6 +54,29 @@ pub enum PackageKind {
     Skill,
     Mcp,
     Bundle,
+}
+
+/// Protocol-level package class. Unlike the legacy storage kind, this states
+/// how a release may contribute behavior to Crumb.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageClass {
+    Instruction,
+    Template,
+    Command,
+    Mcp,
+    Composite,
+}
+
+/// One exact, immutable package dependency.
+///
+/// Phase-A dependencies intentionally use exact semantic versions. Ranges
+/// would make the same request resolve differently as releases are added.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageDependency {
+    pub id: String,
+    pub version: String,
 }
 
 /// Capability declared by a package before it can be enabled.
@@ -200,6 +229,7 @@ pub struct Package {
     pub publisher: String,
     pub version: String,
     pub kind: PackageKind,
+    pub package_class: PackageClass,
     pub display_name: String,
     pub description: String,
     pub license: String,
@@ -209,6 +239,8 @@ pub struct Package {
     pub disclosures: Disclosures,
     #[serde(default)]
     pub connector_requirements: Vec<ConnectorRequirement>,
+    #[serde(default)]
+    pub dependencies: Vec<PackageDependency>,
     pub deprecation: Option<Deprecation>,
     #[serde(default)]
     pub capabilities: BTreeSet<Capability>,
@@ -230,6 +262,25 @@ pub struct Catalog {
     #[serde(default)]
     pub revocations: Vec<Revocation>,
     pub packages: Vec<Package>,
+}
+
+/// Compact package metadata returned by catalog discovery.
+///
+/// Artifact, connector, dependency, and runtime metadata remains behind explicit inspect.
+pub struct CatalogSearchHit<'catalog> {
+    pub id: &'catalog str,
+    pub publisher: &'catalog str,
+    pub version: &'catalog str,
+    pub package_class: PackageClass,
+    pub display_name: &'catalog str,
+    pub description: &'catalog str,
+    pub license: &'catalog str,
+}
+
+/// One bounded page of compact catalog search results.
+pub struct CatalogSearchPage<'catalog> {
+    pub hits: Vec<CatalogSearchHit<'catalog>>,
+    pub next_offset: Option<usize>,
 }
 
 impl Catalog {
@@ -257,8 +308,82 @@ impl Catalog {
             })
     }
 
+    /// Searches compact package metadata and returns one bounded page in catalog order.
+    ///
+    /// `offset` counts matching releases, not raw catalog entries. An empty query pages
+    /// through every release. Results expose only compact discovery metadata; callers must
+    /// explicitly inspect an exact package before seeing dependencies, capabilities, connectors,
+    /// artifacts, or runtime configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query or requested page exceeds the public search limits.
+    pub fn search(
+        &self,
+        query: &str,
+        offset: usize,
+        page_size: usize,
+    ) -> Result<CatalogSearchPage<'_>> {
+        if query.len() > MAX_CATALOG_SEARCH_QUERY_BYTES {
+            bail!(
+                "marketplace search query exceeds the {MAX_CATALOG_SEARCH_QUERY_BYTES}-byte limit"
+            );
+        }
+        if page_size == 0 || page_size > MAX_CATALOG_SEARCH_PAGE_SIZE {
+            bail!(
+                "marketplace search page size must be between 1 and {MAX_CATALOG_SEARCH_PAGE_SIZE}"
+            );
+        }
+        let terms = query
+            .split_whitespace()
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        if terms.len() > MAX_CATALOG_SEARCH_TERMS {
+            bail!("marketplace search query exceeds the {MAX_CATALOG_SEARCH_TERMS}-term limit");
+        }
+
+        let mut skipped = 0_usize;
+        let mut packages = Vec::with_capacity(page_size.saturating_add(1));
+        for package in &self.packages {
+            if !package_matches_search(package, &terms) {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            packages.push(CatalogSearchHit {
+                id: &package.id,
+                publisher: &package.publisher,
+                version: &package.version,
+                package_class: package.package_class,
+                display_name: &package.display_name,
+                description: &package.description,
+                license: &package.license,
+            });
+            if packages.len() > page_size {
+                break;
+            }
+        }
+        let has_more = packages.len() > page_size;
+        packages.truncate(page_size);
+        let next_offset = if has_more {
+            Some(
+                offset
+                    .checked_add(packages.len())
+                    .context("marketplace search offset overflowed")?,
+            )
+        } else {
+            None
+        };
+        Ok(CatalogSearchPage {
+            hits: packages,
+            next_offset,
+        })
+    }
+
     fn validate(&self) -> Result<()> {
-        if self.schema_version != 2 || !valid_slug(&self.name) {
+        if self.schema_version != 3 || !valid_slug(&self.name) {
             bail!("unsupported marketplace schema or invalid marketplace name");
         }
         if self.publishers.is_empty() {
@@ -331,6 +456,84 @@ impl Catalog {
         Ok(package)
     }
 
+    /// Resolves an install request to an immutable dependency-first plan.
+    ///
+    /// Dependencies are exact releases, so resolution is deterministic and
+    /// rejects unavailable, revoked, incompatible, conflicting, or cyclic
+    /// graphs before installation mutates the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the root or any dependency cannot be installed.
+    pub fn installation_plan(&self, id: &str) -> Result<Vec<&Package>> {
+        let root = self.installable_package(id)?;
+        let mut selected = BTreeMap::<&str, &str>::new();
+        let mut visiting = BTreeSet::<(&str, &str)>::new();
+        let mut resolved = BTreeSet::<(&str, &str)>::new();
+        let mut plan = Vec::new();
+        self.resolve_release(root, &mut selected, &mut visiting, &mut resolved, &mut plan)?;
+        Ok(plan)
+    }
+
+    fn resolve_release<'catalog>(
+        &'catalog self,
+        package: &'catalog Package,
+        selected: &mut BTreeMap<&'catalog str, &'catalog str>,
+        visiting: &mut BTreeSet<(&'catalog str, &'catalog str)>,
+        resolved: &mut BTreeSet<(&'catalog str, &'catalog str)>,
+        plan: &mut Vec<&'catalog Package>,
+    ) -> Result<()> {
+        let identity = (package.id.as_str(), package.version.as_str());
+        if let Some(version) = selected.insert(identity.0, identity.1)
+            && version != identity.1
+        {
+            bail!(
+                "marketplace dependency conflict for `{}`: `{version}` and `{}`",
+                package.id,
+                package.version
+            );
+        }
+        if resolved.contains(&identity) {
+            return Ok(());
+        }
+        if !visiting.insert(identity) {
+            bail!("marketplace dependency cycle includes `{}`", package.id);
+        }
+        for dependency in &package.dependencies {
+            let release = self
+                .packages
+                .iter()
+                .find(|candidate| {
+                    candidate.id == dependency.id && candidate.version == dependency.version
+                })
+                .with_context(|| {
+                    format!(
+                        "marketplace dependency `{}@{}` required by `{}` was not found",
+                        dependency.id, dependency.version, package.id
+                    )
+                })?;
+            if self.is_revoked(release) {
+                bail!(
+                    "marketplace dependency `{}@{}` is revoked",
+                    dependency.id,
+                    dependency.version
+                );
+            }
+            if !release.compatibility.supports_current() {
+                bail!(
+                    "marketplace dependency `{}@{}` is incompatible with this Crumb build",
+                    dependency.id,
+                    dependency.version
+                );
+            }
+            self.resolve_release(release, selected, visiting, resolved, plan)?;
+        }
+        visiting.remove(&identity);
+        resolved.insert(identity);
+        plan.push(package);
+        Ok(())
+    }
+
     /// Compares active installed releases with this already-authenticated catalog.
     ///
     /// Revoked active releases are always reported, including when pinned. Only newer,
@@ -401,6 +604,20 @@ impl Catalog {
         plan.sort_by(|left, right| left.package_id.cmp(&right.package_id));
         plan
     }
+}
+
+fn package_matches_search(package: &Package, terms: &[String]) -> bool {
+    let compact_metadata = [
+        package.id.as_str(),
+        package.publisher.as_str(),
+        package.version.as_str(),
+        package.display_name.as_str(),
+        package.description.as_str(),
+        package.license.as_str(),
+    ]
+    .join(" ")
+    .to_ascii_lowercase();
+    terms.iter().all(|term| compact_metadata.contains(term))
 }
 
 /// Returns the public catalog shipped with this Crumb build.
@@ -631,13 +848,66 @@ impl Package {
                 bail!("package `{}` repeats a connector requirement", self.id);
             }
         }
+        let mut dependencies = BTreeSet::new();
+        for dependency in &self.dependencies {
+            dependency.validate()?;
+            if dependency.id == self.id {
+                bail!("package `{}` cannot depend on itself", self.id);
+            }
+            if !dependencies.insert(dependency.id.as_str()) {
+                bail!("package `{}` repeats a dependency", self.id);
+            }
+        }
         let paths = self.validate_artifacts()?;
         self.validate_skills(&paths)?;
         self.validate_mcp_servers()?;
         if self.skills.is_empty() && self.mcp_servers.is_empty() {
             bail!("package `{}` exposes no skills or MCP servers", self.id);
         }
+        match self.package_class {
+            PackageClass::Instruction
+                if self.kind != PackageKind::Skill
+                    || self.skills.is_empty()
+                    || !self.mcp_servers.is_empty() =>
+            {
+                bail!("package `{}` has invalid instruction metadata", self.id);
+            }
+            PackageClass::Mcp if self.kind != PackageKind::Mcp || self.mcp_servers.is_empty() => {
+                bail!("package `{}` has invalid MCP class metadata", self.id);
+            }
+            PackageClass::Template
+                if self.kind != PackageKind::Bundle || !self.mcp_servers.is_empty() =>
+            {
+                bail!("package `{}` has invalid template metadata", self.id);
+            }
+            PackageClass::Command
+                if self.kind != PackageKind::Bundle
+                    || !self.capabilities.contains(&Capability::ProcessExecution)
+                    || self.skills.is_empty()
+                    || !self.mcp_servers.is_empty() =>
+            {
+                bail!("package `{}` has invalid command-adapter metadata", self.id);
+            }
+            PackageClass::Composite
+                if self.kind != PackageKind::Bundle
+                    || self.dependencies.is_empty()
+                    || self.skills.is_empty()
+                    || !self.mcp_servers.is_empty() =>
+            {
+                bail!("package `{}` has invalid composite metadata", self.id);
+            }
+            _ => {}
+        }
         Ok(())
+    }
+
+    /// Total immutable artifact bytes disclosed before installation approval.
+    #[must_use]
+    pub fn declared_size_bytes(&self) -> u64 {
+        self.artifacts
+            .iter()
+            .map(|artifact| artifact.size_bytes)
+            .fold(0, u64::saturating_add)
     }
 
     fn validate_artifacts(&self) -> Result<BTreeSet<&Path>> {
@@ -743,6 +1013,15 @@ impl Package {
                 }
                 _ => {}
             }
+        }
+        Ok(())
+    }
+}
+
+impl PackageDependency {
+    fn validate(&self) -> Result<()> {
+        if !valid_package_id(&self.id) || Version::parse(&self.version).is_err() {
+            bail!("marketplace package dependency is invalid");
         }
         Ok(())
     }
@@ -1648,7 +1927,7 @@ mod tests {
 
     fn catalog_json(hash: &str, path: &str) -> String {
         format!(
-            r#"{{"schema_version":2,"name":"crumb-public","publishers":[{{"id":"crumb","display_name":"Crumb","source_url":"https://example.test/crumb","identity":{{"issuer":"https://issuer.example.test","subject":"repo:crumb/test"}}}}],"revocations":[],"packages":[{{"id":"crumb/review","publisher":"crumb","version":"1.0.0","kind":"skill","display_name":"Review","description":"Review code","license":"MIT","source":"./packages/review","compatibility":{{"minimum_crumb_version":"0.1.0","maximum_crumb_version_exclusive":"0.2.0","platforms":["linux","macos","windows"]}},"provenance":{{"repository":"https://example.test/review","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","released_at":"2026-10-17T00:00:00Z","trust":{{"kind":"bundled"}}}},"disclosures":{{"security_url":"https://example.test/security","privacy_url":null,"data_flow":"local only"}},"connector_requirements":[],"deprecation":null,"artifacts":[{{"path":"{path}","sha256":"{hash}","size_bytes":9,"url":null,"bundle_url":null}}],"skills":[{{"id":"review","path":"{path}"}}]}}]}}"#
+            r#"{{"schema_version":3,"name":"crumb-public","publishers":[{{"id":"crumb","display_name":"Crumb","source_url":"https://example.test/crumb","identity":{{"issuer":"https://issuer.example.test","subject":"repo:crumb/test"}}}}],"revocations":[],"packages":[{{"id":"crumb/review","publisher":"crumb","version":"1.0.0","kind":"skill","package_class":"instruction","display_name":"Review","description":"Review code","license":"MIT","source":"./packages/review","compatibility":{{"minimum_crumb_version":"0.1.0","maximum_crumb_version_exclusive":"0.2.0","platforms":["linux","macos","windows"]}},"provenance":{{"repository":"https://example.test/review","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","released_at":"2026-10-17T00:00:00Z","trust":{{"kind":"bundled"}}}},"disclosures":{{"security_url":"https://example.test/security","privacy_url":null,"data_flow":"local only"}},"connector_requirements":[],"dependencies":[],"deprecation":null,"artifacts":[{{"path":"{path}","sha256":"{hash}","size_bytes":9,"url":null,"bundle_url":null}}],"skills":[{{"id":"review","path":"{path}"}}]}}]}}"#
         )
     }
 
@@ -1663,6 +1942,50 @@ mod tests {
             active: true,
             pinned,
         }
+    }
+
+    #[test]
+    fn catalog_search_pages_ten_thousand_releases_without_copying_bodies() {
+        let hash = format!("{:x}", Sha256::digest(b"# Review\n"));
+        let mut catalog = catalog(&hash, "SKILL.md");
+        let template = catalog.packages.remove(0);
+        catalog.packages = (0..10_000)
+            .map(|patch| {
+                let mut package = template.clone();
+                package.version = format!("1.0.{patch}");
+                package
+            })
+            .collect();
+
+        let page = catalog
+            .search("review code", 9_990, 7)
+            .expect("bounded search succeeds");
+        assert_eq!(page.hits.len(), 7);
+        assert_eq!(page.hits[0].version, "1.0.9990");
+        assert_eq!(page.next_offset, Some(9_997));
+
+        let final_page = catalog
+            .search("review code", page.next_offset.expect("next page"), 7)
+            .expect("final page succeeds");
+        assert_eq!(final_page.hits.len(), 3);
+        assert_eq!(final_page.hits[2].version, "1.0.9999");
+        assert_eq!(final_page.next_offset, None);
+
+        assert!(std::ptr::eq(
+            page.hits[0].version,
+            catalog.packages[9_990].version.as_str()
+        ));
+    }
+
+    #[test]
+    fn catalog_search_rejects_unbounded_queries_and_pages() {
+        let hash = format!("{:x}", Sha256::digest(b"# Review\n"));
+        let catalog = catalog(&hash, "SKILL.md");
+
+        assert!(catalog.search(&"x".repeat(257), 0, 20).is_err());
+        assert!(catalog.search("review", 0, 0).is_err());
+        assert!(catalog.search("review", 0, 101).is_err());
+        assert!(catalog.search(&vec!["x"; 17].join(" "), 0, 20).is_err());
     }
 
     #[test]
@@ -1931,6 +2254,119 @@ mod tests {
         catalog.revocations.clear();
         catalog.packages[0].compatibility.minimum_crumb_version = "9.0.0".to_owned();
         assert!(catalog.installable_package("crumb/review").is_err());
+    }
+
+    #[test]
+    fn package_classes_are_explicit_and_fail_closed() {
+        let catalog = catalog(&"a".repeat(64), "SKILL.md");
+        let package = &catalog.packages[0];
+        assert_eq!(package.package_class, super::PackageClass::Instruction);
+        assert_eq!(package.declared_size_bytes(), 9);
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&catalog_json(&"a".repeat(64), "SKILL.md")).expect("catalog JSON");
+        value["packages"][0]
+            .as_object_mut()
+            .expect("package object")
+            .remove("package_class");
+        assert!(Catalog::parse(value.to_string().as_bytes()).is_err());
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&catalog_json(&"a".repeat(64), "SKILL.md")).expect("catalog JSON");
+        value["packages"][0]["package_class"] = serde_json::json!("template");
+        assert!(Catalog::parse(value.to_string().as_bytes()).is_err());
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&catalog_json(&"a".repeat(64), "SKILL.md")).expect("catalog JSON");
+        value["schema_version"] = serde_json::json!(2);
+        assert!(Catalog::parse(value.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn dependency_resolution_is_exact_ordered_and_fail_closed() {
+        let mut catalog = catalog(&"a".repeat(64), "SKILL.md");
+        let mut dependency = catalog.packages[0].clone();
+        dependency.id = "crumb/base".to_owned();
+        dependency.display_name = "Base".to_owned();
+
+        let root = &mut catalog.packages[0];
+        root.kind = super::PackageKind::Bundle;
+        root.package_class = super::PackageClass::Composite;
+        root.dependencies.push(super::PackageDependency {
+            id: dependency.id.clone(),
+            version: dependency.version.clone(),
+        });
+        catalog.packages.push(dependency.clone());
+
+        let plan = catalog
+            .installation_plan("crumb/review")
+            .expect("dependency plan");
+        assert_eq!(
+            plan.iter()
+                .map(|package| package.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["crumb/base", "crumb/review"]
+        );
+
+        catalog.revocations.push(Revocation {
+            package: dependency.id.clone(),
+            version: dependency.version.clone(),
+            reason: "compromised".to_owned(),
+            revoked_at: "2026-10-17T00:00:00Z".to_owned(),
+        });
+        assert!(catalog.installation_plan("crumb/review").is_err());
+        catalog.revocations.clear();
+
+        catalog.packages[1]
+            .dependencies
+            .push(super::PackageDependency {
+                id: "crumb/review".to_owned(),
+                version: "1.0.0".to_owned(),
+            });
+        assert!(catalog.installation_plan("crumb/review").is_err());
+    }
+
+    #[test]
+    fn dependency_resolution_rejects_missing_and_conflicting_versions() {
+        let mut catalog = catalog(&"a".repeat(64), "SKILL.md");
+        let mut first = catalog.packages[0].clone();
+        first.id = "crumb/first".to_owned();
+        let mut second = first.clone();
+        second.id = "crumb/second".to_owned();
+        let mut common_v1 = first.clone();
+        common_v1.id = "crumb/common".to_owned();
+        let mut common_v2 = common_v1.clone();
+        common_v2.version = "2.0.0".to_owned();
+
+        first.dependencies.push(super::PackageDependency {
+            id: common_v1.id.clone(),
+            version: common_v1.version.clone(),
+        });
+        second.dependencies.push(super::PackageDependency {
+            id: common_v2.id.clone(),
+            version: common_v2.version.clone(),
+        });
+        let root = &mut catalog.packages[0];
+        root.kind = super::PackageKind::Bundle;
+        root.package_class = super::PackageClass::Composite;
+        root.dependencies.extend([
+            super::PackageDependency {
+                id: first.id.clone(),
+                version: first.version.clone(),
+            },
+            super::PackageDependency {
+                id: second.id.clone(),
+                version: second.version.clone(),
+            },
+        ]);
+        catalog.packages.extend([first, second, common_v1]);
+        assert!(catalog.installation_plan("crumb/review").is_err());
+
+        catalog.packages.push(common_v2);
+        let error = catalog
+            .installation_plan("crumb/review")
+            .expect_err("conflicting exact releases must fail");
+        assert!(error.to_string().contains("dependency conflict"));
     }
 
     #[test]

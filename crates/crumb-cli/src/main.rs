@@ -48,9 +48,9 @@ use crumb_harness_dsh::HarnessActivity;
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_marketplace::{
     Catalog, InstallScope, InstallationStore, InstalledRelease, Installer, MAX_CATALOG_BYTES,
-    MAX_SIGSTORE_BUNDLE_BYTES, McpTransport as MarketplaceMcpTransport, Package, PublisherIdentity,
-    ReleaseTrust, RemoteCatalogCache, SignedArtifact, SigstoreVerifier, UpdateStatus,
-    bundled_catalog, verify_package_files,
+    MAX_SIGSTORE_BUNDLE_BYTES, McpTransport as MarketplaceMcpTransport, Package, PackageClass,
+    PublisherIdentity, ReleaseTrust, RemoteCatalogCache, SignedArtifact, SigstoreVerifier,
+    UpdateStatus, bundled_catalog, verify_package_files,
 };
 use crumb_mcp::{
     McpDispatcher, StdioMcpLimits, StreamableHttpLimits, register_stdio_servers,
@@ -192,6 +192,24 @@ fn run_command_line_action() -> Result<bool> {
         export_reviews(&current_process_dir()?, id, &mut io::stdout().lock())?;
         return Ok(true);
     }
+    if arguments.first().is_some_and(|group| group == "skill") {
+        let arguments = arguments
+            .iter()
+            .skip(1)
+            .map(|argument| {
+                argument
+                    .to_str()
+                    .context("skill arguments must be valid UTF-8")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let command = if arguments.is_empty() {
+            "/skill".to_owned()
+        } else {
+            format!("/skill {}", arguments.join(" "))
+        };
+        handle_skill_command(&command, &current_process_dir()?, &mut io::stdout().lock())?;
+        return Ok(true);
+    }
     let action = match arguments.as_slice() {
         [] => return Ok(false),
         [group, action] if group == "auth" && action == "login" => AuthAction::Login,
@@ -199,7 +217,7 @@ fn run_command_line_action() -> Result<bool> {
         [group, action] if group == "auth" && action == "logout" => AuthAction::Logout,
         _ => {
             return Err(anyhow!(
-                "usage: crumb [exec [--json] <request> | auth <login|status|logout> | mcp serve | review export <id|all> | completions <shell> | jobs <list|run <id>|tick>]"
+                "usage: crumb [exec [--json] <request> | skill <operation> | auth <login|status|logout> | mcp serve | review export <id|all> | completions <shell> | jobs <list|run <id>|tick>]"
             ));
         }
     };
@@ -4144,7 +4162,11 @@ fn handle_builtin(
             )?;
         }
         BuiltInCommand::Reserved(command) => {
-            show_reserved(&command, cwd, agent_runtime, writer)?;
+            if command == "/skill" || command.starts_with("/skill ") {
+                handle_skill_command(&command, cwd, writer)?;
+            } else {
+                show_reserved(&command, cwd, agent_runtime, writer)?;
+            }
         }
         BuiltInCommand::Version => {
             writeln!(writer, "crumb {}", env!("CARGO_PKG_VERSION"))?;
@@ -4216,6 +4238,7 @@ fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
                 "/context",
                 "/attach",
                 "/detach",
+                "/skill",
                 "/skills",
                 "/plugins",
                 "/marketplace",
@@ -4308,8 +4331,146 @@ fn show_skills(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     }
     writeln!(
         writer,
-        "  `/skills add <id> <path>` · `/skills load|unload <id>` · `/skills remove <id>`"
+        "  `/skill search|inspect|install|enable|disable|remove|doctor`"
     )?;
+    writeln!(
+        writer,
+        "  Legacy local registration remains under `/skills`."
+    )?;
+    Ok(())
+}
+
+fn handle_skill_command(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let arguments = command
+        .strip_prefix("/skill")
+        .map(str::trim)
+        .context("skill command must begin with `/skill`")?;
+    if arguments.is_empty() {
+        show_skills(cwd, writer)?;
+        writeln!(
+            writer,
+            "  CLI: `crumb skill <search|inspect|install|enable|disable|update|rollback|remove|doctor>`"
+        )?;
+        return Ok(());
+    }
+    if arguments == "search" || arguments.starts_with("search ") {
+        let query = arguments.strip_prefix("search").unwrap_or_default().trim();
+        return search_skill_catalog(query, writer);
+    }
+    if let Some(selector) = arguments.strip_prefix("inspect ") {
+        let id = resolve_bundled_skill_selector(selector.trim(), "inspect")?;
+        return show_marketplace(&format!("/marketplace inspect {id}"), cwd, writer);
+    }
+    if let Some(install) = arguments.strip_prefix("install ") {
+        let normalized = normalize_bundled_skill_install(install)?;
+        return show_marketplace(&format!("/marketplace install {normalized}"), cwd, writer);
+    }
+    if arguments == "enable" || arguments.starts_with("enable ") {
+        return set_skill_enabled(command, cwd, true, writer);
+    }
+    if arguments == "disable" || arguments.starts_with("disable ") {
+        return set_skill_enabled(command, cwd, false, writer);
+    }
+    if let Some(update) = arguments.strip_prefix("update ") {
+        return show_marketplace(&format!("/marketplace update {update}"), cwd, writer);
+    }
+    if let Some(rollback) = arguments.strip_prefix("rollback ") {
+        return show_marketplace(&format!("/marketplace rollback {rollback}"), cwd, writer);
+    }
+    if let Some(remove) = arguments.strip_prefix("remove ") {
+        return show_marketplace(&format!("/marketplace uninstall {remove}"), cwd, writer);
+    }
+    if arguments == "doctor" || arguments.starts_with("doctor ") {
+        let suffix = arguments.strip_prefix("doctor").unwrap_or_default();
+        return show_marketplace(&format!("/marketplace doctor{suffix}"), cwd, writer);
+    }
+    Err(anyhow!(
+        "usage: /skill [search [query] | inspect <publisher/name>[@version] | install <publisher/name>[@version] [--scope project|user] | enable|disable <id> | update <publisher/name> [--scope project|user] | rollback <publisher/name> [--to <version>] [--scope project|user] | remove <publisher/name> [--scope project|user] | doctor [--scope project|user]]"
+    ))
+}
+
+fn search_skill_catalog(query: &str, writer: &mut dyn Write) -> Result<()> {
+    let catalog = bundled_catalog()?;
+    let page = catalog.search(query, 0, 20)?;
+    let matches = page
+        .hits
+        .iter()
+        .filter(|hit| hit.package_class == PackageClass::Instruction)
+        .collect::<Vec<_>>();
+    writeln!(writer, "◆ Skill catalog · compact offline metadata")?;
+    if matches.is_empty() {
+        writeln!(writer, "  No skills matched `{query}`.")?;
+    } else {
+        for package in matches {
+            writeln!(
+                writer,
+                "  ○ {:<28} v{:<9} {}",
+                package.id, package.version, package.description
+            )?;
+        }
+    }
+    if let Some(offset) = page.next_offset {
+        writeln!(
+            writer,
+            "  More compact metadata is available at offset {offset}."
+        )?;
+    }
+    writeln!(
+        writer,
+        "  Search never installs or enables a skill; inspect one before installing."
+    )?;
+    Ok(())
+}
+
+fn resolve_bundled_skill_selector(selector: &str, operation: &str) -> Result<String> {
+    let (id, requested_version) = selector
+        .rsplit_once('@')
+        .map_or((selector, None), |(id, version)| (id, Some(version)));
+    if id.is_empty() || id.split('/').count() != 2 {
+        bail!("usage: /skill {operation} <publisher/name>[@version]");
+    }
+    let catalog = bundled_catalog()?;
+    let package = catalog
+        .package(id)
+        .with_context(|| format!("skill package `{id}` was not found"))?;
+    if package.skills.is_empty() {
+        bail!("package `{id}` is not an instruction skill");
+    }
+    if let Some(version) = requested_version
+        && version != package.version
+    {
+        bail!(
+            "skill package `{id}` is available at {}, not requested version {version}",
+            package.version
+        );
+    }
+    Ok(id.to_owned())
+}
+
+fn normalize_bundled_skill_install(arguments: &str) -> Result<String> {
+    let mut parts = arguments.split_whitespace();
+    let selector = parts
+        .next()
+        .context("usage: /skill install <publisher/name>[@version] [--scope project|user]")?;
+    let id = resolve_bundled_skill_selector(selector, "install")?;
+    let catalog = bundled_catalog()?;
+    let plan = catalog.installation_plan(&id)?;
+    ensure_single_release_skill_install(&id, plan.len())?;
+    let remaining = parts.collect::<Vec<_>>().join(" ");
+    if remaining.is_empty() {
+        Ok(id)
+    } else {
+        Ok(format!("{id} {remaining}"))
+    }
+}
+
+fn ensure_single_release_skill_install(id: &str, plan_len: usize) -> Result<()> {
+    if plan_len > 1 {
+        bail!(
+            "skill package `{id}` requires {} dependencies; installation was not started because this CLI stage cannot yet activate the complete plan atomically",
+            plan_len - 1
+        );
+    }
     Ok(())
 }
 
@@ -4749,13 +4910,19 @@ fn set_skill_enabled(
     enabled: bool,
     writer: &mut dyn Write,
 ) -> Result<()> {
-    let action = if enabled { "load" } else { "unload" };
-    let prefix = format!("/skills {action}");
+    let (legacy_action, singular_action) = if enabled {
+        ("load", "enable")
+    } else {
+        ("unload", "disable")
+    };
+    let legacy_prefix = format!("/skills {legacy_action}");
+    let singular_prefix = format!("/skill {singular_action}");
     let id = command
-        .strip_prefix(&prefix)
+        .strip_prefix(&legacy_prefix)
+        .or_else(|| command.strip_prefix(&singular_prefix))
         .map(str::trim)
         .filter(|id| !id.is_empty())
-        .with_context(|| format!("usage: /skills {action} <id>"))?;
+        .with_context(|| format!("usage: /skill {singular_action} <id>"))?;
     update_agent_config(cwd, |config| {
         if let Some(skill) = config.skills.iter_mut().find(|skill| skill.id == id) {
             skill.enabled = enabled;
@@ -4773,7 +4940,7 @@ fn set_skill_enabled(
     writeln!(
         writer,
         "◆ Skill {} · {id}",
-        if enabled { "loaded" } else { "unloaded" }
+        if enabled { "enabled" } else { "disabled" }
     )?;
     Ok(())
 }
@@ -10280,8 +10447,9 @@ mod tests {
         TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
         agent_config_location, apply_builtin_model_packs, completion_footer_frame,
         composer_anchor_sequence, configure_permissions, configure_plugin, effort_display_name,
-        effort_wire_name, failed_command_recovery, finished_tool_activity, fixed_footer_frame,
-        initial_agent_activity, marketplace_update_blocker, openrouter_preset,
+        effort_wire_name, ensure_single_release_skill_install, failed_command_recovery,
+        finished_tool_activity, fixed_footer_frame, handle_skill_command, initial_agent_activity,
+        marketplace_update_blocker, normalize_bundled_skill_install, openrouter_preset,
         parse_credential_reference, parse_exec_request, parse_paused_submission,
         parse_provider_header, parse_resume_session_argument, read_agent_config,
         read_bounded_response, register_local_skill, resolve_memory_keep,
@@ -10479,6 +10647,68 @@ mod tests {
                 .all(|skill| skill.id != "review")
         );
         assert!(skill_path.is_file());
+        std::fs::remove_dir_all(workspace).expect("workspace removed");
+    }
+
+    #[test]
+    fn singular_skill_namespace_searches_without_installing_or_enabling() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-skill-search-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace is created");
+        let mut output = Vec::new();
+
+        handle_skill_command("/skill search review", &workspace, &mut output)
+            .expect("compact metadata search succeeds");
+
+        let rendered = String::from_utf8(output).expect("output is UTF-8");
+        assert!(rendered.contains("crumb/code-review"));
+        assert!(rendered.contains("never installs or enables"));
+        assert!(
+            read_agent_config(&workspace)
+                .expect("config loads")
+                .skills
+                .iter()
+                .all(|skill| skill.id != "code-review")
+        );
+        assert!(!workspace.join(".crumb/marketplace").exists());
+        std::fs::remove_dir_all(workspace).expect("workspace removed");
+    }
+
+    #[test]
+    fn singular_skill_namespace_accepts_exact_versions_and_explicit_enablement() {
+        assert_eq!(
+            normalize_bundled_skill_install("crumb/code-review@1.0.0 --scope project")
+                .expect("catalog version matches"),
+            "crumb/code-review --scope project"
+        );
+        assert!(normalize_bundled_skill_install("crumb/code-review@9.9.9").is_err());
+        assert!(ensure_single_release_skill_install("crumb/code-review", 1).is_ok());
+        assert!(
+            ensure_single_release_skill_install("crumb/composite", 3)
+                .expect_err("dependency installation fails closed")
+                .to_string()
+                .contains("installation was not started")
+        );
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-skill-enable-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace is created");
+        let mut output = Vec::new();
+        handle_skill_command("/skill enable failure-autopsy", &workspace, &mut output)
+            .expect("bundled skill is explicitly enabled");
+        assert!(
+            read_agent_config(&workspace)
+                .expect("config loads")
+                .skills
+                .iter()
+                .any(|skill| skill.id == "failure-autopsy" && skill.enabled)
+        );
         std::fs::remove_dir_all(workspace).expect("workspace removed");
     }
 

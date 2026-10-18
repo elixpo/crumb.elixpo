@@ -255,7 +255,10 @@ fn slash_suggestions(prefix: &str, pos: usize, workspace: &Path) -> Vec<Suggesti
     let mut commands = crumb_repl::SLASH_COMMANDS
         .iter()
         .filter(|command| {
-            !is_setting_command(command.usage) || command.usage.starts_with("/permissions")
+            !is_setting_command(command.usage)
+                || command.usage.starts_with("/permissions")
+                || command.usage == "/skill"
+                || command.usage.starts_with("/skill ")
         })
         .map(|command| (command.usage.to_owned(), command.description.to_owned()))
         .collect::<Vec<_>>();
@@ -316,6 +319,7 @@ fn is_setting_command(usage: &str) -> bool {
     [
         "/auth",
         "/connectors",
+        "/skill",
         "/skills",
         "/context",
         "/mode",
@@ -352,13 +356,13 @@ fn configured_skill_actions(workspace: &Path) -> Vec<(String, String)> {
         .flat_map(|skill| {
             let mut actions = vec![if skill.enabled {
                 (
-                    format!("/skills unload {}", skill.id),
-                    "unload from agent context".to_owned(),
+                    format!("/skill disable {}", skill.id),
+                    "disable in agent context".to_owned(),
                 )
             } else {
                 (
-                    format!("/skills load {}", skill.id),
-                    "load into agent context".to_owned(),
+                    format!("/skill enable {}", skill.id),
+                    "enable in agent context".to_owned(),
                 )
             }];
             if !skill.enabled {
@@ -376,8 +380,8 @@ fn configured_skill_actions(workspace: &Path) -> Vec<(String, String)> {
             .filter(|skill| !configured_ids.contains(skill.id))
             .map(|skill| {
                 (
-                    format!("/skills load {}", skill.id),
-                    format!("load bundled skill · {}", skill.description),
+                    format!("/skill enable {}", skill.id),
+                    format!("enable bundled skill · {}", skill.description),
                 )
             }),
     );
@@ -652,6 +656,40 @@ mod tests {
     }
 
     #[test]
+    fn skill_completion_exposes_protocol_operations_after_backspacing() {
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
+
+        let partial = completer.complete("/skil", 5);
+        assert!(
+            partial
+                .suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "/skill")
+        );
+
+        let nested = completer.complete("/skill ", 7);
+        for action in [
+            "search ",
+            "inspect ",
+            "install ",
+            "enable ",
+            "disable ",
+            "update ",
+            "rollback ",
+            "remove ",
+            "doctor",
+        ] {
+            assert!(
+                nested
+                    .suggestions()
+                    .iter()
+                    .any(|candidate| candidate.value == format!("/skill {action}")),
+                "missing nested skill suggestion for {action}"
+            );
+        }
+    }
+
+    #[test]
     fn permissions_completion_exposes_root_and_nested_actions() {
         let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
 
@@ -701,7 +739,7 @@ mod tests {
             result
                 .suggestions()
                 .iter()
-                .any(|candidate| { candidate.value == "/skills load failure-autopsy" })
+                .any(|candidate| { candidate.value == "/skill enable failure-autopsy" })
         );
         std::fs::remove_dir_all(workspace).expect("workspace removed");
     }
@@ -726,13 +764,13 @@ mod tests {
         let skill = result
             .suggestions()
             .iter()
-            .find(|candidate| candidate.value == "/skills load review")
+            .find(|candidate| candidate.value == "/skill enable review")
             .expect("disabled skill exposes a load action");
         assert!(
             skill
                 .display_override
                 .as_deref()
-                .is_some_and(|display| display.starts_with("? skills load review"))
+                .is_some_and(|display| display.starts_with("? skill enable review"))
         );
         std::fs::remove_dir_all(workspace).expect("temporary workspace can be removed");
     }

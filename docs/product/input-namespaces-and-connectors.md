@@ -34,7 +34,8 @@ never interpreted as prompts or passed to the native shell accidentally.
 - `/context` — show the context budget and attached references
 - `/attach` and `/detach` — manage files, folders, or connector resources
 - `/connectors` — list, connect, inspect, or revoke integrations
-- `/skills` and `/plugins` — discover, enable, disable, and inspect capabilities
+- `/skill search|inspect|install|enable|disable|remove|doctor` — manage skill packages explicitly
+- `/skills` and `/plugins` — inspect legacy local-skill registrations and plugin capabilities
 - `/tools` — show available tools and their risk classes
 - `/permissions` — inspect or change user-granted policy
 - `/memory` — inspect, edit, or clear user-approved memory
@@ -68,6 +69,15 @@ activation prefix and does nothing without a surrounding command or prompt.
 References resolve deterministically before model input. Missing, ambiguous,
 oversized, or unauthorized references fail visibly. Referencing a connector
 does not grant permission to use it.
+
+## Skill activation boundary
+
+`crumb skill search <query>` reads compact catalog metadata only. It never
+downloads instructions or changes agent context. `inspect` shows package
+provenance and requirements, `install` verifies and registers components in a
+disabled state, and `enable` is a separate explicit action. Natural-language
+routing may recommend these commands, but cannot invoke installation or
+enablement on the user's behalf.
 
 ## Connector rollout
 
