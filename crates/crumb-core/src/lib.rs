@@ -1,8 +1,5 @@
 //! Provider-neutral domain types shared by crumb components.
 
-mod dry_run;
-pub use dry_run::{BlastRadiusAssessment, MatchedPattern, Severity, assess_shell_command};
-
 /// A command handled directly by crumb rather than the native shell.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BuiltInCommand {
