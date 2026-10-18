@@ -1175,20 +1175,18 @@ fn select_request_route<'a>(
 fn request_needs_coder(request: &str) -> bool {
     let request = request.to_ascii_lowercase();
     [
-        "code",
         "implement",
         "refactor",
         "debug",
+        "fix ",
         "fix the test",
         "fix this test",
         "compile",
-        "cargo ",
-        "npm ",
-        "python",
-        ".rs",
-        ".ts",
-        ".tsx",
-        ".py",
+        "write code",
+        "edit code",
+        "patch code",
+        "run the tests",
+        "run tests",
     ]
     .iter()
     .any(|term| request.contains(term))
@@ -1798,6 +1796,12 @@ mod tests {
         assert_eq!(
             select_request_route(&config, "hello")
                 .expect("router")
+                .model,
+            "router"
+        );
+        assert_eq!(
+            select_request_route(&config, "explain this Rust code")
+                .expect("cheap router")
                 .model,
             "router"
         );

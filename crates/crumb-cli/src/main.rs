@@ -1212,19 +1212,15 @@ fn render_startup(
 ) -> Result<u16> {
     let cwd = current_process_dir()?;
     let config = read_agent_config(&cwd).unwrap_or_default();
-    let model = config
-        .models
-        .get(&Modality::Text)
-        .and_then(|routes| routes.first())
-        .map(|route| format!("{}/{}", route.provider, route.model));
     let text_route = config
         .models
         .get(&Modality::Text)
         .and_then(|routes| routes.first());
+    let pack = text_route.map(|_| active_pack_label(&config));
     let startup = StartupContext {
         version: env!("CARGO_PKG_VERSION"),
         platform,
-        model: model.as_deref(),
+        model: pack,
         mode: agent_mode_name(config.mode),
         effort: Some(
             text_route
@@ -1234,7 +1230,7 @@ fn render_startup(
         session_budget_tokens: context_token_budget(&config, text_route),
         context_tokens,
         auto_compaction: matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
-        agent_configured: config.harness.is_some() && model.is_some(),
+        agent_configured: config.harness.is_some() && text_route.is_some(),
     };
     let terminal_width = if interactive {
         size().map_or(100, |(columns, _)| columns)
@@ -1350,11 +1346,11 @@ fn context_footer_status(
         .models
         .get(&Modality::Text)
         .and_then(|routes| routes.first());
-    let model = text_route.map(|route| format!("{}/{}", route.provider, route.model));
+    let pack = text_route.map(|_| active_pack_label(&config));
     let startup = StartupContext {
         version: env!("CARGO_PKG_VERSION"),
         platform,
-        model: model.as_deref(),
+        model: pack,
         mode: agent_mode_name(config.mode),
         effort: Some(
             text_route
@@ -1364,7 +1360,7 @@ fn context_footer_status(
         session_budget_tokens: context_token_budget(&config, text_route),
         context_tokens,
         auto_compaction: matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
-        agent_configured: config.harness.is_some() && model.is_some(),
+        agent_configured: config.harness.is_some() && text_route.is_some(),
     };
     renderer.context_footer(&startup, size().map_or(100, |(columns, _)| columns))
 }
@@ -1909,9 +1905,7 @@ fn handle_agent_boundary(
         .models
         .get(&Modality::Text)
         .and_then(|routes| routes.first());
-    let model = route.map_or("not configured".to_owned(), |route| {
-        format!("{}/{}", route.provider, route.model)
-    });
+    let pack = active_pack_label(config);
     let effort = Some(
         route
             .and_then(|route| config.reasoning_effort_for(route))
@@ -1922,7 +1916,7 @@ fn handle_agent_boundary(
         writer,
         "{}",
         renderer.agent_header_for_width(
-            &model,
+            pack,
             effort,
             agent_mode_name(config.mode),
             None,
@@ -4524,6 +4518,7 @@ fn set_text_model(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<(
                 reasoning_effort: None,
             },
         );
+        config.active_model_pack = None;
         Ok(())
     })?;
     writeln!(writer, "◆ Text model · {provider_id}/{model_id}")?;
@@ -4543,11 +4538,11 @@ fn show_model_packs(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         } else {
             "○"
         };
-        writeln!(writer, "  {marker} {} ({id})", pack.label)?;
         writeln!(
             writer,
-            "    router {} · vision {} · image {} · coder {}",
-            pack.router.model, pack.vision.model, pack.image_generation.model, pack.coder.model
+            "  {marker} {} ({id}) · {}",
+            pack.label,
+            model_pack_summary(id)
         )?;
     }
     writeln!(writer, "  Switch with `/pack use <id>`")?;
@@ -4581,12 +4576,21 @@ fn set_model_pack(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<(
         .get(id)
         .context("selected model pack disappeared")?;
     writeln!(writer, "◆ Model pack · {}", pack.label)?;
+    writeln!(writer, "  {}", model_pack_summary(id))?;
     writeln!(
         writer,
-        "  router {} · vision {} · image {} · coder {}",
-        pack.router.model, pack.vision.model, pack.image_generation.model, pack.coder.model
+        "  Router, coder, vision, and image roles switch automatically."
     )?;
     Ok(())
+}
+
+fn model_pack_summary(id: &str) -> &'static str {
+    match id {
+        "quick" => "lowest latency and cost",
+        "balanced" => "balanced quality and cost",
+        "deep" => "strongest reasoning, higher cost",
+        _ => "custom capability mix",
+    }
 }
 
 fn promote_model_route(
@@ -9345,8 +9349,8 @@ fn prompt_model_status(cwd: &Path) -> String {
                     .reasoning_effort_for(route)
                     .map_or("default", effort_display_name);
                 format!(
-                    "{} · {} · {effort}",
-                    route.model,
+                    "pack {} · {} · effort {effort}",
+                    active_pack_label(&config),
                     agent_mode_name(config.mode)
                 )
             },
@@ -9356,6 +9360,14 @@ fn prompt_model_status(cwd: &Path) -> String {
         status.push_str(&profile);
     }
     status
+}
+
+fn active_pack_label(config: &AgentConfig) -> &str {
+    config
+        .active_model_pack
+        .as_ref()
+        .and_then(|id| config.model_packs.get(id))
+        .map_or("Custom", |pack| pack.label.as_str())
 }
 
 fn selected_profile_id(cwd: &Path) -> Option<String> {

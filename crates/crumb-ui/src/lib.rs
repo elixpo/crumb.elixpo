@@ -224,9 +224,9 @@ impl Renderer {
         } else {
             WORDMARK
         };
-        let model = context.model.unwrap_or("model not configured");
+        let pack = context.model.unwrap_or("not configured");
         let state = if context.agent_configured {
-            format!("Ready · {model} · {}", context.mode)
+            format!("Ready · pack {pack} · {}", context.mode)
         } else {
             "Native shell ready · run /auth login for AI".to_owned()
         };
@@ -330,14 +330,9 @@ impl Renderer {
     /// Renders compact, non-secret model and context state for the fixed footer.
     #[must_use]
     pub fn context_footer(&self, context: &StartupContext<'_>, terminal_width: u16) -> String {
-        let model = context
-            .model
-            .unwrap_or("native")
-            .rsplit('/')
-            .next()
-            .unwrap_or("native");
+        let pack = context.model.unwrap_or("native");
         let text = format!(
-            "effort {} · {} · {model} · {}",
+            "effort {} · pack {pack} · {} · {}",
             context.effort.unwrap_or("default"),
             context_meter(context),
             context.mode
@@ -483,7 +478,7 @@ impl Renderer {
     /// Renders a compact, non-blocking startup readiness summary.
     #[must_use]
     pub fn startup_status(&self, context: &StartupContext<'_>) -> String {
-        let model = context.model.unwrap_or("not configured");
+        let pack = context.model.unwrap_or("not configured");
         let state = if context.agent_configured {
             "agent ready"
         } else {
@@ -491,7 +486,7 @@ impl Renderer {
         };
         if self.settings.output == OutputMode::ScreenReader {
             return format!(
-                "crumb {} on {}\n{state}; model {model}; mode {}",
+                "crumb {} on {}\n{state}; pack {pack}; mode {}",
                 context.version, context.platform, context.mode
             );
         }
@@ -510,7 +505,7 @@ impl Renderer {
                 },
                 "36;1"
             ),
-            self.paint(&format!("{state} · {model} · {}", context.mode), "2")
+            self.paint(&format!("{state} · pack {pack} · {}", context.mode), "2")
         )
     }
 
@@ -536,7 +531,7 @@ impl Renderer {
         skill: Option<&str>,
         terminal_width: u16,
     ) -> String {
-        let mut details = vec![format!("model {model}"), format!("mode {mode}")];
+        let mut details = vec![format!("pack {model}"), format!("mode {mode}")];
         if let Some(effort) = effort {
             details.push(format!("effort {effort}"));
         }
@@ -1656,8 +1651,8 @@ mod tests {
         });
 
         assert_eq!(
-            renderer.agent_header("qwen-coder", Some("high"), "auto", None),
-            "  [ CRUMB ]  model qwen-coder · mode auto · effort high"
+            renderer.agent_header("Balanced Crumb", Some("high"), "auto", None),
+            "  [ CRUMB ]  pack Balanced Crumb · mode auto · effort high"
         );
         assert_eq!(renderer.agent_response("done\n"), "\n  ╰──▶ done");
         assert_eq!(
@@ -1811,7 +1806,7 @@ mod tests {
             &StartupContext {
                 version: "0.1.0",
                 platform: Platform::Linux,
-                model: Some("pollinations/nova-fast"),
+                model: Some("Quick Crumb"),
                 mode: "auto",
                 effort: Some("high"),
                 session_budget_tokens: 64_000,
@@ -1825,8 +1820,8 @@ mod tests {
         assert!(footer.contains("Model context"));
         assert!(footer.contains("12.8k / 64.0k"));
         assert!(footer.contains("effort high"));
-        assert!(footer.contains("nova-fast · auto"));
-        assert!(!footer.contains("pollinations/"));
+        assert!(footer.contains("pack Quick Crumb"));
+        assert!(footer.contains("auto"));
         assert!(footer.chars().count() <= 100);
     }
 
@@ -1842,7 +1837,7 @@ mod tests {
             &StartupContext {
                 version: "0.1.0",
                 platform: Platform::Linux,
-                model: Some("pollinations/nova-fast"),
+                model: Some("Quick Crumb"),
                 mode: "auto",
                 effort: None,
                 session_budget_tokens: 64_000,
@@ -1858,7 +1853,7 @@ mod tests {
             &StartupContext {
                 version: "0.1.0",
                 platform: Platform::Linux,
-                model: Some("pollinations/nova-fast"),
+                model: Some("Quick Crumb"),
                 mode: "auto",
                 effort: Some("extra high"),
                 session_budget_tokens: 64_000,
@@ -2002,7 +1997,7 @@ mod tests {
         let status = renderer.startup_status(&StartupContext {
             version: "0.1.0",
             platform: Platform::Linux,
-            model: Some("pollinations/nova-fast"),
+            model: Some("Balanced Crumb"),
             mode: "auto",
             effort: Some("medium"),
             session_budget_tokens: 64_000,
@@ -2013,13 +2008,13 @@ mod tests {
 
         assert_eq!(
             status,
-            " SESSION   crumb 0.1.0 · linux\n●  agent ready · pollinations/nova-fast · auto"
+            " SESSION   crumb 0.1.0 · linux\n●  agent ready · pack Balanced Crumb · auto"
         );
         let welcome = renderer.welcome(
             &StartupContext {
                 version: "0.1.0",
                 platform: Platform::Linux,
-                model: Some("pollinations/nova-fast"),
+                model: Some("Balanced Crumb"),
                 mode: "auto",
                 effort: Some("medium"),
                 session_budget_tokens: 64_000,
@@ -2030,7 +2025,7 @@ mod tests {
             120,
         );
         assert!(welcome.contains("Crumb CLI v0.1.0 · Native commands stay native."));
-        assert!(welcome.contains("Ready · pollinations/nova-fast · auto"));
+        assert!(welcome.contains("Ready · pack Balanced Crumb · auto"));
         assert!(!welcome.contains("Model context"));
         assert!(!welcome.contains("compact"));
         assert!(welcome.contains("╭▄█▄╮"));
@@ -2047,7 +2042,7 @@ mod tests {
         let context = StartupContext {
             version: "0.1.0",
             platform: Platform::Linux,
-            model: Some("pollinations/nova-fast"),
+            model: Some("Deep Crumb"),
             mode: "auto",
             effort: Some("extra high"),
             session_budget_tokens: 64_000,
@@ -2119,8 +2114,8 @@ mod tests {
         });
 
         assert_eq!(
-            renderer.agent_header("qwen-coder", None, "plan", None),
-            "Crumb agent\nmodel qwen-coder, mode plan"
+            renderer.agent_header("Deep Crumb", None, "plan", None),
+            "Crumb agent\npack Deep Crumb, mode plan"
         );
         assert_eq!(
             renderer.agent_error("stopped", true),
