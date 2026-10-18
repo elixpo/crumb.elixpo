@@ -94,7 +94,7 @@ mod provider_discovery;
 mod provider_projection;
 mod shell_completion;
 
-use agent_runtime::{AgentRuntime, apply_selected_profile, validate_skill_path};
+use agent_runtime::{AgentRuntime, ResumeContinuity, apply_selected_profile, validate_skill_path};
 use completion::{COMPLETION_PALETTE_ROWS, CompletionWorkspace, CrumbCompleter};
 use context::{parse_attachment, resolve_request_context};
 use provider_discovery::{compatibility_diagnostics, discover_models};
@@ -6147,14 +6147,15 @@ fn reattach_job(
     if runtime.is_none() {
         *runtime = Some(AgentRuntime::new()?);
     }
-    runtime
+    let continuity = runtime
         .as_mut()
         .context("agent runtime is unavailable")?
         .resume(cwd, session_id.as_str())?;
     writeln!(
         writer,
-        "◆ Reattached session {} from job {id}",
-        session_id.as_str()
+        "◆ Reattached session {} from job {id}{}",
+        session_id.as_str(),
+        resume_continuity_suffix(continuity)
     )?;
     Ok(())
 }
@@ -6405,11 +6406,22 @@ fn show_sessions(
             if runtime.is_none() {
                 *runtime = Some(AgentRuntime::new()?);
             }
-            runtime
+            let continuity = runtime
                 .as_mut()
                 .context("agent runtime is unavailable")?
                 .resume(cwd, id)?;
-            writeln!(writer, "◆ Resumed session {id}")?;
+            match continuity {
+                ResumeContinuity::AlreadyActive => {
+                    writeln!(writer, "◆ Session {id} is already active")?;
+                }
+                ResumeContinuity::Warm | ResumeContinuity::MetadataOnly => {
+                    writeln!(
+                        writer,
+                        "◆ Resumed session {id}{}",
+                        resume_continuity_suffix(continuity)
+                    )?;
+                }
+            }
         }
         ["search", query @ ..] if !query.is_empty() => {
             show_session_search(&root, &query.join(" "), writer)?;
@@ -6446,6 +6458,14 @@ fn show_sessions(
         )?,
     }
     Ok(())
+}
+
+const fn resume_continuity_suffix(continuity: ResumeContinuity) -> &'static str {
+    match continuity {
+        ResumeContinuity::AlreadyActive => " · already active",
+        ResumeContinuity::Warm => " · warm conversation restored",
+        ResumeContinuity::MetadataOnly => " · metadata only; transcript was not persisted",
+    }
 }
 
 fn show_session_list(root: &Path, writer: &mut dyn Write) -> Result<()> {
