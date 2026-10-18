@@ -208,6 +208,14 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "list pending peer deliveries without opening them",
     },
     SlashCommand {
+        usage: "/peer tasks",
+        description: "list durable redacted peer task state",
+    },
+    SlashCommand {
+        usage: "/peer task ",
+        description: "inspect one durable redacted peer task",
+    },
+    SlashCommand {
         usage: "/peer inspect ",
         description: "safely inspect one pending peer delivery",
     },

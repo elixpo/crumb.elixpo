@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
@@ -7,6 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use crumb_a2a_exchanges::{ExchangeDirection, ExchangeRecord, ExchangeState};
 use crumb_a2a_inbound::{ClaimedInbound, InboundCoordinator};
 use crumb_a2a_runtime::{A2aRuntime, ReceivedDelivery, RuntimeOptions};
 use crumb_agent::config::SkillConfig;
@@ -393,6 +394,26 @@ pub struct PeerResponseSummary {
     pub enqueued_at_ms: u64,
 }
 
+/// Content-free durable A2A exchange for terminal status views.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerTaskSummary {
+    pub delivery_id: String,
+    pub direction: &'static str,
+    pub state: &'static str,
+    pub peer_instance_id: String,
+    pub peer_display_name: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub request_part_count: u32,
+    pub request_artifact_count: u32,
+    pub correlated_delivery_id: Option<String>,
+    pub response_part_count: Option<u32>,
+    pub response_artifact_count: Option<u32>,
+    pub request_digest: String,
+    pub response_digest: Option<String>,
+    pub retry_pending: bool,
+}
+
 /// Verified, receiver-owned projection of one quarantined peer file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerQuarantinedFile {
@@ -764,6 +785,64 @@ impl AgentRuntime {
                     })
             })
             .collect())
+    }
+
+    /// Lists durable, content-free peer task state across process restarts.
+    ///
+    /// Live registry names are presentation-only. A stable instance ID is
+    /// used when the peer is offline.
+    pub fn peer_tasks(&self) -> Result<Vec<PeerTaskSummary>> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        let live = peer
+            .runtime
+            .list_peers()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| (entry.instance_id, entry.name))
+            .collect::<BTreeMap<_, _>>();
+        let pending = peer
+            .runtime
+            .list_pending()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|delivery| delivery.delivery_id)
+            .collect::<BTreeSet<_>>();
+        Ok(peer
+            .runtime
+            .list_exchanges()?
+            .into_iter()
+            .map(|record| project_peer_task(record, &live, &pending))
+            .collect())
+    }
+
+    /// Loads one exact durable, content-free peer task.
+    pub fn peer_task(&self, delivery_id: &str) -> Result<PeerTaskSummary> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        let live = peer
+            .runtime
+            .list_peers()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| (entry.instance_id, entry.name))
+            .collect::<BTreeMap<_, _>>();
+        let pending = peer
+            .runtime
+            .list_pending()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|delivery| delivery.delivery_id)
+            .collect::<BTreeSet<_>>();
+        Ok(project_peer_task(
+            peer.runtime.exchange(delivery_id)?,
+            &live,
+            &pending,
+        ))
     }
 
     /// Acknowledges one exact correlated response without exposing its body.
@@ -2024,6 +2103,53 @@ const fn peer_task_state_label(state: crumb_a2a::TaskState) -> &'static str {
         crumb_a2a::TaskState::InputRequired => "input_required",
         crumb_a2a::TaskState::Rejected => "rejected",
         crumb_a2a::TaskState::AuthRequired => "auth_required",
+    }
+}
+
+fn project_peer_task(
+    record: ExchangeRecord,
+    live_names: &BTreeMap<String, String>,
+    pending: &BTreeSet<String>,
+) -> PeerTaskSummary {
+    let direction = match record.direction {
+        ExchangeDirection::Outbound => "outbound",
+        ExchangeDirection::Inbound => "inbound",
+    };
+    let state = match record.state {
+        ExchangeState::OutboundSent => "sent",
+        ExchangeState::OutboundResponseAvailable => "response available",
+        ExchangeState::OutboundAcknowledged => "acknowledged",
+        ExchangeState::InboundClaimed => "claimed",
+        ExchangeState::InboundRunning => "running",
+        ExchangeState::InboundCompleted => "completed",
+        ExchangeState::InboundRejected => "rejected",
+    };
+    let peer_display_name = live_names
+        .get(&record.peer_instance_id)
+        .cloned()
+        .unwrap_or_else(|| record.peer_instance_id.clone());
+    let retry_pending = record.direction == ExchangeDirection::Inbound
+        && pending.contains(&record.delivery_id)
+        && matches!(
+            record.state,
+            ExchangeState::InboundClaimed | ExchangeState::InboundRunning
+        );
+    PeerTaskSummary {
+        delivery_id: record.delivery_id,
+        direction,
+        state,
+        peer_instance_id: record.peer_instance_id,
+        peer_display_name,
+        created_at_ms: record.created_at_ms,
+        updated_at_ms: record.updated_at_ms,
+        request_part_count: record.request_part_count,
+        request_artifact_count: record.request_artifact_count,
+        correlated_delivery_id: record.correlated_delivery_id,
+        response_part_count: record.response_part_count,
+        response_artifact_count: record.response_artifact_count,
+        request_digest: record.request_digest,
+        response_digest: record.response_digest,
+        retry_pending,
     }
 }
 

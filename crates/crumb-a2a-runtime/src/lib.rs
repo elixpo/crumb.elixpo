@@ -12,7 +12,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use crumb_a2a::{SendMessageRequest, SendMessageResponse};
+use crumb_a2a::{Part, SendMessageRequest, SendMessageResponse, Validate, to_json};
+use crumb_a2a_exchanges::{
+    ExchangeDirection, ExchangeRecord, ExchangeStore, NewExchange, ResponseMetadata,
+};
 use crumb_a2a_local::{
     CompletedResponseReceipt, DeliverySummary, EnqueueReceipt, LocalBus, LocalBusOptions,
     PeerEntry, PendingDeliverySummary, ProcessMetadata, ReceivedMessage, Registration,
@@ -20,6 +23,7 @@ use crumb_a2a_local::{
 };
 pub use crumb_a2a_local::{DeliveryKind, QuarantinedArtifact, ReceivedDelivery};
 use crumb_instance::{InstanceMetadata, InstanceStore};
+use sha2::{Digest as _, Sha256};
 
 /// Minimum lease duration that leaves useful scheduling room for a heartbeat.
 pub const MIN_RUNTIME_LEASE_TTL: Duration = Duration::from_millis(30);
@@ -92,6 +96,7 @@ struct StopControl {
 struct RuntimeInner {
     bus: LocalBus,
     workspace: PathBuf,
+    exchanges: ExchangeStore,
     registration: Arc<Mutex<Registration>>,
     health: Arc<Mutex<RuntimeHealth>>,
     stop: Arc<StopControl>,
@@ -206,6 +211,7 @@ impl A2aRuntime {
         Ok(Self {
             inner: Arc::new(RuntimeInner {
                 bus,
+                exchanges: ExchangeStore::for_workspace(workspace),
                 workspace: workspace.to_path_buf(),
                 registration,
                 health,
@@ -260,9 +266,26 @@ impl A2aRuntime {
     ) -> Result<EnqueueReceipt> {
         self.inner.ensure_running()?;
         let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
-        self.inner
+        let metadata = part_counts(&request.message.parts)
+            .and_then(|counts| digest_json(request).map(|digest| (counts, digest)))
+            .ok();
+        let receipt = self
+            .inner
             .bus
-            .enqueue(&registration, recipient_instance_id, request)
+            .enqueue(&registration, recipient_instance_id, request)?;
+        // The transport is authoritative. The redacted view is deliberately
+        // best-effort so damaged optional metadata cannot disable A2A.
+        if let Some(((part_count, artifact_count), request_digest)) = metadata {
+            let _ = self.inner.exchanges.record(&NewExchange {
+                delivery_id: receipt.delivery_id.clone(),
+                direction: ExchangeDirection::Outbound,
+                peer_instance_id: receipt.recipient_instance_id.clone(),
+                request_digest,
+                request_part_count: part_count,
+                request_artifact_count: artifact_count,
+            });
+        }
+        Ok(receipt)
     }
 
     /// Atomically claims this runtime's oldest pending message.
@@ -297,7 +320,27 @@ impl A2aRuntime {
     pub fn list_deliveries(&self) -> Result<Vec<DeliverySummary>> {
         self.inner.ensure_running()?;
         let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
-        self.inner.bus.list_deliveries(&registration)
+        let deliveries = self.inner.bus.list_deliveries(&registration)?;
+        for delivery in &deliveries {
+            let Some(original) = delivery.in_reply_to_delivery_id.as_deref() else {
+                continue;
+            };
+            let Ok(received) = self
+                .inner
+                .bus
+                .inspect_response_delivery(&registration, &delivery.delivery_id)
+            else {
+                continue;
+            };
+            let Ok(response) = response_metadata(&received) else {
+                continue;
+            };
+            let _ = self
+                .inner
+                .exchanges
+                .mark_response_available(original, response);
+        }
+        Ok(deliveries)
     }
 
     /// Reads one exact pending delivery without changing queue state.
@@ -428,9 +471,27 @@ impl A2aRuntime {
     pub fn acknowledge_response(&self, delivery_id: &str) -> Result<()> {
         self.inner.ensure_running()?;
         let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
+        let observation = self
+            .inner
+            .bus
+            .inspect_response_delivery(&registration, delivery_id)
+            .ok()
+            .and_then(|response| {
+                let original = response_correlation(&response).ok()?.to_owned();
+                let metadata = response_metadata(&response).ok()?;
+                Some((original, metadata))
+            });
         self.inner
             .bus
-            .acknowledge_response(&registration, delivery_id)
+            .acknowledge_response(&registration, delivery_id)?;
+        if let Some((original, metadata)) = observation {
+            let _ = self
+                .inner
+                .exchanges
+                .mark_response_available(&original, metadata);
+            let _ = self.inner.exchanges.mark_acknowledged(&original);
+        }
+        Ok(())
     }
 
     /// Claims or resumes one exact response and acknowledges it atomically
@@ -442,7 +503,48 @@ impl A2aRuntime {
     pub fn consume_response(&self, delivery_id: &str) -> Result<String> {
         self.inner.ensure_running()?;
         let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
-        self.inner.bus.consume_response(&registration, delivery_id)
+        let observation = self
+            .inner
+            .bus
+            .inspect_response_delivery(&registration, delivery_id)
+            .ok()
+            .and_then(|response| {
+                let original = response_correlation(&response).ok()?.to_owned();
+                let metadata = response_metadata(&response).ok()?;
+                Some((original, metadata))
+            });
+        let sender = self
+            .inner
+            .bus
+            .consume_response(&registration, delivery_id)?;
+        if let Some((original, metadata)) = observation {
+            let _ = self
+                .inner
+                .exchanges
+                .mark_response_available(&original, metadata);
+            let _ = self.inner.exchanges.mark_acknowledged(&original);
+        }
+        Ok(sender)
+    }
+
+    /// Lists durable content-free exchanges for terminal inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when existing exchange metadata is unsafe or malformed.
+    pub fn list_exchanges(&self) -> Result<Vec<ExchangeRecord>> {
+        self.inner.ensure_running()?;
+        self.inner.exchanges.list()
+    }
+
+    /// Loads one exact durable content-free exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid/unknown identifier or unsafe metadata.
+    pub fn exchange(&self, delivery_id: &str) -> Result<ExchangeRecord> {
+        self.inner.ensure_running()?;
+        self.inner.exchanges.load(delivery_id)
     }
 
     /// Acknowledges one claimed delivery.
@@ -500,6 +602,65 @@ impl A2aRuntime {
     pub fn shutdown(&self) -> Result<()> {
         self.inner.shutdown()
     }
+}
+
+fn digest_json(value: &(impl serde::Serialize + Validate)) -> Result<String> {
+    let encoded = to_json(value).context("A2A exchange digest encoding failed")?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn part_counts(parts: &[Part]) -> Result<(u32, u32)> {
+    let total = u32::try_from(parts.len()).context("A2A part count exceeds supported bounds")?;
+    let artifacts = u32::try_from(parts.iter().filter(|part| part.url.is_some()).count())
+        .context("A2A artifact count exceeds supported bounds")?;
+    Ok((total, artifacts))
+}
+
+fn add_part_counts(total: &mut (u32, u32), parts: &[Part]) -> Result<()> {
+    let current = part_counts(parts)?;
+    total.0 = total
+        .0
+        .checked_add(current.0)
+        .context("A2A response part count overflowed")?;
+    total.1 = total
+        .1
+        .checked_add(current.1)
+        .context("A2A response artifact count overflowed")?;
+    Ok(())
+}
+
+fn response_correlation(delivery: &ReceivedDelivery) -> Result<&str> {
+    match delivery {
+        ReceivedDelivery::Response(response) => Ok(&response.in_reply_to_delivery_id),
+        ReceivedDelivery::Request(_) => bail!("A2A delivery is not a correlated response"),
+    }
+}
+
+fn response_metadata(delivery: &ReceivedDelivery) -> Result<ResponseMetadata> {
+    let ReceivedDelivery::Response(received) = delivery else {
+        bail!("A2A delivery is not a correlated response");
+    };
+    let mut counts = (0, 0);
+    if let Some(message) = &received.response.message {
+        add_part_counts(&mut counts, &message.parts)?;
+    }
+    if let Some(task) = &received.response.task {
+        if let Some(message) = &task.status.message {
+            add_part_counts(&mut counts, &message.parts)?;
+        }
+        for artifact in &task.artifacts {
+            add_part_counts(&mut counts, &artifact.parts)?;
+        }
+        for message in &task.history {
+            add_part_counts(&mut counts, &message.parts)?;
+        }
+    }
+    Ok(ResponseMetadata {
+        delivery_id: received.delivery_id.clone(),
+        digest: digest_json(&received.response)?,
+        part_count: Some(counts.0),
+        artifact_count: Some(counts.1),
+    })
 }
 
 fn validate_workspace_identity(workspace: &Path, expected: &InstanceMetadata) -> Result<()> {
@@ -694,6 +855,13 @@ mod tests {
                 &request("msg-1", "hello peer"),
             )
             .expect("enqueue from clone");
+        let exchange = first.exchange(&receipt.delivery_id).expect("exchange view");
+        assert_eq!(
+            exchange.state,
+            crumb_a2a_exchanges::ExchangeState::OutboundSent
+        );
+        assert_eq!(exchange.peer_instance_id, second_instance.instance_id);
+        assert_eq!(exchange.request_part_count, 1);
         let pending = second.list_pending().expect("pending summaries");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].delivery_id, receipt.delivery_id);
@@ -707,6 +875,92 @@ mod tests {
             .expect("acknowledge");
         assert_eq!(first.own_peer().expect("own peer").name, "Builder One");
 
+        first.shutdown().expect("first shutdown");
+        second.shutdown().expect("second shutdown");
+    }
+
+    #[test]
+    fn correlated_response_lifecycle_is_visible_and_acknowledged() {
+        let temporary = TempDir::new().expect("temporary root");
+        let bus = temporary.path().join("bus");
+        let (first_workspace, first_instance) = workspace(temporary.path(), "Sender");
+        let (second_workspace, second_instance) = workspace(temporary.path(), "Receiver");
+        let first = A2aRuntime::start(&bus, &first_workspace, &first_instance, options())
+            .expect("first runtime");
+        let second = A2aRuntime::start(&bus, &second_workspace, &second_instance, options())
+            .expect("second runtime");
+        let sent = first
+            .enqueue(&second_instance.instance_id, &request("message-1", "work"))
+            .expect("request");
+        second
+            .claim_pending(&sent.delivery_id)
+            .expect("claim request");
+        let response = SendMessageResponse {
+            task: None,
+            message: Some(Message {
+                message_id: "message-response".to_owned(),
+                context_id: Some("ctx-runtime".to_owned()),
+                task_id: None,
+                role: Role::Agent,
+                parts: vec![Part::text("done")],
+                metadata: None,
+                extensions: Vec::new(),
+                reference_task_ids: Vec::new(),
+            }),
+        };
+        let response_receipt = second
+            .complete_claimed_request(&sent.delivery_id, &response)
+            .expect("complete request");
+
+        first.list_deliveries().expect("observe response");
+        assert_eq!(
+            first.exchange(&sent.delivery_id).expect("available").state,
+            crumb_a2a_exchanges::ExchangeState::OutboundResponseAvailable
+        );
+        first
+            .consume_response(&response_receipt.delivery_id)
+            .expect("acknowledge response");
+        assert_eq!(
+            first
+                .exchange(&sent.delivery_id)
+                .expect("acknowledged")
+                .state,
+            crumb_a2a_exchanges::ExchangeState::OutboundAcknowledged
+        );
+        first.shutdown().expect("first shutdown");
+        second.shutdown().expect("second shutdown");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_optional_exchange_metadata_does_not_block_transport() {
+        let temporary = TempDir::new().expect("temporary root");
+        let bus = temporary.path().join("bus");
+        let (first_workspace, first_instance) = workspace(temporary.path(), "Sender");
+        let (second_workspace, second_instance) = workspace(temporary.path(), "Receiver");
+        let first = A2aRuntime::start(&bus, &first_workspace, &first_instance, options())
+            .expect("first runtime");
+        let second = A2aRuntime::start(&bus, &second_workspace, &second_instance, options())
+            .expect("second runtime");
+        fs::create_dir(first_workspace.join(".crumb/a2a")).expect("a2a metadata");
+        std::os::unix::fs::symlink(
+            temporary.path(),
+            first_workspace.join(".crumb/a2a/exchanges"),
+        )
+        .expect("unsafe exchange root");
+
+        let receipt = first
+            .enqueue(&second_instance.instance_id, &request("message-1", "work"))
+            .expect("transport remains usable");
+        assert_eq!(
+            second
+                .list_pending()
+                .expect("pending")
+                .first()
+                .map(|delivery| delivery.delivery_id.as_str()),
+            Some(receipt.delivery_id.as_str())
+        );
+        assert!(first.exchange(&receipt.delivery_id).is_err());
         first.shutdown().expect("first shutdown");
         second.shutdown().expect("second shutdown");
     }

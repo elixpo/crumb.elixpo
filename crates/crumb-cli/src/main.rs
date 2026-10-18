@@ -104,7 +104,7 @@ mod shell_completion;
 
 use agent_runtime::{
     AgentRuntime, PeerDeliveryInspection, PeerInspectionKind, PeerInspectionPart,
-    PeerQuarantinedFile, PeerResponseSummary, PeerTurnStatus, ResumeContinuity,
+    PeerQuarantinedFile, PeerResponseSummary, PeerTaskSummary, PeerTurnStatus, ResumeContinuity,
     apply_selected_profile, validate_skill_path,
 };
 use completion::{COMPLETION_PALETTE_ROWS, CompletionWorkspace, CrumbCompleter};
@@ -1013,6 +1013,14 @@ fn handle_repl_event(
     context: &mut InputContext<'_>,
 ) -> Result<Option<ReplOutcome>> {
     match event {
+        InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
+            if command == "/peer tasks"
+                || command == "/peer task"
+                || command.starts_with("/peer task ") =>
+        {
+            show_peer_task_command(&command, context)?;
+            Ok(None)
+        }
         InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
             if command == "/peer inbox"
                 || command == "/peer responses"
@@ -5524,6 +5532,15 @@ fn show_peer_help(writer: &mut dyn Write) -> Result<()> {
     writeln!(writer, "  /peer status show this instance and active peers")?;
     writeln!(
         writer,
+        "  /peer tasks  list durable redacted exchange state"
+    )?;
+    writeln!(writer, "  /peer task <delivery-id>")?;
+    writeln!(
+        writer,
+        "               inspect one redacted exchange across restarts"
+    )?;
+    writeln!(
+        writer,
         "  /peer inbox  list pending deliveries without opening them"
     )?;
     writeln!(writer, "  /peer inspect <delivery-id>")?;
@@ -5603,6 +5620,38 @@ fn show_peer_read_command(command: &str, context: &mut InputContext<'_>) -> Resu
     } else {
         format_peer_inbox(runtime.peer_inbox()?)
     };
+    let width = size().map_or(80, |(columns, _)| columns);
+    writeln!(
+        context.writer,
+        "{}",
+        context
+            .renderer
+            .peer_untrusted_text_for_width(&details, width)
+    )?;
+    Ok(())
+}
+
+fn show_peer_task_command(command: &str, context: &mut InputContext<'_>) -> Result<()> {
+    let delivery_id = if command == "/peer tasks" {
+        None
+    } else {
+        Some(
+            command
+                .strip_prefix("/peer task ")
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && !value.contains(char::is_whitespace))
+                .context("usage: /peer task <delivery-id>")?,
+        )
+    };
+    initialize_optional_peer_runtime(context.agent_runtime, context.cwd, context.writer)?;
+    let runtime = context
+        .agent_runtime
+        .as_ref()
+        .context("local A2A runtime is unavailable")?;
+    let details = delivery_id.map_or_else(
+        || runtime.peer_tasks().map(format_peer_tasks),
+        |delivery_id| runtime.peer_task(delivery_id).map(format_peer_task),
+    )?;
     let width = size().map_or(80, |(columns, _)| columns);
     writeln!(
         context.writer,
@@ -5988,6 +6037,62 @@ fn format_peer_responses(responses: Vec<PeerResponseSummary>) -> String {
             response.in_reply_to_delivery_id,
             peer_timestamp(response.enqueued_at_ms)
         );
+    }
+    output
+}
+
+fn format_peer_tasks(tasks: Vec<PeerTaskSummary>) -> String {
+    let mut output = String::from("Durable peer tasks · content-free\n");
+    if tasks.is_empty() {
+        output.push_str("tasks  none");
+        return output;
+    }
+    let _ = write!(output, "tasks  {}", tasks.len());
+    for task in tasks {
+        let _ = write!(
+            output,
+            "\n{} · {} · {} · {} · {}",
+            task.delivery_id,
+            task.direction,
+            if task.retry_pending {
+                "retry pending"
+            } else {
+                task.state
+            },
+            task.peer_display_name,
+            peer_timestamp(task.updated_at_ms)
+        );
+    }
+    output
+}
+
+fn format_peer_task(task: PeerTaskSummary) -> String {
+    let mut output = format!(
+        "Durable peer task · content-free\ndelivery  {}\ndirection {}\nstate     {}\npeer      {}\npeer id   {}\ncreated   {}\nupdated   {}\nrequest   {} parts · {} artifacts\nreq hash  sha256:{}",
+        task.delivery_id,
+        task.direction,
+        if task.retry_pending {
+            "retry pending"
+        } else {
+            task.state
+        },
+        task.peer_display_name,
+        task.peer_instance_id,
+        peer_timestamp(task.created_at_ms),
+        peer_timestamp(task.updated_at_ms),
+        task.request_part_count,
+        task.request_artifact_count,
+        &task.request_digest[..12]
+    );
+    if let Some(delivery_id) = task.correlated_delivery_id {
+        let _ = write!(output, "\nresponse  {delivery_id}");
+    }
+    if let (Some(parts), Some(artifacts)) = (task.response_part_count, task.response_artifact_count)
+    {
+        let _ = write!(output, "\nresult    {parts} parts · {artifacts} artifacts");
+    }
+    if let Some(digest) = task.response_digest {
+        let _ = write!(output, "\nres hash  sha256:{}", &digest[..12]);
     }
     output
 }
@@ -11955,22 +12060,22 @@ mod tests {
         effort_wire_name, ensure_single_release_skill_install, exact_skill_manifest_url,
         exact_skill_run_config, failed_command_recovery, finished_tool_activity,
         fixed_footer_frame, format_peer_inbox, format_peer_inspection,
-        format_peer_quarantined_file, handle_skill_command, initial_agent_activity,
-        install_marketplace_package, load_exact_skill_manifest, marketplace_update_blocker,
-        normalize_bundled_skill_install, openrouter_preset, parse_cli_skill_run,
-        parse_credential_reference, parse_exec_request, parse_interactive_skill_run,
-        parse_paused_submission, parse_provider_header, parse_resume_session_argument,
-        read_agent_config, read_bounded_response, register_local_skill,
-        render_skill_discovery_search, resolve_memory_keep, sanitize_transcript_output,
-        select_discovery_skill, set_skill_enabled, shell_blast_radius, shell_tool_config,
-        should_auto_enable_rtk, show_graph, show_instance, show_marketplace, show_memory,
-        show_profile_with_stores, suggestion_width, transcript_activity_row,
+        format_peer_quarantined_file, format_peer_task, handle_skill_command,
+        initial_agent_activity, install_marketplace_package, load_exact_skill_manifest,
+        marketplace_update_blocker, normalize_bundled_skill_install, openrouter_preset,
+        parse_cli_skill_run, parse_credential_reference, parse_exec_request,
+        parse_interactive_skill_run, parse_paused_submission, parse_provider_header,
+        parse_resume_session_argument, read_agent_config, read_bounded_response,
+        register_local_skill, render_skill_discovery_search, resolve_memory_keep,
+        sanitize_transcript_output, select_discovery_skill, set_skill_enabled, shell_blast_radius,
+        shell_tool_config, should_auto_enable_rtk, show_graph, show_instance, show_marketplace,
+        show_memory, show_profile_with_stores, suggestion_width, transcript_activity_row,
         unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
         visible_tool_activity, workspace_read_host, write_bounded_response_delta_for_width,
     };
     use crate::agent_runtime::{
         PeerDeliveryInspection, PeerInboxSummary, PeerInspectionKind, PeerInspectionPart,
-        PeerQuarantinedFile,
+        PeerQuarantinedFile, PeerTaskSummary,
     };
 
     #[test]
@@ -13292,6 +13397,34 @@ mod tests {
         assert!(output.contains("2 parts · 1 artifacts"));
         assert!(!output.contains("message body"));
         assert!(!output.contains("/home/"));
+    }
+
+    #[test]
+    fn peer_task_format_is_content_free_and_restart_readable() {
+        let output = format_peer_task(PeerTaskSummary {
+            delivery_id: format!("delivery_{}", "a".repeat(64)),
+            direction: "inbound",
+            state: "running",
+            peer_instance_id: format!("crumb_{}", "b".repeat(32)),
+            peer_display_name: "Miso".to_owned(),
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_001_000,
+            request_part_count: 2,
+            request_artifact_count: 1,
+            correlated_delivery_id: None,
+            response_part_count: None,
+            response_artifact_count: None,
+            request_digest: "c".repeat(64),
+            response_digest: None,
+            retry_pending: true,
+        });
+
+        assert!(output.contains("retry pending"));
+        assert!(output.contains("Miso"));
+        assert!(output.contains("sha256:cccccccccccc"));
+        for forbidden in ["message body", "provider", "tool output", "/home/"] {
+            assert!(!output.contains(forbidden));
+        }
     }
 
     #[test]

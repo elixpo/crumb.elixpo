@@ -1025,6 +1025,44 @@ impl LocalBus {
         Ok(envelope.received())
     }
 
+    /// Reads one exact pending or already-claimed response without changing queue state.
+    ///
+    /// This supports content-free lifecycle recording around an independently
+    /// claimed response. Requests are rejected by this response-only view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid ownership, an unknown identifier, a request,
+    /// or unsafe pending/processing storage.
+    pub fn inspect_response_delivery(
+        &self,
+        recipient: &Registration,
+        delivery_id: &str,
+    ) -> Result<ReceivedDelivery> {
+        self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
+        self.require_live_owner(recipient, now_ms()?)?;
+        validate_delivery_id(delivery_id)?;
+        let (pending, processing, _acknowledged) =
+            self.queue_directories(recipient.instance_id())?;
+        let filename = delivery_filename(delivery_id)?;
+        let pending_path = pending.join(&filename);
+        let processing_path = processing.join(&filename);
+        let path = if path_exists_without_following(&pending_path)? {
+            pending_path
+        } else {
+            processing_path
+        };
+        let envelope: DeliveryEnvelope =
+            read_required_json(&path, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+        envelope.validate()?;
+        validate_queued_envelope(&path, &envelope, recipient.instance_id())?;
+        if envelope.kind() != DeliveryKind::Response {
+            bail!("local A2A delivery is a request, not a response");
+        }
+        Ok(envelope.received())
+    }
+
     /// Verifies and copies one exact file part from a pending delivery into a
     /// receiver-owned quarantine without claiming or acknowledging delivery.
     ///

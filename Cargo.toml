@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/crumb-a2a",
+    "crates/crumb-a2a-exchanges",
     "crates/crumb-a2a-inbound",
     "crates/crumb-a2a-local",
     "crates/crumb-a2a-runtime",
@@ -50,6 +51,7 @@ bytes = "1.11"
 chrono = "0.4.45"
 crossterm = "0.29.0"
 crumb-a2a = { path = "crates/crumb-a2a" }
+crumb-a2a-exchanges = { path = "crates/crumb-a2a-exchanges" }
 crumb-a2a-inbound = { path = "crates/crumb-a2a-inbound" }
 crumb-a2a-local = { path = "crates/crumb-a2a-local" }
 crumb-a2a-runtime = { path = "crates/crumb-a2a-runtime" }

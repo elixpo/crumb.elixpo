@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 crumb-a2a.workspace = true
+crumb-a2a-exchanges.workspace = true
 crumb-a2a-runtime.workspace = true
 crumb-a2a-tasks.workspace = true
 sha2.workspace = true

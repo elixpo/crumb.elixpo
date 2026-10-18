@@ -664,6 +664,8 @@ mod tests {
         for command in [
             "/peer status",
             "/peer inbox",
+            "/peer tasks",
+            "/peer task ",
             "/peer inspect ",
             "/peer file",
             "/peer file fetch ",

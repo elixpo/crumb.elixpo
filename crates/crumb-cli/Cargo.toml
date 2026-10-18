@@ -13,6 +13,7 @@ anyhow.workspace = true
 chrono.workspace = true
 crumb-agent = { path = "../crumb-agent" }
 crumb-a2a.workspace = true
+crumb-a2a-exchanges.workspace = true
 crumb-a2a-inbound.workspace = true
 crumb-a2a-runtime.workspace = true
 crumb-auth = { path = "../crumb-auth" }

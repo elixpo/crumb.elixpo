@@ -13,6 +13,9 @@ use crumb_a2a::{
     MAX_TEXT_BYTES, Message, Part, Role, SendMessageRequest, SendMessageResponse, Validate as _,
     to_json,
 };
+use crumb_a2a_exchanges::{
+    ExchangeDirection, ExchangeStore, NewExchange, ResponseMetadata as ExchangeResponse,
+};
 use crumb_a2a_runtime::A2aRuntime;
 use crumb_a2a_tasks::{NewTask, ResponseRecord, TaskRecord, TaskState, TaskStore};
 use sha2::{Digest as _, Sha256};
@@ -130,6 +133,7 @@ impl fmt::Debug for ClaimedInbound {
 pub struct InboundCoordinator {
     runtime: A2aRuntime,
     tasks: TaskStore,
+    exchanges: ExchangeStore,
 }
 
 impl InboundCoordinator {
@@ -139,6 +143,7 @@ impl InboundCoordinator {
         Self {
             runtime,
             tasks: TaskStore::for_workspace(workspace),
+            exchanges: ExchangeStore::for_workspace(workspace),
         }
     }
 
@@ -187,6 +192,15 @@ impl InboundCoordinator {
                 .context("terminal inbound A2A task could not be released")?;
             bail!("inbound A2A task is already terminal");
         }
+        let _ = self.exchanges.record(&NewExchange {
+            delivery_id: claimed.delivery_id.clone(),
+            direction: ExchangeDirection::Inbound,
+            peer_instance_id: claimed.sender_instance_id.clone(),
+            request_digest: claimed.request_digest.clone(),
+            request_part_count: u32::try_from(received.request.message.parts.len())
+                .unwrap_or(u32::MAX),
+            request_artifact_count: claimed.projection.artifact_count,
+        });
         Ok((claimed, record))
     }
 
@@ -197,7 +211,9 @@ impl InboundCoordinator {
     /// Returns an error if the redacted record is absent or incompatible.
     pub fn mark_running(&self, claimed: &ClaimedInbound) -> Result<TaskRecord> {
         self.ensure_claim_matches_ledger(claimed)?;
-        self.tasks.mark_running(&claimed.delivery_id)
+        let record = self.tasks.mark_running(&claimed.delivery_id)?;
+        let _ = self.exchanges.mark_running(&claimed.delivery_id);
+        Ok(record)
     }
 
     /// Queues a valid `ROLE_AGENT` response before recording completion.
@@ -226,10 +242,16 @@ impl InboundCoordinator {
         {
             bail!("completed A2A response receipt does not match the inbound request");
         }
-        self.tasks.mark_completed(
+        let record = self.tasks.mark_completed(
             &claimed.delivery_id,
             ResponseRecord::new(proof.delivery_id, proof.digest)?,
-        )
+        )?;
+        if let Ok(response) = exchange_response_from(&response, &record) {
+            let _ = self
+                .exchanges
+                .mark_completed(&claimed.delivery_id, response);
+        }
+        Ok(record)
     }
 
     /// Reconciles the crash window after a running request's response became
@@ -254,10 +276,20 @@ impl InboundCoordinator {
         if proof.recipient_instance_id != record.sender_instance_id {
             bail!("durable A2A response recipient does not match the task sender");
         }
-        self.tasks.mark_completed(
+        let record = self.tasks.mark_completed(
             delivery_id,
-            ResponseRecord::new(proof.delivery_id, proof.digest)?,
-        )
+            ResponseRecord::new(proof.delivery_id.clone(), proof.digest.clone())?,
+        )?;
+        let _ = self.exchanges.mark_completed(
+            delivery_id,
+            ExchangeResponse {
+                delivery_id: proof.delivery_id,
+                digest: proof.digest,
+                part_count: None,
+                artifact_count: None,
+            },
+        );
+        Ok(record)
     }
 
     /// Sends the protocol's minimal rejected task response before marking the
@@ -289,10 +321,23 @@ impl InboundCoordinator {
         {
             bail!("rejected A2A response receipt does not match the inbound request");
         }
-        self.tasks.mark_rejected(
+        let record = self.tasks.mark_rejected(
             &claimed.delivery_id,
-            Some(ResponseRecord::new(proof.delivery_id, proof.digest)?),
-        )
+            Some(ResponseRecord::new(
+                proof.delivery_id.clone(),
+                proof.digest.clone(),
+            )?),
+        )?;
+        let _ = self.exchanges.mark_rejected(
+            &claimed.delivery_id,
+            ExchangeResponse {
+                delivery_id: proof.delivery_id,
+                digest: proof.digest,
+                part_count: Some(0),
+                artifact_count: Some(0),
+            },
+        );
+        Ok(record)
     }
 
     /// Reconciles an explicitly rejected request after a response-before-ledger
@@ -317,10 +362,23 @@ impl InboundCoordinator {
         if proof.recipient_instance_id != record.sender_instance_id {
             bail!("durable A2A rejection recipient does not match the task sender");
         }
-        self.tasks.mark_rejected(
+        let record = self.tasks.mark_rejected(
             delivery_id,
-            Some(ResponseRecord::new(proof.delivery_id, proof.digest)?),
-        )
+            Some(ResponseRecord::new(
+                proof.delivery_id.clone(),
+                proof.digest.clone(),
+            )?),
+        )?;
+        let _ = self.exchanges.mark_rejected(
+            delivery_id,
+            ExchangeResponse {
+                delivery_id: proof.delivery_id,
+                digest: proof.digest,
+                part_count: None,
+                artifact_count: None,
+            },
+        );
+        Ok(record)
     }
 
     /// Releases a claimed/running request to pending for a retryable failure.
@@ -337,6 +395,7 @@ impl InboundCoordinator {
             bail!("only an active inbound A2A task can be released for retry");
         }
         self.runtime.release(&claimed.delivery_id)?;
+        let _ = self.exchanges.touch_retryable(&claimed.delivery_id);
         Ok(record)
     }
 
@@ -436,6 +495,51 @@ fn append_bounded(output: &mut String, value: &str) -> bool {
     }
     output.push_str(&value[..boundary]);
     false
+}
+
+fn exchange_response_from(
+    response: &SendMessageResponse,
+    record: &TaskRecord,
+) -> Result<ExchangeResponse> {
+    let identity = record
+        .response
+        .as_ref()
+        .context("completed inbound A2A task lacks response identity")?;
+    let mut part_count = 0_u32;
+    let mut artifact_count = 0_u32;
+    let mut include = |parts: &[Part]| -> Result<()> {
+        let parts_len = u32::try_from(parts.len())
+            .context("inbound A2A response part count exceeds supported bounds")?;
+        let artifacts = u32::try_from(parts.iter().filter(|part| part.url.is_some()).count())
+            .context("inbound A2A response artifact count exceeds supported bounds")?;
+        part_count = part_count
+            .checked_add(parts_len)
+            .context("inbound A2A response part count overflowed")?;
+        artifact_count = artifact_count
+            .checked_add(artifacts)
+            .context("inbound A2A response artifact count overflowed")?;
+        Ok(())
+    };
+    if let Some(message) = &response.message {
+        include(&message.parts)?;
+    }
+    if let Some(task) = &response.task {
+        if let Some(message) = &task.status.message {
+            include(&message.parts)?;
+        }
+        for artifact in &task.artifacts {
+            include(&artifact.parts)?;
+        }
+        for message in &task.history {
+            include(&message.parts)?;
+        }
+    }
+    Ok(ExchangeResponse {
+        delivery_id: identity.delivery_id.clone(),
+        digest: identity.digest.clone(),
+        part_count: Some(part_count),
+        artifact_count: Some(artifact_count),
+    })
 }
 
 fn response_for(claimed: &ClaimedInbound, output: &str) -> Result<SendMessageResponse> {
@@ -623,6 +727,13 @@ mod tests {
         assert_eq!(first, repeated);
         assert!(coordinator.complete(&claimed, "different output").is_err());
         assert_eq!(first.state, TaskState::Completed);
+        let exchange = ExchangeStore::for_workspace(&fixture.receiver_workspace)
+            .load(&delivery_id)
+            .expect("completed exchange");
+        assert_eq!(
+            exchange.state,
+            crumb_a2a_exchanges::ExchangeState::InboundCompleted
+        );
         let response_record = first.response.expect("response record");
 
         let delivery = fixture
@@ -659,6 +770,13 @@ mod tests {
             .release_retryable(&claimed)
             .expect("release retryable");
         assert_eq!(released.state, TaskState::Running);
+        assert_eq!(
+            ExchangeStore::for_workspace(&fixture.receiver_workspace)
+                .load(&delivery_id)
+                .expect("retry exchange")
+                .state,
+            crumb_a2a_exchanges::ExchangeState::InboundRunning
+        );
 
         let (retried, retried_record) = coordinator.claim(&delivery_id).expect("retry claim");
         assert_eq!(retried.request_digest(), claimed.request_digest());
