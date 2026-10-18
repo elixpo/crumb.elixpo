@@ -812,7 +812,7 @@ impl Renderer {
         output
     }
 
-    fn agent_change_activity(&self, label: &str, additions: u64, deletions: u64) -> String {
+    fn agent_change_activity(self, label: &str, additions: u64, deletions: u64) -> String {
         let counts = format!("+{additions} -{deletions}");
         if self.settings.output == OutputMode::ScreenReader {
             return format!("Activity: {label} · {counts}");
