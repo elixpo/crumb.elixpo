@@ -1,5 +1,6 @@
 //! Native tools whose permissions remain owned by Crumb.
 
+mod a2a;
 mod checkpoint;
 mod clock;
 mod disposable;
@@ -9,6 +10,10 @@ mod stack_detection;
 mod web;
 mod workspace;
 
+pub use a2a::{
+    LIST_PEER_AGENTS_TOOL, ListPeerAgentsTool, SEND_PEER_MESSAGE_TOOL, SHARE_PEER_FILE_TOOL,
+    SendPeerMessageTool, SharePeerFileTool, register_a2a_tools,
+};
 pub use checkpoint::{
     CheckpointDecision, CheckpointFile, CheckpointStatus, CheckpointStore, WorkspaceCheckpoint,
 };

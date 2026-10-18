@@ -8,8 +8,11 @@ rust-version.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 crumb-agent = { path = "../crumb-agent" }
+crumb-a2a.workspace = true
+crumb-a2a-runtime.workspace = true
 crumb-core = { path = "../crumb-core" }
 crumb-optimize = { path = "../crumb-optimize" }
+getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -20,6 +23,9 @@ url.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
+
+[dev-dependencies]
+crumb-instance.workspace = true
 
 [lints]
 workspace = true

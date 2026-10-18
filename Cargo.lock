@@ -798,9 +798,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "crumb-a2a",
+ "crumb-a2a-runtime",
  "crumb-agent",
  "crumb-core",
+ "crumb-instance",
  "crumb-optimize",
+ "getrandom 0.4.3",
  "reqwest",
  "rustix",
  "serde",
