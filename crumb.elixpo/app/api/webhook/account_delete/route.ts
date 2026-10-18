@@ -33,7 +33,7 @@ async function validSignature(secret: string, message: string, header: string): 
 }
 
 export async function POST(request: Request) {
-  const secret = config().accountsWebhookSecret
+  const secret = (await config()).accountsWebhookSecret
   if (!secret) return NextResponse.json({ error: 'webhook_not_configured' }, { status: 503 })
 
   const timestamp = request.headers.get('x-elixpo-timestamp') || ''

@@ -3,7 +3,7 @@ import { DEVICE_SCOPES } from '@/lib/accounts-device'
 import { config } from '@/lib/cloudflare'
 
 export async function GET() {
-  const env = config()
+  const env = await config()
   if (!env.accountsCliClientId) {
     return NextResponse.json({ error: 'device_flow_not_configured' }, { status: 503 })
   }

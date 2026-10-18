@@ -15,5 +15,5 @@ export async function GET(request: Request) {
     userId: user.id,
     verifier: pkceVerifier,
   }), { expirationTtl: 600 })
-  return NextResponse.redirect(authorizeUrl(oauthState, await challenge(pkceVerifier), request.url))
+  return NextResponse.redirect(await authorizeUrl(oauthState, await challenge(pkceVerifier), request.url))
 }

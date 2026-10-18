@@ -14,8 +14,8 @@ export async function challenge(value: string): Promise<string> {
   return encode(new Uint8Array(await crypto.subtle.digest('SHA-256', text(value))))
 }
 
-export function authorizeUrl(state: string, pkce: string, requestUrl: string): string {
-  const key = config().pollinationsAppKey
+export async function authorizeUrl(state: string, pkce: string, requestUrl: string): Promise<string> {
+  const key = (await config()).pollinationsAppKey
   if (!key?.startsWith('pk_')) throw new Error('Pollinations App Key is not configured')
   const url = new URL(AUTHORIZE)
   url.search = new URLSearchParams({
@@ -33,13 +33,14 @@ export function authorizeUrl(state: string, pkce: string, requestUrl: string): s
 }
 
 export async function exchangeCode(code: string, pkceVerifier: string, requestUrl: string) {
+  const env = await config()
   const response = await fetch(TOKEN, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
     body: new URLSearchParams({
       grant_type: 'authorization_code',
       code,
-      client_id: config().pollinationsAppKey,
+      client_id: env.pollinationsAppKey,
       redirect_uri: `${originFor(requestUrl)}/api/integrations/pollinations/callback`,
       code_verifier: pkceVerifier,
     }),

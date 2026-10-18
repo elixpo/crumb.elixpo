@@ -34,8 +34,8 @@ export async function destroySession(): Promise<void> {
   cookieStore.delete('crumb_session')
 }
 
-export function accountsAuthorizeUrl(state: string, requestUrl: string): string {
-  const env = config()
+export async function accountsAuthorizeUrl(state: string, requestUrl: string): Promise<string> {
+  const env = await config()
   const url = new URL('/oauth/authorize', env.accountsOrigin)
   url.search = new URLSearchParams({
     response_type: 'code',
@@ -48,7 +48,7 @@ export function accountsAuthorizeUrl(state: string, requestUrl: string): string 
 }
 
 export async function finishAccountsLogin(code: string, requestUrl: string, userAgent = ''): Promise<User> {
-  const env = config()
+  const env = await config()
   const accounts = env.accountsOrigin
   const tokenResponse = await fetch(new URL('/api/auth/token', accounts), {
     method: 'POST',
