@@ -46,6 +46,7 @@ const MAX_WARM_SESSION_STATES: usize = 8;
 struct TurnApprovals {
     configured: ConfiguredApprovals,
     interactive: InteractiveApprovalBroker,
+    approved: Mutex<BTreeSet<(String, String)>>,
 }
 
 struct TurnResources {
@@ -80,10 +81,25 @@ impl ApprovalBroker for TurnApprovals {
     ) -> ApprovalDecision {
         let configured = self.configured.decide(request, arguments, cancellation);
         if configured == ApprovalDecision::AllowOnce {
-            configured
-        } else {
-            self.interactive.decide(request, arguments, cancellation)
+            return configured;
         }
+        let key = (request.tool.clone(), request.arguments_digest.clone());
+        if self
+            .approved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key)
+        {
+            return ApprovalDecision::AllowOnce;
+        }
+        let decision = self.interactive.decide(request, arguments, cancellation);
+        if decision == ApprovalDecision::AllowOnce {
+            self.approved
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key);
+        }
+        decision
     }
 }
 
@@ -1478,6 +1494,7 @@ impl AgentRuntime {
             Some(interactive) => Arc::new(TurnApprovals {
                 configured,
                 interactive,
+                approved: Mutex::new(BTreeSet::new()),
             }),
             None => Arc::new(configured),
         };

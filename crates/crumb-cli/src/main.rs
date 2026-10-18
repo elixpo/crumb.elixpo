@@ -2361,6 +2361,11 @@ fn response_requests_confirmation(response: &str) -> bool {
         "do you want me to continue",
         "would you like me to run",
         "do you want me to run",
+        "need your permission",
+        "requires your permission",
+        "need permission to",
+        "can't merge without permission",
+        "cannot merge without permission",
         "ready to proceed",
     ]
     .iter()
@@ -12750,6 +12755,9 @@ mod tests {
         assert!(super::is_confirmation_reply("yes"));
         assert!(super::is_confirmation_reply("go ahead"));
         assert!(super::is_affirmative_reply("execute it"));
+        assert!(super::response_requests_confirmation(
+            "I need your permission before I can merge it."
+        ));
         assert!(!super::is_confirmation_reply("yes --help"));
         assert!(!super::response_requests_confirmation(
             "The command completed successfully."
