@@ -273,6 +273,7 @@ pub struct AgentRuntime {
     context_tokens_estimate: u64,
     session_tokens_estimate: u64,
     provider_input_tokens: u64,
+    provider_cached_input_tokens: u64,
     provider_output_tokens: u64,
     last_response: Option<String>,
     compactions: u32,
@@ -443,6 +444,7 @@ impl AgentRuntime {
             context_tokens_estimate: 0,
             session_tokens_estimate: 0,
             provider_input_tokens: 0,
+            provider_cached_input_tokens: 0,
             provider_output_tokens: 0,
             last_response: None,
             compactions: 0,
@@ -577,8 +579,12 @@ impl AgentRuntime {
 
     /// Returns provider-reported input and output tokens for this process.
     #[must_use]
-    pub const fn provider_token_usage(&self) -> (u64, u64) {
-        (self.provider_input_tokens, self.provider_output_tokens)
+    pub const fn provider_token_usage(&self) -> (u64, u64, u64) {
+        (
+            self.provider_input_tokens,
+            self.provider_cached_input_tokens,
+            self.provider_output_tokens,
+        )
     }
 
     /// Runs a turn off the terminal input thread and emits only bounded,
@@ -867,6 +873,9 @@ impl AgentRuntime {
             self.provider_input_tokens = self
                 .provider_input_tokens
                 .saturating_add(result.input_tokens);
+            self.provider_cached_input_tokens = self
+                .provider_cached_input_tokens
+                .saturating_add(result.cached_input_tokens);
             self.provider_output_tokens = self
                 .provider_output_tokens
                 .saturating_add(result.output_tokens);
@@ -1027,6 +1036,7 @@ impl AgentRuntime {
             final_response: outcome.text,
             finish_reason: Some("stop".to_owned()),
             input_tokens: outcome.usage.input_tokens,
+            cached_input_tokens: outcome.usage.cached_input_tokens,
             output_tokens: outcome.usage.output_tokens,
             context_tokens: outcome.context_tokens,
             events: Vec::new(),
@@ -1911,6 +1921,7 @@ mod tests {
 
         bridge.emit(HarnessEvent::Usage(TokenUsage {
             input_tokens: 1_200,
+            cached_input_tokens: 0,
             output_tokens: 80,
         }));
         bridge.finish().expect("activity callback succeeds");
@@ -2086,6 +2097,7 @@ mod tests {
             final_response: "done".to_owned(),
             finish_reason: Some("stop".to_owned()),
             input_tokens: 4_300,
+            cached_input_tokens: 0,
             output_tokens: 100,
             context_tokens: 4_400,
             events: Vec::new(),

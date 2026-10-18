@@ -32,7 +32,7 @@ impl<'a> From<&'a ChatRequest> for ChatCompletionRequest<'a> {
                 .enumerate()
                 .rev()
                 .filter_map(|(index, message)| (message.role == ChatRole::User).then_some(index))
-                .take(3)
+                .take(2)
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -47,7 +47,7 @@ impl<'a> From<&'a ChatRequest> for ChatCompletionRequest<'a> {
                     ChatCompletionMessage::new(
                         message,
                         prompt_cache_supported
-                            && ((index == 0 && message.role == ChatRole::System)
+                            && ((index < 2 && message.role == ChatRole::System)
                                 || cacheable_user_messages.contains(&index)),
                     )
                 })
@@ -281,6 +281,14 @@ struct PendingToolCall {
 struct WireUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<WirePromptTokenDetails>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WirePromptTokenDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -329,6 +337,7 @@ impl From<WireEmbeddingResponse> for EmbeddingResponse {
                 .collect(),
             usage: TokenUsage {
                 input_tokens: response.usage.prompt_tokens,
+                cached_input_tokens: 0,
                 output_tokens: 0,
             },
         }
@@ -482,6 +491,9 @@ impl SseDecoder {
         if let Some(usage) = chunk.usage {
             output.push(ChatEvent::Usage(TokenUsage {
                 input_tokens: usage.prompt_tokens,
+                cached_input_tokens: usage
+                    .prompt_tokens_details
+                    .map_or(0, |details| details.cached_tokens),
                 output_tokens: usage.completion_tokens,
             }));
         }
@@ -578,8 +590,12 @@ mod tests {
                 ChatMessage::text(ChatRole::System, "dynamic"),
                 ChatMessage::text(ChatRole::User, "hello"),
             ],
-            tools: Vec::new(),
-            tool_choice: ToolChoice::None,
+            tools: vec![ToolDefinition {
+                name: "run_shell".to_owned(),
+                description: "run a bounded command".to_owned(),
+                input_schema: serde_json::json!({"type":"object"}),
+            }],
+            tool_choice: ToolChoice::Auto,
             max_output_tokens: None,
         };
 
@@ -592,12 +608,17 @@ mod tests {
             json["messages"][0]["content"][0]["cache_control"]["type"],
             "ephemeral"
         );
-        assert_eq!(json["messages"][1]["content"], "dynamic");
+        assert_eq!(json["messages"][1]["content"][0]["text"], "dynamic");
+        assert_eq!(
+            json["messages"][1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
         assert_eq!(json["messages"][2]["content"][0]["text"], "hello");
         assert_eq!(
             json["messages"][2]["content"][0]["cache_control"]["type"],
             "ephemeral"
         );
+        assert_eq!(json["tools"][0]["function"]["name"], "run_shell");
     }
 
     #[test]
@@ -725,7 +746,7 @@ mod tests {
         let payload = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"hé\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],",
-            "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n",
+            "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":2}}}\n\n",
             "data: [DONE]\n\n"
         );
         let split = payload.find("é").expect("unicode text should exist") + 1;
@@ -747,6 +768,7 @@ mod tests {
                 ChatEvent::TextDelta("hé".to_owned()),
                 ChatEvent::Usage(TokenUsage {
                     input_tokens: 3,
+                    cached_input_tokens: 2,
                     output_tokens: 1,
                 }),
                 ChatEvent::Finished(FinishReason::Stop),

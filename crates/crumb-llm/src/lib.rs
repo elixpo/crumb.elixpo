@@ -143,6 +143,7 @@ pub struct ChatRequest {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TokenUsage {
     pub input_tokens: u64,
+    pub cached_input_tokens: u64,
     pub output_tokens: u64,
 }
 
@@ -342,6 +343,7 @@ mod tests {
             vectors: vec![vec![0.25, 0.75]],
             usage: TokenUsage {
                 input_tokens: 2,
+                cached_input_tokens: 0,
                 output_tokens: 0,
             },
         }

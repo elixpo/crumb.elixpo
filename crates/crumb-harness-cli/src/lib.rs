@@ -142,6 +142,7 @@ fn run_child(
         final_response,
         finish_reason: Some("completed".to_owned()),
         input_tokens: 0,
+        cached_input_tokens: 0,
         output_tokens: 0,
         context_tokens: 0,
         events: Vec::new(),

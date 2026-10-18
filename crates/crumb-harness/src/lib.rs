@@ -508,6 +508,10 @@ impl NativeHarness {
                 ChatEvent::Usage(usage) => {
                     round.usage.input_tokens =
                         round.usage.input_tokens.saturating_add(usage.input_tokens);
+                    round.usage.cached_input_tokens = round
+                        .usage
+                        .cached_input_tokens
+                        .saturating_add(usage.cached_input_tokens);
                     round.usage.output_tokens = round
                         .usage
                         .output_tokens
@@ -938,6 +942,9 @@ fn record_successful_tool_evidence(messages: &mut Vec<ChatMessage>, round_succee
 
 fn record_usage(total: &mut TokenUsage, round: TokenUsage) {
     total.input_tokens = total.input_tokens.saturating_add(round.input_tokens);
+    total.cached_input_tokens = total
+        .cached_input_tokens
+        .saturating_add(round.cached_input_tokens);
     total.output_tokens = total.output_tokens.saturating_add(round.output_tokens);
 }
 
@@ -1314,11 +1321,13 @@ fn system_messages(turn: &HarnessTurn) -> Vec<ChatMessage> {
         stable.push_str("\n\n## Selected persona\n");
         stable.push_str(persona);
     }
-    if !turn.static_context.is_empty() {
-        stable.push_str("\n\n## Active skills\n");
-        stable.push_str(&turn.static_context.join("\n\n"));
-    }
     let mut messages = vec![ChatMessage::text(ChatRole::System, stable)];
+    if !turn.static_context.is_empty() {
+        messages.push(ChatMessage::text(
+            ChatRole::System,
+            format!("## Active skills\n{}", turn.static_context.join("\n\n")),
+        ));
+    }
     if !turn.trusted_context.is_empty() {
         let mut context = String::from("## Trusted runtime context\n");
         context.push_str(&turn.trusted_context.join("\n\n"));
@@ -1795,15 +1804,29 @@ mod tests {
         assert!(messages[0].content.contains("every requested item"));
         assert!(messages[0].content.contains("Never offer to 'dive deeper'"));
         assert!(super::BASE_SYSTEM_PROMPT.len() < 2_500);
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
         assert!(
             messages
                 .iter()
                 .all(|message| message.role == ChatRole::System)
         );
         assert!(messages[0].content.contains("Be warm and brief."));
-        assert!(messages[0].content.contains("Skill: web research"));
-        assert!(messages[1].content.contains("Locale: en-IN"));
+        assert!(!messages[0].content.contains("Skill: web research"));
+        assert!(messages[1].content.contains("Skill: web research"));
+        assert!(messages[2].content.contains("Locale: en-IN"));
+    }
+
+    #[test]
+    fn dynamic_skills_do_not_invalidate_the_stable_system_cache_prefix() {
+        let first = turn();
+        let mut second = turn();
+        second.static_context = vec!["Skill: safe refactor".to_owned()];
+
+        let first_messages = super::system_messages(&first);
+        let second_messages = super::system_messages(&second);
+
+        assert_eq!(first_messages[0], second_messages[0]);
+        assert_ne!(first_messages[1], second_messages[1]);
     }
 
     #[test]
@@ -1866,6 +1889,7 @@ mod tests {
             }),
             ChatEvent::Usage(TokenUsage {
                 input_tokens: 100,
+                cached_input_tokens: 80,
                 output_tokens: 2,
             }),
             ChatEvent::Finished(FinishReason::ToolCall),
@@ -1877,6 +1901,7 @@ mod tests {
             ChatEvent::TextDelta("It is 24 C.".to_owned()),
             ChatEvent::Usage(TokenUsage {
                 input_tokens: 10,
+                cached_input_tokens: 5,
                 output_tokens: 5,
             }),
             ChatEvent::Finished(FinishReason::Stop),
@@ -1923,6 +1948,7 @@ mod tests {
         assert_eq!(outcome.model_rounds, 2);
         assert_eq!(outcome.tool_calls, 1);
         assert_eq!(outcome.usage.input_tokens, 110);
+        assert_eq!(outcome.usage.cached_input_tokens, 85);
         assert_eq!(outcome.usage.output_tokens, 7);
         assert_eq!(outcome.context_tokens, 15);
         assert_eq!(calls.load(Ordering::Relaxed), 1);

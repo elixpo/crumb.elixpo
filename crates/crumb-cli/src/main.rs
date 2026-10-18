@@ -4163,15 +4163,22 @@ fn show_provider_usage(
         .get(&Modality::Text)
         .and_then(|routes| routes.first())
         .map_or("provider", |route| route.provider.as_str());
-    let (input, output) = runtime.map_or((0, 0), AgentRuntime::provider_token_usage);
+    let (input, cached, output) = runtime.map_or((0, 0, 0), AgentRuntime::provider_token_usage);
+    let uncached = input.saturating_sub(cached);
     let (_, estimated, _) = runtime.map_or((0, 0, 0), AgentRuntime::token_usage);
     writeln!(writer, "◆ Session usage · {provider}")?;
     writeln!(
         writer,
-        "  reported  {} input · {} output · {} total tokens",
+        "  processed {} input · {} output · {} total tokens",
         compact_token_count(input),
         compact_token_count(output),
         compact_token_count(input.saturating_add(output))
+    )?;
+    writeln!(
+        writer,
+        "  cache     {} hit · {} uncached input",
+        compact_token_count(cached),
+        compact_token_count(uncached)
     )?;
     writeln!(
         writer,
