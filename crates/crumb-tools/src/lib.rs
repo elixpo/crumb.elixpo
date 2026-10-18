@@ -7,6 +7,7 @@ mod disposable;
 mod github;
 mod shell;
 mod stack_detection;
+mod wait;
 mod web;
 mod workspace;
 
@@ -25,6 +26,7 @@ pub use stack_detection::{
     DetectedStack, LanguageDetection, StackConfidence, StackDetectionLimits,
     register_stack_detection_tool,
 };
+pub use wait::{WaitToolLimits, register_wait_tool};
 pub use web::{WebFetchLimits, register_web_fetch_tool};
 pub use workspace::{
     WorkspaceToolLimits, WorkspaceWriteLimits, register_workspace_read_tools,
