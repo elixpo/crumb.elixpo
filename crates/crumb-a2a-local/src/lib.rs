@@ -34,6 +34,8 @@ pub const AUTOMATIC_ACKNOWLEDGEMENT_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000
 pub const AUTOMATIC_ACKNOWLEDGEMENT_RETAIN_LATEST: usize = 256;
 /// Maximum immutable staged artifact files per sender instance.
 pub const MAX_STAGED_ARTIFACTS: usize = 64;
+/// Maximum verified peer artifact files retained in one workspace quarantine.
+pub const MAX_QUARANTINED_ARTIFACTS: usize = 64;
 /// Maximum encoded registry entry size.
 pub const MAX_REGISTRY_BYTES: usize = 16 * 1024;
 /// Maximum encoded delivery envelope size.
@@ -1071,10 +1073,26 @@ impl LocalBus {
         let quarantine = a2a.join("quarantine");
         ensure_private_directory(&quarantine)?;
         let delivery_directory = quarantine.join(delivery_id);
-        ensure_private_directory(&delivery_directory)?;
         let digest_directory = delivery_directory.join(&claimed_digest);
-        ensure_private_directory(&digest_directory)?;
         let destination = digest_directory.join(filename);
+
+        let quarantined_count = count_quarantined_artifacts(&quarantine)?;
+        if path_exists_without_following(&destination)? {
+            verify_existing_artifact(&destination, &claimed_digest, claimed_size)?;
+            return Ok(QuarantinedArtifact {
+                relative_path: PathBuf::from(".crumb")
+                    .join("a2a")
+                    .join("quarantine")
+                    .join(delivery_id)
+                    .join(&claimed_digest)
+                    .join(filename),
+                sha256: claimed_digest,
+                size_bytes: claimed_size,
+            });
+        }
+        if quarantined_count >= MAX_QUARANTINED_ARTIFACTS {
+            bail!("local A2A quarantined artifact limit has been reached");
+        }
 
         let mut source_file =
             open_regular_file_without_replacement(&source, "staged peer artifact")?;
@@ -1087,27 +1105,37 @@ impl LocalBus {
         {
             bail!("staged peer artifact does not match its claimed size");
         }
-        let mut temporary = tempfile::NamedTempFile::new_in(&digest_directory)
-            .context("temporary quarantine artifact could not be created")?;
-        set_private_permissions(temporary.as_file())?;
-        let (actual_digest, actual_size) = copy_and_hash(&mut source_file, &mut temporary)?;
-        if actual_digest != claimed_digest || actual_size != claimed_size {
-            bail!("staged peer artifact bytes do not match the delivery claim");
-        }
-        temporary
-            .as_file_mut()
-            .sync_all()
-            .context("temporary quarantine artifact could not sync")?;
-        match temporary.persist_noclobber(&destination) {
-            Ok(_) => sync_directory(&digest_directory)
-                .context("quarantine digest directory could not sync")?,
-            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                verify_existing_artifact(&destination, &claimed_digest, claimed_size)?;
+        ensure_private_directory(&delivery_directory)?;
+        ensure_private_directory(&digest_directory)?;
+        let quarantine_result = (|| -> Result<()> {
+            let mut temporary = tempfile::NamedTempFile::new_in(&digest_directory)
+                .context("temporary quarantine artifact could not be created")?;
+            set_private_permissions(temporary.as_file())?;
+            let (actual_digest, actual_size) = copy_and_hash(&mut source_file, &mut temporary)?;
+            if actual_digest != claimed_digest || actual_size != claimed_size {
+                bail!("staged peer artifact bytes do not match the delivery claim");
             }
-            Err(error) => {
-                return Err(error.error).context("artifact could not be atomically quarantined");
+            temporary
+                .as_file_mut()
+                .sync_all()
+                .context("temporary quarantine artifact could not sync")?;
+            match temporary.persist_noclobber(&destination) {
+                Ok(_) => sync_directory(&digest_directory)
+                    .context("quarantine digest directory could not sync")?,
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    verify_existing_artifact(&destination, &claimed_digest, claimed_size)?;
+                }
+                Err(error) => {
+                    return Err(error.error)
+                        .context("artifact could not be atomically quarantined");
+                }
             }
+            Ok(())
+        })();
+        if quarantine_result.is_err() {
+            remove_empty_quarantine_directories(&digest_directory, &delivery_directory);
         }
+        quarantine_result?;
 
         Ok(QuarantinedArtifact {
             relative_path: PathBuf::from(".crumb")
@@ -2487,6 +2515,80 @@ fn count_staged_artifacts(sender_root: &Path) -> Result<usize> {
     Ok(count)
 }
 
+fn count_quarantined_artifacts(quarantine_root: &Path) -> Result<usize> {
+    let mut delivery_directories = 0_usize;
+    let mut digest_directories = 0_usize;
+    let mut artifacts = 0_usize;
+    for delivery in
+        fs::read_dir(quarantine_root).context("peer quarantine root could not be read")?
+    {
+        let delivery = delivery.context("peer quarantine delivery entry could not be read")?;
+        let delivery_name = delivery
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("peer quarantine delivery name is not valid UTF-8"))?;
+        validate_delivery_id(&delivery_name)?;
+        let metadata = fs::symlink_metadata(delivery.path())
+            .context("peer quarantine delivery entry could not be inspected")?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            bail!("peer quarantine delivery entries must be directories, not symlinks");
+        }
+        delivery_directories = delivery_directories.saturating_add(1);
+        if delivery_directories > MAX_QUARANTINED_ARTIFACTS {
+            bail!("local A2A quarantine directory limit has been exceeded");
+        }
+
+        for digest in fs::read_dir(delivery.path())
+            .context("peer quarantine delivery directory could not be read")?
+        {
+            let digest = digest.context("peer quarantine digest entry could not be read")?;
+            let digest_name = digest
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("peer quarantine digest name is not valid UTF-8"))?;
+            validate_lower_hex(&digest_name, 64, "peer quarantine artifact digest")?;
+            let metadata = fs::symlink_metadata(digest.path())
+                .context("peer quarantine digest entry could not be inspected")?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                bail!("peer quarantine digest entries must be directories, not symlinks");
+            }
+            digest_directories = digest_directories.saturating_add(1);
+            if digest_directories > MAX_QUARANTINED_ARTIFACTS {
+                bail!("local A2A quarantine directory limit has been exceeded");
+            }
+
+            for artifact in fs::read_dir(digest.path())
+                .context("peer quarantine digest directory could not be read")?
+            {
+                let artifact =
+                    artifact.context("peer quarantine artifact entry could not be read")?;
+                let filename = artifact
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("peer quarantine filename is not valid UTF-8"))?;
+                validate_artifact_filename(&filename)?;
+                let metadata = fs::symlink_metadata(artifact.path())
+                    .context("peer quarantine artifact entry could not be inspected")?;
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                    bail!("peer quarantine artifacts must be regular files, not symlinks");
+                }
+                artifacts = artifacts.saturating_add(1);
+                if artifacts > MAX_QUARANTINED_ARTIFACTS {
+                    bail!("local A2A quarantined artifact limit has been exceeded");
+                }
+            }
+        }
+    }
+    Ok(artifacts)
+}
+
+fn remove_empty_quarantine_directories(digest_directory: &Path, delivery_directory: &Path) {
+    for directory in [digest_directory, delivery_directory] {
+        // Removing a non-empty directory fails, so received artifacts are never deleted.
+        let _ = fs::remove_dir(directory);
+    }
+}
+
 fn random_identifier(prefix: &str) -> Result<String> {
     let mut random = [0_u8; 16];
     getrandom::fill(&mut random)
@@ -2850,6 +2952,20 @@ mod tests {
         let mut request = request(id, "shared file");
         request.message.parts.push(file);
         request
+    }
+
+    fn add_quarantined_artifact(workspace: &Path, index: usize) {
+        let delivery_id = format!("delivery_{:064x}", index + 1);
+        let digest = format!("{:064x}", index + 1_000);
+        let directory = workspace
+            .join(".crumb")
+            .join("a2a")
+            .join("quarantine")
+            .join(delivery_id)
+            .join(digest);
+        fs::create_dir_all(&directory).expect("quarantine fixture directory");
+        fs::write(directory.join(format!("artifact-{index}.bin")), b"fixture")
+            .expect("quarantine fixture artifact");
     }
 
     fn response(id: &str, text: &str) -> SendMessageResponse {
@@ -3833,6 +3949,181 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_rejects_a_new_artifact_at_capacity_without_changing_pending_delivery() {
+        let (temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let sender_workspace = temporary.path().join("capacity-source");
+        let receiver_workspace = temporary.path().join("capacity-target");
+        fs::create_dir(&sender_workspace).expect("sender workspace");
+        fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        fs::write(sender_workspace.join("new.bin"), b"new artifact").expect("source");
+        let staged = bus
+            .stage_artifact(&first_registration, &sender_workspace, Path::new("new.bin"))
+            .expect("stage");
+        let receipt = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &file_request("msg-quarantine-capacity", &staged),
+            )
+            .expect("enqueue");
+        for index in 0..MAX_QUARANTINED_ARTIFACTS {
+            add_quarantined_artifact(&receiver_workspace, index);
+        }
+
+        let error = bus
+            .quarantine_artifact(
+                &second_registration,
+                &receiver_workspace,
+                &receipt.delivery_id,
+                2,
+            )
+            .expect_err("capacity must reject a new artifact");
+        assert!(error.to_string().contains("limit has been reached"));
+        assert_eq!(
+            bus.list_pending(&second_registration)
+                .expect("pending")
+                .len(),
+            1
+        );
+        assert!(
+            !receiver_workspace
+                .join(".crumb")
+                .join("a2a")
+                .join("quarantine")
+                .join(&receipt.delivery_id)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn quarantine_refetches_an_existing_verified_artifact_at_capacity() {
+        let (temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let sender_workspace = temporary.path().join("refetch-source");
+        let receiver_workspace = temporary.path().join("refetch-target");
+        fs::create_dir(&sender_workspace).expect("sender workspace");
+        fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        fs::write(sender_workspace.join("existing.bin"), b"existing artifact").expect("source");
+        let staged = bus
+            .stage_artifact(
+                &first_registration,
+                &sender_workspace,
+                Path::new("existing.bin"),
+            )
+            .expect("stage");
+        let receipt = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &file_request("msg-quarantine-refetch", &staged),
+            )
+            .expect("enqueue");
+        let first = bus
+            .quarantine_artifact(
+                &second_registration,
+                &receiver_workspace,
+                &receipt.delivery_id,
+                2,
+            )
+            .expect("initial quarantine");
+        for index in 0..MAX_QUARANTINED_ARTIFACTS - 1 {
+            add_quarantined_artifact(&receiver_workspace, index);
+        }
+
+        let refetched = bus
+            .quarantine_artifact(
+                &second_registration,
+                &receiver_workspace,
+                &receipt.delivery_id,
+                2,
+            )
+            .expect("idempotent refetch at capacity");
+        assert_eq!(refetched, first);
+        assert_eq!(
+            fs::read(receiver_workspace.join(refetched.relative_path)).expect("artifact bytes"),
+            b"existing artifact"
+        );
+        assert_eq!(
+            bus.list_pending(&second_registration)
+                .expect("pending")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn quarantine_rejects_unsafe_storage_entries_without_changing_pending_delivery() {
+        let (temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let sender_workspace = temporary.path().join("unsafe-storage-source");
+        let receiver_workspace = temporary.path().join("unsafe-storage-target");
+        fs::create_dir(&sender_workspace).expect("sender workspace");
+        fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        fs::write(sender_workspace.join("file.bin"), b"safe source").expect("source");
+        let staged = bus
+            .stage_artifact(
+                &first_registration,
+                &sender_workspace,
+                Path::new("file.bin"),
+            )
+            .expect("stage");
+        let receipt = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &file_request("msg-unsafe-storage", &staged),
+            )
+            .expect("enqueue");
+        let quarantine = receiver_workspace.join(".crumb/a2a/quarantine");
+        fs::create_dir_all(&quarantine).expect("quarantine root");
+        fs::write(
+            quarantine.join(format!("delivery_{:064x}", 1)),
+            b"not a directory",
+        )
+        .expect("unsafe delivery entry");
+
+        assert!(
+            bus.quarantine_artifact(
+                &second_registration,
+                &receiver_workspace,
+                &receipt.delivery_id,
+                2,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            bus.list_pending(&second_registration)
+                .expect("pending")
+                .len(),
+            1
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let unsafe_entry = quarantine.join(format!("delivery_{:064x}", 1));
+            fs::remove_file(&unsafe_entry).expect("remove unsafe regular entry");
+            let outside = receiver_workspace.join("outside-quarantine");
+            fs::create_dir(&outside).expect("outside directory");
+            symlink(&outside, &unsafe_entry).expect("unsafe delivery symlink");
+            assert!(
+                bus.quarantine_artifact(
+                    &second_registration,
+                    &receiver_workspace,
+                    &receipt.delivery_id,
+                    2,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                bus.list_pending(&second_registration)
+                    .expect("pending")
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn artifact_claim_rejects_https_foreign_sender_and_unsafe_references() {
         let sender = "crumb_0123456789abcdef0123456789abcdef";
         let digest = "ab".repeat(32);
@@ -3960,6 +4251,15 @@ mod tests {
                 .expect("pending")
                 .len(),
             1
+        );
+        assert!(
+            !receiver_workspace
+                .join(".crumb")
+                .join("a2a")
+                .join("quarantine")
+                .join(receipt.delivery_id)
+                .exists(),
+            "a rejected fetch must not leave delivery directories behind"
         );
     }
 
