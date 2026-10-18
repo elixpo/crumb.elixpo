@@ -244,6 +244,14 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "verify one pending file part into quarantine",
     },
     SlashCommand {
+        usage: "/peer file import ",
+        description: "import one fetched peer file into a new workspace path",
+    },
+    SlashCommand {
+        usage: "/peer file discard ",
+        description: "discard one exact fetched peer file and receipt",
+    },
+    SlashCommand {
         usage: "/review",
         description: "review Crumb-owned edits",
     },

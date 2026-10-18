@@ -21,7 +21,9 @@ use crumb_a2a_local::{
     PeerEntry, PendingDeliverySummary, ProcessMetadata, ReceivedMessage, Registration,
     StagedArtifact,
 };
-pub use crumb_a2a_local::{DeliveryKind, QuarantinedArtifact, ReceivedDelivery};
+pub use crumb_a2a_local::{
+    DeliveryKind, DiscardedArtifact, ImportedArtifact, QuarantinedArtifact, ReceivedDelivery,
+};
 use crumb_instance::{InstanceMetadata, InstanceStore};
 use sha2::{Digest as _, Sha256};
 
@@ -384,6 +386,48 @@ impl A2aRuntime {
         let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
         self.inner.bus.quarantine_artifact(
             &registration,
+            &self.inner.workspace,
+            delivery_id,
+            part_index,
+        )
+    }
+
+    /// Imports one exact durable quarantine receipt into a new relative
+    /// workspace destination. This never consults or changes inbox state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after shutdown begins or when the receipt, quarantined
+    /// bytes, or destination fails validation.
+    pub fn import_quarantined_artifact(
+        &self,
+        delivery_id: &str,
+        part_index: usize,
+        relative_destination: &Path,
+    ) -> Result<ImportedArtifact> {
+        self.inner.ensure_running()?;
+        crumb_a2a_local::import_quarantined_artifact(
+            &self.inner.workspace,
+            delivery_id,
+            part_index,
+            relative_destination,
+        )
+    }
+
+    /// Discards one exact durable quarantine receipt and its verified bytes.
+    /// This never consults or changes inbox state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after shutdown begins or when the receipt or exact
+    /// quarantined artifact fails validation or cannot be removed safely.
+    pub fn discard_quarantined_artifact(
+        &self,
+        delivery_id: &str,
+        part_index: usize,
+    ) -> Result<DiscardedArtifact> {
+        self.inner.ensure_running()?;
+        crumb_a2a_local::discard_quarantined_artifact(
             &self.inner.workspace,
             delivery_id,
             part_index,
@@ -1062,5 +1106,62 @@ mod tests {
         assert!(!registry.contains(workspace.to_string_lossy().as_ref()));
         assert!(runtime.stage_artifact(Path::new("../result.txt")).is_err());
         runtime.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn quarantine_receipt_imports_after_runtime_restart_and_delivery_ack() {
+        let temporary = TempDir::new().expect("temporary root");
+        let bus = temporary.path().join("bus");
+        let (sender_workspace, sender_instance) = workspace(temporary.path(), "Receipt Sender");
+        let (receiver_workspace, receiver_instance) =
+            workspace(temporary.path(), "Receipt Receiver");
+        fs::create_dir(receiver_workspace.join("imports")).expect("import parent");
+        fs::write(
+            sender_workspace.join("result.txt"),
+            b"restart-safe artifact\n",
+        )
+        .expect("artifact source");
+        let sender = A2aRuntime::start(&bus, &sender_workspace, &sender_instance, options())
+            .expect("sender runtime");
+        let receiver = A2aRuntime::start(&bus, &receiver_workspace, &receiver_instance, options())
+            .expect("receiver runtime");
+        let staged = sender
+            .stage_artifact(Path::new("result.txt"))
+            .expect("stage artifact");
+        let mut file = Part::file(staged.relative_url, staged.filename, "text/plain");
+        file.metadata = Some(serde_json::json!({
+            "sha256": staged.sha256,
+            "sizeBytes": staged.size_bytes,
+        }));
+        let mut outbound = request("message-restart-receipt", "artifact follows");
+        outbound.message.parts.push(file);
+        let delivery = sender
+            .enqueue(&receiver_instance.instance_id, &outbound)
+            .expect("enqueue artifact");
+        receiver
+            .quarantine_artifact(&delivery.delivery_id, 2)
+            .expect("fetch artifact");
+        let claimed = receiver
+            .claim_pending(&delivery.delivery_id)
+            .expect("claim delivery");
+        receiver
+            .acknowledge(&claimed.delivery_id)
+            .expect("ack delivery");
+        receiver.shutdown().expect("receiver shutdown");
+
+        let restarted = A2aRuntime::start(&bus, &receiver_workspace, &receiver_instance, options())
+            .expect("receiver restart");
+        let imported = restarted
+            .import_quarantined_artifact(&delivery.delivery_id, 2, Path::new("imports/result.txt"))
+            .expect("import after restart");
+        assert_eq!(imported.size_bytes, 22);
+        assert_eq!(
+            fs::read(receiver_workspace.join(imported.relative_destination))
+                .expect("imported bytes"),
+            b"restart-safe artifact\n"
+        );
+        assert_eq!(restarted.list_pending().expect("pending"), vec![]);
+        restarted.shutdown().expect("restarted shutdown");
+        sender.shutdown().expect("sender shutdown");
     }
 }

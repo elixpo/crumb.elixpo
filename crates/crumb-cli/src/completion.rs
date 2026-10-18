@@ -669,6 +669,8 @@ mod tests {
             "/peer inspect ",
             "/peer file",
             "/peer file fetch ",
+            "/peer file import ",
+            "/peer file discard ",
         ] {
             assert!(
                 nested
@@ -680,11 +682,26 @@ mod tests {
         }
 
         let files = completer.complete("/peer file ", 11);
+        for command in [
+            "/peer file fetch ",
+            "/peer file import ",
+            "/peer file discard ",
+        ] {
+            assert!(
+                files
+                    .suggestions()
+                    .iter()
+                    .any(|candidate| candidate.value == command),
+                "missing nested peer file suggestion for {command}"
+            );
+        }
+
+        let backspaced = completer.complete("/peer file im", 13);
         assert!(
-            files
+            backspaced
                 .suggestions()
                 .iter()
-                .any(|candidate| candidate.value == "/peer file fetch ")
+                .any(|candidate| candidate.value == "/peer file import ")
         );
     }
 

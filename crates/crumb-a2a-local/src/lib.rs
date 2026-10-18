@@ -13,8 +13,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use crumb_a2a::{
-    MAX_WIRE_BYTES, PROTOCOL_VERSION, SendMessageRequest, SendMessageResponse, Task, TaskState,
-    TaskStatus, Validate as _, to_json,
+    MAX_PARTS, MAX_WIRE_BYTES, PROTOCOL_VERSION, SendMessageRequest, SendMessageResponse, Task,
+    TaskState, TaskStatus, Validate as _, to_json,
 };
 use crumb_instance::{InstanceMetadata, validate_instance_name};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -42,12 +42,15 @@ pub const MAX_REGISTRY_BYTES: usize = 16 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = MAX_WIRE_BYTES + 16 * 1024;
 /// Maximum size of a file staged for later approval-gated import.
 pub const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum encoded receiver-owned quarantine receipt size.
+pub const MAX_QUARANTINE_RECEIPT_BYTES: usize = 4 * 1024;
 
 const REGISTRY_DIRECTORY: &str = "registry";
 const LOCK_DIRECTORY: &str = ".locks";
 const LOCK_GATE_FILE: &str = ".gate";
 const INBOX_DIRECTORY: &str = "inboxes";
 const ARTIFACT_DIRECTORY: &str = "artifacts";
+const QUARANTINE_RECEIPT_DIRECTORY: &str = "quarantine-receipts";
 const PENDING_DIRECTORY: &str = "pending";
 const PROCESSING_DIRECTORY: &str = "processing";
 const ACKNOWLEDGED_DIRECTORY: &str = "acknowledged";
@@ -349,6 +352,67 @@ pub struct QuarantinedArtifact {
     pub size_bytes: u64,
 }
 
+/// Receiver-approved import of a verified quarantine artifact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportedArtifact {
+    pub relative_destination: PathBuf,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+/// Content-free result of discarding one exact quarantine artifact receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscardedArtifact {
+    pub delivery_id: String,
+    pub part_index: usize,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct QuarantineReceipt {
+    schema_version: u32,
+    delivery_id: String,
+    part_index: usize,
+    sender_instance_id: String,
+    created_at_ms: u64,
+    sha256: String,
+    size_bytes: u64,
+    filename: String,
+}
+
+impl QuarantineReceipt {
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != LOCAL_BUS_SCHEMA_VERSION {
+            bail!("unsupported peer quarantine receipt schema");
+        }
+        validate_delivery_id(&self.delivery_id)?;
+        if self.part_index == 0 || self.part_index > MAX_PARTS {
+            bail!("peer quarantine receipt part index is invalid");
+        }
+        validate_instance_id(&self.sender_instance_id)?;
+        if self.created_at_ms == 0 {
+            bail!("peer quarantine receipt timestamp is invalid");
+        }
+        validate_lower_hex(&self.sha256, 64, "peer quarantine receipt digest")?;
+        if self.size_bytes > MAX_ARTIFACT_BYTES {
+            bail!("peer quarantine receipt exceeds the artifact size limit");
+        }
+        validate_artifact_filename(&self.filename)
+    }
+
+    fn matches_verified_claim(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.delivery_id == other.delivery_id
+            && self.part_index == other.part_index
+            && self.sender_instance_id == other.sender_instance_id
+            && self.sha256 == other.sha256
+            && self.size_bytes == other.size_bytes
+            && self.filename == other.filename
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DeliveryEnvelope {
@@ -639,6 +703,45 @@ fn verified_artifact_claim<'a>(
         bail!("peer artifact size claim exceeds the 8 MiB limit");
     }
     Ok((digest.to_owned(), size_bytes, filename))
+}
+
+fn quarantined_artifact_projection(
+    delivery_id: &str,
+    sha256: String,
+    size_bytes: u64,
+    filename: &str,
+) -> QuarantinedArtifact {
+    QuarantinedArtifact {
+        relative_path: PathBuf::from(".crumb")
+            .join("a2a")
+            .join("quarantine")
+            .join(delivery_id)
+            .join(&sha256)
+            .join(filename),
+        sha256,
+        size_bytes,
+    }
+}
+
+fn quarantine_receipt(
+    delivery_id: &str,
+    part_index: usize,
+    sender_instance_id: &str,
+    created_at_ms: u64,
+    sha256: &str,
+    size_bytes: u64,
+    filename: &str,
+) -> QuarantineReceipt {
+    QuarantineReceipt {
+        schema_version: LOCAL_BUS_SCHEMA_VERSION,
+        delivery_id: delivery_id.to_owned(),
+        part_index,
+        sender_instance_id: sender_instance_id.to_owned(),
+        created_at_ms,
+        sha256: sha256.to_owned(),
+        size_bytes,
+        filename: filename.to_owned(),
+    }
 }
 
 /// Filesystem-backed local A2A bus rooted only at a caller-approved path.
@@ -1086,8 +1189,8 @@ impl LocalBus {
         let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
         self.require_live_owner(recipient, now_ms()?)?;
         validate_delivery_id(delivery_id)?;
-        if part_index == 0 {
-            bail!("peer file part index is one-based and must be at least 1");
+        if part_index == 0 || part_index > MAX_PARTS {
+            bail!("peer file part index is outside the supported message range");
         }
         let (pending, _processing, _acknowledged) =
             self.queue_directories(recipient.instance_id())?;
@@ -1100,6 +1203,16 @@ impl LocalBus {
             .context("peer delivery does not contain that part index")?;
         let (claimed_digest, claimed_size, filename) =
             verified_artifact_claim(&envelope.sender_instance_id, part)?;
+        let receipt = quarantine_receipt(
+            delivery_id,
+            part_index,
+            &envelope.sender_instance_id,
+            now_ms()?,
+            &claimed_digest,
+            claimed_size,
+            filename,
+        );
+        receipt.validate()?;
         let source =
             self.verified_artifact_source(&envelope.sender_instance_id, &claimed_digest, filename)?;
 
@@ -1108,6 +1221,7 @@ impl LocalBus {
         ensure_private_directory(&crumb)?;
         let a2a = crumb.join("a2a");
         ensure_private_directory(&a2a)?;
+        let _quarantine_lock = acquire_quarantine_lock(&a2a)?;
         let quarantine = a2a.join("quarantine");
         ensure_private_directory(&quarantine)?;
         let delivery_directory = quarantine.join(delivery_id);
@@ -1117,16 +1231,13 @@ impl LocalBus {
         let quarantined_count = count_quarantined_artifacts(&quarantine)?;
         if path_exists_without_following(&destination)? {
             verify_existing_artifact(&destination, &claimed_digest, claimed_size)?;
-            return Ok(QuarantinedArtifact {
-                relative_path: PathBuf::from(".crumb")
-                    .join("a2a")
-                    .join("quarantine")
-                    .join(delivery_id)
-                    .join(&claimed_digest)
-                    .join(filename),
-                sha256: claimed_digest,
-                size_bytes: claimed_size,
-            });
+            persist_quarantine_receipt(&a2a, &receipt)?;
+            return Ok(quarantined_artifact_projection(
+                delivery_id,
+                claimed_digest,
+                claimed_size,
+                filename,
+            ));
         }
         if quarantined_count >= MAX_QUARANTINED_ARTIFACTS {
             bail!("local A2A quarantined artifact limit has been reached");
@@ -1145,46 +1256,36 @@ impl LocalBus {
         }
         ensure_private_directory(&delivery_directory)?;
         ensure_private_directory(&digest_directory)?;
-        let quarantine_result = (|| -> Result<()> {
-            let mut temporary = tempfile::NamedTempFile::new_in(&digest_directory)
-                .context("temporary quarantine artifact could not be created")?;
-            set_private_permissions(temporary.as_file())?;
-            let (actual_digest, actual_size) = copy_and_hash(&mut source_file, &mut temporary)?;
-            if actual_digest != claimed_digest || actual_size != claimed_size {
-                bail!("staged peer artifact bytes do not match the delivery claim");
-            }
-            temporary
-                .as_file_mut()
-                .sync_all()
-                .context("temporary quarantine artifact could not sync")?;
-            match temporary.persist_noclobber(&destination) {
-                Ok(_) => sync_directory(&digest_directory)
-                    .context("quarantine digest directory could not sync")?,
-                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    verify_existing_artifact(&destination, &claimed_digest, claimed_size)?;
-                }
-                Err(error) => {
-                    return Err(error.error)
-                        .context("artifact could not be atomically quarantined");
-                }
-            }
-            Ok(())
-        })();
+        let quarantine_result = copy_verified_artifact_into_quarantine(
+            &mut source_file,
+            &digest_directory,
+            &destination,
+            &claimed_digest,
+            claimed_size,
+        );
         if quarantine_result.is_err() {
             remove_empty_quarantine_directories(&digest_directory, &delivery_directory);
         }
-        quarantine_result?;
+        let artifact_was_created = quarantine_result?;
+        if let Err(error) = persist_quarantine_receipt(&a2a, &receipt) {
+            if artifact_was_created {
+                remove_exact_unreferenced_quarantine_artifact(
+                    &destination,
+                    &digest_directory,
+                    &delivery_directory,
+                    &claimed_digest,
+                    claimed_size,
+                )?;
+            }
+            return Err(error);
+        }
 
-        Ok(QuarantinedArtifact {
-            relative_path: PathBuf::from(".crumb")
-                .join("a2a")
-                .join("quarantine")
-                .join(delivery_id)
-                .join(&claimed_digest)
-                .join(filename),
-            sha256: claimed_digest,
-            size_bytes: claimed_size,
-        })
+        Ok(quarantined_artifact_projection(
+            delivery_id,
+            claimed_digest,
+            claimed_size,
+            filename,
+        ))
     }
 
     fn verified_artifact_source(
@@ -2320,6 +2421,360 @@ fn validate_relative_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Imports one previously verified quarantine artifact into a new workspace
+/// destination without consulting or mutating the transport inbox.
+///
+/// The durable receiver receipt remains until an explicit discard, allowing
+/// the operation to work after restart or delivery acknowledgement.
+///
+/// # Errors
+///
+/// Returns an error for an invalid receipt, tampered quarantine bytes, unsafe
+/// destination, symlinked or missing parent, or an existing destination.
+pub fn import_quarantined_artifact(
+    workspace_root: &Path,
+    delivery_id: &str,
+    part_index: usize,
+    relative_destination: &Path,
+) -> Result<ImportedArtifact> {
+    inspect_directory(workspace_root, "receiver workspace root")?;
+    validate_import_destination(relative_destination)?;
+    let a2a = inspect_quarantine_layout(workspace_root)?;
+    let _lock = acquire_quarantine_lock(&a2a)?;
+    let (receipt, _receipt_path) = read_quarantine_receipt(&a2a, delivery_id, part_index)?;
+    let artifact_path = quarantine_artifact_path(&a2a, &receipt)?;
+    let mut source =
+        open_regular_file_without_replacement(&artifact_path, "receiver quarantine artifact")?;
+    if source
+        .metadata()
+        .context("receiver quarantine artifact metadata is unavailable")?
+        .len()
+        != receipt.size_bytes
+    {
+        bail!("receiver quarantine artifact size no longer matches its receipt");
+    }
+
+    let destination = workspace_root.join(relative_destination);
+    let parent = destination.parent().unwrap_or(workspace_root);
+    inspect_workspace_destination_parent(workspace_root, parent)?;
+    if path_exists_without_following(&destination)? {
+        bail!("peer file import destination already exists");
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .context("temporary peer file import could not be created")?;
+    set_private_permissions(temporary.as_file())?;
+    let (actual_digest, actual_size) = copy_and_hash(&mut source, &mut temporary)?;
+    if actual_digest != receipt.sha256 || actual_size != receipt.size_bytes {
+        bail!("receiver quarantine artifact bytes no longer match its receipt");
+    }
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .context("temporary peer file import could not sync")?;
+    temporary
+        .persist_noclobber(&destination)
+        .map_err(|error| error.error)
+        .context("peer file import destination must not already exist")?;
+    sync_directory(parent).context("peer file import parent could not sync")?;
+
+    Ok(ImportedArtifact {
+        relative_destination: relative_destination.to_path_buf(),
+        sha256: receipt.sha256,
+        size_bytes: receipt.size_bytes,
+    })
+}
+
+/// Discards one exact verified quarantine artifact and its durable receipt.
+///
+/// Other part receipts that reference the same content keep their shared
+/// quarantine artifact. This operation never touches delivery queue state.
+///
+/// # Errors
+///
+/// Returns an error for an invalid receipt, unsafe storage, or tampered bytes.
+pub fn discard_quarantined_artifact(
+    workspace_root: &Path,
+    delivery_id: &str,
+    part_index: usize,
+) -> Result<DiscardedArtifact> {
+    inspect_directory(workspace_root, "receiver workspace root")?;
+    let a2a = inspect_quarantine_layout(workspace_root)?;
+    let _lock = acquire_quarantine_lock(&a2a)?;
+    let (receipt, receipt_path) = read_quarantine_receipt(&a2a, delivery_id, part_index)?;
+    let artifact_path = quarantine_artifact_path(&a2a, &receipt)?;
+    if !path_exists_without_following(&artifact_path)? {
+        bail!("receiver quarantine artifact is unavailable");
+    }
+    verify_quarantine_artifact(&artifact_path, &receipt)?;
+    let receipt_directory = receipt_path
+        .parent()
+        .context("peer quarantine receipt parent is unavailable")?;
+    let shared = receipt_directory_has_reference(receipt_directory, &receipt_path, &receipt)?;
+    if !shared {
+        remove_regular_file(&artifact_path, "receiver quarantine artifact")?;
+        if let Some(digest_directory) = artifact_path.parent() {
+            sync_directory(digest_directory)
+                .context("peer quarantine digest directory could not sync")?;
+        }
+    }
+    remove_regular_file(&receipt_path, "peer quarantine receipt")?;
+    sync_directory(receipt_directory)
+        .context("peer quarantine receipt directory could not sync")?;
+    cleanup_quarantine_receipt(&a2a, &receipt);
+
+    Ok(DiscardedArtifact {
+        delivery_id: receipt.delivery_id,
+        part_index: receipt.part_index,
+        sha256: receipt.sha256,
+        size_bytes: receipt.size_bytes,
+    })
+}
+
+fn validate_import_destination(path: &Path) -> Result<()> {
+    validate_relative_path(path)?;
+    if path.as_os_str().len() > 4_096 {
+        bail!("peer file import destination is too long");
+    }
+    for component in path.components() {
+        let Component::Normal(value) = component else {
+            bail!("peer file import destination contains an unsafe component");
+        };
+        let value = value
+            .to_str()
+            .context("peer file import destination must be UTF-8")?;
+        if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+            bail!("peer file import destination component is unsafe");
+        }
+        if value.eq_ignore_ascii_case(".crumb") || value.eq_ignore_ascii_case(".git") {
+            bail!("peer files cannot be imported into protected metadata directories");
+        }
+    }
+    Ok(())
+}
+
+fn inspect_workspace_destination_parent(workspace_root: &Path, parent: &Path) -> Result<()> {
+    let relative = parent
+        .strip_prefix(workspace_root)
+        .context("peer file import parent escaped the workspace")?;
+    let mut current = workspace_root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            bail!("peer file import parent contains an unsafe component");
+        };
+        current.push(component);
+        inspect_directory(&current, "peer file import parent")?;
+    }
+    Ok(())
+}
+
+fn inspect_quarantine_layout(workspace_root: &Path) -> Result<PathBuf> {
+    let crumb = workspace_root.join(".crumb");
+    inspect_directory(&crumb, "receiver metadata root")?;
+    let a2a = crumb.join("a2a");
+    inspect_directory(&a2a, "receiver A2A metadata root")?;
+    inspect_directory(&a2a.join("quarantine"), "receiver quarantine root")?;
+    inspect_directory(
+        &a2a.join(QUARANTINE_RECEIPT_DIRECTORY),
+        "peer quarantine receipt root",
+    )?;
+    Ok(a2a)
+}
+
+fn acquire_quarantine_lock(a2a_root: &Path) -> Result<File> {
+    let file = open_lock_file(&a2a_root.join(".quarantine.lock"))?;
+    file.lock()
+        .context("receiver quarantine lock could not be acquired")?;
+    Ok(file)
+}
+
+fn quarantine_receipt_filename(part_index: usize) -> Result<String> {
+    if part_index == 0 || part_index > MAX_PARTS {
+        bail!("peer quarantine part index is outside the supported message range");
+    }
+    Ok(format!("part-{part_index}.json"))
+}
+
+fn persist_quarantine_receipt(a2a_root: &Path, receipt: &QuarantineReceipt) -> Result<()> {
+    receipt.validate()?;
+    let root = a2a_root.join(QUARANTINE_RECEIPT_DIRECTORY);
+    ensure_private_directory(&root)?;
+    let delivery_root = root.join(&receipt.delivery_id);
+    let path = delivery_root.join(quarantine_receipt_filename(receipt.part_index)?);
+    let delivery_exists = path_exists_without_following(&delivery_root)?;
+    if delivery_exists {
+        inspect_directory(&delivery_root, "peer quarantine receipt delivery root")?;
+    }
+    if delivery_exists && path_exists_without_following(&path)? {
+        let existing: QuarantineReceipt = read_required_json(
+            &path,
+            MAX_QUARANTINE_RECEIPT_BYTES,
+            "peer quarantine receipt",
+        )?;
+        existing.validate()?;
+        if !existing.matches_verified_claim(receipt) {
+            bail!("peer quarantine receipt conflicts with existing verified content");
+        }
+        return Ok(());
+    }
+    if count_quarantine_receipts(&root)? >= MAX_QUARANTINED_ARTIFACTS {
+        bail!("local A2A quarantine receipt limit has been reached");
+    }
+    if !delivery_exists {
+        ensure_private_directory(&delivery_root)?;
+    }
+    atomic_write_new_json(&delivery_root, &path, receipt, MAX_QUARANTINE_RECEIPT_BYTES)
+}
+
+fn read_quarantine_receipt(
+    a2a_root: &Path,
+    delivery_id: &str,
+    part_index: usize,
+) -> Result<(QuarantineReceipt, PathBuf)> {
+    validate_delivery_id(delivery_id)?;
+    let root = a2a_root.join(QUARANTINE_RECEIPT_DIRECTORY);
+    inspect_directory(&root, "peer quarantine receipt root")?;
+    let delivery_root = root.join(delivery_id);
+    inspect_directory(&delivery_root, "peer quarantine receipt delivery root")?;
+    let path = delivery_root.join(quarantine_receipt_filename(part_index)?);
+    let receipt: QuarantineReceipt = read_required_json(
+        &path,
+        MAX_QUARANTINE_RECEIPT_BYTES,
+        "peer quarantine receipt",
+    )?;
+    receipt.validate()?;
+    if receipt.delivery_id != delivery_id || receipt.part_index != part_index {
+        bail!("peer quarantine receipt does not match its requested identity");
+    }
+    Ok((receipt, path))
+}
+
+fn quarantine_artifact_path(a2a_root: &Path, receipt: &QuarantineReceipt) -> Result<PathBuf> {
+    receipt.validate()?;
+    let delivery_root = a2a_root.join("quarantine").join(&receipt.delivery_id);
+    inspect_directory(&delivery_root, "receiver quarantine delivery root")?;
+    let digest_root = delivery_root.join(&receipt.sha256);
+    inspect_directory(&digest_root, "receiver quarantine digest root")?;
+    Ok(digest_root.join(&receipt.filename))
+}
+
+fn verify_quarantine_artifact(path: &Path, receipt: &QuarantineReceipt) -> Result<()> {
+    let mut file = open_regular_file_without_replacement(path, "receiver quarantine artifact")?;
+    let (digest, size) = hash_file(&mut file)?;
+    if digest != receipt.sha256 || size != receipt.size_bytes {
+        bail!("receiver quarantine artifact bytes no longer match its receipt");
+    }
+    Ok(())
+}
+
+fn hash_file(source: &mut File) -> Result<(String, u64)> {
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 32 * 1024].into_boxed_slice();
+    let mut size = 0_u64;
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .context("quarantine artifact could not be read")?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(u64::try_from(read).context("artifact chunk size is unsupported")?)
+            .context("quarantine artifact size overflowed")?;
+        if size > MAX_ARTIFACT_BYTES {
+            bail!("quarantine artifact exceeds the 8 MiB limit");
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok((format!("{:x}", digest.finalize()), size))
+}
+
+fn count_quarantine_receipts(root: &Path) -> Result<usize> {
+    let mut count = 0_usize;
+    let mut delivery_count = 0_usize;
+    for delivery in fs::read_dir(root).context("peer quarantine receipt root could not be read")? {
+        let delivery =
+            delivery.context("peer quarantine receipt delivery entry could not be read")?;
+        let delivery_id = delivery
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("peer quarantine receipt delivery ID is not UTF-8"))?;
+        validate_delivery_id(&delivery_id)?;
+        inspect_directory(&delivery.path(), "peer quarantine receipt delivery root")?;
+        delivery_count = delivery_count.saturating_add(1);
+        if delivery_count > MAX_QUARANTINED_ARTIFACTS {
+            bail!("local A2A quarantine receipt directory limit has been exceeded");
+        }
+        for path in visible_regular_entries(
+            &delivery.path(),
+            MAX_QUARANTINED_ARTIFACTS,
+            "quarantine receipt delivery root",
+        )? {
+            let receipt: QuarantineReceipt = read_required_json(
+                &path,
+                MAX_QUARANTINE_RECEIPT_BYTES,
+                "peer quarantine receipt",
+            )?;
+            receipt.validate()?;
+            if receipt.delivery_id != delivery_id
+                || path.file_name()
+                    != Some(quarantine_receipt_filename(receipt.part_index)?.as_ref())
+            {
+                bail!("peer quarantine receipt does not match its storage path");
+            }
+            count = count.saturating_add(1);
+            if count > MAX_QUARANTINED_ARTIFACTS {
+                bail!("local A2A quarantine receipt limit has been exceeded");
+            }
+        }
+    }
+    Ok(count.max(delivery_count))
+}
+
+fn receipt_directory_has_reference(
+    directory: &Path,
+    excluded: &Path,
+    target: &QuarantineReceipt,
+) -> Result<bool> {
+    for path in visible_regular_entries(
+        directory,
+        MAX_QUARANTINED_ARTIFACTS,
+        "quarantine receipt delivery root",
+    )? {
+        if path == excluded {
+            continue;
+        }
+        let receipt: QuarantineReceipt = read_required_json(
+            &path,
+            MAX_QUARANTINE_RECEIPT_BYTES,
+            "peer quarantine receipt",
+        )?;
+        receipt.validate()?;
+        if receipt.delivery_id != target.delivery_id {
+            bail!("peer quarantine receipt is stored under the wrong delivery");
+        }
+        if path.file_name() != Some(quarantine_receipt_filename(receipt.part_index)?.as_ref()) {
+            bail!("peer quarantine receipt does not match its storage path");
+        }
+        if receipt.sha256 == target.sha256 && receipt.filename == target.filename {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn cleanup_quarantine_receipt(a2a_root: &Path, receipt: &QuarantineReceipt) {
+    let artifact_digest = a2a_root
+        .join("quarantine")
+        .join(&receipt.delivery_id)
+        .join(&receipt.sha256);
+    let artifact_delivery = a2a_root.join("quarantine").join(&receipt.delivery_id);
+    remove_empty_quarantine_directories(&artifact_digest, &artifact_delivery);
+    let receipt_delivery = a2a_root
+        .join(QUARANTINE_RECEIPT_DIRECTORY)
+        .join(&receipt.delivery_id);
+    let _ = fs::remove_dir(receipt_delivery);
+}
+
 fn validate_instance_id(value: &str) -> Result<()> {
     validate_prefixed_hex(
         value,
@@ -2462,6 +2917,57 @@ fn copy_and_hash(
             .context("temporary artifact could not be written")?;
     }
     Ok((format!("{:x}", digest.finalize()), size))
+}
+
+fn copy_verified_artifact_into_quarantine(
+    source: &mut File,
+    digest_directory: &Path,
+    destination: &Path,
+    expected_digest: &str,
+    expected_size: u64,
+) -> Result<bool> {
+    let mut temporary = tempfile::NamedTempFile::new_in(digest_directory)
+        .context("temporary quarantine artifact could not be created")?;
+    set_private_permissions(temporary.as_file())?;
+    let (actual_digest, actual_size) = copy_and_hash(source, &mut temporary)?;
+    if actual_digest != expected_digest || actual_size != expected_size {
+        bail!("staged peer artifact bytes do not match the delivery claim");
+    }
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .context("temporary quarantine artifact could not sync")?;
+    let created = match temporary.persist_noclobber(destination) {
+        Ok(_) => {
+            sync_directory(digest_directory)
+                .context("quarantine digest directory could not sync")?;
+            true
+        }
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            verify_existing_artifact(destination, expected_digest, expected_size)?;
+            false
+        }
+        Err(error) => {
+            return Err(error.error).context("artifact could not be atomically quarantined");
+        }
+    };
+    Ok(created)
+}
+
+fn remove_exact_unreferenced_quarantine_artifact(
+    artifact: &Path,
+    digest_directory: &Path,
+    delivery_directory: &Path,
+    expected_digest: &str,
+    expected_size: u64,
+) -> Result<()> {
+    verify_existing_artifact(artifact, expected_digest, expected_size)
+        .context("new quarantine artifact changed before receipt rollback")?;
+    remove_regular_file(artifact, "unreferenced receiver quarantine artifact")?;
+    sync_directory(digest_directory)
+        .context("quarantine digest directory could not sync after receipt rollback")?;
+    remove_empty_quarantine_directories(digest_directory, delivery_directory);
+    Ok(())
 }
 
 fn verify_existing_artifact(path: &Path, expected_digest: &str, expected_size: u64) -> Result<()> {
@@ -3984,6 +4490,271 @@ mod tests {
             0
         );
         assert_eq!(count_visible_entries(&acknowledged).expect("ack count"), 0);
+        discard_quarantined_artifact(&receiver_workspace, &receipt.delivery_id, 2)
+            .expect("discard while delivery remains pending");
+        assert_eq!(
+            bus.list_pending(&second_registration)
+                .expect("pending")
+                .len(),
+            1
+        );
+        assert_eq!(count_visible_entries(&acknowledged).expect("ack count"), 0);
+    }
+
+    #[test]
+    fn durable_quarantine_receipt_imports_after_ack_without_overwrite_or_queue_changes() {
+        let (temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let sender_workspace = temporary.path().join("receipt-source");
+        let receiver_workspace = temporary.path().join("receipt-target");
+        fs::create_dir(&sender_workspace).expect("sender workspace");
+        fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        fs::create_dir(receiver_workspace.join("imports")).expect("import directory");
+        fs::write(sender_workspace.join("report.txt"), b"durable receipt\n").expect("source");
+        let staged = bus
+            .stage_artifact(
+                &first_registration,
+                &sender_workspace,
+                Path::new("report.txt"),
+            )
+            .expect("stage");
+        let receipt = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &file_request("msg-durable-receipt", &staged),
+            )
+            .expect("enqueue");
+        bus.quarantine_artifact(
+            &second_registration,
+            &receiver_workspace,
+            &receipt.delivery_id,
+            2,
+        )
+        .expect("fetch into quarantine");
+        let claimed = bus
+            .claim_pending(&second_registration, &receipt.delivery_id)
+            .expect("claim original delivery");
+        bus.acknowledge(&second_registration, &claimed.delivery_id)
+            .expect("ack original delivery");
+
+        let imported = import_quarantined_artifact(
+            &receiver_workspace,
+            &receipt.delivery_id,
+            2,
+            Path::new("imports/report.txt"),
+        )
+        .expect("import from durable receipt");
+        assert_eq!(imported.sha256, staged.sha256);
+        assert_eq!(imported.size_bytes, staged.size_bytes);
+        assert_eq!(
+            fs::read(receiver_workspace.join(&imported.relative_destination))
+                .expect("imported bytes"),
+            b"durable receipt\n"
+        );
+        assert!(
+            import_quarantined_artifact(
+                &receiver_workspace,
+                &receipt.delivery_id,
+                2,
+                Path::new("imports/report.txt"),
+            )
+            .is_err(),
+            "import must never overwrite an existing destination"
+        );
+        assert_eq!(
+            bus.list_pending(&second_registration).expect("pending"),
+            Vec::<PendingDeliverySummary>::new()
+        );
+        let (_pending, processing, acknowledged) = bus
+            .queue_directories(second_registration.instance_id())
+            .expect("inbox");
+        assert_eq!(
+            count_visible_entries(&processing).expect("processing count"),
+            0
+        );
+        assert_eq!(count_visible_entries(&acknowledged).expect("ack count"), 1);
+
+        let discarded = discard_quarantined_artifact(&receiver_workspace, &receipt.delivery_id, 2)
+            .expect("discard fetched artifact");
+        assert_eq!(discarded.sha256, staged.sha256);
+        assert!(receiver_workspace.join("imports/report.txt").is_file());
+        assert_eq!(
+            bus.list_pending(&second_registration).expect("pending"),
+            Vec::<PendingDeliverySummary>::new()
+        );
+        assert_eq!(count_visible_entries(&acknowledged).expect("ack count"), 1);
+        assert!(
+            discard_quarantined_artifact(&receiver_workspace, &receipt.delivery_id, 2).is_err()
+        );
+    }
+
+    #[test]
+    fn quarantine_refetch_rejects_a_receipt_swapped_to_another_sender_identity() {
+        let (temporary, bus, first, second, first_registration, second_registration) = setup();
+        let sender_workspace = temporary.path().join("sender-bound-source");
+        let receiver_workspace = temporary.path().join("sender-bound-target");
+        fs::create_dir(&sender_workspace).expect("sender workspace");
+        fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        fs::write(sender_workspace.join("bound.bin"), b"sender-bound bytes").expect("source");
+        let staged = bus
+            .stage_artifact(
+                &first_registration,
+                &sender_workspace,
+                Path::new("bound.bin"),
+            )
+            .expect("stage");
+        let delivery = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &file_request("msg-sender-bound", &staged),
+            )
+            .expect("enqueue");
+        bus.quarantine_artifact(
+            &second_registration,
+            &receiver_workspace,
+            &delivery.delivery_id,
+            2,
+        )
+        .expect("initial fetch");
+
+        let a2a = receiver_workspace.join(".crumb").join("a2a");
+        let (mut stored, receipt_path) =
+            read_quarantine_receipt(&a2a, &delivery.delivery_id, 2).expect("stored receipt");
+        assert_eq!(stored.sender_instance_id, first.instance_id);
+        stored.sender_instance_id.clone_from(&second.instance_id);
+        stored
+            .validate()
+            .expect("alternate sender is structurally valid");
+        atomic_replace_json(
+            receipt_path.parent().expect("receipt directory"),
+            &receipt_path,
+            &stored,
+            MAX_QUARANTINE_RECEIPT_BYTES,
+        )
+        .expect("swap receipt sender");
+
+        let error = bus
+            .quarantine_artifact(
+                &second_registration,
+                &receiver_workspace,
+                &delivery.delivery_id,
+                2,
+            )
+            .expect_err("sender-swapped receipt must be rejected");
+        assert!(error.to_string().contains("conflicts"));
+        assert_eq!(
+            bus.list_pending(&second_registration)
+                .expect("pending")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn quarantine_import_rejects_unsafe_paths_and_tampered_bytes() {
+        let (temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let sender_workspace = temporary.path().join("import-safety-source");
+        let receiver_workspace = temporary.path().join("import-safety-target");
+        fs::create_dir(&sender_workspace).expect("sender workspace");
+        fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        fs::create_dir(receiver_workspace.join("existing-parent")).expect("existing parent");
+        fs::write(sender_workspace.join("safe.bin"), b"safe bytes").expect("source");
+        fs::write(receiver_workspace.join("existing.bin"), b"keep me").expect("existing target");
+        let staged = bus
+            .stage_artifact(
+                &first_registration,
+                &sender_workspace,
+                Path::new("safe.bin"),
+            )
+            .expect("stage");
+        let receipt = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &file_request("msg-import-safety", &staged),
+            )
+            .expect("enqueue");
+        let fetched = bus
+            .quarantine_artifact(
+                &second_registration,
+                &receiver_workspace,
+                &receipt.delivery_id,
+                2,
+            )
+            .expect("fetch");
+
+        for destination in [
+            Path::new("../escape.bin"),
+            Path::new("/absolute.bin"),
+            Path::new(".crumb/escape.bin"),
+            Path::new(".git/escape.bin"),
+            Path::new("nested/.git/escape.bin"),
+            Path::new("missing-parent/file.bin"),
+            Path::new("existing.bin"),
+        ] {
+            assert!(
+                import_quarantined_artifact(
+                    &receiver_workspace,
+                    &receipt.delivery_id,
+                    2,
+                    destination,
+                )
+                .is_err(),
+                "accepted unsafe destination {destination:?}"
+            );
+        }
+        assert_eq!(
+            fs::read(receiver_workspace.join("existing.bin")).expect("existing target"),
+            b"keep me"
+        );
+
+        let imported = import_quarantined_artifact(
+            &receiver_workspace,
+            &receipt.delivery_id,
+            2,
+            Path::new("existing-parent/valid.bin"),
+        )
+        .expect("safe import");
+        assert_eq!(imported.sha256, staged.sha256);
+        assert_eq!(
+            bus.list_pending(&second_registration)
+                .expect("pending")
+                .len(),
+            1
+        );
+
+        fs::write(receiver_workspace.join(&fetched.relative_path), b"tampered")
+            .expect("tamper quarantine");
+        assert!(
+            import_quarantined_artifact(
+                &receiver_workspace,
+                &receipt.delivery_id,
+                2,
+                Path::new("existing-parent/import.bin"),
+            )
+            .is_err()
+        );
+        assert!(
+            discard_quarantined_artifact(&receiver_workspace, &receipt.delivery_id, 2).is_err()
+        );
+        fs::remove_file(receiver_workspace.join(&fetched.relative_path))
+            .expect("remove quarantine artifact");
+        assert!(
+            discard_quarantined_artifact(&receiver_workspace, &receipt.delivery_id, 2).is_err(),
+            "discard must not remove a receipt when its verified artifact is missing"
+        );
+        assert!(
+            !receiver_workspace
+                .join("existing-parent/import.bin")
+                .exists()
+        );
+        assert_eq!(
+            bus.list_pending(&second_registration)
+                .expect("pending")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -4030,6 +4801,65 @@ mod tests {
                 .join("quarantine")
                 .join(&receipt.delivery_id)
                 .exists()
+        );
+    }
+
+    #[test]
+    fn quarantine_rolls_back_a_new_artifact_when_receipt_persistence_fails() {
+        let (temporary, bus, first, second, first_registration, second_registration) = setup();
+        let sender_workspace = temporary.path().join("receipt-capacity-source");
+        let receiver_workspace = temporary.path().join("receipt-capacity-target");
+        fs::create_dir(&sender_workspace).expect("sender workspace");
+        fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        fs::write(sender_workspace.join("new.bin"), b"new verified artifact").expect("source");
+        let staged = bus
+            .stage_artifact(&first_registration, &sender_workspace, Path::new("new.bin"))
+            .expect("stage");
+        let delivery = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &file_request("msg-receipt-capacity", &staged),
+            )
+            .expect("enqueue");
+        let a2a = receiver_workspace.join(".crumb").join("a2a");
+        fs::create_dir_all(&a2a).expect("receiver A2A metadata root");
+        for index in 0..MAX_QUARANTINED_ARTIFACTS {
+            let fixture = quarantine_receipt(
+                &format!("delivery_{:064x}", index + 1),
+                1,
+                &first.instance_id,
+                u64::try_from(index).expect("fixture timestamp") + 1,
+                &format!("{:064x}", index + 1_000),
+                7,
+                &format!("artifact-{index}.bin"),
+            );
+            persist_quarantine_receipt(&a2a, &fixture).expect("fixture receipt");
+        }
+
+        let error = bus
+            .quarantine_artifact(
+                &second_registration,
+                &receiver_workspace,
+                &delivery.delivery_id,
+                2,
+            )
+            .expect_err("receipt capacity must fail the fetch");
+        assert!(error.to_string().contains("receipt limit"));
+        assert!(
+            !receiver_workspace
+                .join(".crumb")
+                .join("a2a")
+                .join("quarantine")
+                .join(&delivery.delivery_id)
+                .exists(),
+            "new artifact must be rolled back when its receipt cannot persist"
+        );
+        assert_eq!(
+            bus.list_pending(&second_registration)
+                .expect("pending")
+                .len(),
+            1
         );
     }
 
@@ -4479,5 +5309,53 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_import_rejects_symlinked_destination_parent() {
+        use std::os::unix::fs::symlink;
+
+        let (temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let sender_workspace = temporary.path().join("symlink-import-source");
+        let receiver_workspace = temporary.path().join("symlink-import-target");
+        let outside = temporary.path().join("outside-import-target");
+        fs::create_dir(&sender_workspace).expect("sender workspace");
+        fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        fs::create_dir(&outside).expect("outside directory");
+        symlink(&outside, receiver_workspace.join("linked-parent")).expect("parent symlink");
+        fs::write(sender_workspace.join("file.bin"), b"verified").expect("source");
+        let staged = bus
+            .stage_artifact(
+                &first_registration,
+                &sender_workspace,
+                Path::new("file.bin"),
+            )
+            .expect("stage");
+        let receipt = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &file_request("msg-symlink-import", &staged),
+            )
+            .expect("enqueue");
+        bus.quarantine_artifact(
+            &second_registration,
+            &receiver_workspace,
+            &receipt.delivery_id,
+            2,
+        )
+        .expect("fetch");
+
+        assert!(
+            import_quarantined_artifact(
+                &receiver_workspace,
+                &receipt.delivery_id,
+                2,
+                Path::new("linked-parent/file.bin"),
+            )
+            .is_err()
+        );
+        assert!(!outside.join("file.bin").exists());
     }
 }

@@ -423,6 +423,23 @@ pub struct PeerQuarantinedFile {
     pub relative_path: PathBuf,
 }
 
+/// Receiver-approved import result with no transport or absolute paths.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerImportedFile {
+    pub relative_destination: PathBuf,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+/// Content-free result of discarding one exact quarantine receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerDiscardedFile {
+    pub delivery_id: String,
+    pub part_index: usize,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
 /// Safe, URL-free projection of one peer-provided message part.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PeerInspectionPart {
@@ -929,6 +946,52 @@ impl AgentRuntime {
             sha256: artifact.sha256,
             size_bytes: artifact.size_bytes,
             relative_path: artifact.relative_path,
+        })
+    }
+
+    /// Imports a previously fetched peer file into one safe relative workspace
+    /// destination without exposing the operation as a model tool.
+    pub fn import_peer_file(
+        &self,
+        delivery_id: &str,
+        part_index: usize,
+        relative_destination: &Path,
+    ) -> Result<PeerImportedFile> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        let imported = peer.runtime.import_quarantined_artifact(
+            delivery_id,
+            part_index,
+            relative_destination,
+        )?;
+        Ok(PeerImportedFile {
+            relative_destination: imported.relative_destination,
+            sha256: imported.sha256,
+            size_bytes: imported.size_bytes,
+        })
+    }
+
+    /// Discards one exact fetched peer file and durable receipt without
+    /// changing its original delivery or invoking a model.
+    pub fn discard_peer_file(
+        &self,
+        delivery_id: &str,
+        part_index: usize,
+    ) -> Result<PeerDiscardedFile> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        let discarded = peer
+            .runtime
+            .discard_quarantined_artifact(delivery_id, part_index)?;
+        Ok(PeerDiscardedFile {
+            delivery_id: discarded.delivery_id,
+            part_index: discarded.part_index,
+            sha256: discarded.sha256,
+            size_bytes: discarded.size_bytes,
         })
     }
 
@@ -3048,6 +3111,9 @@ mod tests {
                 .descriptor("read_file"),
             None
         );
+        let host = ToolHost::default();
+        assert!(host.descriptor("import_peer_file").is_none());
+        assert!(host.descriptor("discard_peer_file").is_none());
         sender.shutdown().expect("sender stops");
     }
 

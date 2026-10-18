@@ -103,9 +103,9 @@ mod provider_projection;
 mod shell_completion;
 
 use agent_runtime::{
-    AgentRuntime, PeerDeliveryInspection, PeerInspectionKind, PeerInspectionPart,
-    PeerQuarantinedFile, PeerResponseSummary, PeerTaskSummary, PeerTurnStatus, ResumeContinuity,
-    apply_selected_profile, validate_skill_path,
+    AgentRuntime, PeerDeliveryInspection, PeerDiscardedFile, PeerImportedFile, PeerInspectionKind,
+    PeerInspectionPart, PeerQuarantinedFile, PeerResponseSummary, PeerTaskSummary, PeerTurnStatus,
+    ResumeContinuity, apply_selected_profile, validate_skill_path,
 };
 use completion::{COMPLETION_PALETTE_ROWS, CompletionWorkspace, CrumbCompleter};
 use context::{parse_attachment, resolve_request_context};
@@ -1042,9 +1042,14 @@ fn handle_repl_event(
             Ok(None)
         }
         InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
-            if command == "/peer file fetch" || command.starts_with("/peer file fetch ") =>
+            if command == "/peer file fetch"
+                || command.starts_with("/peer file fetch ")
+                || command == "/peer file import"
+                || command.starts_with("/peer file import ")
+                || command == "/peer file discard"
+                || command.starts_with("/peer file discard ") =>
         {
-            handle_peer_file_fetch(&command, context)?;
+            handle_peer_file_command(&command, context)?;
             Ok(None)
         }
         InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
@@ -5572,6 +5577,19 @@ fn show_peer_help(writer: &mut dyn Write) -> Result<()> {
     )?;
     writeln!(
         writer,
+        "  /peer file import <delivery-id> <part-index> <relative-destination>"
+    )?;
+    writeln!(
+        writer,
+        "               import verified bytes without overwriting workspace files"
+    )?;
+    writeln!(writer, "  /peer file discard <delivery-id> <part-index>")?;
+    writeln!(
+        writer,
+        "               discard one exact quarantine artifact and receipt"
+    )?;
+    writeln!(
+        writer,
         "  Ask Crumb to message a peer or share a relative workspace file; each outbound exchange is approval-gated."
     )?;
     writeln!(
@@ -5743,22 +5761,8 @@ fn handle_peer_action(command: &str, context: &mut InputContext<'_>) -> Result<(
     )
 }
 
-fn handle_peer_file_fetch(command: &str, context: &mut InputContext<'_>) -> Result<()> {
-    let arguments = command
-        .strip_prefix("/peer file fetch ")
-        .context("usage: /peer file fetch <delivery-id> <part-index>")?;
-    let mut fields = arguments.split_whitespace();
-    let delivery_id = fields
-        .next()
-        .context("usage: /peer file fetch <delivery-id> <part-index>")?;
-    let part_index = fields
-        .next()
-        .context("usage: /peer file fetch <delivery-id> <part-index>")?
-        .parse::<usize>()
-        .context("peer file part index must be a positive integer")?;
-    if fields.next().is_some() || part_index == 0 {
-        bail!("usage: /peer file fetch <delivery-id> <part-index>");
-    }
+fn handle_peer_file_command(command: &str, context: &mut InputContext<'_>) -> Result<()> {
+    let (action, delivery_id, part_index, destination) = parse_peer_file_command(command)?;
     exact_peer_delivery_id(delivery_id)?;
     initialize_optional_peer_runtime(context.agent_runtime, context.cwd, context.writer)?;
     let workspace = instance_workspace(context.cwd)?;
@@ -5774,12 +5778,34 @@ fn handle_peer_file_fetch(command: &str, context: &mut InputContext<'_>) -> Resu
             artifact_count: 1,
         })
     )?;
-    let artifact = context
+    let runtime = context
         .agent_runtime
         .as_ref()
-        .context("local A2A runtime is unavailable")?
-        .quarantine_peer_file(delivery_id, part_index)
-        .context("peer file could not be verified into quarantine")?;
+        .context("local A2A runtime is unavailable")?;
+    let details = match action {
+        "fetch" => format_peer_quarantined_file(
+            &runtime
+                .quarantine_peer_file(delivery_id, part_index)
+                .context("peer file could not be verified into quarantine")?,
+        ),
+        "import" => format_peer_imported_file(
+            &runtime
+                .import_peer_file(
+                    delivery_id,
+                    part_index,
+                    destination
+                        .as_deref()
+                        .context("peer import destination is unavailable")?,
+                )
+                .context("peer file could not be imported safely")?,
+        ),
+        "discard" => format_peer_discarded_file(
+            &runtime
+                .discard_peer_file(delivery_id, part_index)
+                .context("peer file could not be discarded safely")?,
+        ),
+        _ => unreachable!("validated peer file action"),
+    };
     writeln!(
         context.writer,
         "{}",
@@ -5791,7 +5817,6 @@ fn handle_peer_file_fetch(command: &str, context: &mut InputContext<'_>) -> Resu
             artifact_count: 1,
         })
     )?;
-    let details = format_peer_quarantined_file(&artifact);
     let width = size().map_or(80, |(columns, _)| columns);
     writeln!(
         context.writer,
@@ -5803,6 +5828,51 @@ fn handle_peer_file_fetch(command: &str, context: &mut InputContext<'_>) -> Resu
     Ok(())
 }
 
+fn parse_peer_file_command(command: &str) -> Result<(&str, &str, usize, Option<PathBuf>)> {
+    let (action, arguments, usage) =
+        if let Some(arguments) = command.strip_prefix("/peer file fetch ") {
+            (
+                "fetch",
+                arguments,
+                "/peer file fetch <delivery-id> <part-index>",
+            )
+        } else if let Some(arguments) = command.strip_prefix("/peer file import ") {
+            (
+                "import",
+                arguments,
+                "/peer file import <delivery-id> <part-index> <relative-destination>",
+            )
+        } else if let Some(arguments) = command.strip_prefix("/peer file discard ") {
+            (
+                "discard",
+                arguments,
+                "/peer file discard <delivery-id> <part-index>",
+            )
+        } else if command == "/peer file import" {
+            bail!("usage: /peer file import <delivery-id> <part-index> <relative-destination>");
+        } else if command == "/peer file discard" {
+            bail!("usage: /peer file discard <delivery-id> <part-index>");
+        } else {
+            bail!("usage: /peer file fetch <delivery-id> <part-index>");
+        };
+    let mut fields = arguments.split_whitespace();
+    let delivery_id = fields.next().with_context(|| format!("usage: {usage}"))?;
+    let part_index = fields
+        .next()
+        .with_context(|| format!("usage: {usage}"))?
+        .parse::<usize>()
+        .context("peer file part index must be a positive integer")?;
+    let destination = if action == "import" {
+        fields.next().map(PathBuf::from)
+    } else {
+        None
+    };
+    if fields.next().is_some() || part_index == 0 || (action == "import" && destination.is_none()) {
+        bail!("usage: {usage}");
+    }
+    Ok((action, delivery_id, part_index, destination))
+}
+
 fn format_peer_quarantined_file(artifact: &PeerQuarantinedFile) -> String {
     format!(
         "delivery  {}\nsha256    {}\nsize      {} B\nquarantine {}",
@@ -5810,6 +5880,22 @@ fn format_peer_quarantined_file(artifact: &PeerQuarantinedFile) -> String {
         artifact.sha256,
         artifact.size_bytes,
         artifact.relative_path.display()
+    )
+}
+
+fn format_peer_imported_file(artifact: &PeerImportedFile) -> String {
+    format!(
+        "destination {}\nsha256     {}\nsize       {} B",
+        artifact.relative_destination.display(),
+        artifact.sha256,
+        artifact.size_bytes,
+    )
+}
+
+fn format_peer_discarded_file(artifact: &PeerDiscardedFile) -> String {
+    format!(
+        "delivery  {}\npart      {}\nsha256    {}\nsize      {} B",
+        artifact.delivery_id, artifact.part_index, artifact.sha256, artifact.size_bytes,
     )
 }
 
@@ -12059,11 +12145,11 @@ mod tests {
         composer_anchor_sequence, configure_permissions, configure_plugin, effort_display_name,
         effort_wire_name, ensure_single_release_skill_install, exact_skill_manifest_url,
         exact_skill_run_config, failed_command_recovery, finished_tool_activity,
-        fixed_footer_frame, format_peer_inbox, format_peer_inspection,
-        format_peer_quarantined_file, format_peer_task, handle_skill_command,
-        initial_agent_activity, install_marketplace_package, load_exact_skill_manifest,
-        marketplace_update_blocker, normalize_bundled_skill_install, openrouter_preset,
-        parse_cli_skill_run, parse_credential_reference, parse_exec_request,
+        fixed_footer_frame, format_peer_discarded_file, format_peer_imported_file,
+        format_peer_inbox, format_peer_inspection, format_peer_quarantined_file, format_peer_task,
+        handle_skill_command, initial_agent_activity, install_marketplace_package,
+        load_exact_skill_manifest, marketplace_update_blocker, normalize_bundled_skill_install,
+        openrouter_preset, parse_cli_skill_run, parse_credential_reference, parse_exec_request,
         parse_interactive_skill_run, parse_paused_submission, parse_provider_header,
         parse_resume_session_argument, read_agent_config, read_bounded_response,
         register_local_skill, render_skill_discovery_search, resolve_memory_keep,
@@ -12074,8 +12160,8 @@ mod tests {
         visible_tool_activity, workspace_read_host, write_bounded_response_delta_for_width,
     };
     use crate::agent_runtime::{
-        PeerDeliveryInspection, PeerInboxSummary, PeerInspectionKind, PeerInspectionPart,
-        PeerQuarantinedFile, PeerTaskSummary,
+        PeerDeliveryInspection, PeerDiscardedFile, PeerImportedFile, PeerInboxSummary,
+        PeerInspectionKind, PeerInspectionPart, PeerQuarantinedFile, PeerTaskSummary,
     };
 
     #[test]
@@ -13473,6 +13559,33 @@ mod tests {
         assert!(!output.contains("/home/"));
         assert!(!output.contains("/tmp/local-a2a-bus"));
         assert!(!output.contains("artifacts/"));
+    }
+
+    #[test]
+    fn peer_file_import_and_discard_output_never_expose_transport_paths() {
+        let imported = format_peer_imported_file(&PeerImportedFile {
+            relative_destination: PathBuf::from("imports/file.txt"),
+            sha256: "cd".repeat(32),
+            size_bytes: 91,
+        });
+        assert!(imported.contains("imports/file.txt"));
+        assert!(imported.contains(&"cd".repeat(32)));
+        assert!(imported.contains("91 B"));
+        assert!(!imported.contains("delivery_"));
+        assert!(!imported.contains("/home/"));
+        assert!(!imported.contains("artifacts/"));
+
+        let discarded = format_peer_discarded_file(&PeerDiscardedFile {
+            delivery_id: "delivery_0123456789abcdef".to_owned(),
+            part_index: 2,
+            sha256: "ef".repeat(32),
+            size_bytes: 91,
+        });
+        assert!(discarded.contains("delivery_0123456789abcdef"));
+        assert!(discarded.contains("part      2"));
+        assert!(!discarded.contains("/home/"));
+        assert!(!discarded.contains("artifacts/"));
+        assert!(!discarded.contains("quarantine/"));
     }
 
     #[test]
