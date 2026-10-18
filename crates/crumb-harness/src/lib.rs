@@ -449,13 +449,7 @@ impl NativeHarness {
         let (mut completeness_retry_used, mut suppress_tools_once) = (false, false);
 
         loop {
-            if metrics.model_rounds == self.limits.max_model_rounds.get() {
-                return Err(HarnessError::new(
-                    HarnessErrorKind::ModelRoundLimit,
-                    "model round limit reached",
-                ));
-            }
-            metrics.model_rounds += 1;
+            begin_model_round(metrics, self.limits.max_model_rounds)?;
             let tool_choice = (require_tool, suppress_tools_once);
             let request = build_request(&turn, &messages, &definitions, tool_choice);
             let mut round = self
@@ -663,6 +657,17 @@ impl NativeHarness {
             success,
         })
     }
+}
+
+fn begin_model_round(metrics: &mut TurnMetrics, maximum: NonZeroUsize) -> Result<(), HarnessError> {
+    if metrics.model_rounds == maximum.get() {
+        return Err(HarnessError::new(
+            HarnessErrorKind::ModelRoundLimit,
+            "model round limit reached",
+        ));
+    }
+    metrics.model_rounds += 1;
+    Ok(())
 }
 
 fn tool_definitions_for_turn(tools: &ToolHost, user_message: &str) -> Vec<ToolDefinition> {
@@ -1271,37 +1276,10 @@ fn prepare_completeness_retry(
 fn missing_requested_checks(user_message: &str, response: &str) -> Vec<&'static str> {
     let request = user_message.to_ascii_lowercase();
     let response = response.to_ascii_lowercase();
-    let asks_auth = [
-        "authenticat",
-        "logged in",
-        "logged into",
-        "signed in",
-        "login status",
-        "auth status",
-    ]
-    .iter()
-    .any(|term| request.contains(term));
-    let answers_auth = [
-        "authenticat",
-        "logged in",
-        "logged into",
-        "signed in",
-        "not logged",
-        "not authenticat",
-        "credential",
-    ]
-    .iter()
-    .any(|term| response.contains(term));
     let asks_branch = request.contains("branch");
     let answers_branch = response.contains("branch");
     let mut missing = Vec::new();
-    if asks_auth && !answers_auth {
-        missing.push(if request.contains("github") {
-            "GitHub authentication status"
-        } else {
-            "authentication status"
-        });
-    }
+    append_missing_auth_check(&request, &response, &mut missing);
     if asks_branch && !answers_branch {
         missing.push("current Git branch");
     }
@@ -1380,6 +1358,37 @@ fn missing_requested_checks(user_message: &str, response: &str) -> Vec<&'static 
         }
     }
     missing
+}
+
+fn append_missing_auth_check(request: &str, response: &str, missing: &mut Vec<&'static str>) {
+    let asks_auth = [
+        "authenticat",
+        "logged in",
+        "logged into",
+        "signed in",
+        "login status",
+        "auth status",
+    ]
+    .iter()
+    .any(|term| request.contains(term));
+    let answers_auth = [
+        "authenticat",
+        "logged in",
+        "logged into",
+        "signed in",
+        "not logged",
+        "not authenticat",
+        "credential",
+    ]
+    .iter()
+    .any(|term| response.contains(term));
+    if asks_auth && !answers_auth {
+        missing.push(if request.contains("github") {
+            "GitHub authentication status"
+        } else {
+            "authentication status"
+        });
+    }
 }
 
 fn prepare_research_retry(
@@ -2552,7 +2561,10 @@ mod tests {
             super::missing_requested_checks(request, "The checks are still running."),
             ["terminal wait/watch outcome"]
         );
-        assert!(super::missing_requested_checks(request, "The checks passed.").is_empty());
+        assert_eq!(
+            super::missing_requested_checks(request, "The checks passed."),
+            Vec::<&'static str>::new()
+        );
     }
 
     #[test]
