@@ -69,10 +69,10 @@ use crumb_pty::{PtyInput, PtyResizer, SystemPty, TerminalSize};
 use crumb_repl::{ReplOutcome, read_classified_line};
 use crumb_tools::{
     AgentShellConfig, CheckpointDecision, CheckpointStatus, CheckpointStore, DisposableToolConfig,
-    StackDetectionLimits, WebFetchLimits, WorkspaceToolLimits, WorkspaceWriteLimits,
-    register_current_time_tool, register_disposable_tool, register_shell_tool_with_optimizer,
-    register_stack_detection_tool, register_web_fetch_tool, register_workspace_read_tools,
-    register_workspace_write_tool,
+    GitHubIssueLimits, StackDetectionLimits, WebFetchLimits, WorkspaceToolLimits,
+    WorkspaceWriteLimits, register_current_time_tool, register_disposable_tool,
+    register_github_issue_tool, register_shell_tool_with_optimizer, register_stack_detection_tool,
+    register_web_fetch_tool, register_workspace_read_tools, register_workspace_write_tool,
 };
 use crumb_ui::{GitSegment, PromptContext, Renderer, StartupContext, UiSettings};
 use directories::BaseDirs;
@@ -94,7 +94,7 @@ mod provider_discovery;
 mod provider_projection;
 mod shell_completion;
 
-use agent_runtime::{AgentRuntime, apply_selected_profile, validate_skill_path};
+use agent_runtime::{AgentRuntime, ResumeContinuity, apply_selected_profile, validate_skill_path};
 use completion::{COMPLETION_PALETTE_ROWS, CompletionWorkspace, CrumbCompleter};
 use context::{parse_attachment, resolve_request_context};
 use provider_discovery::{compatibility_diagnostics, discover_models};
@@ -501,6 +501,13 @@ fn workspace_read_host(
     register_web_fetch_tool(
         &mut host,
         WebFetchLimits {
+            timeout: Duration::from_secs(config.limits.max_wall_time_seconds.min(60)),
+            max_output_bytes,
+        },
+    )?;
+    register_github_issue_tool(
+        &mut host,
+        GitHubIssueLimits {
             timeout: Duration::from_secs(config.limits.max_wall_time_seconds.min(60)),
             max_output_bytes,
         },
@@ -3056,6 +3063,7 @@ fn trusted_tool_detail(name: &str, arguments: &serde_json::Value) -> Option<Stri
         "run_shell" => "command",
         "web_search" => "query",
         "web_fetch" => "url",
+        "github_issue" => "target",
         _ => return None,
     };
     let raw = arguments.get(field)?.as_str()?.trim();
@@ -3078,6 +3086,7 @@ fn trusted_tool_detail(name: &str, arguments: &serde_json::Value) -> Option<Stri
         "run_shell" => format!("$ {detail}"),
         "web_search" => format!("search: {detail}"),
         "web_fetch" => format!("fetch: {detail}"),
+        "github_issue" => format!("GitHub: {detail}"),
         _ => detail,
     })
 }
@@ -3865,6 +3874,7 @@ fn visible_tool_activity(name: &str, detail: Option<&str>) -> String {
         ("write_file", Some(path)) => format!("Editing file · {path}"),
         ("web_search", Some(query)) => format!("Searching web · {query}"),
         ("web_fetch", Some(url)) => format!("Fetching page · {url}"),
+        ("github_issue", Some(target)) => format!("Fetching GitHub item · {target}"),
         (_, Some(detail)) => format!("{} · {detail}", tool_activity_label(name)),
         (_, None) => tool_activity_label(name),
     }
@@ -3883,6 +3893,8 @@ fn finished_tool_activity(
         ("web_search", false) => "Web search failed",
         ("web_fetch", true) => "Fetched page",
         ("web_fetch", false) => "Page fetch failed",
+        ("github_issue", true) => "Fetched GitHub item",
+        ("github_issue", false) => "GitHub fetch failed",
         ("write_file", true) => "Edited file",
         ("write_file", false) => "Edit failed",
         (_, true) => "Tool completed",
@@ -4470,6 +4482,7 @@ fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         ("run_shell", "workspace process", true),
         ("spawn_agents", "parallel analysis", true),
         ("web_fetch", "network", true),
+        ("github_issue", "network", true),
         (
             "web_search",
             "network",
@@ -4534,8 +4547,15 @@ fn configure_permissions(command: &str, cwd: &Path, writer: &mut dyn Write) -> R
         _ => bail!("unknown permission action `{action}`"),
     };
     match scope {
-        "network" if !matches!(*tool, "web_fetch" | "web_search" | "spawn_agents") => {
-            bail!("network permission tool must be web_fetch, web_search, or spawn_agents");
+        "network"
+            if !matches!(
+                *tool,
+                "web_fetch" | "web_search" | "github_issue" | "spawn_agents"
+            ) =>
+        {
+            bail!(
+                "network permission tool must be web_fetch, web_search, github_issue, or spawn_agents"
+            );
         }
         "workspace" if *tool != "write_file" => {
             bail!("workspace permission tool must be write_file");
@@ -4608,7 +4628,7 @@ fn grant_all_permissions(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         config
             .permissions
             .allow_network_tools
-            .extend(["spawn_agents", "web_fetch", "web_search"].map(str::to_owned));
+            .extend(["spawn_agents", "web_fetch", "web_search", "github_issue"].map(str::to_owned));
         config
             .permissions
             .allow_workspace_tools
@@ -6127,14 +6147,15 @@ fn reattach_job(
     if runtime.is_none() {
         *runtime = Some(AgentRuntime::new()?);
     }
-    runtime
+    let continuity = runtime
         .as_mut()
         .context("agent runtime is unavailable")?
         .resume(cwd, session_id.as_str())?;
     writeln!(
         writer,
-        "◆ Reattached session {} from job {id}",
-        session_id.as_str()
+        "◆ Reattached session {} from job {id}{}",
+        session_id.as_str(),
+        resume_continuity_suffix(continuity)
     )?;
     Ok(())
 }
@@ -6385,11 +6406,22 @@ fn show_sessions(
             if runtime.is_none() {
                 *runtime = Some(AgentRuntime::new()?);
             }
-            runtime
+            let continuity = runtime
                 .as_mut()
                 .context("agent runtime is unavailable")?
                 .resume(cwd, id)?;
-            writeln!(writer, "◆ Resumed session {id}")?;
+            match continuity {
+                ResumeContinuity::AlreadyActive => {
+                    writeln!(writer, "◆ Session {id} is already active")?;
+                }
+                ResumeContinuity::Warm | ResumeContinuity::MetadataOnly => {
+                    writeln!(
+                        writer,
+                        "◆ Resumed session {id}{}",
+                        resume_continuity_suffix(continuity)
+                    )?;
+                }
+            }
         }
         ["search", query @ ..] if !query.is_empty() => {
             show_session_search(&root, &query.join(" "), writer)?;
@@ -6426,6 +6458,14 @@ fn show_sessions(
         )?,
     }
     Ok(())
+}
+
+const fn resume_continuity_suffix(continuity: ResumeContinuity) -> &'static str {
+    match continuity {
+        ResumeContinuity::AlreadyActive => " · already active",
+        ResumeContinuity::Warm => " · warm conversation restored",
+        ResumeContinuity::MetadataOnly => " · metadata only; transcript was not persisted",
+    }
 }
 
 fn show_session_list(root: &Path, writer: &mut dyn Write) -> Result<()> {
@@ -10507,6 +10547,7 @@ mod tests {
             .permissions;
 
         assert!(permissions.allow_network_tools.contains("web_search"));
+        assert!(permissions.allow_network_tools.contains("github_issue"));
         assert!(permissions.allow_workspace_tools.contains("write_file"));
         assert!(permissions.allow_execution_tools.contains("run_shell"));
         assert!(permissions.allow_execution_tools.contains("run_disposable"));
@@ -10682,11 +10723,12 @@ mod tests {
         let host = workspace_read_host(&workspace, &AgentConfig::default(), None)
             .expect("workspace tools are registered");
         let tools = host.tools().collect::<Vec<_>>();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
         for (name, risk) in [
             ("current_time", RiskClass::ReadOnly),
             ("diagnose_last_failure", RiskClass::ReadOnly),
             ("detect_stack", RiskClass::ReadOnly),
+            ("github_issue", RiskClass::NetworkAccess),
             ("list_directory", RiskClass::ReadOnly),
             ("read_file", RiskClass::ReadOnly),
             ("run_disposable", RiskClass::ProcessExecution),

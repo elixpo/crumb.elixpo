@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
@@ -34,6 +34,8 @@ use crate::provider_projection::project_provider;
 
 type TurnThreadResult = (AgentRuntime, Result<RunResult>);
 static ACTIVE_CANCELLATION: OnceLock<Arc<Mutex<Option<CancellationToken>>>> = OnceLock::new();
+static CANCELLATION_INSTALL_LOCK: Mutex<()> = Mutex::new(());
+const MAX_WARM_SESSION_STATES: usize = 8;
 
 struct TurnApprovals {
     configured: ConfiguredApprovals,
@@ -286,8 +288,44 @@ pub struct AgentRuntime {
     provider_output_tokens: u64,
     last_response: Option<String>,
     compactions: u32,
+    warm_session_states: VecDeque<WarmSessionState>,
     review_notes: Vec<ReviewNote>,
     review_note_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SessionRuntimeKey {
+    workspace: PathBuf,
+    session_id: String,
+}
+
+#[derive(Default)]
+struct SessionRuntimeState {
+    native_conversation: Option<Conversation>,
+    context_tokens_estimate: u64,
+    session_tokens_estimate: u64,
+    provider_input_tokens: u64,
+    provider_cached_input_tokens: u64,
+    provider_output_tokens: u64,
+    last_response: Option<String>,
+    compactions: u32,
+}
+
+struct WarmSessionState {
+    key: SessionRuntimeKey,
+    state: SessionRuntimeState,
+}
+
+/// Describes how much live context was available when selecting a session.
+///
+/// Session journals intentionally contain no raw transcript, so a session
+/// selected after a process restart can restore metadata but not conversation
+/// text. Warm state never leaves the current Crumb process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResumeContinuity {
+    AlreadyActive,
+    Warm,
+    MetadataOnly,
 }
 
 struct ReviewNote {
@@ -403,6 +441,29 @@ fn profile_effort_wire_name(effort: &str) -> Option<&'static str> {
     }
 }
 
+fn install_cancellation_handler() -> Result<Arc<Mutex<Option<CancellationToken>>>> {
+    let _install_guard = CANCELLATION_INSTALL_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("agent cancellation handler lock was poisoned"))?;
+    if let Some(slot) = ACTIVE_CANCELLATION.get() {
+        return Ok(Arc::clone(slot));
+    }
+    let slot: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+    let signal_slot = Arc::clone(&slot);
+    ctrlc::set_handler(move || {
+        if let Ok(active) = signal_slot.lock()
+            && let Some(cancellation) = active.as_ref()
+        {
+            cancellation.cancel();
+        }
+    })
+    .context("failed to install agent cancellation handler")?;
+    ACTIVE_CANCELLATION
+        .set(Arc::clone(&slot))
+        .map_err(|_| anyhow::anyhow!("agent cancellation handler initialized concurrently"))?;
+    Ok(slot)
+}
+
 fn apply_profile_skills(profile: &ProfileDocument, config: &mut AgentConfig) -> &'static str {
     if profile.skills.is_empty() {
         return "project";
@@ -427,22 +488,7 @@ impl AgentRuntime {
     /// Returns an error when the operating system signal handler cannot be
     /// installed.
     pub fn new() -> Result<Self> {
-        let active_cancellation = if let Some(slot) = ACTIVE_CANCELLATION.get() {
-            Arc::clone(slot)
-        } else {
-            let slot: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
-            let signal_slot = Arc::clone(&slot);
-            ctrlc::set_handler(move || {
-                if let Ok(active) = signal_slot.lock()
-                    && let Some(cancellation) = active.as_ref()
-                {
-                    cancellation.cancel();
-                }
-            })
-            .context("failed to install agent cancellation handler")?;
-            let _ = ACTIVE_CANCELLATION.set(Arc::clone(&slot));
-            slot
-        };
+        let active_cancellation = install_cancellation_handler()?;
         Ok(Self {
             active_cancellation,
             session: None,
@@ -457,6 +503,7 @@ impl AgentRuntime {
             provider_output_tokens: 0,
             last_response: None,
             compactions: 0,
+            warm_session_states: VecDeque::with_capacity(MAX_WARM_SESSION_STATES),
             review_notes: Vec::new(),
             review_note_bytes: 0,
         })
@@ -502,7 +549,7 @@ impl AgentRuntime {
     ///
     /// Returns an error when the session is missing, belongs to another
     /// workspace, or cannot be reopened safely.
-    pub fn resume(&mut self, workspace: &Path, session_id: &str) -> Result<()> {
+    pub fn resume(&mut self, workspace: &Path, session_id: &str) -> Result<ResumeContinuity> {
         let workspace = std::fs::canonicalize(workspace)
             .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
         let root = session_root(&workspace);
@@ -513,27 +560,108 @@ impl AgentRuntime {
         if summary.workspace != workspace {
             bail!("session belongs to a different workspace");
         }
+        let target_key = SessionRuntimeKey {
+            workspace: workspace.clone(),
+            session_id: summary.id.as_str().to_owned(),
+        };
+        if self.active_session_key().as_ref() == Some(&target_key) {
+            return Ok(ResumeContinuity::AlreadyActive);
+        }
+        let journal = SessionJournal::open(&root, &summary.id)?;
         if let Some(supervisor) = self.supervisor.as_mut() {
             supervisor.shutdown()?;
         }
         self.supervisor = None;
         self.supervisor_limits = None;
-        self.native_conversation = None;
-        self.last_response = None;
+        self.park_active_session_state();
         self.environment_revision = self.environment_revision.saturating_add(1);
-        let journal = SessionJournal::open(&root, &summary.id)?;
         self.session = Some(AgentSession::resume(
             summary.id,
             summary.mode,
             workspace,
             journal,
         ));
-        Ok(())
+        if self.restore_warm_session_state(&target_key) {
+            Ok(ResumeContinuity::Warm)
+        } else {
+            self.restore_active_state(SessionRuntimeState::default());
+            Ok(ResumeContinuity::MetadataOnly)
+        }
     }
 
     #[must_use]
     pub fn active_session_id(&self) -> Option<&str> {
         self.session.as_ref().map(|session| session.id().as_str())
+    }
+
+    fn active_session_key(&self) -> Option<SessionRuntimeKey> {
+        self.session.as_ref().map(|session| SessionRuntimeKey {
+            workspace: session.workspace().to_path_buf(),
+            session_id: session.id().as_str().to_owned(),
+        })
+    }
+
+    fn park_active_session_state(&mut self) {
+        let Some(key) = self.active_session_key() else {
+            return;
+        };
+        let state = self.take_active_state();
+        self.cache_warm_session_state(key, state);
+    }
+
+    fn cache_warm_session_state(&mut self, key: SessionRuntimeKey, state: SessionRuntimeState) {
+        if let Some(index) = self
+            .warm_session_states
+            .iter()
+            .position(|entry| entry.key == key)
+        {
+            self.warm_session_states.remove(index);
+        }
+        self.warm_session_states
+            .push_back(WarmSessionState { key, state });
+        while self.warm_session_states.len() > MAX_WARM_SESSION_STATES {
+            self.warm_session_states.pop_front();
+        }
+    }
+
+    fn restore_warm_session_state(&mut self, key: &SessionRuntimeKey) -> bool {
+        let Some(index) = self
+            .warm_session_states
+            .iter()
+            .position(|entry| &entry.key == key)
+        else {
+            return false;
+        };
+        let entry = self
+            .warm_session_states
+            .remove(index)
+            .expect("located warm session state must still exist");
+        self.restore_active_state(entry.state);
+        true
+    }
+
+    fn take_active_state(&mut self) -> SessionRuntimeState {
+        SessionRuntimeState {
+            native_conversation: self.native_conversation.take(),
+            context_tokens_estimate: std::mem::take(&mut self.context_tokens_estimate),
+            session_tokens_estimate: std::mem::take(&mut self.session_tokens_estimate),
+            provider_input_tokens: std::mem::take(&mut self.provider_input_tokens),
+            provider_cached_input_tokens: std::mem::take(&mut self.provider_cached_input_tokens),
+            provider_output_tokens: std::mem::take(&mut self.provider_output_tokens),
+            last_response: self.last_response.take(),
+            compactions: std::mem::take(&mut self.compactions),
+        }
+    }
+
+    fn restore_active_state(&mut self, state: SessionRuntimeState) {
+        self.native_conversation = state.native_conversation;
+        self.context_tokens_estimate = state.context_tokens_estimate;
+        self.session_tokens_estimate = state.session_tokens_estimate;
+        self.provider_input_tokens = state.provider_input_tokens;
+        self.provider_cached_input_tokens = state.provider_cached_input_tokens;
+        self.provider_output_tokens = state.provider_output_tokens;
+        self.last_response = state.last_response;
+        self.compactions = state.compactions;
     }
 
     /// Ensures a session exists and persists one typed context reference.
@@ -586,7 +714,7 @@ impl AgentRuntime {
         )
     }
 
-    /// Returns provider-reported input and output tokens for this process.
+    /// Returns provider-reported input and output tokens for the active session.
     #[must_use]
     pub const fn provider_token_usage(&self) -> (u64, u64, u64) {
         (
@@ -1138,8 +1266,7 @@ impl AgentRuntime {
             }
             self.supervisor = None;
             self.supervisor_limits = None;
-            self.native_conversation = None;
-            self.last_response = None;
+            self.park_active_session_state();
             self.session = None;
             self.environment_revision = self.environment_revision.saturating_add(1);
         }
@@ -1578,6 +1705,16 @@ fn skill_is_relevant(skill: &SkillConfig, request: &str) -> bool {
             "search", "web", "online", "current", "latest", "today", "weather", "news", "price",
             "festival", "who is", "what is",
         ]),
+        "github-workflow" => {
+            contains_any(&[
+                "github",
+                "github.com",
+                "gh",
+                "pull request",
+                "pr",
+                "workflow run",
+            ]) || (request.contains('#') && contains_any(&["issue", "pr"]))
+        }
         "karpathy-guidelines" => contains_any(&[
             "code",
             "coding",
@@ -1781,20 +1918,24 @@ fn new_session_id() -> Result<SessionId> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crumb_agent::{AgentConfig, Modality, ModelPack, ModelRoute, SkillConfig};
-    use crumb_harness::{EventSink, HarnessEvent};
+    use crumb_agent::{
+        AgentConfig, AgentMode, AgentSession, Modality, ModelPack, ModelRoute, SessionId,
+        SessionJournal, SkillConfig,
+    };
+    use crumb_harness::{Conversation, EventSink, HarnessEvent};
     use crumb_harness_dsh::HarnessActivity;
     use crumb_llm::TokenUsage;
     use crumb_profile::{ProfileDocument, ProfileReference, ProfileSelectionStore, ProfileStore};
 
     use super::{
-        AgentRuntime, NativeEventBridge, apply_profile_effort, apply_profile_model,
-        apply_profile_selection, apply_profile_skills, attach_profile_context,
-        attach_skill_context, load_enabled_skill_context, load_request_images, request_needs_coder,
-        select_request_route, validate_skill_path,
+        AgentRuntime, NativeEventBridge, ResumeContinuity, SessionRuntimeKey, SessionRuntimeState,
+        apply_profile_effort, apply_profile_model, apply_profile_selection, apply_profile_skills,
+        attach_profile_context, attach_skill_context, load_enabled_skill_context,
+        load_request_images, request_needs_coder, select_request_route, validate_skill_path,
     };
 
     fn route(model: &str) -> ModelRoute {
@@ -1802,6 +1943,37 @@ mod tests {
             provider: "pollinations".to_owned(),
             model: model.to_owned(),
             reasoning_effort: None,
+        }
+    }
+
+    fn persisted_session(workspace: &Path, id: &str) -> AgentSession {
+        let id = SessionId::new(id).expect("session id");
+        let journal =
+            SessionJournal::open(&super::session_root(workspace), &id).expect("session journal");
+        AgentSession::start(id, AgentMode::Auto, workspace.to_path_buf(), journal)
+            .expect("session starts")
+    }
+
+    fn isolated_runtime() -> AgentRuntime {
+        AgentRuntime {
+            active_cancellation: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            session: None,
+            supervisor: None,
+            supervisor_limits: None,
+            native_conversation: None,
+            environment_revision: 1,
+            context_tokens_estimate: 0,
+            session_tokens_estimate: 0,
+            provider_input_tokens: 0,
+            provider_cached_input_tokens: 0,
+            provider_output_tokens: 0,
+            last_response: None,
+            compactions: 0,
+            warm_session_states: std::collections::VecDeque::with_capacity(
+                super::MAX_WARM_SESSION_STATES,
+            ),
+            review_notes: Vec::new(),
+            review_note_bytes: 0,
         }
     }
 
@@ -2048,6 +2220,29 @@ mod tests {
     }
 
     #[test]
+    fn github_skill_loads_only_for_github_work() {
+        let skills = [SkillConfig {
+            id: "github-workflow".to_owned(),
+            path: crate::bundled_skills::path("github-workflow"),
+            enabled: true,
+        }];
+
+        let github = load_enabled_skill_context(
+            &skills,
+            Path::new("."),
+            "fetch https://github.com/elixpo/crumb.elixpo/issues/148",
+        )
+        .expect("GitHub skill loads");
+        let unrelated =
+            load_enabled_skill_context(&skills, Path::new("."), "explain this local Rust function")
+                .expect("unrelated request is accepted");
+
+        assert_eq!(github.len(), 1);
+        assert!(github[0].contains("## Skill: github-workflow"));
+        assert_eq!(unrelated, Vec::<String>::new());
+    }
+
+    #[test]
     fn community_and_authoring_skills_are_discovered_on_demand() {
         let skills = [
             SkillConfig {
@@ -2143,6 +2338,144 @@ mod tests {
 
         assert_eq!(runtime.token_usage().0, 5_700);
         assert_eq!(runtime.last_response(), Some("done"));
+    }
+
+    #[test]
+    fn warm_session_switch_restores_conversation_and_accounting() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let workspace = directory
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let mut runtime = isolated_runtime();
+        runtime.session = Some(persisted_session(&workspace, "session-a"));
+        runtime.native_conversation = Some(Conversation::new(NonZeroUsize::MIN));
+        runtime.context_tokens_estimate = 1_100;
+        runtime.session_tokens_estimate = 2_200;
+        runtime.provider_input_tokens = 300;
+        runtime.provider_cached_input_tokens = 200;
+        runtime.provider_output_tokens = 100;
+        runtime.last_response = Some("answer from a".to_owned());
+        runtime.compactions = 2;
+        drop(persisted_session(&workspace, "session-b"));
+
+        assert_eq!(
+            runtime.resume(&workspace, "session-b").expect("resume b"),
+            ResumeContinuity::MetadataOnly
+        );
+        assert!(runtime.native_conversation.is_none());
+        assert_eq!(runtime.token_usage(), (0, 0, 0));
+        assert_eq!(runtime.provider_token_usage(), (0, 0, 0));
+        assert_eq!(runtime.last_response(), None);
+
+        runtime.native_conversation = Some(Conversation::new(NonZeroUsize::MIN));
+        runtime.context_tokens_estimate = 3_300;
+        runtime.session_tokens_estimate = 4_400;
+        runtime.provider_input_tokens = 700;
+        runtime.last_response = Some("answer from b".to_owned());
+
+        assert_eq!(
+            runtime.resume(&workspace, "session-a").expect("resume a"),
+            ResumeContinuity::Warm
+        );
+        assert!(runtime.native_conversation.is_some());
+        assert_eq!(runtime.token_usage(), (1_100, 2_200, 2));
+        assert_eq!(runtime.provider_token_usage(), (300, 200, 100));
+        assert_eq!(runtime.last_response(), Some("answer from a"));
+
+        assert_eq!(
+            runtime
+                .resume(&workspace, "session-b")
+                .expect("resume b again"),
+            ResumeContinuity::Warm
+        );
+        assert_eq!(runtime.token_usage(), (3_300, 4_400, 0));
+        assert_eq!(runtime.provider_token_usage(), (700, 0, 0));
+        assert_eq!(runtime.last_response(), Some("answer from b"));
+
+        let journal = std::fs::read_to_string(
+            super::session_root(&workspace)
+                .join("session-a")
+                .join("events.jsonl"),
+        )
+        .expect("journal remains readable");
+        assert!(!journal.contains("answer from a"));
+    }
+
+    #[test]
+    fn same_session_resume_is_a_no_op_and_invalid_resume_is_transactional() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let workspace = directory
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let mut runtime = isolated_runtime();
+        runtime.session = Some(persisted_session(&workspace, "active-session"));
+        runtime.native_conversation = Some(Conversation::new(NonZeroUsize::MIN));
+        runtime.context_tokens_estimate = 900;
+        runtime.last_response = Some("still active".to_owned());
+
+        assert_eq!(
+            runtime
+                .resume(&workspace, "active-session")
+                .expect("same session"),
+            ResumeContinuity::AlreadyActive
+        );
+        assert_eq!(runtime.token_usage().0, 900);
+        assert_eq!(runtime.last_response(), Some("still active"));
+        assert!(runtime.native_conversation.is_some());
+        assert!(runtime.warm_session_states.is_empty());
+
+        assert!(runtime.resume(&workspace, "missing-session").is_err());
+        assert_eq!(runtime.active_session_id(), Some("active-session"));
+        assert_eq!(runtime.token_usage().0, 900);
+        assert_eq!(runtime.last_response(), Some("still active"));
+        assert!(runtime.native_conversation.is_some());
+        assert!(runtime.warm_session_states.is_empty());
+    }
+
+    #[test]
+    fn warm_session_cache_is_bounded_and_workspace_scoped() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let workspace = directory
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let other_workspace = workspace.join("other");
+        let mut runtime = isolated_runtime();
+        for index in 0..=super::MAX_WARM_SESSION_STATES {
+            runtime.cache_warm_session_state(
+                SessionRuntimeKey {
+                    workspace: workspace.clone(),
+                    session_id: format!("session-{index}"),
+                },
+                SessionRuntimeState {
+                    session_tokens_estimate: u64::try_from(index).expect("small index"),
+                    ..SessionRuntimeState::default()
+                },
+            );
+        }
+
+        assert_eq!(
+            runtime.warm_session_states.len(),
+            super::MAX_WARM_SESSION_STATES
+        );
+        assert_eq!(
+            runtime
+                .warm_session_states
+                .front()
+                .map(|entry| entry.key.session_id.as_str()),
+            Some("session-1")
+        );
+        assert!(!runtime.restore_warm_session_state(&SessionRuntimeKey {
+            workspace: other_workspace,
+            session_id: "session-1".to_owned(),
+        }));
+        assert!(runtime.restore_warm_session_state(&SessionRuntimeKey {
+            workspace,
+            session_id: "session-1".to_owned(),
+        }));
+        assert_eq!(runtime.token_usage().1, 1);
     }
 
     #[test]

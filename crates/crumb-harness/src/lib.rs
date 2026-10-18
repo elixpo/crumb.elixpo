@@ -111,16 +111,19 @@ impl EventSink for Vec<HarnessEvent> {
 struct ConversationTurn {
     user: String,
     assistant: String,
-    action_facts: Vec<String>,
 }
 
 const MAX_HISTORY_BYTES: usize = 24 * 1024;
+const MAX_ACTION_FACT_BYTES: usize = 8 * 1024;
+const MAX_ACTION_FACTS: usize = 64;
+const TRUNCATION_MARKER: &str = "\n[... earlier turn content compacted ...]\n";
 
 /// In-memory bounded conversation state. It is never persisted by this crate.
 #[derive(Clone, Debug)]
 pub struct Conversation {
     max_turns: NonZeroUsize,
     turns: VecDeque<ConversationTurn>,
+    action_facts: VecDeque<String>,
 }
 
 impl Conversation {
@@ -129,6 +132,7 @@ impl Conversation {
         Self {
             max_turns,
             turns: VecDeque::with_capacity(max_turns.get()),
+            action_facts: VecDeque::new(),
         }
     }
 
@@ -143,53 +147,105 @@ impl Conversation {
     }
 
     fn messages(&self) -> Vec<ChatMessage> {
-        let mut retained = Vec::new();
-        let mut retained_bytes = 0_usize;
-        for turn in self.turns.iter().rev() {
-            let turn_bytes = turn
-                .user
-                .len()
-                .saturating_add(turn.assistant.len())
-                .saturating_add(turn.action_facts.iter().map(String::len).sum::<usize>());
-            if !retained.is_empty() && retained_bytes.saturating_add(turn_bytes) > MAX_HISTORY_BYTES
-            {
-                break;
-            }
-            retained.push(turn);
-            retained_bytes = retained_bytes.saturating_add(turn_bytes);
+        if self.turns.is_empty() && self.action_facts.is_empty() {
+            return Vec::new();
         }
-        retained
-            .into_iter()
-            .rev()
-            .flat_map(|turn| {
-                let mut messages = vec![
-                    ChatMessage::text(ChatRole::User, turn.user.clone()),
-                    ChatMessage::text(ChatRole::Assistant, turn.assistant.clone()),
-                ];
-                if !turn.action_facts.is_empty() {
-                    messages.push(ChatMessage::text(
-                        ChatRole::System,
-                        format!(
-                            "Authoritative successful actions from the prior turn. Reuse these exact path anchors for follow-up references; do not relocate them relative to the current workspace:\n- {}",
-                            turn.action_facts.join("\n- ")
-                        ),
-                    ));
-                }
-                messages
-            })
-            .collect()
+
+        let history_budget = MAX_HISTORY_BYTES.saturating_sub(self.action_fact_bytes());
+        let message_budget = history_budget
+            .checked_div(self.turns.len().saturating_mul(2))
+            .unwrap_or_default();
+        let mut messages = Vec::with_capacity(self.turns.len().saturating_mul(2) + 1);
+        for turn in &self.turns {
+            messages.push(ChatMessage::text(
+                ChatRole::User,
+                compact_history_message(&turn.user, message_budget),
+            ));
+            messages.push(ChatMessage::text(
+                ChatRole::Assistant,
+                compact_history_message(&turn.assistant, message_budget),
+            ));
+        }
+        if !self.action_facts.is_empty() {
+            messages.push(ChatMessage::text(
+                ChatRole::System,
+                format!(
+                    "Authoritative successful actions from earlier turns. Reuse these exact path anchors for follow-up references; do not relocate them relative to the current workspace:\n- {}",
+                    self.action_facts
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join("\n- ")
+                ),
+            ));
+        }
+        messages
     }
 
     fn commit(&mut self, user: String, assistant: String, action_facts: Vec<String>) {
         if self.turns.len() == self.max_turns.get() {
             self.turns.pop_front();
         }
-        self.turns.push_back(ConversationTurn {
-            user,
-            assistant,
-            action_facts,
-        });
+        self.turns.push_back(ConversationTurn { user, assistant });
+        for fact in action_facts {
+            self.retain_action_fact(fact);
+        }
     }
+
+    fn retain_action_fact(&mut self, fact: String) {
+        if fact.is_empty() || self.action_facts.contains(&fact) {
+            return;
+        }
+        while !self.action_facts.is_empty()
+            && (self.action_facts.len() == MAX_ACTION_FACTS
+                || self.action_fact_bytes().saturating_add(fact.len()) > MAX_ACTION_FACT_BYTES)
+        {
+            self.action_facts.pop_front();
+        }
+        if fact.len() <= MAX_ACTION_FACT_BYTES {
+            self.action_facts.push_back(fact);
+        }
+    }
+
+    fn action_fact_bytes(&self) -> usize {
+        self.action_facts.iter().map(String::len).sum()
+    }
+}
+
+fn compact_history_message(message: &str, max_bytes: usize) -> String {
+    if message.len() <= max_bytes {
+        return message.to_owned();
+    }
+    if max_bytes <= TRUNCATION_MARKER.len() {
+        return String::new();
+    }
+    let content_budget = max_bytes - TRUNCATION_MARKER.len();
+    let head_budget = content_budget.div_ceil(2);
+    let tail_budget = content_budget / 2;
+    let head_end = floor_char_boundary(message, head_budget);
+    let tail_start = ceil_char_boundary(message, message.len().saturating_sub(tail_budget));
+    format!(
+        "{}{}{}",
+        &message[..head_end],
+        TRUNCATION_MARKER,
+        &message[tail_start..]
+    )
+}
+
+fn floor_char_boundary(value: &str, mut index: usize) -> usize {
+    index = index.min(value.len());
+    while !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(value: &str, mut index: usize) -> usize {
+    index = index.min(value.len());
+    while index < value.len() && !value.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 /// Successful turn result.
@@ -388,17 +444,12 @@ impl NativeHarness {
         let mut output_bytes = 0_usize;
         let mut retries = RequiredToolRetries::new(&definitions);
         let mut require_tool = initial_tool_requirement(&definitions, &turn.user_message);
-        let (mut successful_tool_evidence, mut grounding_retry_used) = (false, false);
+        let (mut successful_tool_evidence, mut failed_tool_evidence) = (false, false);
+        let (mut grounding_retry_used, mut failure_retry_used) = (false, false);
         let (mut completeness_retry_used, mut suppress_tools_once) = (false, false);
 
         loop {
-            if metrics.model_rounds == self.limits.max_model_rounds.get() {
-                return Err(HarnessError::new(
-                    HarnessErrorKind::ModelRoundLimit,
-                    "model round limit reached",
-                ));
-            }
-            metrics.model_rounds += 1;
+            begin_model_round(metrics, self.limits.max_model_rounds)?;
             let tool_choice = (require_tool, suppress_tools_once);
             let request = build_request(&turn, &messages, &definitions, tool_choice);
             let mut round = self
@@ -415,7 +466,9 @@ impl NativeHarness {
                             &round.text,
                             &turn.user_message,
                             successful_tool_evidence,
+                            failed_tool_evidence,
                             &mut grounding_retry_used,
+                            &mut failure_retry_used,
                             &mut completeness_retry_used,
                             &mut suppress_tools_once,
                             &mut retries,
@@ -468,6 +521,7 @@ impl NativeHarness {
                     round_succeeded = true;
                     metrics.record_successful_action(&call);
                 } else {
+                    failed_tool_evidence = true;
                     failed_tools.push(call.name.clone());
                 }
                 messages.push(ChatMessage::tool_result(call.id, result.content));
@@ -603,6 +657,17 @@ impl NativeHarness {
             success,
         })
     }
+}
+
+fn begin_model_round(metrics: &mut TurnMetrics, maximum: NonZeroUsize) -> Result<(), HarnessError> {
+    if metrics.model_rounds == maximum.get() {
+        return Err(HarnessError::new(
+            HarnessErrorKind::ModelRoundLimit,
+            "model round limit reached",
+        ));
+    }
+    metrics.model_rounds += 1;
+    Ok(())
 }
 
 fn tool_definitions_for_turn(tools: &ToolHost, user_message: &str) -> Vec<ToolDefinition> {
@@ -992,7 +1057,9 @@ fn prepare_response_retry(
     response: &str,
     user_message: &str,
     successful_tool_evidence: bool,
+    failed_tool_evidence: bool,
     grounding_retry_used: &mut bool,
+    failure_retry_used: &mut bool,
     completeness_retry_used: &mut bool,
     suppress_tools_once: &mut bool,
     retries: &mut RequiredToolRetries,
@@ -1007,12 +1074,75 @@ fn prepare_response_retry(
     ) {
         return Some((false, *suppress_tools_once));
     }
-    if prepare_completeness_retry(messages, response, user_message, completeness_retry_used) {
+    if prepare_failure_grounding_retry(
+        messages,
+        response,
+        successful_tool_evidence,
+        failed_tool_evidence,
+        failure_retry_used,
+        suppress_tools_once,
+    ) {
+        return Some((false, *suppress_tools_once));
+    }
+    let terminal_tool_failure = failed_tool_evidence
+        && !successful_tool_evidence
+        && response_reports_execution_failure(response);
+    if !terminal_tool_failure
+        && prepare_completeness_retry(messages, response, user_message, completeness_retry_used)
+    {
         return Some((true, false));
     }
     retries
         .prepare(messages, user_message, response)
         .then_some((true, false))
+}
+
+fn prepare_failure_grounding_retry(
+    messages: &mut Vec<ChatMessage>,
+    response: &str,
+    successful_tool_evidence: bool,
+    failed_tool_evidence: bool,
+    retry_used: &mut bool,
+    suppress_tools_once: &mut bool,
+) -> bool {
+    if successful_tool_evidence
+        || !failed_tool_evidence
+        || *retry_used
+        || response_reports_execution_failure(response)
+    {
+        return false;
+    }
+    messages.push(ChatMessage::text(ChatRole::Assistant, response));
+    messages.push(ChatMessage::text(
+        ChatRole::System,
+        "Every attempted tool call failed, so the draft cannot claim a verified result. Correct it using the tool errors already present: state the exact blocker and the smallest actionable recovery. Do not invent success, absence, or permission state, and do not call another tool.",
+    ));
+    *retry_used = true;
+    *suppress_tools_once = true;
+    true
+}
+
+fn response_reports_execution_failure(response: &str) -> bool {
+    let response = response.to_ascii_lowercase();
+    [
+        "failed",
+        "error",
+        "permission denied",
+        "access denied",
+        "not found",
+        "unavailable",
+        "timed out",
+        "timeout",
+        "cancelled",
+        "canceled",
+        "exit code",
+        "exit status",
+        "could not",
+        "couldn't",
+        "unable to",
+    ]
+    .iter()
+    .any(|phrase| response.contains(phrase))
 }
 
 fn prepare_grounding_retry(
@@ -1081,6 +1211,12 @@ fn user_requires_execution(user_message: &str) -> bool {
         "execute ",
         "build ",
         "test ",
+        "wait for",
+        "wait until",
+        "watch ",
+        "monitor ",
+        "keep checking",
+        "poll ",
     ]
     .iter()
     .any(|phrase| user_message.contains(phrase))
@@ -1140,37 +1276,119 @@ fn prepare_completeness_retry(
 fn missing_requested_checks(user_message: &str, response: &str) -> Vec<&'static str> {
     let request = user_message.to_ascii_lowercase();
     let response = response.to_ascii_lowercase();
-    let asks_github_auth = request.contains("github")
-        && [
-            "authenticat",
-            "logged in",
-            "logged into",
-            "login status",
-            "auth status",
-        ]
-        .iter()
-        .any(|term| request.contains(term));
-    let answers_github_auth = response.contains("github")
-        && [
-            "authenticat",
-            "logged in",
-            "logged into",
-            "not logged",
-            "not authenticat",
-            "credential",
-        ]
-        .iter()
-        .any(|term| response.contains(term));
     let asks_branch = request.contains("branch");
     let answers_branch = response.contains("branch");
     let mut missing = Vec::new();
-    if asks_github_auth && !answers_github_auth {
-        missing.push("GitHub authentication status");
-    }
+    append_missing_auth_check(&request, &response, &mut missing);
     if asks_branch && !answers_branch {
         missing.push("current Git branch");
     }
+    let checks = [
+        (
+            "test result",
+            &["test ", "tests", "test suite"][..],
+            &["test", "pass", "fail", "error"][..],
+        ),
+        (
+            "build result",
+            &["build ", "compile "][..],
+            &["build", "compiled", "pass", "fail", "error"][..],
+        ),
+        (
+            "installation or version status",
+            &["installed", "version of", "--version"][..],
+            &[
+                "installed",
+                "not installed",
+                "version",
+                "found",
+                "not found",
+            ][..],
+        ),
+        (
+            "requested file or directory result",
+            &[
+                "file named",
+                "folder named",
+                "directory named",
+                "does this exist",
+                "is there",
+                "locate ",
+                "find me",
+            ][..],
+            &[
+                "file",
+                "folder",
+                "directory",
+                "path",
+                "found",
+                "exists",
+                "not found",
+                "does not exist",
+                "could not",
+            ][..],
+        ),
+        (
+            "terminal wait/watch outcome",
+            &[
+                "wait for",
+                "wait until",
+                "watch ",
+                "monitor ",
+                "keep checking",
+                "poll ",
+            ][..],
+            &[
+                "completed",
+                "finished",
+                "passed",
+                "failed",
+                "timed out",
+                "deadline",
+                "cancelled",
+                "canceled",
+            ][..],
+        ),
+    ];
+    for (label, request_terms, response_terms) in checks {
+        let requested = request_terms.iter().any(|term| request.contains(term));
+        let answered = response_terms.iter().any(|term| response.contains(term));
+        if requested && !answered && !missing.contains(&label) {
+            missing.push(label);
+        }
+    }
     missing
+}
+
+fn append_missing_auth_check(request: &str, response: &str, missing: &mut Vec<&'static str>) {
+    let asks_auth = [
+        "authenticat",
+        "logged in",
+        "logged into",
+        "signed in",
+        "login status",
+        "auth status",
+    ]
+    .iter()
+    .any(|term| request.contains(term));
+    let answers_auth = [
+        "authenticat",
+        "logged in",
+        "logged into",
+        "signed in",
+        "not logged",
+        "not authenticat",
+        "credential",
+    ]
+    .iter()
+    .any(|term| response.contains(term));
+    if asks_auth && !answers_auth {
+        missing.push(if request.contains("github") {
+            "GitHub authentication status"
+        } else {
+            "authentication status"
+        });
+    }
 }
 
 fn prepare_research_retry(
@@ -1720,6 +1938,19 @@ mod tests {
         }
     }
 
+    struct FailingTool(Arc<AtomicUsize>);
+
+    impl ToolHandler for FailingTool {
+        fn call(
+            &self,
+            _arguments: &serde_json::Value,
+            _cancellation: &CancellationToken,
+        ) -> Result<ToolOutput> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(ToolOutput::error("permission denied by host policy"))
+        }
+    }
+
     fn tools(calls: Arc<AtomicUsize>) -> ToolHost {
         let mut tools = ToolHost::default();
         tools
@@ -1749,6 +1980,23 @@ mod tests {
                     transport: ToolTransport::Native,
                 },
                 Arc::new(CountingTool(calls)),
+            )
+            .expect("tool registers");
+        tools
+    }
+
+    fn failing_shell_tools(calls: Arc<AtomicUsize>) -> ToolHost {
+        let mut tools = ToolHost::default();
+        tools
+            .register(
+                ToolDescriptor {
+                    name: "run_shell".to_owned(),
+                    description: "Run a shell command".to_owned(),
+                    input_schema: json!({"type":"object"}),
+                    risk: RiskClass::ReadOnly,
+                    transport: ToolTransport::Native,
+                },
+                Arc::new(FailingTool(calls)),
             )
             .expect("tool registers");
         tools
@@ -2281,6 +2529,120 @@ mod tests {
     }
 
     #[test]
+    fn general_multi_part_checks_report_each_missing_outcome() {
+        let request = "build the project, run the tests, and tell me whether g++ is installed";
+
+        assert_eq!(
+            super::missing_requested_checks(request, "The build completed successfully."),
+            ["test result", "installation or version status"]
+        );
+        assert_eq!(
+            super::missing_requested_checks(
+                request,
+                "The build completed, all tests passed, and g++ is installed."
+            ),
+            Vec::<&'static str>::new()
+        );
+        assert_eq!(
+            super::missing_requested_checks(
+                "check whether I am authenticated to npm and run the tests",
+                "All tests passed."
+            ),
+            ["authentication status"]
+        );
+    }
+
+    #[test]
+    fn wait_requests_require_a_terminal_outcome() {
+        let request = "watch the checks and wait for them to finish";
+
+        assert!(super::user_requires_execution(request));
+        assert_eq!(
+            super::missing_requested_checks(request, "The checks are still running."),
+            ["terminal wait/watch outcome"]
+        );
+        assert_eq!(
+            super::missing_requested_checks(request, "The checks passed."),
+            Vec::<&'static str>::new()
+        );
+    }
+
+    #[test]
+    fn explicit_failure_reports_are_accepted_but_unverified_success_is_not() {
+        assert!(super::response_reports_execution_failure(
+            "The command failed with permission denied."
+        ));
+        assert!(!super::response_reports_execution_failure(
+            "The requested directory exists."
+        ));
+    }
+
+    #[tokio::test]
+    async fn completely_failed_tool_chain_cannot_be_reported_as_success() {
+        let shell_call = |id: &str| {
+            vec![
+                ChatEvent::ToolCall(ToolCall {
+                    id: id.to_owned(),
+                    name: "run_shell".to_owned(),
+                    arguments: json!({"command":"command -v g++"}),
+                }),
+                ChatEvent::Finished(FinishReason::ToolCall),
+            ]
+        };
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            shell_call("shell_1"),
+            shell_call("shell_2"),
+            vec![
+                ChatEvent::TextDelta("g++ is installed and available.".to_owned()),
+                ChatEvent::Finished(FinishReason::Stop),
+            ],
+            vec![
+                ChatEvent::TextDelta(
+                    "The check failed because host policy denied the command.".to_owned(),
+                ),
+                ChatEvent::Finished(FinishReason::Stop),
+            ],
+        ]));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let harness = NativeHarness::new(
+            provider.clone(),
+            failing_shell_tools(calls.clone()),
+            Arc::new(DenyAllApprovals),
+            HarnessLimits::default(),
+        );
+        let (root, mut session) = session(AgentMode::Auto);
+        let mut conversation = harness.conversation();
+        let mut events = Vec::new();
+        let mut request = turn();
+        request.user_message = "check whether g++ is installed".to_owned();
+
+        let outcome = harness
+            .run_turn(
+                &mut session,
+                &mut conversation,
+                request,
+                &CancellationToken::default(),
+                &mut events,
+            )
+            .await
+            .expect("turn succeeds with an honest blocker");
+
+        assert_eq!(
+            outcome.text,
+            "The check failed because host policy denied the command."
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let requests = provider.requests.lock().expect("request lock");
+        assert_eq!(requests[3].tool_choice, ToolChoice::None);
+        assert!(requests[3].messages.iter().any(|message| {
+            message.role == ChatRole::System
+                && message.content.contains("Every attempted tool call failed")
+        }));
+        drop(requests);
+        drop(root);
+    }
+
+    #[test]
     fn provider_identity_claims_are_corrected_at_the_product_boundary() {
         assert_eq!(
             super::sanitize_agent_response(
@@ -2483,7 +2845,16 @@ mod tests {
 
     #[tokio::test]
     async fn denied_tool_never_reaches_its_handler() {
-        let provider = Arc::new(ScriptedProvider::new(vec![tool_round(), answer_round()]));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_round(),
+            answer_round(),
+            vec![
+                ChatEvent::TextDelta(
+                    "The weather lookup failed because permission was denied.".to_owned(),
+                ),
+                ChatEvent::Finished(FinishReason::Stop),
+            ],
+        ]));
         let calls = Arc::new(AtomicUsize::new(0));
         let harness = NativeHarness::new(
             provider.clone(),
@@ -2525,6 +2896,7 @@ mod tests {
                 .content
                 .contains("denied")
         );
+        assert_eq!(requests[2].tool_choice, ToolChoice::None);
     }
 
     #[tokio::test]
@@ -2635,7 +3007,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_prompt_drops_old_turns_beyond_the_byte_budget() {
+    fn conversation_prompt_compacts_each_turn_without_dropping_the_sequence() {
         let mut conversation = Conversation::new(NonZeroUsize::new(3).expect("non-zero"));
         conversation.commit("old".repeat(5_000), "answer".repeat(5_000), Vec::new());
         conversation.commit("latest".to_owned(), "kept".to_owned(), Vec::new());
@@ -2643,9 +3015,58 @@ mod tests {
         let messages = conversation.messages();
 
         assert_eq!(conversation.len(), 2);
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].content, "latest");
-        assert_eq!(messages[1].content, "kept");
+        assert_eq!(messages.len(), 4);
+        assert!(
+            messages[0]
+                .content
+                .contains("earlier turn content compacted")
+        );
+        assert!(
+            messages[1]
+                .content
+                .contains("earlier turn content compacted")
+        );
+        assert_eq!(messages[2].content, "latest");
+        assert_eq!(messages[3].content, "kept");
+        assert!(
+            messages
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>()
+                <= super::MAX_HISTORY_BYTES
+        );
+    }
+
+    #[test]
+    fn authoritative_action_facts_survive_turn_eviction() {
+        let mut conversation = Conversation::new(NonZeroUsize::MIN);
+        conversation.commit(
+            "create it".to_owned(),
+            "done".to_owned(),
+            vec!["Created ~/test_folder.".to_owned()],
+        );
+        conversation.commit(
+            "now work inside it".to_owned(),
+            "okay".to_owned(),
+            Vec::new(),
+        );
+
+        let messages = conversation.messages();
+
+        assert_eq!(conversation.len(), 1);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content, "now work inside it");
+        assert!(messages[2].content.contains("Created ~/test_folder."));
+    }
+
+    #[test]
+    fn conversation_compaction_preserves_utf8_boundaries() {
+        let compacted = super::compact_history_message(&"🦀".repeat(100), 96);
+
+        assert!(compacted.len() <= 96);
+        assert!(compacted.contains("earlier turn content compacted"));
+        assert!(compacted.starts_with('🦀'));
+        assert!(compacted.ends_with('🦀'));
     }
 
     #[test]

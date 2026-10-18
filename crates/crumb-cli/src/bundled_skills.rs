@@ -13,6 +13,7 @@ pub(crate) const DEFAULT_IDS: &[&str] = &[
     "security-review",
     "plan-execute",
     "web-research",
+    "github-workflow",
     "karpathy-guidelines",
     "skill-authoring",
     "crumb-commands",
@@ -84,6 +85,10 @@ pub(crate) static ALL: &[BundledSkill] = &[
     skill!(
         "web-research",
         "automatically research current or uncertain facts with source verification"
+    ),
+    skill!(
+        "github-workflow",
+        "inspect GitHub issues, pull requests, authentication, branches, and checks"
     ),
     community_skill!(
         "karpathy-guidelines",

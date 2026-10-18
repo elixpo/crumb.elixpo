@@ -139,6 +139,17 @@ impl CommandCatalog {
                 None,
             );
         }
+        // A URL is data for the agent, not an executable path. Route it before
+        // the path and shell-syntax checks so pasted issue/page URLs cannot be
+        // handed to the user's shell.
+        if first_word_is_http_url(trimmed) {
+            return decision(
+                InputRoute::Agent,
+                RouteReason::NaturalLanguageCandidate,
+                input,
+                None,
+            );
+        }
         if has_unambiguous_shell_syntax(trimmed) {
             return decision(InputRoute::Native, RouteReason::ShellSyntax, input, None);
         }
@@ -229,8 +240,9 @@ fn looks_like_sentence(input: &str) -> bool {
     let first = words
         .first()
         .map_or("", |word| word.trim_matches(sentence_punctuation));
+    let first = first.to_ascii_lowercase();
     let question_lead = matches!(
-        first.to_ascii_lowercase().as_str(),
+        first.as_str(),
         "what"
             | "what's"
             | "whats"
@@ -253,6 +265,9 @@ fn looks_like_sentence(input: &str) -> bool {
             | "review"
             | "summarize"
     );
+    if looks_like_agent_imperative(&first, &words) {
+        return true;
+    }
     if words.len() >= 3 && (input.ends_with('?') || question_lead) {
         return true;
     }
@@ -273,6 +288,87 @@ fn looks_like_sentence(input: &str) -> bool {
         .map(|word| word.trim_matches(sentence_punctuation).chars().count());
     lengths.clone().filter(|length| *length <= 3).count() >= 2
         && lengths.filter(|length| *length >= 5).count() >= 2
+}
+
+fn looks_like_agent_imperative(first: &str, words: &[&str]) -> bool {
+    let direct_lead = matches!(
+        first,
+        "ask"
+            | "fetch"
+            | "search"
+            | "explain"
+            | "tell"
+            | "show"
+            | "check"
+            | "inspect"
+            | "investigate"
+            | "fix"
+            | "update"
+            | "add"
+            | "remove"
+            | "wait"
+            | "watch"
+            | "monitor"
+            | "compare"
+            | "summarize"
+            | "describe"
+            | "review"
+            | "create"
+    );
+    if words.len() >= 2 && direct_lead && !looks_like_shell_arguments(&words[1..]) {
+        return true;
+    }
+    let ambiguous_lead = matches!(
+        first,
+        "find" | "make" | "open" | "read" | "get" | "run" | "build" | "use"
+    );
+    let conversational_glue = words.iter().skip(1).any(|word| {
+        matches!(
+            word.trim_matches(sentence_punctuation)
+                .to_ascii_lowercase()
+                .as_str(),
+            "a" | "an"
+                | "the"
+                | "me"
+                | "my"
+                | "this"
+                | "that"
+                | "these"
+                | "those"
+                | "please"
+                | "current"
+                | "currently"
+        )
+    });
+    if words.len() >= 3
+        && ambiguous_lead
+        && conversational_glue
+        && !looks_like_shell_arguments(&words[1..])
+    {
+        return true;
+    }
+    false
+}
+
+fn first_word_is_http_url(input: &str) -> bool {
+    input
+        .split_whitespace()
+        .next()
+        .is_some_and(|word| word.starts_with("https://") || word.starts_with("http://"))
+}
+
+fn looks_like_shell_arguments(arguments: &[&str]) -> bool {
+    arguments.iter().any(|argument| {
+        argument.starts_with('-')
+            || argument == &"."
+            || argument == &".."
+            || argument.starts_with("./")
+            || argument.starts_with("../")
+            || argument.starts_with("~/")
+            || argument.starts_with('/')
+            || argument.contains('=')
+            || argument.contains('*')
+    })
 }
 
 fn sentence_punctuation(character: char) -> bool {
@@ -422,7 +518,14 @@ mod tests {
     };
 
     fn catalog() -> CommandCatalog {
-        CommandCatalog::with_commands(["git".to_owned(), "cargo".to_owned(), "echo".to_owned()])
+        CommandCatalog::with_commands([
+            "git".to_owned(),
+            "cargo".to_owned(),
+            "curl".to_owned(),
+            "echo".to_owned(),
+            "find".to_owned(),
+            "make".to_owned(),
+        ])
     }
 
     #[test]
@@ -462,6 +565,38 @@ mod tests {
         assert_eq!(decision.route, InputRoute::Agent);
         assert_eq!(decision.payload, "explain this error");
         assert_eq!(decision.reason, RouteReason::NaturalLanguageCandidate);
+    }
+
+    #[test]
+    fn urls_and_imperative_requests_route_to_the_agent() {
+        for request in [
+            "https://github.com/elixpo/crumb.elixpo/issues/148",
+            "https://github.com/elixpo/crumb.elixpo/issues/148 this is the issue",
+            "fetch issue elixpo/crumb.elixpo#148",
+            "find me the elixpo_projects folder",
+            "make the default mode smarter",
+            "wait for the checks to pass",
+        ] {
+            let decision = catalog().route(request, &RoutePolicy::default());
+            assert_eq!(decision.route, InputRoute::Agent, "{request}");
+            assert_eq!(decision.reason, RouteReason::NaturalLanguageCandidate);
+        }
+    }
+
+    #[test]
+    fn real_commands_with_arguments_stay_native() {
+        for command in [
+            "find . -name Cargo.toml",
+            "git status --short",
+            "curl https://example.com",
+            "make test",
+        ] {
+            assert_eq!(
+                catalog().route(command, &RoutePolicy::default()).route,
+                InputRoute::Native,
+                "{command}"
+            );
+        }
     }
 
     #[test]
