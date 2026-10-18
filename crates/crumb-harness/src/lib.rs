@@ -106,6 +106,7 @@ impl EventSink for Vec<HarnessEvent> {
 struct ConversationTurn {
     user: String,
     assistant: String,
+    action_facts: Vec<String>,
 }
 
 const MAX_HISTORY_BYTES: usize = 24 * 1024;
@@ -140,7 +141,11 @@ impl Conversation {
         let mut retained = Vec::new();
         let mut retained_bytes = 0_usize;
         for turn in self.turns.iter().rev() {
-            let turn_bytes = turn.user.len().saturating_add(turn.assistant.len());
+            let turn_bytes = turn
+                .user
+                .len()
+                .saturating_add(turn.assistant.len())
+                .saturating_add(turn.action_facts.iter().map(String::len).sum::<usize>());
             if !retained.is_empty() && retained_bytes.saturating_add(turn_bytes) > MAX_HISTORY_BYTES
             {
                 break;
@@ -152,19 +157,33 @@ impl Conversation {
             .into_iter()
             .rev()
             .flat_map(|turn| {
-                [
+                let mut messages = vec![
                     ChatMessage::text(ChatRole::User, turn.user.clone()),
                     ChatMessage::text(ChatRole::Assistant, turn.assistant.clone()),
-                ]
+                ];
+                if !turn.action_facts.is_empty() {
+                    messages.push(ChatMessage::text(
+                        ChatRole::System,
+                        format!(
+                            "Authoritative successful actions from the prior turn. Reuse these exact path anchors for follow-up references; do not relocate them relative to the current workspace:\n- {}",
+                            turn.action_facts.join("\n- ")
+                        ),
+                    ));
+                }
+                messages
             })
             .collect()
     }
 
-    fn commit(&mut self, user: String, assistant: String) {
+    fn commit(&mut self, user: String, assistant: String, action_facts: Vec<String>) {
         if self.turns.len() == self.max_turns.get() {
             self.turns.pop_front();
         }
-        self.turns.push_back(ConversationTurn { user, assistant });
+        self.turns.push_back(ConversationTurn {
+            user,
+            assistant,
+            action_facts,
+        });
     }
 }
 
@@ -220,6 +239,17 @@ impl Error for HarnessError {}
 struct TurnMetrics {
     model_rounds: usize,
     tool_calls: usize,
+    action_facts: Vec<String>,
+}
+
+impl TurnMetrics {
+    fn record_successful_action(&mut self, call: &ToolCall) {
+        if let Some(fact) = safe_successful_action_fact(call)
+            && !self.action_facts.contains(&fact)
+        {
+            self.action_facts.push(fact);
+        }
+    }
 }
 
 struct ModelRound {
@@ -353,8 +383,7 @@ impl NativeHarness {
         let mut retries = RequiredToolRetries::new(&definitions);
         let mut require_tool = initial_tool_requirement(&definitions, &turn.user_message);
         let (mut successful_tool_evidence, mut grounding_retry_used) = (false, false);
-        let mut completeness_retry_used = false;
-        let mut suppress_tools_once = false;
+        let (mut completeness_retry_used, mut suppress_tools_once) = (false, false);
 
         loop {
             if metrics.model_rounds == self.limits.max_model_rounds.get() {
@@ -431,6 +460,7 @@ impl NativeHarness {
                 emit_tool_output(sink, &call, &result);
                 if result.success {
                     round_succeeded = true;
+                    metrics.record_successful_action(&call);
                 } else {
                     failed_tools.push(call.name.clone());
                 }
@@ -749,7 +779,11 @@ fn finish_turn(
     for chunk in chunks {
         sink.emit(HarnessEvent::TextDelta(chunk));
     }
-    conversation.commit(turn.user_message, final_text.clone());
+    conversation.commit(
+        turn.user_message,
+        final_text.clone(),
+        metrics.action_facts.clone(),
+    );
     HarnessOutcome {
         text: final_text,
         usage,
@@ -757,6 +791,44 @@ fn finish_turn(
         model_rounds: metrics.model_rounds,
         tool_calls: metrics.tool_calls,
     }
+}
+
+fn safe_successful_action_fact(call: &ToolCall) -> Option<String> {
+    if call.name != "run_shell" {
+        return None;
+    }
+    let command = call.arguments.get("command")?.as_str()?.trim();
+    if command.is_empty()
+        || command.chars().any(|character| {
+            matches!(
+                character,
+                ';' | '|' | '&' | '>' | '<' | '$' | '`' | '\n' | '\r'
+            )
+        })
+    {
+        return None;
+    }
+    let mut words = command.split_whitespace();
+    if words.next()? != "mkdir" {
+        return None;
+    }
+    let paths = words
+        .filter(|word| !word.starts_with('-'))
+        .filter(|word| safe_path_anchor(word))
+        .take(8)
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return None;
+    }
+    Some(format!("Created {}.", paths.join(", ")))
+}
+
+fn safe_path_anchor(path: &str) -> bool {
+    path.len() <= 512
+        && !path.is_empty()
+        && path
+            .chars()
+            .all(|character| character.is_alphanumeric() || "/._~-".contains(character))
 }
 
 fn prepare_execution_retry(
@@ -2504,8 +2576,8 @@ mod tests {
     fn conversation_retains_only_its_configured_turn_bound() {
         let mut conversation =
             Conversation::new(NonZeroUsize::new(1).expect("constant is non-zero"));
-        conversation.commit("first".to_owned(), "one".to_owned());
-        conversation.commit("second".to_owned(), "two".to_owned());
+        conversation.commit("first".to_owned(), "one".to_owned(), Vec::new());
+        conversation.commit("second".to_owned(), "two".to_owned(), Vec::new());
 
         assert_eq!(conversation.len(), 1);
         assert_eq!(conversation.messages()[0].content, "second");
@@ -2514,8 +2586,8 @@ mod tests {
     #[test]
     fn conversation_prompt_drops_old_turns_beyond_the_byte_budget() {
         let mut conversation = Conversation::new(NonZeroUsize::new(3).expect("non-zero"));
-        conversation.commit("old".repeat(5_000), "answer".repeat(5_000));
-        conversation.commit("latest".to_owned(), "kept".to_owned());
+        conversation.commit("old".repeat(5_000), "answer".repeat(5_000), Vec::new());
+        conversation.commit("latest".to_owned(), "kept".to_owned(), Vec::new());
 
         let messages = conversation.messages();
 
@@ -2523,5 +2595,37 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "latest");
         assert_eq!(messages[1].content, "kept");
+    }
+
+    #[test]
+    fn successful_directory_creation_is_retained_as_an_authoritative_path_anchor() {
+        let call = ToolCall {
+            id: "mkdir-1".to_owned(),
+            name: "run_shell".to_owned(),
+            arguments: json!({"command":"mkdir ~/test_folder"}),
+        };
+        let fact = super::safe_successful_action_fact(&call).expect("safe mkdir is retained");
+        let mut conversation = Conversation::new(NonZeroUsize::MIN);
+        conversation.commit(
+            "create a folder in ~/".to_owned(),
+            "Created it in your home directory.".to_owned(),
+            vec![fact],
+        );
+
+        let messages = conversation.messages();
+        assert_eq!(messages.len(), 3);
+        assert!(messages[2].content.contains("Created ~/test_folder."));
+        assert!(messages[2].content.contains("do not relocate"));
+    }
+
+    #[test]
+    fn compound_shell_commands_are_not_retained_as_cross_turn_facts() {
+        let call = ToolCall {
+            id: "mkdir-1".to_owned(),
+            name: "run_shell".to_owned(),
+            arguments: json!({"command":"mkdir safe; printf secret"}),
+        };
+
+        assert_eq!(super::safe_successful_action_fact(&call), None);
     }
 }
