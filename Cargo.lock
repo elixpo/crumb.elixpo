@@ -549,6 +549,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "crumb-a2a-tasks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "crumb-agent"
 version = "0.1.0"
 dependencies = [
