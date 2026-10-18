@@ -83,7 +83,7 @@ jobs:
             done < <(awk -F/ '/^packages\/[^/]+\// {print $2}' "$RUNNER_TEMP/changed-files" | sort -u)
             npm_packages="${npm_packages# }"
             vscode_packages="${vscode_packages# }"
-            if grep -Eq '^(crumb\.elixpo/|deploy\.sh$)' "$RUNNER_TEMP/changed-files"; then website=true; else website=false; fi
+            if grep -Eq '^(crumb\.elixpo/|deploy\.sh$|\.env$|\.sops\.yaml$|\.github/workflows/deploy\.yml$)' "$RUNNER_TEMP/changed-files"; then website=true; else website=false; fi
             if grep -Eq '^crumb\.elixpo/migrations/' "$RUNNER_TEMP/changed-files"; then migrations=true; else migrations=false; fi
           fi
           echo "npm_packages=$npm_packages" >> "$GITHUB_OUTPUT"
@@ -221,9 +221,12 @@ jobs:
           cosign sign-blob --yes
           --bundle crumb.elixpo/public/marketplace/catalog.sigstore.json
           crumb.elixpo/public/marketplace/catalog.json
-      - name: Build, migrate, and deploy website
+      - name: Build website
+        run: ./deploy.sh --worker build
+      - name: Upload encrypted application secrets
+        run: ./deploy.sh --worker secrets
+      - name: Migrate and deploy website
         run: |
           set -euo pipefail
-          ./deploy.sh --worker build
           if [ "$RUN_MIGRATIONS" = "true" ]; then ./deploy.sh --worker migrate; fi
           ./deploy.sh --worker deploy
