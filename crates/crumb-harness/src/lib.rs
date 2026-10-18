@@ -3116,8 +3116,9 @@ mod tests {
             super::missing_requested_checks(request, "There is nothing to commit."),
             ["merge result"]
         );
-        assert!(
-            super::missing_requested_checks(request, "The pull request was merged.").is_empty()
+        assert_eq!(
+            super::missing_requested_checks(request, "The pull request was merged."),
+            Vec::<&'static str>::new()
         );
     }
 
