@@ -1538,6 +1538,9 @@ impl AgentRuntime {
             memory.context,
             request,
             self.token_usage(),
+            self.native_conversation
+                .as_ref()
+                .map_or(0, Conversation::len),
             context_token_budget(config, route),
             &workspace,
         );
@@ -2389,10 +2392,11 @@ fn image_media_type(path: &Path) -> Option<(&'static str, &'static str)> {
 
 fn runtime_session_context(
     (context_tokens, session_tokens, compactions): (u64, u64, u32),
+    retained_turns: usize,
     context_limit: u64,
 ) -> String {
     format!(
-        "Runtime session (authoritative): conversation retains completed turns; context ~{context_tokens}/{context_limit} tokens; session usage ~{session_tokens}; compactions {compactions}. Attachments and approved memory are separate. Never claim every interaction starts fresh."
+        "Runtime session (authoritative): conversation retains {retained_turns} completed turns; context ~{context_tokens}/{context_limit} tokens; session usage ~{session_tokens}; compactions {compactions}. Attachments and approved memory are separate. Never claim every interaction starts fresh."
     )
 }
 
@@ -2407,12 +2411,17 @@ fn runtime_context(
     memory: Option<String>,
     request: &str,
     usage: (u64, u64, u32),
+    retained_turns: usize,
     context_limit: u64,
     workspace: &Path,
 ) -> Vec<String> {
     let mut context = memory.into_iter().collect::<Vec<_>>();
     if request_needs_session_context(request) {
-        context.push(runtime_session_context(usage, context_limit));
+        context.push(runtime_session_context(
+            usage,
+            retained_turns,
+            context_limit,
+        ));
     }
     context.push(runtime_workspace_context(workspace));
     context
@@ -4038,12 +4047,12 @@ mod tests {
 
     #[test]
     fn runtime_context_truthfully_describes_live_conversation_state() {
-        let context = super::runtime_session_context((1_250, 4_800, 2), 64_000);
+        let context = super::runtime_session_context((1_250, 4_800, 2), 3, 64_000);
 
         assert!(context.contains("~1250/64000 tokens"));
         assert!(context.contains("session usage ~4800"));
         assert!(context.contains("compactions 2"));
-        assert!(context.contains("conversation retains completed turns"));
+        assert!(context.contains("conversation retains 3 completed turns"));
         assert!(context.contains("Never claim every interaction starts fresh"));
     }
 
