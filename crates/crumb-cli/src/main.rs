@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
@@ -48,10 +48,11 @@ use crumb_harness::SelectedSkill;
 use crumb_harness_dsh::HarnessActivity;
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_marketplace::{
-    Catalog, InstallScope, InstallationStore, InstalledRelease, Installer, MAX_CATALOG_BYTES,
+    Catalog, DiscoveryEntry, DiscoveryIndex, InstallScope, InstallationStore, InstalledRelease,
+    Installer, MAX_CATALOG_BYTES, MAX_DISCOVERY_INDEX_BYTES, MAX_PACKAGE_MANIFEST_BYTES,
     MAX_SIGSTORE_BUNDLE_BYTES, McpTransport as MarketplaceMcpTransport, Package, PackageClass,
-    PublisherIdentity, ReleaseTrust, RemoteCatalogCache, SignedArtifact, SigstoreVerifier,
-    UpdateStatus, bundled_catalog, verify_package_files,
+    PackageReleaseRef, PublisherIdentity, ReleaseTrust, RemoteCatalogCache, SignedArtifact,
+    SigstoreVerifier, UpdateStatus, bundled_catalog, verify_package_files,
 };
 use crumb_mcp::{
     McpDispatcher, StdioMcpLimits, StreamableHttpLimits, register_stdio_servers,
@@ -108,6 +109,10 @@ const FULLSCREEN_TOP_GUTTER: u16 = 1;
 const MARKETPLACE_CATALOG_URL: &str = "https://crumb.elixpo.com/marketplace/catalog.json";
 const MARKETPLACE_CATALOG_BUNDLE_URL: &str =
     "https://crumb.elixpo.com/marketplace/catalog.sigstore.json";
+const MARKETPLACE_DISCOVERY_INDEX_URL: &str = "https://crumb.elixpo.com/marketplace/discovery.json";
+const MARKETPLACE_DISCOVERY_INDEX_BUNDLE_URL: &str =
+    "https://crumb.elixpo.com/marketplace/discovery.sigstore.json";
+const MARKETPLACE_MANIFEST_BASE_URL: &str = "https://crumb.elixpo.com/marketplace/manifests";
 const MARKETPLACE_CATALOG_SIGNER: &str =
     "https://github.com/elixpo/crumb.elixpo/.github/workflows/deploy.yml@refs/heads/main";
 const SIGSTORE_GITHUB_ACTIONS_ISSUER: &str = "https://token.actions.githubusercontent.com";
@@ -4668,8 +4673,11 @@ fn handle_skill_command(command: &str, cwd: &Path, writer: &mut dyn Write) -> Re
         return search_skill_catalog(query, writer);
     }
     if let Some(selector) = arguments.strip_prefix("inspect ") {
-        let id = resolve_bundled_skill_selector(selector.trim(), "inspect")?;
-        return show_marketplace(&format!("/marketplace inspect {id}"), cwd, writer);
+        let selector = selector.trim();
+        if let Ok(id) = resolve_bundled_skill_selector(selector, "inspect") {
+            return show_marketplace(&format!("/marketplace inspect {id}"), cwd, writer);
+        }
+        return inspect_remote_skill(selector, writer);
     }
     if let Some(install) = arguments.strip_prefix("install ") {
         let normalized = normalize_bundled_skill_install(install)?;
@@ -4700,22 +4708,57 @@ fn handle_skill_command(command: &str, cwd: &Path, writer: &mut dyn Write) -> Re
 }
 
 fn search_skill_catalog(query: &str, writer: &mut dyn Write) -> Result<()> {
-    let catalog = bundled_catalog()?;
-    let page = catalog.search(query, 0, 20)?;
+    let discovery = load_skill_discovery()?;
+    render_skill_discovery_search(&discovery.index, query, discovery.source, writer)
+}
+
+#[derive(Clone, Copy)]
+enum DiscoverySource {
+    AuthenticatedRemote,
+    AuthenticatedCache,
+    BundledFallback,
+}
+
+impl DiscoverySource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::AuthenticatedRemote => "authenticated remote index",
+            Self::AuthenticatedCache => "authenticated cached index",
+            Self::BundledFallback => "bundled offline fallback",
+        }
+    }
+}
+
+struct LoadedDiscovery {
+    index: DiscoveryIndex,
+    source: DiscoverySource,
+}
+
+fn render_skill_discovery_search(
+    index: &DiscoveryIndex,
+    query: &str,
+    source: DiscoverySource,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let page = index.search(query, 0, 20)?;
     let matches = page
         .hits
         .iter()
-        .filter(|hit| hit.package_class == PackageClass::Instruction)
+        .filter(|entry| entry.package_class == PackageClass::Instruction)
         .collect::<Vec<_>>();
-    writeln!(writer, "◆ Skill catalog · compact offline metadata")?;
+    writeln!(
+        writer,
+        "◆ Skill catalog · compact metadata · {}",
+        source.label()
+    )?;
     if matches.is_empty() {
         writeln!(writer, "  No skills matched `{query}`.")?;
     } else {
-        for package in matches {
+        for entry in matches {
             writeln!(
                 writer,
                 "  ○ {:<28} v{:<9} {}",
-                package.id, package.version, package.description
+                entry.release.id, entry.release.version, entry.description
             )?;
         }
     }
@@ -4727,7 +4770,378 @@ fn search_skill_catalog(query: &str, writer: &mut dyn Write) -> Result<()> {
     }
     writeln!(
         writer,
-        "  Search never installs or enables a skill; inspect one before installing."
+        "  Search fetched no manifests and never installs or enables a skill; inspect an exact release first."
+    )?;
+    Ok(())
+}
+
+fn load_skill_discovery() -> Result<LoadedDiscovery> {
+    if let (Ok(client), Ok(verifier)) = (marketplace_http_client(), SigstoreVerifier::production())
+        && let Ok((index_bytes, bundle)) = download_discovery_index_payload(&client)
+    {
+        verify_discovery_index_payload(&index_bytes, &bundle, &verifier)?;
+        let index = DiscoveryIndex::parse(&index_bytes)?;
+        let _ = cache_discovery_index(&index_bytes, &bundle);
+        return Ok(LoadedDiscovery {
+            index,
+            source: DiscoverySource::AuthenticatedRemote,
+        });
+    }
+    if let Some(index) = load_cached_discovery_index()? {
+        return Ok(LoadedDiscovery {
+            index,
+            source: DiscoverySource::AuthenticatedCache,
+        });
+    }
+    Ok(LoadedDiscovery {
+        index: bundled_catalog()?.discovery_index()?,
+        source: DiscoverySource::BundledFallback,
+    })
+}
+
+fn download_discovery_index_payload(
+    client: &reqwest::blocking::Client,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let index_bytes = download_marketplace_url(
+        client,
+        MARKETPLACE_DISCOVERY_INDEX_URL,
+        MAX_DISCOVERY_INDEX_BYTES,
+        MarketplaceContent::Json,
+    )?;
+    let bundle = download_marketplace_url(
+        client,
+        MARKETPLACE_DISCOVERY_INDEX_BUNDLE_URL,
+        MAX_SIGSTORE_BUNDLE_BYTES,
+        MarketplaceContent::Json,
+    )?;
+    Ok((index_bytes, bundle))
+}
+
+fn verify_discovery_index_payload(
+    index_bytes: &[u8],
+    bundle: &[u8],
+    verifier: &SigstoreVerifier,
+) -> Result<()> {
+    verifier.verify(
+        index_bytes,
+        bundle,
+        &PublisherIdentity {
+            issuer: SIGSTORE_GITHUB_ACTIONS_ISSUER.to_owned(),
+            subject: MARKETPLACE_CATALOG_SIGNER.to_owned(),
+        },
+    )
+}
+
+fn discovery_cache_root() -> Result<PathBuf> {
+    Ok(BaseDirs::new()
+        .context("home directory is unavailable")?
+        .home_dir()
+        .join(".crumb/marketplace/discovery"))
+}
+
+fn cache_discovery_index(index_bytes: &[u8], bundle: &[u8]) -> Result<()> {
+    DiscoveryIndex::parse(index_bytes)?;
+    if bundle.is_empty() || bundle.len() > MAX_SIGSTORE_BUNDLE_BYTES {
+        bail!("marketplace discovery signature bundle exceeds the size limit");
+    }
+    let root = discovery_cache_root()?;
+    std::fs::create_dir_all(&root)?;
+    let digest = format!("{:x}", Sha256::digest(index_bytes));
+    let received_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let destination = root.join(format!("index-{received_at:020}-{digest}.json"));
+    let bundle_destination = destination.with_extension("sigstore.json");
+    persist_cache_bytes(&bundle_destination, bundle)?;
+    persist_cache_bytes(&destination, index_bytes)?;
+    prune_discovery_indexes(&root, 3);
+    Ok(())
+}
+
+fn prune_discovery_indexes(root: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| is_discovery_index_cache_file(path))
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    let remove_count = paths.len().saturating_sub(keep);
+    for path in paths.into_iter().take(remove_count) {
+        let _ = std::fs::remove_file(path.with_extension("sigstore.json"));
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn load_cached_discovery_index() -> Result<Option<DiscoveryIndex>> {
+    let root = discovery_cache_root()?;
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Ok(None);
+    };
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| is_discovery_index_cache_file(path))
+        .collect::<Vec<_>>();
+    paths.sort_unstable_by(|left, right| right.cmp(left));
+    let Ok(verifier) = SigstoreVerifier::production() else {
+        return Ok(None);
+    };
+    for path in paths {
+        let Ok(Some(bytes)) = read_bounded_cache_file(&path, MAX_DISCOVERY_INDEX_BYTES) else {
+            continue;
+        };
+        let bundle_path = path.with_extension("sigstore.json");
+        let Ok(Some(bundle)) = read_bounded_cache_file(&bundle_path, MAX_SIGSTORE_BUNDLE_BYTES)
+        else {
+            continue;
+        };
+        let identity = PublisherIdentity {
+            issuer: SIGSTORE_GITHUB_ACTIONS_ISSUER.to_owned(),
+            subject: MARKETPLACE_CATALOG_SIGNER.to_owned(),
+        };
+        if verifier.verify(&bytes, &bundle, &identity).is_ok()
+            && let Ok(index) = DiscoveryIndex::parse(&bytes)
+        {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+fn read_bounded_cache_file(path: &Path, maximum_bytes: usize) -> Result<Option<Vec<u8>>> {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Ok(None);
+    };
+    if !metadata.file_type().is_file()
+        || metadata.len() == 0
+        || metadata.len() > maximum_bytes as u64
+    {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path)?;
+    if bytes.is_empty() || bytes.len() > maximum_bytes {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+fn is_discovery_index_cache_file(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("index-") && !name.ends_with(".sigstore"))
+        && path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+}
+
+fn inspect_remote_skill(selector: &str, writer: &mut dyn Write) -> Result<()> {
+    let discovery = load_skill_discovery()?;
+    let entry = select_discovery_skill(&discovery.index, selector)?;
+    let package = load_exact_skill_manifest(entry, discovery.source)?;
+    show_remote_skill_package(entry, &package, discovery.source, writer)
+}
+
+fn select_discovery_skill<'index>(
+    index: &'index DiscoveryIndex,
+    selector: &str,
+) -> Result<&'index DiscoveryEntry> {
+    let (id, requested_version) = selector
+        .rsplit_once('@')
+        .map_or((selector, None), |(id, version)| (id, Some(version)));
+    if id.is_empty() || id.split('/').count() != 2 || requested_version.is_some_and(str::is_empty) {
+        bail!("usage: /skill inspect <publisher/name>[@version]");
+    }
+    index
+        .releases
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry.package_class == PackageClass::Instruction
+                && entry.release.id == id
+                && requested_version.is_none_or(|version| entry.release.version == version)
+        })
+        .with_context(|| format!("remote skill package `{selector}` was not found"))
+}
+
+fn load_exact_skill_manifest(entry: &DiscoveryEntry, source: DiscoverySource) -> Result<Package> {
+    if matches!(source, DiscoverySource::BundledFallback) {
+        let catalog = bundled_catalog()?;
+        let package = catalog.package_for_release(&entry.release)?;
+        let bytes = serde_json::to_vec(package)?;
+        return Package::parse_referenced_manifest(&bytes, &entry.release);
+    }
+    let client = marketplace_http_client()?;
+    match download_exact_skill_manifest_bytes(&client, &entry.release) {
+        Ok(bytes) => {
+            let package = Package::parse_referenced_manifest(&bytes, &entry.release)?;
+            let _ = cache_skill_manifest(&entry.release, &bytes);
+            Ok(package)
+        }
+        Err(download_error) => load_cached_skill_manifest(&entry.release)?.with_context(|| {
+            format!(
+                "exact skill manifest download failed and no verified cached copy is available: {download_error:#}"
+            )
+        }),
+    }
+}
+
+fn download_exact_skill_manifest_bytes(
+    client: &reqwest::blocking::Client,
+    release: &PackageReleaseRef,
+) -> Result<Vec<u8>> {
+    let url = exact_skill_manifest_url(release)?;
+    let maximum_bytes = usize::try_from(release.manifest_size_bytes)
+        .unwrap_or(MAX_PACKAGE_MANIFEST_BYTES)
+        .min(MAX_PACKAGE_MANIFEST_BYTES);
+    download_marketplace_url(client, &url, maximum_bytes, MarketplaceContent::Json)
+}
+
+fn exact_skill_manifest_url(release: &PackageReleaseRef) -> Result<String> {
+    let (publisher, name) = release
+        .id
+        .split_once('/')
+        .context("marketplace release has an invalid package id")?;
+    let mut url = url::Url::parse(&format!("{MARKETPLACE_MANIFEST_BASE_URL}/"))?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow!("marketplace manifest base URL cannot contain path segments"))?
+        .push(publisher)
+        .push(name)
+        .push(&format!("{}.json", release.version));
+    Ok(url.to_string())
+}
+
+fn manifest_cache_path(release: &PackageReleaseRef) -> Result<PathBuf> {
+    Ok(discovery_cache_root()?
+        .join("manifests")
+        .join(format!("{}.json", release.manifest_sha256)))
+}
+
+fn cache_skill_manifest(release: &PackageReleaseRef, bytes: &[u8]) -> Result<()> {
+    Package::parse_referenced_manifest(bytes, release)?;
+    let destination = manifest_cache_path(release)?;
+    let root = destination
+        .parent()
+        .context("marketplace manifest cache has no parent")?;
+    std::fs::create_dir_all(root)?;
+    match std::fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            if let Some(existing) =
+                read_bounded_cache_file(&destination, MAX_PACKAGE_MANIFEST_BYTES)?
+                && Package::parse_referenced_manifest(&existing, release).is_ok()
+            {
+                return Ok(());
+            }
+            std::fs::remove_file(&destination)
+                .context("invalid cached marketplace manifest could not be replaced")?;
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            std::fs::remove_file(&destination)
+                .context("linked marketplace manifest cache could not be replaced")?;
+        }
+        Ok(_) => bail!("marketplace manifest cache path is not a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    persist_cache_bytes(&destination, bytes)
+}
+
+fn persist_cache_bytes(destination: &Path, bytes: &[u8]) -> Result<()> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let staging = destination.with_extension(format!("tmp-{}-{nonce}", std::process::id()));
+    let write_result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&staging, destination)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&staging);
+        if destination.is_file() {
+            return Ok(());
+        }
+    }
+    write_result
+}
+
+fn load_cached_skill_manifest(release: &PackageReleaseRef) -> Result<Option<Package>> {
+    let path = manifest_cache_path(release)?;
+    let Some(bytes) = read_bounded_cache_file(&path, MAX_PACKAGE_MANIFEST_BYTES)? else {
+        return Ok(None);
+    };
+    Ok(Package::parse_referenced_manifest(&bytes, release).ok())
+}
+
+fn show_remote_skill_package(
+    entry: &DiscoveryEntry,
+    package: &Package,
+    source: DiscoverySource,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    if package.package_class != entry.package_class
+        || package.publisher != entry.publisher
+        || package.provenance.trust != entry.trust
+    {
+        bail!("exact skill manifest metadata does not match its discovery entry");
+    }
+    writeln!(writer, "◆ {} · {}", package.display_name, package.id)?;
+    writeln!(
+        writer,
+        "  version {} · instruction skill · {}",
+        package.version, package.license
+    )?;
+    writeln!(writer, "  {}", package.description)?;
+    writeln!(writer, "  source {}", package.source)?;
+    writeln!(
+        writer,
+        "  publisher {} · trust {} · revision {}",
+        package.publisher,
+        match package.provenance.trust {
+            ReleaseTrust::Bundled => "bundled",
+            ReleaseTrust::SigstoreBundle => "signed discovery + pinned manifest digest",
+        },
+        &package.provenance.revision[..12]
+    )?;
+    writeln!(writer, "  discovery {}", source.label())?;
+    writeln!(
+        writer,
+        "  state {}",
+        if entry.revoked {
+            "revoked"
+        } else if entry.deprecated {
+            "deprecated"
+        } else {
+            "available"
+        }
+    )?;
+    writeln!(writer, "  data flow {}", package.disclosures.data_flow)?;
+    let capabilities = package
+        .capabilities
+        .iter()
+        .map(|capability| format!("{capability:?}").to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    writeln!(
+        writer,
+        "  capabilities {}",
+        if capabilities.is_empty() {
+            "none".to_owned()
+        } else {
+            capabilities.join(" · ")
+        }
+    )?;
+    writeln!(
+        writer,
+        "  Inspection fetched this exact manifest only; no package was installed or enabled."
     )?;
     Ok(())
 }
@@ -10752,19 +11166,21 @@ mod tests {
     use crumb_profile::{ProfileSelectionStore, ProfileStore};
 
     use super::{
-        CrumbEditMode, ExitGesture, MarketplaceContent, PausedSubmission, Renderer,
-        SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
+        CrumbEditMode, DiscoverySource, ExitGesture, MarketplaceContent, PausedSubmission,
+        Renderer, SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
         TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
         agent_config_location, apply_builtin_model_packs, bundled_catalog, completion_footer_frame,
         composer_anchor_sequence, configure_permissions, configure_plugin, effort_display_name,
-        effort_wire_name, ensure_single_release_skill_install, exact_skill_run_config,
-        failed_command_recovery, finished_tool_activity, fixed_footer_frame, handle_skill_command,
-        initial_agent_activity, install_marketplace_package, marketplace_update_blocker,
+        effort_wire_name, ensure_single_release_skill_install, exact_skill_manifest_url,
+        exact_skill_run_config, failed_command_recovery, finished_tool_activity,
+        fixed_footer_frame, handle_skill_command, initial_agent_activity,
+        install_marketplace_package, load_exact_skill_manifest, marketplace_update_blocker,
         normalize_bundled_skill_install, openrouter_preset, parse_cli_skill_run,
         parse_credential_reference, parse_exec_request, parse_interactive_skill_run,
         parse_paused_submission, parse_provider_header, parse_resume_session_argument,
-        read_agent_config, read_bounded_response, register_local_skill, resolve_memory_keep,
-        sanitize_transcript_output, set_skill_enabled, shell_blast_radius, shell_tool_config,
+        read_agent_config, read_bounded_response, register_local_skill,
+        render_skill_discovery_search, resolve_memory_keep, sanitize_transcript_output,
+        select_discovery_skill, set_skill_enabled, shell_blast_radius, shell_tool_config,
         should_auto_enable_rtk, show_graph, show_marketplace, show_memory,
         show_profile_with_stores, suggestion_width, transcript_activity_row,
         unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
@@ -10971,8 +11387,17 @@ mod tests {
         std::fs::create_dir_all(&workspace).expect("workspace is created");
         let mut output = Vec::new();
 
-        handle_skill_command("/skill search review", &workspace, &mut output)
-            .expect("compact metadata search succeeds");
+        let discovery = bundled_catalog()
+            .expect("bundled catalog")
+            .discovery_index()
+            .expect("compact discovery index");
+        render_skill_discovery_search(
+            &discovery,
+            "review",
+            DiscoverySource::BundledFallback,
+            &mut output,
+        )
+        .expect("compact metadata search succeeds");
 
         let rendered = String::from_utf8(output).expect("output is UTF-8");
         assert!(rendered.contains("crumb/code-review"));
@@ -10986,6 +11411,32 @@ mod tests {
         );
         assert!(!workspace.join(".crumb/marketplace").exists());
         std::fs::remove_dir_all(workspace).expect("workspace removed");
+    }
+
+    #[test]
+    fn discovery_selects_an_exact_or_latest_instruction_release() {
+        let discovery = bundled_catalog()
+            .expect("bundled catalog")
+            .discovery_index()
+            .expect("compact discovery index");
+        let latest = select_discovery_skill(&discovery, "crumb/code-review")
+            .expect("latest release resolves");
+        let exact = select_discovery_skill(
+            &discovery,
+            &format!("crumb/code-review@{}", latest.release.version),
+        )
+        .expect("exact release resolves");
+
+        assert_eq!(latest.release, exact.release);
+        let manifest = load_exact_skill_manifest(exact, DiscoverySource::BundledFallback)
+            .expect("exact referenced manifest verifies");
+        assert_eq!(manifest.id, exact.release.id);
+        assert_eq!(manifest.version, exact.release.version);
+        let manifest_url = exact_skill_manifest_url(&exact.release).expect("manifest URL");
+        assert!(manifest_url.starts_with("https://crumb.elixpo.com/marketplace/manifests/"));
+        assert!(manifest_url.ends_with(&format!("/{}.json", exact.release.version)));
+        assert!(select_discovery_skill(&discovery, "crumb/code-review@99.0.0").is_err());
+        assert!(select_discovery_skill(&discovery, "not-a-package").is_err());
     }
 
     #[test]

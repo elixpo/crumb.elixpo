@@ -82,6 +82,11 @@ enablement on the user's behalf. `crumb skill run <publisher/name>[@version] --
 release whose exact instruction files are already enabled. Skill text remains
 workflow guidance: it cannot grant permissions or expand the requested task.
 
+Remote discovery is lazy and explicit: search authenticates one bounded compact index, while
+inspect fetches only the exact manifest selected from that index and verifies its pinned digest.
+Validated compact indexes and exact manifests may be reused offline. There is no marketplace
+network activity at startup and discovery never activates a skill.
+
 ## Connector rollout
 
 ### Available foundation
