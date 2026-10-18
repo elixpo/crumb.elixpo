@@ -274,6 +274,7 @@ pub struct AgentRuntime {
     session_tokens_estimate: u64,
     provider_input_tokens: u64,
     provider_output_tokens: u64,
+    last_response: Option<String>,
     compactions: u32,
     review_notes: Vec<ReviewNote>,
     review_note_bytes: usize,
@@ -443,6 +444,7 @@ impl AgentRuntime {
             session_tokens_estimate: 0,
             provider_input_tokens: 0,
             provider_output_tokens: 0,
+            last_response: None,
             compactions: 0,
             review_notes: Vec::new(),
             review_note_bytes: 0,
@@ -506,6 +508,7 @@ impl AgentRuntime {
         self.supervisor = None;
         self.supervisor_limits = None;
         self.native_conversation = None;
+        self.last_response = None;
         self.environment_revision = self.environment_revision.saturating_add(1);
         let journal = SessionJournal::open(&root, &summary.id)?;
         self.session = Some(AgentSession::resume(
@@ -852,6 +855,9 @@ impl AgentRuntime {
         limit: u64,
         auto_compaction: bool,
     ) {
+        self.last_response = result
+            .map(|result| result.final_response.trim().to_owned())
+            .filter(|response| !response.is_empty());
         let response = result.map_or("", |result| result.final_response.as_str());
         let estimated = estimate_tokens(request).saturating_add(estimate_tokens(response));
         let reported = result.map_or(0, |result| {
@@ -878,6 +884,11 @@ impl AgentRuntime {
             self.context_tokens_estimate = limit.saturating_mul(16) / 100;
             self.compactions = self.compactions.saturating_add(1);
         }
+    }
+
+    #[must_use]
+    pub fn last_response(&self) -> Option<&str> {
+        self.last_response.as_deref()
     }
 
     fn start_turn(
@@ -1109,6 +1120,7 @@ impl AgentRuntime {
             self.supervisor = None;
             self.supervisor_limits = None;
             self.native_conversation = None;
+            self.last_response = None;
             self.session = None;
             self.environment_revision = self.environment_revision.saturating_add(1);
         }
@@ -2083,6 +2095,7 @@ mod tests {
         runtime.record_token_estimate("request", Some(&result), 64_000, false);
 
         assert_eq!(runtime.token_usage().0, 5_700);
+        assert_eq!(runtime.last_response(), Some("done"));
     }
 
     #[test]

@@ -1711,10 +1711,8 @@ impl AgentTerminal {
 }
 
 fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<ReplOutcome>> {
-    let agent_config = load_effective_agent_config(context.cwd, context.writer)?;
-    let mut decision = context
-        .command_catalog
-        .route(command, &agent_config.routing);
+    let mut agent_config = load_effective_agent_config(context.cwd, context.writer)?;
+    let mut decision = route_with_conversation_context(command, context, &mut agent_config)?;
     if !matches!(decision.route, InputRoute::Native) {
         prepare_agent_context(&mut decision, context, &agent_config)?;
         let decision = context.command_context.attach_to(decision, &agent_config);
@@ -1805,6 +1803,77 @@ fn handle_input(command: &str, context: &mut InputContext<'_>) -> Result<Option<
             Ok(Some(ReplOutcome::Exit))
         }
     }
+}
+
+fn route_with_conversation_context(
+    command: &str,
+    context: &mut InputContext<'_>,
+    agent_config: &mut AgentConfig,
+) -> Result<RouteDecision> {
+    let confirmation_reply = context
+        .agent_runtime
+        .as_ref()
+        .and_then(AgentRuntime::last_response)
+        .is_some_and(response_requests_confirmation)
+        && is_confirmation_reply(command);
+    if confirmation_reply
+        && is_affirmative_reply(command)
+        && matches!(agent_config.mode, AgentMode::Plan)
+    {
+        update_agent_config(context.cwd, |config| {
+            config.mode = AgentMode::Auto;
+            Ok(())
+        })?;
+        agent_config.mode = AgentMode::Auto;
+        writeln!(context.writer, "◆ Mode · execution (auto)")?;
+    }
+    let routed_input = if confirmation_reply {
+        format!(": {command}")
+    } else {
+        command.to_owned()
+    };
+    Ok(context
+        .command_catalog
+        .route(&routed_input, &agent_config.routing))
+}
+
+fn is_confirmation_reply(input: &str) -> bool {
+    matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+            | "n"
+            | "no"
+            | "continue"
+            | "proceed"
+            | "go ahead"
+            | "do it"
+            | "run it"
+            | "execute it"
+    )
+}
+
+fn is_affirmative_reply(input: &str) -> bool {
+    matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes" | "continue" | "proceed" | "go ahead" | "do it" | "run it" | "execute it"
+    )
+}
+
+fn response_requests_confirmation(response: &str) -> bool {
+    let response = response.to_ascii_lowercase();
+    [
+        "should i proceed",
+        "shall i proceed",
+        "would you like me to proceed",
+        "do you want me to proceed",
+        "would you like me to continue",
+        "do you want me to continue",
+        "would you like me to run",
+        "do you want me to run",
+        "ready to proceed",
+    ]
+    .iter()
+    .any(|phrase| response.contains(phrase))
 }
 
 fn prepare_agent_context(
@@ -10170,6 +10239,20 @@ mod tests {
             ApprovalMode::FullAccess
         );
         std::fs::remove_dir_all(workspace).expect("workspace removed");
+    }
+
+    #[test]
+    fn prose_confirmation_replies_are_detected_without_matching_unrelated_shell_input() {
+        assert!(super::response_requests_confirmation(
+            "The change is ready. Should I proceed?"
+        ));
+        assert!(super::is_confirmation_reply("yes"));
+        assert!(super::is_confirmation_reply("go ahead"));
+        assert!(super::is_affirmative_reply("execute it"));
+        assert!(!super::is_confirmation_reply("yes --help"));
+        assert!(!super::response_requests_confirmation(
+            "The command completed successfully."
+        ));
     }
 
     #[test]
