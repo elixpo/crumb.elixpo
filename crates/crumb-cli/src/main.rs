@@ -2966,6 +2966,9 @@ fn observe_agent_turn(
         .interactive
         .then(KeyboardEnhancementGuard::enable)
         .transpose()?;
+    if terminal.interactive {
+        input.redraw(writer)?;
+    }
     while !task.is_finished() {
         if let Ok(pending) = task.recv_approval_timeout(Duration::ZERO) {
             input.clear_line(writer)?;
@@ -3894,10 +3897,22 @@ impl SteeringInput {
 
     fn redraw(&mut self, writer: &mut dyn Write) -> Result<()> {
         if self.buffer.is_empty() {
-            return self.clear_line(writer);
+            self.clear_line(writer)?;
+            return self.focus_placeholder();
         }
         self.redraw_composer(&self.buffer, writer)?;
         self.visible = true;
+        Ok(())
+    }
+
+    fn focus_placeholder(&self) -> Result<()> {
+        if !self.fullscreen {
+            return Ok(());
+        }
+        let (_, rows) = size()?;
+        let mut terminal = io::stderr();
+        terminal.write_all(follow_up_cursor_sequence(rows).as_bytes())?;
+        terminal.flush()?;
         Ok(())
     }
 
@@ -11734,6 +11749,11 @@ fn composer_anchor_sequence(terminal_rows: u16) -> String {
     format!("\x1b[{};1H", composer_row.saturating_add(1))
 }
 
+fn follow_up_cursor_sequence(terminal_rows: u16) -> String {
+    let composer_row = terminal_rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
+    format!("\x1b[{};5H", composer_row.saturating_add(1))
+}
+
 fn render_idle_composer(
     renderer: Renderer,
     header_rows: u16,
@@ -12171,11 +12191,12 @@ mod tests {
         composer_anchor_sequence, configure_permissions, configure_plugin, effort_display_name,
         effort_wire_name, ensure_single_release_skill_install, exact_skill_manifest_url,
         exact_skill_run_config, failed_command_recovery, finished_tool_activity,
-        fixed_footer_frame, format_peer_discarded_file, format_peer_imported_file,
-        format_peer_inbox, format_peer_inspection, format_peer_quarantined_file, format_peer_task,
-        handle_skill_command, initial_agent_activity, install_marketplace_package,
-        load_exact_skill_manifest, marketplace_update_blocker, normalize_bundled_skill_install,
-        openrouter_preset, parse_cli_skill_run, parse_credential_reference, parse_exec_request,
+        fixed_footer_frame, follow_up_cursor_sequence, format_peer_discarded_file,
+        format_peer_imported_file, format_peer_inbox, format_peer_inspection,
+        format_peer_quarantined_file, format_peer_task, handle_skill_command,
+        initial_agent_activity, install_marketplace_package, load_exact_skill_manifest,
+        marketplace_update_blocker, normalize_bundled_skill_install, openrouter_preset,
+        parse_cli_skill_run, parse_credential_reference, parse_exec_request,
         parse_interactive_skill_run, parse_paused_submission, parse_provider_header,
         parse_resume_session_argument, read_agent_config, read_bounded_response,
         register_local_skill, render_skill_discovery_search, resolve_memory_keep,
@@ -13625,6 +13646,12 @@ mod tests {
             frame,
             "\x1b7\x1b[40;1H\x1b[2K  Type a follow-up · Enter steer · Ctrl+Enter queue · /pause · Ctrl+C cancel\x1b8"
         );
+    }
+
+    #[test]
+    fn active_follow_up_cursor_is_placed_inside_the_composer() {
+        assert_eq!(follow_up_cursor_sequence(40), "\x1b[35;5H");
+        assert_eq!(follow_up_cursor_sequence(4), "\x1b[1;5H");
     }
 
     #[test]
