@@ -108,13 +108,13 @@ use agent_runtime::{
     ResumeContinuity, apply_selected_profile, validate_skill_path,
 };
 use completion::{COMPLETION_PALETTE_ROWS, CompletionWorkspace, CrumbCompleter};
-use context::{parse_attachment, resolve_request_context};
+use context::{MAX_PASTE_ARTIFACT_BYTES, parse_attachment, resolve_request_context};
 use provider_discovery::{compatibility_diagnostics, discover_models};
 use shell_completion::{CompletionShell, write_completion};
 
 const INTERACTIVE_HISTORY_CAPACITY: usize = 1_000;
 const LARGE_PASTE_MIN_BYTES: usize = 4 * 1024;
-const MAX_PASTE_ARTIFACT_BYTES: usize = 48 * 1024;
+const MAX_PENDING_PASTE_BYTES: usize = 192 * 1024;
 const FULLSCREEN_SIDE_GUTTER: u16 = 2;
 const FULLSCREEN_TOP_GUTTER: u16 = 1;
 const MARKETPLACE_CATALOG_URL: &str = "https://crumb.elixpo.com/marketplace/catalog.json";
@@ -11105,7 +11105,17 @@ impl PendingPasteArtifacts {
         }
         let digest = format!("{:x}", Sha256::digest(paste.as_bytes()));
         let marker = format!("@paste:sha256-{digest}");
-        self.contents.entry(marker.clone()).or_insert(paste);
+        if self.contents.contains_key(&marker) {
+            return marker;
+        }
+        let retained = self.contents.values().map(String::len).sum::<usize>();
+        if retained.saturating_add(paste.len()) > MAX_PENDING_PASTE_BYTES {
+            return format!(
+                "[paste rejected: pending artifacts exceed the {} byte request limit]",
+                MAX_PENDING_PASTE_BYTES
+            );
+        }
+        self.contents.insert(marker.clone(), paste);
         marker
     }
 
