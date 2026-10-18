@@ -1698,10 +1698,7 @@ fn render_startup(
     let cwd = current_process_dir()?;
     let config = read_agent_config(&cwd).unwrap_or_default();
     let instance = instance_store(&cwd).load().ok();
-    let text_route = config
-        .models
-        .get(&Modality::Text)
-        .and_then(|routes| routes.first());
+    let text_route = selected_text_route(&config);
     let pack = text_route.map(|_| active_pack_label(&config));
     let startup = StartupContext {
         version: env!("CARGO_PKG_VERSION"),
@@ -1833,10 +1830,7 @@ fn context_footer_status(
 ) -> String {
     let config = read_agent_config(cwd).unwrap_or_default();
     let instance = instance_store(cwd).load().ok();
-    let text_route = config
-        .models
-        .get(&Modality::Text)
-        .and_then(|routes| routes.first());
+    let text_route = selected_text_route(&config);
     let pack = text_route.map(|_| active_pack_label(&config));
     let startup = StartupContext {
         version: env!("CARGO_PKG_VERSION"),
@@ -2561,10 +2555,7 @@ fn handle_agent_boundary(
     if matches!(decision.route, InputRoute::Native) {
         unreachable!("native input is handled by the shell path");
     }
-    let route = config
-        .models
-        .get(&Modality::Text)
-        .and_then(|routes| routes.first());
+    let route = selected_text_route(config);
     let pack = active_pack_label(config);
     let effort = Some(
         route
@@ -5427,10 +5418,7 @@ fn show_reserved(
         "/pack" => show_model_packs(cwd, writer)?,
         "/effort" => {
             let config = read_agent_config(cwd)?;
-            let text_route = config
-                .models
-                .get(&Modality::Text)
-                .and_then(|routes| routes.first());
+            let text_route = selected_text_route(&config);
             let effort = text_route
                 .and_then(|route| config.reasoning_effort_for(route))
                 .unwrap_or("provider default");
@@ -6314,11 +6302,7 @@ fn show_provider_usage(
     writer: &mut dyn Write,
 ) -> Result<()> {
     let config = read_agent_config(cwd)?;
-    let provider = config
-        .models
-        .get(&Modality::Text)
-        .and_then(|routes| routes.first())
-        .map_or("provider", |route| route.provider.as_str());
+    let provider = selected_text_route(&config).map_or("provider", |route| route.provider.as_str());
     let (input, cached, output) = runtime.map_or((0, 0, 0), AgentRuntime::provider_token_usage);
     let uncached = input.saturating_sub(cached);
     let (_, estimated, _) = runtime.map_or((0, 0, 0), AgentRuntime::token_usage);
@@ -8079,10 +8063,7 @@ fn show_doctor(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
             backend, command, ..
         }) => {
             let discovery = BackendDiscovery::discover(*backend, command);
-            let route = config
-                .models
-                .get(&Modality::Text)
-                .and_then(|routes| routes.first())
+            let route = selected_text_route(&config)
                 .context("coding backend has no selected text model")?;
             let effort = config
                 .reasoning_effort_for(route)
@@ -8527,10 +8508,7 @@ fn show_session_config(
     writer: &mut dyn Write,
 ) -> Result<()> {
     let config = read_agent_config(cwd)?;
-    let route = config
-        .models
-        .get(&Modality::Text)
-        .and_then(|routes| routes.first());
+    let route = selected_text_route(&config);
     let (context_tokens, session_tokens, compactions) =
         runtime.map_or((0, 0, 0), AgentRuntime::token_usage);
     writeln!(writer, "◆ Session configuration")?;
@@ -11780,23 +11758,19 @@ fn prompt_model_status(cwd: &Path) -> String {
     let Ok(config) = read_agent_config(cwd) else {
         return "native".to_owned();
     };
-    let mut status = config
-        .models
-        .get(&Modality::Text)
-        .and_then(|routes| routes.first())
-        .map_or_else(
-            || "native".to_owned(),
-            |route| {
-                let effort = config
-                    .reasoning_effort_for(route)
-                    .map_or("default", effort_display_name);
-                format!(
-                    "pack {} · {} · effort {effort}",
-                    active_pack_label(&config),
-                    agent_mode_name(config.mode)
-                )
-            },
-        );
+    let mut status = selected_text_route(&config).map_or_else(
+        || "native".to_owned(),
+        |route| {
+            let effort = config
+                .reasoning_effort_for(route)
+                .map_or("default", effort_display_name);
+            format!(
+                "pack {} · {} · effort {effort}",
+                active_pack_label(&config),
+                agent_mode_name(config.mode)
+            )
+        },
+    );
     if let Some(profile) = selected_profile_id(cwd) {
         status.push_str(" · profile ");
         status.push_str(&profile);
@@ -11810,6 +11784,20 @@ fn active_pack_label(config: &AgentConfig) -> &str {
         .as_ref()
         .and_then(|id| config.model_packs.get(id))
         .map_or("Custom", |pack| pack.label.as_str())
+}
+
+fn selected_text_route(config: &AgentConfig) -> Option<&ModelRoute> {
+    config
+        .active_model_pack
+        .as_ref()
+        .and_then(|id| config.model_packs.get(id))
+        .map(|pack| &pack.router)
+        .or_else(|| {
+            config
+                .models
+                .get(&Modality::Text)
+                .and_then(|routes| routes.first())
+        })
 }
 
 fn selected_profile_id(cwd: &Path) -> Option<String> {
@@ -12342,8 +12330,9 @@ mod tests {
         MouseEventKind,
     };
     use crumb_agent::{
-        AgentConfig, ApprovalMode, CredentialReference, HarnessConfig, OptimizerConfig,
-        ProviderConfig, ProviderHeader, ProviderModel, ProviderProtocol, RiskClass, SkillConfig,
+        AgentConfig, ApprovalMode, CredentialReference, HarnessConfig, Modality, ModelRoute,
+        OptimizerConfig, ProviderConfig, ProviderHeader, ProviderModel, ProviderProtocol,
+        RiskClass, SkillConfig,
     };
     use crumb_marketplace::UpdateStatus;
     use crumb_memory::{MemoryScope, MemorySet, MemoryStore};
@@ -12478,6 +12467,57 @@ mod tests {
                 .router
                 .model,
             "nova"
+        );
+    }
+
+    #[test]
+    fn context_budget_uses_the_active_pack_router() {
+        let route = |model: &str| ModelRoute {
+            provider: "pollinations".to_owned(),
+            model: model.to_owned(),
+            reasoning_effort: None,
+        };
+        let mut config = AgentConfig::default();
+        let mut provider = ProviderConfig::new(
+            "Pollinations",
+            ProviderProtocol::OpenAiCompletions,
+            "https://example.invalid/v1",
+        );
+        provider.models = [
+            ("nova-fast", 128_000),
+            ("nova", 1_048_576),
+            ("qwen-coder", 262_144),
+            ("Circuit-Overtime/OreoLook", 262_144),
+            ("flux", 32_000),
+            ("klein", 32_000),
+        ]
+        .into_iter()
+        .map(|(id, context_window)| {
+            let mut model = ProviderModel::new(id);
+            model.context_window = Some(context_window);
+            model
+        })
+        .collect();
+        config.providers.insert("pollinations".to_owned(), provider);
+        config
+            .models
+            .insert(Modality::Text, vec![route("nova-fast"), route("nova")]);
+
+        apply_builtin_model_packs(&mut config);
+
+        let selected = super::selected_text_route(&config).expect("balanced route");
+        assert_eq!(selected.model, "nova");
+        assert_eq!(
+            super::context_token_budget(&config, Some(selected)),
+            256_000
+        );
+
+        config.active_model_pack = Some("quick".to_owned());
+        let selected = super::selected_text_route(&config).expect("quick route");
+        assert_eq!(selected.model, "nova-fast");
+        assert_eq!(
+            super::context_token_budget(&config, Some(selected)),
+            128_000
         );
     }
 
