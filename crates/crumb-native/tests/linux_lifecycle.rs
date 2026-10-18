@@ -64,8 +64,14 @@ fn foreground_input_and_interrupt_return_control_to_crumb() {
         .join()
         .expect("foreground lifecycle worker should not panic");
 
-    assert!(output.contains("prompt=answer"), "unexpected output: {output:?}");
-    assert!(output.contains("after-interrupt"), "unexpected output: {output:?}");
+    assert!(
+        output.contains("prompt=answer"),
+        "unexpected output: {output:?}"
+    );
+    assert!(
+        output.contains("after-interrupt"),
+        "unexpected output: {output:?}"
+    );
 }
 
 fn exercise_lifecycle() -> Result<String> {
@@ -128,10 +134,7 @@ fn exercise_foreground_input_and_interrupt() -> Result<String> {
         .expect("interrupt writer should not panic")?;
     assert_eq!(interrupted.exit_code, 130);
 
-    let resumed = completed(
-        session
-            .execute("printf 'after-interrupt\\n'", &mut output)?,
-    );
+    let resumed = completed(session.execute("printf 'after-interrupt\\n'", &mut output)?);
     assert_eq!(resumed.exit_code, 0);
     session.shutdown()?;
 
