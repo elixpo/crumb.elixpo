@@ -25,7 +25,10 @@ two inspectable skills and one descriptor for Crumb's built-in policy-controlled
 The user-facing skill protocol is available both as `crumb skill ...` and the
 interactive `/skill ...` namespace. Search is metadata-only; inspect performs
 no mutation; install leaves every component disabled; and enable/disable stays
-separate from package installation and removal. The plural `/skills` namespace
+separate from package installation and removal. `run <publisher/name>[@version]
+-- <task>` verifies the active installed release and executes only its already
+enabled instruction skill. Running never installs, enables, or expands tool
+permissions. The plural `/skills` namespace
 remains as a compatibility surface for local registrations.
 
 ## Memory lifecycle

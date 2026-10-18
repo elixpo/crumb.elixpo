@@ -289,6 +289,7 @@ fn run_worker(worker: WorkerSpec) -> Result<Finding> {
         images: Vec::new(),
         persona: None,
         static_context: Vec::new(),
+        selected_skills: Vec::new(),
         trusted_context: Vec::new(),
         max_output_tokens: config.max_output_tokens,
     };

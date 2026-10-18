@@ -44,6 +44,7 @@ use crumb_graph::{
     EdgeConfidence, EvidenceFreshness, GraphEvidence, GraphLimits, GraphSettingsStore,
     GraphifyAdapter, NativeSearchEvidence, NativeSearchLimits, ProjectGraph, native_project_search,
 };
+use crumb_harness::SelectedSkill;
 use crumb_harness_dsh::HarnessActivity;
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
 use crumb_marketplace::{
@@ -84,6 +85,7 @@ use reedline::{
     Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent, Signal, Suggestion,
     default_emacs_keybindings,
 };
+use sha2::{Digest, Sha256};
 
 mod agent_runtime;
 mod bundled_skills;
@@ -202,6 +204,16 @@ fn run_command_line_action() -> Result<bool> {
                     .context("skill arguments must be valid UTF-8")
             })
             .collect::<Result<Vec<_>>>()?;
+        if arguments.first().is_some_and(|action| *action == "run") {
+            let (selector, request) = parse_cli_skill_run(&arguments)?;
+            run_skill_job(
+                &current_process_dir()?,
+                selector,
+                &request,
+                &mut io::stdout().lock(),
+            )?;
+            return Ok(true);
+        }
         let command = if arguments.is_empty() {
             "/skill".to_owned()
         } else {
@@ -279,6 +291,241 @@ fn run_agent_exec(cwd: &Path, request: &str, json: bool, writer: &mut dyn Write)
         writeln!(writer, "{response}")?;
     }
     Ok(())
+}
+
+fn run_skill_job(cwd: &Path, selector: &str, request: &str, writer: &mut dyn Write) -> Result<()> {
+    let config = effective_agent_config(cwd)?;
+    let resolved = exact_skill_run_config(cwd, &config, selector)?;
+    let mut runtime = AgentRuntime::new()?;
+    runtime.select_skills_for_next_turn(vec![resolved.receipt])?;
+    let cancellation = CancellationToken::default();
+    let result = runtime.run_local_job(request, &resolved.config, cwd, &cancellation)?;
+    writeln!(
+        writer,
+        "{}",
+        crumb_ui::visible_agent_text(&result.final_response)
+    )?;
+    Ok(())
+}
+
+fn effective_agent_config(cwd: &Path) -> Result<AgentConfig> {
+    let config = read_agent_config(cwd)?;
+    Ok(apply_selected_profile(&config, cwd)
+        .context("selected persona profile could not be applied")?
+        .config)
+}
+
+fn parse_cli_skill_run<'a>(arguments: &'a [&'a str]) -> Result<(&'a str, String)> {
+    let ["run", selector, "--", request @ ..] = arguments else {
+        bail!("usage: crumb skill run <publisher/name>[@version] -- <task>");
+    };
+    let request = request.join(" ");
+    let request = request.trim();
+    if request.is_empty() {
+        bail!("usage: crumb skill run <publisher/name>[@version] -- <task>");
+    }
+    Ok((selector, request.to_owned()))
+}
+
+#[derive(Clone)]
+struct LocatedSkillRelease {
+    release: InstalledRelease,
+    scope: InstallScope,
+    root: PathBuf,
+}
+
+#[derive(Debug)]
+struct ExactSkillRun {
+    config: AgentConfig,
+    receipt: SelectedSkill,
+}
+
+fn exact_skill_run_config(
+    cwd: &Path,
+    config: &AgentConfig,
+    selector: &str,
+) -> Result<ExactSkillRun> {
+    let (package_id, requested_version) = parse_skill_run_selector(selector)?;
+    let (_, project_root) = agent_config_location(cwd);
+    let selected =
+        resolve_installed_skill_release(&project_root, package_id, requested_version, selector)?;
+    if selected.release.package.package_class != PackageClass::Instruction
+        || selected.release.package.skills.is_empty()
+    {
+        bail!("package `{selector}` is installed, but it is not an instruction skill");
+    }
+    verify_package_files(&selected.release.package, &selected.root)
+        .with_context(|| {
+            format!(
+                "installed skill package `{selector}` failed verification; remove and reinstall it before running"
+            )
+        })?;
+
+    let mut selected_skills = Vec::with_capacity(selected.release.package.skills.len());
+    for entry in &selected.release.package.skills {
+        let expected_path = std::fs::canonicalize(selected.root.join(&entry.path))
+            .with_context(|| format!("installed skill `{}` source is unavailable", entry.id))?;
+        let registered = config.skills.iter().find(|skill| {
+            skill.id == entry.id
+                && std::fs::canonicalize(&skill.path)
+                    .is_ok_and(|registered_path| registered_path == expected_path)
+        });
+        let Some(registered) = registered else {
+            bail!(
+                "installed skill `{}` is not registered to package `{package_id}`; reinstall with `crumb skill install {selector}`",
+                entry.id
+            );
+        };
+        if !registered.enabled {
+            bail!(
+                "skill `{}` is installed but disabled in the effective profile; run `crumb skill enable {}` and ensure the active profile permits it before executing",
+                entry.id,
+                entry.id
+            );
+        }
+        selected_skills.push(registered.clone());
+    }
+    let mut exact = config.clone();
+    exact.skills = selected_skills;
+    Ok(ExactSkillRun {
+        config: exact,
+        receipt: marketplace_skill_receipt(&selected),
+    })
+}
+
+fn marketplace_skill_receipt(selected: &LocatedSkillRelease) -> SelectedSkill {
+    let package = &selected.release.package;
+    let mut digest = Sha256::new();
+    digest.update(package.id.as_bytes());
+    digest.update(package.version.as_bytes());
+    for artifact in &package.artifacts {
+        digest.update(artifact.path.to_string_lossy().as_bytes());
+        digest.update(artifact.sha256.as_bytes());
+    }
+    let digest = digest.finalize();
+    SelectedSkill {
+        identity: package.id.clone(),
+        version: Some(package.version.clone()),
+        provenance: Some(format!(
+            "marketplace:{}:{}@{}",
+            install_scope_name(selected.scope),
+            package.provenance.repository,
+            package.provenance.revision
+        )),
+        digest: Some(format!("sha256:{digest:x}")),
+        capabilities: package
+            .capabilities
+            .iter()
+            .map(|capability| format!("{capability:?}").to_ascii_lowercase())
+            .collect(),
+        grants: Vec::new(),
+    }
+}
+
+fn resolve_installed_skill_release(
+    project_root: &Path,
+    package_id: &str,
+    requested_version: Option<&str>,
+    selector: &str,
+) -> Result<LocatedSkillRelease> {
+    let mut installed = Vec::new();
+    for scope in [InstallScope::Project, InstallScope::User] {
+        let store = marketplace_install_store(scope, project_root)?;
+        for release in store
+            .list()?
+            .into_iter()
+            .filter(|release| release.package.id == package_id)
+        {
+            let root = marketplace_release_root(&release, scope, project_root)?;
+            installed.push(LocatedSkillRelease {
+                release,
+                scope,
+                root,
+            });
+        }
+    }
+    if installed.is_empty() {
+        bail!(
+            "skill package `{selector}` is not installed; run `crumb skill install {selector}` first"
+        );
+    }
+    let mut candidates = installed
+        .iter()
+        .filter(|located| {
+            located.release.active
+                && requested_version
+                    .is_none_or(|version| located.release.package.version == version)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        if let Some(version) = requested_version
+            && installed
+                .iter()
+                .any(|located| located.release.package.version == version)
+        {
+            bail!(
+                "skill package `{package_id}@{version}` is installed but not active; activate that recorded release with `crumb skill rollback {package_id} --to {version}`"
+            );
+        }
+        let versions = installed
+            .iter()
+            .filter(|located| located.release.active)
+            .map(|located| located.release.package.version.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "skill package `{selector}` is not the active installed release{}",
+            if versions.is_empty() {
+                String::new()
+            } else {
+                format!(" (active: {versions})")
+            }
+        );
+    }
+    candidates.sort_by_key(|located| match located.scope {
+        InstallScope::Project => 0_u8,
+        InstallScope::User => 1_u8,
+    });
+    if requested_version.is_none()
+        && candidates
+            .iter()
+            .map(|located| located.release.package.version.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            > 1
+    {
+        bail!(
+            "multiple active versions of `{package_id}` are installed; rerun with `<publisher/name>@<version>`"
+        );
+    }
+    Ok(candidates.remove(0))
+}
+
+fn parse_skill_run_selector(selector: &str) -> Result<(&str, Option<&str>)> {
+    let selector = selector.trim();
+    let (package_id, version) = selector
+        .rsplit_once('@')
+        .map_or((selector, None), |(id, version)| (id, Some(version)));
+    let valid_id = package_id.split_once('/').is_some_and(|(publisher, name)| {
+        !publisher.is_empty()
+            && !name.is_empty()
+            && !name.contains('/')
+            && package_id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.')
+            })
+    });
+    if !valid_id
+        || version.is_some_and(|version| {
+            version.is_empty()
+                || version
+                    .bytes()
+                    .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        })
+    {
+        bail!("usage: crumb skill run <publisher/name>[@version] -- <task>");
+    }
+    Ok((package_id, version))
 }
 
 fn export_reviews(cwd: &Path, id: &str, writer: &mut dyn Write) -> Result<()> {
@@ -732,6 +979,12 @@ fn handle_repl_event(
     context: &mut InputContext<'_>,
 ) -> Result<Option<ReplOutcome>> {
     match event {
+        InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
+            if command == "/skill run" || command.starts_with("/skill run ") =>
+        {
+            run_interactive_skill(&command, context)?;
+            Ok(None)
+        }
         InputEvent::BuiltIn(command)
             if matches!(&command, BuiltInCommand::Auth(AuthAction::Login)) =>
         {
@@ -774,6 +1027,63 @@ fn handle_repl_event(
         InputEvent::NativeInput(command) if command.trim().is_empty() => Ok(None),
         InputEvent::NativeInput(command) => handle_input(&command, context),
     }
+}
+
+fn run_interactive_skill(command: &str, context: &mut InputContext<'_>) -> Result<()> {
+    let (selector, request) = parse_interactive_skill_run(command)?;
+    let config = load_effective_agent_config(context.cwd, context.writer)?;
+    let resolved = exact_skill_run_config(context.cwd, &config, selector)?;
+    let mut decision = RouteDecision {
+        route: InputRoute::Agent,
+        reason: RouteReason::ExplicitAgentPrefix,
+        payload: request.to_owned(),
+        suggestion: None,
+    };
+    prepare_agent_context(&mut decision, context, &resolved.config)?;
+    let decision = context
+        .command_context
+        .attach_to(decision, &resolved.config);
+    if context.agent_runtime.is_none() {
+        *context.agent_runtime = Some(AgentRuntime::new()?);
+    }
+    context
+        .agent_runtime
+        .as_mut()
+        .context("agent runtime is unavailable")?
+        .select_skills_for_next_turn(vec![resolved.receipt])?;
+    let terminal = AgentTerminal::from_input(context);
+    handle_agent_boundary(
+        &decision,
+        &resolved.config,
+        context.cwd,
+        context.agent_runtime,
+        context.renderer,
+        context.writer,
+        &terminal,
+    )?;
+    record_history(
+        context.history,
+        command,
+        context.cwd,
+        context.platform,
+        HistoryMode::Agent,
+        None,
+        context.writer,
+    )?;
+    Ok(())
+}
+
+fn parse_interactive_skill_run(command: &str) -> Result<(&str, &str)> {
+    let arguments = command
+        .strip_prefix("/skill run ")
+        .context("usage: /skill run <publisher/name>[@version] -- <task>")?;
+    let (selector, request) = arguments
+        .split_once(" -- ")
+        .map(|(selector, request)| (selector.trim(), request.trim()))
+        .filter(|(selector, request)| !selector.is_empty() && !request.is_empty())
+        .context("usage: /skill run <publisher/name>[@version] -- <task>")?;
+    parse_skill_run_selector(selector)?;
+    Ok((selector, request))
 }
 
 enum ReplSubmission {
@@ -4331,7 +4641,7 @@ fn show_skills(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     }
     writeln!(
         writer,
-        "  `/skill search|inspect|install|enable|disable|remove|doctor`"
+        "  `/skill search|inspect|install|enable|disable|run|remove|doctor`"
     )?;
     writeln!(
         writer,
@@ -4349,7 +4659,7 @@ fn handle_skill_command(command: &str, cwd: &Path, writer: &mut dyn Write) -> Re
         show_skills(cwd, writer)?;
         writeln!(
             writer,
-            "  CLI: `crumb skill <search|inspect|install|enable|disable|update|rollback|remove|doctor>`"
+            "  CLI: `crumb skill <search|inspect|install|enable|disable|run|update|rollback|remove|doctor>`"
         )?;
         return Ok(());
     }
@@ -4385,7 +4695,7 @@ fn handle_skill_command(command: &str, cwd: &Path, writer: &mut dyn Write) -> Re
         return show_marketplace(&format!("/marketplace doctor{suffix}"), cwd, writer);
     }
     Err(anyhow!(
-        "usage: /skill [search [query] | inspect <publisher/name>[@version] | install <publisher/name>[@version] [--scope project|user] | enable|disable <id> | update <publisher/name> [--scope project|user] | rollback <publisher/name> [--to <version>] [--scope project|user] | remove <publisher/name> [--scope project|user] | doctor [--scope project|user]]"
+        "usage: /skill [search [query] | inspect <publisher/name>[@version] | install <publisher/name>[@version] [--scope project|user] | enable|disable <id> | run <publisher/name>[@version] -- <task> | update <publisher/name> [--scope project|user] | rollback <publisher/name> [--to <version>] [--scope project|user] | remove <publisher/name> [--scope project|user] | doctor [--scope project|user]]"
     ))
 }
 
@@ -10445,14 +10755,15 @@ mod tests {
         CrumbEditMode, ExitGesture, MarketplaceContent, PausedSubmission, Renderer,
         SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
         TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
-        agent_config_location, apply_builtin_model_packs, completion_footer_frame,
+        agent_config_location, apply_builtin_model_packs, bundled_catalog, completion_footer_frame,
         composer_anchor_sequence, configure_permissions, configure_plugin, effort_display_name,
-        effort_wire_name, ensure_single_release_skill_install, failed_command_recovery,
-        finished_tool_activity, fixed_footer_frame, handle_skill_command, initial_agent_activity,
-        marketplace_update_blocker, normalize_bundled_skill_install, openrouter_preset,
-        parse_credential_reference, parse_exec_request, parse_paused_submission,
-        parse_provider_header, parse_resume_session_argument, read_agent_config,
-        read_bounded_response, register_local_skill, resolve_memory_keep,
+        effort_wire_name, ensure_single_release_skill_install, exact_skill_run_config,
+        failed_command_recovery, finished_tool_activity, fixed_footer_frame, handle_skill_command,
+        initial_agent_activity, install_marketplace_package, marketplace_update_blocker,
+        normalize_bundled_skill_install, openrouter_preset, parse_cli_skill_run,
+        parse_credential_reference, parse_exec_request, parse_interactive_skill_run,
+        parse_paused_submission, parse_provider_header, parse_resume_session_argument,
+        read_agent_config, read_bounded_response, register_local_skill, resolve_memory_keep,
         sanitize_transcript_output, set_skill_enabled, shell_blast_radius, shell_tool_config,
         should_auto_enable_rtk, show_graph, show_marketplace, show_memory,
         show_profile_with_stores, suggestion_width, transcript_activity_row,
@@ -10709,6 +11020,106 @@ mod tests {
                 .iter()
                 .any(|skill| skill.id == "failure-autopsy" && skill.enabled)
         );
+        std::fs::remove_dir_all(workspace).expect("workspace removed");
+    }
+
+    #[test]
+    fn skill_run_parsers_require_an_explicit_task_separator() {
+        let arguments = [
+            "run",
+            "crumb/code-review@1.0.0",
+            "--",
+            "review",
+            "this",
+            "change",
+        ];
+        let (selector, request) = parse_cli_skill_run(&arguments).expect("CLI run parses");
+        assert_eq!(selector, "crumb/code-review@1.0.0");
+        assert_eq!(request, "review this change");
+        assert!(parse_cli_skill_run(&["run", "crumb/code-review", "review"]).is_err());
+
+        let (selector, request) =
+            parse_interactive_skill_run("/skill run crumb/code-review@1.0.0 -- review this change")
+                .expect("interactive run parses");
+        assert_eq!(selector, "crumb/code-review@1.0.0");
+        assert_eq!(request, "review this change");
+        assert!(parse_interactive_skill_run("/skill run crumb/code-review").is_err());
+    }
+
+    #[test]
+    fn skill_run_requires_the_exact_installed_skill_to_be_enabled() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-skill-run-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace is created");
+        let catalog = bundled_catalog().expect("bundled catalog is valid");
+        let mut output = Vec::new();
+        install_marketplace_package(&catalog, "crumb/code-review", &workspace, &mut output)
+            .expect("skill installs disabled");
+
+        let config = read_agent_config(&workspace).expect("config loads");
+        let error = exact_skill_run_config(&workspace, &config, "crumb/code-review@1.0.0")
+            .expect_err("disabled skill is rejected");
+        assert!(error.to_string().contains("crumb skill enable code-review"));
+
+        set_skill_enabled("/skill enable code-review", &workspace, true, &mut output)
+            .expect("installed skill is enabled explicitly");
+        let config = read_agent_config(&workspace).expect("config reloads");
+        let exact = exact_skill_run_config(&workspace, &config, "crumb/code-review@1.0.0")
+            .expect("exact enabled skill resolves");
+        assert_eq!(exact.config.skills.len(), 1);
+        assert_eq!(exact.config.skills[0].id, "code-review");
+        assert_eq!(exact.receipt.identity, "crumb/code-review");
+        assert_eq!(exact.receipt.version.as_deref(), Some("1.0.0"));
+        assert!(
+            exact
+                .receipt
+                .provenance
+                .as_deref()
+                .is_some_and(|provenance| provenance.starts_with("marketplace:project:"))
+        );
+        assert!(
+            exact
+                .receipt
+                .digest
+                .as_deref()
+                .is_some_and(|digest| digest.starts_with("sha256:"))
+        );
+        assert_eq!(exact.receipt.grants, Vec::<String>::new());
+        assert!(
+            exact_skill_run_config(&workspace, &config, "crumb/code-review@9.9.9")
+                .expect_err("wrong release is rejected")
+                .to_string()
+                .contains("not the active installed release")
+        );
+        std::fs::remove_dir_all(workspace).expect("workspace removed");
+    }
+
+    #[test]
+    fn skill_run_never_installs_a_missing_package_implicitly() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-skill-run-missing-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace is created");
+        let config = read_agent_config(&workspace).expect("config loads");
+
+        let error = exact_skill_run_config(
+            &workspace,
+            &config,
+            "missing-publisher/missing-skill-791@1.0.0",
+        )
+        .expect_err("missing package is rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("crumb skill install missing-publisher/missing-skill-791@1.0.0")
+        );
+        assert!(!workspace.join(".crumb/marketplace").exists());
         std::fs::remove_dir_all(workspace).expect("workspace removed");
     }
 

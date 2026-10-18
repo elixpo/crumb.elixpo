@@ -72,6 +72,10 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "explicitly install a verified skill package disabled",
     },
     SlashCommand {
+        usage: "/skill run ",
+        description: "run one installed and enabled skill for a task",
+    },
+    SlashCommand {
         usage: "/skill enable ",
         description: "enable one installed or bundled skill",
     },

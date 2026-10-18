@@ -30,6 +30,7 @@ Answer from this reference. Be concise and name the exact command. Never execute
 - `/session` manages saved agent sessions; use `list`, `search`, `resume`, `inspect`, `rename`, `archive`, `restore`, `export`, or `delete`.
 - `/memory` manages explicitly approved memory; use `show`, `remember`, `forget`, `search`, `inspect`, `tag`, `untag`, `replace`, `compact`, `conflicts`, `resolve`, or `repair`.
 - `/skills` lists skills; `load`, `unload`, `add`, and `remove` change their registration or active state.
+- `/skill` manages verified packages. `/skill run <publisher/name>[@version] -- <task>` runs only that exact installed and enabled skill; it never installs or enables one implicitly.
 - `/tools` lists agent tools. `/permissions` inspects permissions; choose `always-ask`, `sensitive`, or `full-access`, and use `allow-network` or `deny-network` for network tools.
 - `/plugins` and `/marketplace` manage external capabilities. `/graph` manages bounded local project-graph evidence. `/profile` manages persona profiles.
 

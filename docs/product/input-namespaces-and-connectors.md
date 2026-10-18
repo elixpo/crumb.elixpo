@@ -34,7 +34,7 @@ never interpreted as prompts or passed to the native shell accidentally.
 - `/context` — show the context budget and attached references
 - `/attach` and `/detach` — manage files, folders, or connector resources
 - `/connectors` — list, connect, inspect, or revoke integrations
-- `/skill search|inspect|install|enable|disable|remove|doctor` — manage skill packages explicitly
+- `/skill search|inspect|install|enable|disable|run|remove|doctor` — manage and explicitly run skill packages
 - `/skills` and `/plugins` — inspect legacy local-skill registrations and plugin capabilities
 - `/tools` — show available tools and their risk classes
 - `/permissions` — inspect or change user-granted policy
@@ -77,7 +77,10 @@ downloads instructions or changes agent context. `inspect` shows package
 provenance and requirements, `install` verifies and registers components in a
 disabled state, and `enable` is a separate explicit action. Natural-language
 routing may recommend these commands, but cannot invoke installation or
-enablement on the user's behalf.
+enablement on the user's behalf. `crumb skill run <publisher/name>[@version] --
+<task>` and its interactive `/skill run` equivalent require an active installed
+release whose exact instruction files are already enabled. Skill text remains
+workflow guidance: it cannot grant permissions or expand the requested task.
 
 ## Connector rollout
 
