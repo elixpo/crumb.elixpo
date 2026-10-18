@@ -3900,7 +3900,7 @@ impl SteeringInput {
         if self.visible {
             if self.fullscreen {
                 let (columns, rows) = size()?;
-                let composer_row = rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
+                let composer_row = follow_up_composer_row(rows);
                 let available_width = columns.saturating_sub(7);
                 let mut frame = Vec::new();
                 crossterm::execute!(frame, MoveTo(4, composer_row))?;
@@ -3944,7 +3944,7 @@ impl SteeringInput {
         let available_width = columns.saturating_sub(7);
         let rendered = self.renderer.composer_follow_up(input, available_width);
         if self.fullscreen {
-            let composer_row = rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
+            let composer_row = follow_up_composer_row(rows);
             let mut frame = Vec::new();
             if !self.visible {
                 write!(frame, "\x1b7")?;
@@ -12049,6 +12049,23 @@ fn composer_visual_rows(line: &str, artifact_width: usize, terminal_columns: u16
     u16::try_from(rows.max(1)).unwrap_or(u16::MAX)
 }
 
+const COMPOSER_PLACEHOLDER: &str =
+    "Ask Crumb anything or type a command · @ context · / commands · Tab complete";
+
+fn composer_placeholder_hint(line: &str, has_artifacts: bool) -> Option<&'static str> {
+    match (line, has_artifacts) {
+        ("", false) => Some(COMPOSER_PLACEHOLDER),
+        ("", true) => Some("Ask Crumb anything…"),
+        // `?` opens the help palette, but it is also inserted into Reedline's
+        // buffer. Keep the composer guidance visible until the user narrows a
+        // help query or accepts a suggestion.
+        ("?", _) => {
+            Some(" Ask Crumb anything or type a command · @ context · / commands · Tab complete")
+        }
+        _ => None,
+    }
+}
+
 struct CrumbPrompt {
     rendered: String,
     right: String,
@@ -12125,7 +12142,6 @@ impl Hinter for CrumbHinter {
         use_ansi_coloring: bool,
         cwd: &str,
     ) -> String {
-        self.placeholder_visible = line.is_empty();
         let (has_artifacts, artifact_width) = {
             let artifacts = self
                 .paste_artifacts
@@ -12139,9 +12155,8 @@ impl Hinter for CrumbHinter {
             input_rows.min(FULLSCREEN_COMPOSER_ROWS.saturating_sub(5).max(1)),
             Ordering::Relaxed,
         );
-        if self.placeholder_visible && !has_artifacts {
-            let placeholder =
-                "Ask Crumb anything or type a command · @ context · / commands · Tab complete";
+        if let Some(placeholder) = composer_placeholder_hint(line, has_artifacts) {
+            self.placeholder_visible = true;
             let hint = if use_ansi_coloring {
                 Style::new()
                     .fg(Color::DarkGray)
@@ -12153,10 +12168,7 @@ impl Hinter for CrumbHinter {
             };
             return self.with_dock(hint);
         }
-        if self.placeholder_visible {
-            let placeholder = "Ask Crumb anything…";
-            return self.with_dock(placeholder.to_owned());
-        }
+        self.placeholder_visible = false;
         let hint = self
             .history
             .handle(line, pos, history, use_ansi_coloring, cwd);
@@ -12456,8 +12468,12 @@ fn composer_anchor_row(terminal_rows: u16, input_rows: u16) -> u16 {
 }
 
 fn follow_up_cursor_sequence(terminal_rows: u16) -> String {
-    let composer_row = terminal_rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
+    let composer_row = follow_up_composer_row(terminal_rows);
     format!("\x1b[{};5H", composer_row.saturating_add(1))
+}
+
+fn follow_up_composer_row(terminal_rows: u16) -> u16 {
+    composer_anchor_row(terminal_rows, 1)
 }
 
 fn render_idle_composer(
@@ -12892,21 +12908,21 @@ mod tests {
     use crumb_profile::{ProfileSelectionStore, ProfileStore};
 
     use super::{
-        ArtifactModalAction, ArtifactModalBounds, CaptureOutcome, CrumbEditMode, DiscoverySource,
-        ExitGesture, MarketplaceContent, PausedSubmission, PendingComposerArtifacts, Renderer,
-        SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
-        TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
-        agent_config_location, aligned_composer_prompt, apply_builtin_model_packs,
-        artifact_modal_action, bundled_catalog, completion_footer_frame, composer_anchor_sequence,
-        composer_visual_rows, configure_permissions, configure_plugin, effort_display_name,
-        effort_wire_name, ensure_single_release_skill_install, exact_skill_manifest_url,
-        exact_skill_run_config, failed_command_recovery, finished_tool_activity,
-        fixed_footer_frame, follow_up_cursor_sequence, format_peer_discarded_file,
-        format_peer_imported_file, format_peer_inbox, format_peer_inspection,
-        format_peer_quarantined_file, format_peer_task, handle_skill_command,
-        initial_agent_activity, install_marketplace_package, load_exact_skill_manifest,
-        marketplace_update_blocker, normalize_bundled_skill_install, openrouter_preset,
-        parse_cli_skill_run, parse_credential_reference, parse_exec_request,
+        ArtifactModalAction, ArtifactModalBounds, COMPOSER_PLACEHOLDER, CaptureOutcome,
+        CrumbEditMode, DiscoverySource, ExitGesture, MarketplaceContent, PausedSubmission,
+        PendingComposerArtifacts, Renderer, SessionCommandContext, SteeringAction,
+        TerminalModeTracker, TranscriptCapture, TranscriptScroll, TranscriptState, UiSettings,
+        active_scroll_direction, agent_config_location, aligned_composer_prompt,
+        apply_builtin_model_packs, artifact_modal_action, bundled_catalog, completion_footer_frame,
+        composer_anchor_sequence, composer_placeholder_hint, composer_visual_rows,
+        configure_permissions, configure_plugin, effort_display_name, effort_wire_name,
+        ensure_single_release_skill_install, exact_skill_manifest_url, exact_skill_run_config,
+        failed_command_recovery, finished_tool_activity, fixed_footer_frame,
+        follow_up_cursor_sequence, format_peer_discarded_file, format_peer_imported_file,
+        format_peer_inbox, format_peer_inspection, format_peer_quarantined_file, format_peer_task,
+        handle_skill_command, initial_agent_activity, install_marketplace_package,
+        load_exact_skill_manifest, marketplace_update_blocker, normalize_bundled_skill_install,
+        openrouter_preset, parse_cli_skill_run, parse_credential_reference, parse_exec_request,
         parse_interactive_skill_run, parse_paused_submission, parse_provider_header,
         parse_resume_session_argument, read_agent_config, read_bounded_response,
         register_local_skill, render_skill_discovery_search, resolve_memory_keep,
@@ -14517,7 +14533,7 @@ mod tests {
 
     #[test]
     fn active_follow_up_cursor_is_placed_inside_the_composer() {
-        assert_eq!(follow_up_cursor_sequence(40), "\x1b[33;5H");
+        assert_eq!(follow_up_cursor_sequence(40), "\x1b[35;5H");
         assert_eq!(follow_up_cursor_sequence(4), "\x1b[1;5H");
     }
 
@@ -14527,6 +14543,24 @@ mod tests {
         assert_eq!(composer_visual_rows(&"x".repeat(77), 0, 80), 2);
         assert_eq!(composer_visual_rows("question", 67, 80), 1);
         assert_eq!(composer_visual_rows("first\nsecond", 0, 80), 2);
+    }
+
+    #[test]
+    fn help_trigger_keeps_composer_guidance_visible() {
+        assert_eq!(
+            composer_placeholder_hint("", false),
+            Some(COMPOSER_PLACEHOLDER)
+        );
+        assert_eq!(
+            composer_placeholder_hint("", true),
+            Some("Ask Crumb anything…")
+        );
+        assert_eq!(
+            composer_placeholder_hint("?", false),
+            Some(" Ask Crumb anything or type a command · @ context · / commands · Tab complete")
+        );
+        assert_eq!(composer_placeholder_hint("? config", false), None);
+        assert_eq!(composer_placeholder_hint("hello?", false), None);
     }
 
     #[test]
