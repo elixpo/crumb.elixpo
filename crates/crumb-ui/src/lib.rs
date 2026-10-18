@@ -345,6 +345,18 @@ impl Renderer {
         self.paint(&format!("  {guide}"), "2")
     }
 
+    /// Renders the persistent keyboard guide when the composer owns artifacts.
+    #[must_use]
+    pub fn composer_artifact_hotkeys(&self, terminal_width: u16) -> String {
+        let guide = if terminal_width < 52 {
+            "^V attach · Alt+X remove · Enter send"
+        } else {
+            "Ctrl+V attach · Alt+P preview · Alt+X remove · Enter send"
+        };
+        let guide = fit_terminal_text(guide, usize::from(terminal_width.saturating_sub(2)));
+        self.paint(&format!("  {guide}"), "2")
+    }
+
     /// Renders the fixed keyboard guide while an agent turn is active.
     #[must_use]
     pub fn composer_active_hotkeys(&self, terminal_width: u16) -> String {
