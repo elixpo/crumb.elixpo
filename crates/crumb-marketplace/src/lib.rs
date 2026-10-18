@@ -19,6 +19,8 @@ const MAX_ARTIFACT_BYTES: usize = 256 * 1024;
 const MAX_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_INSTALLATION_STATE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_INSTALLED_RELEASES: usize = 512;
+const MAX_ATOMIC_INSTALL_PACKAGES: usize = 64;
+const MAX_ATOMIC_INSTALL_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum accepted size for a downloaded marketplace catalog.
 pub const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum accepted size for one Sigstore bundle.
@@ -1493,6 +1495,95 @@ pub struct InstalledPackage {
     pub package: Package,
 }
 
+/// One fully materialized package whose declared artifacts have been verified.
+///
+/// Prepared packages contain data only. Creating or installing one never executes package
+/// content and never changes Crumb permissions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedPackage {
+    package: Package,
+    artifacts: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+impl PreparedPackage {
+    /// Reads and verifies every declared artifact without changing installation state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid metadata, missing or linked files, size-limit violations,
+    /// or artifact digest mismatches.
+    pub fn from_source(package: &Package, source_root: &Path) -> Result<Self> {
+        package.validate()?;
+        let source_root =
+            fs::canonicalize(source_root).context("package source root is unavailable")?;
+        let mut artifacts = BTreeMap::new();
+        for artifact in &package.artifacts {
+            let source = source_root.join(&artifact.path);
+            let metadata = fs::symlink_metadata(&source)
+                .with_context(|| format!("missing package artifact {}", artifact.path.display()))?;
+            if !metadata.file_type().is_file() || metadata.len() > MAX_ARTIFACT_BYTES as u64 {
+                bail!(
+                    "package artifact `{}` is not a bounded file",
+                    artifact.path.display()
+                );
+            }
+            let resolved = fs::canonicalize(&source)?;
+            if !resolved.starts_with(&source_root) {
+                bail!(
+                    "package artifact `{}` escapes its source root",
+                    artifact.path.display()
+                );
+            }
+            artifacts.insert(artifact.path.clone(), fs::read(resolved)?);
+        }
+        Self::from_artifacts(package, artifacts)
+    }
+
+    /// Verifies an already-fetched complete artifact set without installing it.
+    ///
+    /// Authenticity checks such as Sigstore verification remain the fetcher's responsibility;
+    /// this constructor verifies the exact catalog paths, sizes, and SHA-256 digests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid metadata or an incomplete, oversized, or changed artifact
+    /// set.
+    pub fn from_artifacts(
+        package: &Package,
+        artifacts: BTreeMap<PathBuf, Vec<u8>>,
+    ) -> Result<Self> {
+        package.validate()?;
+        if artifacts.len() != package.artifacts.len() {
+            bail!("prepared package artifact set is incomplete");
+        }
+        let mut total_bytes = 0_usize;
+        for artifact in &package.artifacts {
+            let bytes = artifacts.get(&artifact.path).with_context(|| {
+                format!("prepared artifact `{}` is missing", artifact.path.display())
+            })?;
+            verify_artifact_bytes(package, artifact, bytes, &mut total_bytes)?;
+        }
+        if artifacts.keys().any(|path| {
+            !package
+                .artifacts
+                .iter()
+                .any(|artifact| &artifact.path == path)
+        }) {
+            bail!("prepared package contains an undeclared artifact");
+        }
+        Ok(Self {
+            package: package.clone(),
+            artifacts,
+        })
+    }
+
+    /// Returns immutable metadata for the prepared release.
+    #[must_use]
+    pub fn package(&self) -> &Package {
+        &self.package
+    }
+}
+
 /// One immutable package release recorded in a scope-local installation ledger.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1578,6 +1669,137 @@ impl InstallationStore {
                 .cmp(&(&right.package.id, &right.package.version))
         });
         Ok(releases)
+    }
+
+    /// Installs and activates an already-resolved dependency-first package plan as one unit.
+    ///
+    /// Every package and the complete current ledger are validated before filesystem staging.
+    /// All new immutable release directories are staged before any is published, and the ledger
+    /// is replaced only after every directory is in place. On failure, newly published release
+    /// directories are removed and the previous activation state is retained. Existing immutable
+    /// releases and caller-owned source files are never removed.
+    ///
+    /// This operation only copies declared artifacts. It does not execute package content, start
+    /// MCP servers, register runtime output, or grant capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty, oversized, conflicting, or incorrectly ordered plan; pinned
+    /// activation conflicts; changed artifacts; malformed state; or filesystem failures.
+    pub fn install_prepared_plan(&self, plan: &[PreparedPackage]) -> Result<Vec<InstalledRelease>> {
+        self.install_prepared_plan_with(plan, |_| Ok(()), || Ok(()))
+    }
+
+    fn install_prepared_plan_with<BeforePublish, BeforeSave>(
+        &self,
+        plan: &[PreparedPackage],
+        mut before_publish: BeforePublish,
+        before_save: BeforeSave,
+    ) -> Result<Vec<InstalledRelease>>
+    where
+        BeforePublish: FnMut(usize) -> Result<()>,
+        BeforeSave: FnOnce() -> Result<()>,
+    {
+        validate_prepared_plan(plan)?;
+        let current_state = self.load()?;
+        let (next_state, recorded) = Self::next_state_for_plan(&current_state, plan)?;
+
+        let mut staged = Vec::new();
+        for prepared in plan {
+            let destination = self.package_root(&prepared.package);
+            match fs::symlink_metadata(&destination) {
+                Ok(metadata) => {
+                    if !metadata.file_type().is_dir() {
+                        bail!("marketplace release destination is not a directory");
+                    }
+                    verify_package_files(&prepared.package, &destination)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    staged.push(stage_prepared_package(prepared, &destination)?);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let mut published = Vec::new();
+        for (index, staged_package) in staged.into_iter().enumerate() {
+            if let Err(error) = before_publish(index) {
+                return rollback_error(error, &published);
+            }
+            let staging_path = staged_package.directory.keep();
+            if let Err(error) = fs::rename(&staging_path, &staged_package.destination) {
+                let _ = fs::remove_dir_all(&staging_path);
+                return rollback_error(error.into(), &published);
+            }
+            published.push(staged_package.destination);
+        }
+
+        if let Err(error) = before_save().and_then(|()| self.save(&next_state)) {
+            return rollback_error(error, &published);
+        }
+        Ok(recorded)
+    }
+
+    fn next_state_for_plan(
+        current: &InstallationState,
+        plan: &[PreparedPackage],
+    ) -> Result<(InstallationState, Vec<InstalledRelease>)> {
+        let mut next = current.clone();
+        let installed_at = Utc::now().to_rfc3339();
+        let mut recorded = Vec::with_capacity(plan.len());
+        for prepared in plan {
+            let package = &prepared.package;
+            if next.releases.iter().any(|release| {
+                release.package.id == package.id
+                    && release.active
+                    && release.pinned
+                    && release.package.version != package.version
+            }) {
+                bail!(
+                    "package `{}` is pinned; unpin it before changing versions",
+                    package.id
+                );
+            }
+            if let Some(existing) = next.releases.iter().find(|release| {
+                release.package.id == package.id && release.package.version == package.version
+            }) && existing.package != *package
+            {
+                bail!("installed release metadata conflicts with the immutable ledger");
+            }
+
+            let target_was_pinned = next.releases.iter().any(|release| {
+                release.package.id == package.id
+                    && release.package.version == package.version
+                    && release.active
+                    && release.pinned
+            });
+            for release in &mut next.releases {
+                if release.package.id == package.id {
+                    release.active = false;
+                    release.pinned = false;
+                }
+            }
+            let position = next.releases.iter().position(|release| {
+                release.package.id == package.id && release.package.version == package.version
+            });
+            let release = if let Some(position) = position {
+                next.releases[position].active = true;
+                next.releases[position].pinned = target_was_pinned;
+                next.releases[position].clone()
+            } else {
+                let release = InstalledRelease {
+                    package: package.clone(),
+                    installed_at: installed_at.clone(),
+                    active: true,
+                    pinned: false,
+                };
+                next.releases.push(release.clone());
+                release
+            };
+            recorded.push(release);
+        }
+        Self::validate_state(&next)?;
+        Ok((next, recorded))
     }
 
     /// Atomically records an installed release and makes it active.
@@ -1937,6 +2159,128 @@ impl InstallationStore {
     }
 }
 
+struct StagedPackage {
+    destination: PathBuf,
+    directory: tempfile::TempDir,
+}
+
+fn validate_prepared_plan(plan: &[PreparedPackage]) -> Result<()> {
+    if plan.is_empty() || plan.len() > MAX_ATOMIC_INSTALL_PACKAGES {
+        bail!("atomic marketplace install plan is empty or exceeds the package limit");
+    }
+    let mut seen = BTreeMap::new();
+    let mut total_bytes = 0_usize;
+    for prepared in plan {
+        prepared.package.validate()?;
+        let mut package_bytes = 0_usize;
+        for artifact in &prepared.package.artifacts {
+            let bytes = prepared.artifacts.get(&artifact.path).with_context(|| {
+                format!("prepared artifact `{}` is missing", artifact.path.display())
+            })?;
+            verify_artifact_bytes(&prepared.package, artifact, bytes, &mut package_bytes)?;
+        }
+        if prepared.artifacts.len() != prepared.package.artifacts.len() {
+            bail!("prepared package contains an undeclared artifact");
+        }
+        total_bytes = total_bytes.saturating_add(package_bytes);
+        if total_bytes > MAX_ATOMIC_INSTALL_BYTES {
+            bail!("atomic marketplace install plan exceeds the byte limit");
+        }
+        if seen
+            .insert(
+                prepared.package.id.as_str(),
+                prepared.package.version.as_str(),
+            )
+            .is_some()
+        {
+            bail!("atomic marketplace install plan repeats a package");
+        }
+        for dependency in &prepared.package.dependencies {
+            match seen.get(dependency.id.as_str()) {
+                Some(version) if *version == dependency.version => {}
+                Some(_) => {
+                    bail!("atomic marketplace install plan contains a dependency version conflict")
+                }
+                None => bail!(
+                    "atomic marketplace install plan is not dependency-first for `{}@{}`",
+                    dependency.id,
+                    dependency.version
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_artifact_bytes(
+    package: &Package,
+    artifact: &Artifact,
+    bytes: &[u8],
+    total_bytes: &mut usize,
+) -> Result<()> {
+    if bytes.len() > MAX_ARTIFACT_BYTES
+        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != artifact.size_bytes
+    {
+        bail!(
+            "package artifact `{}` has an invalid size",
+            artifact.path.display()
+        );
+    }
+    *total_bytes = total_bytes.saturating_add(bytes.len());
+    if *total_bytes > MAX_PACKAGE_BYTES {
+        bail!("package `{}` exceeds the install size limit", package.id);
+    }
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if !actual.eq_ignore_ascii_case(&artifact.sha256) {
+        bail!(
+            "package artifact `{}` failed integrity verification",
+            artifact.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn stage_prepared_package(prepared: &PreparedPackage, destination: &Path) -> Result<StagedPackage> {
+    let parent = destination
+        .parent()
+        .context("package destination has no parent")?;
+    fs::create_dir_all(parent)?;
+    let directory = Builder::new().prefix(".install-set-").tempdir_in(parent)?;
+    for artifact in &prepared.package.artifacts {
+        let target = directory.path().join(&artifact.path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = prepared
+            .artifacts
+            .get(&artifact.path)
+            .context("verified package artifact is unavailable")?;
+        let mut file = fs::File::create(&target)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()?;
+    }
+    verify_package_files(&prepared.package, directory.path())?;
+    Ok(StagedPackage {
+        destination: destination.to_path_buf(),
+        directory,
+    })
+}
+
+fn rollback_error(error: anyhow::Error, published: &[PathBuf]) -> Result<Vec<InstalledRelease>> {
+    let mut cleanup_error = None;
+    for path in published.iter().rev() {
+        if let Err(error) = fs::remove_dir_all(path)
+            && cleanup_error.is_none()
+        {
+            cleanup_error = Some(error);
+        }
+    }
+    if let Some(cleanup_error) = cleanup_error {
+        bail!("{error:#}; atomic install rollback is incomplete: {cleanup_error}");
+    }
+    Err(error)
+}
+
 fn orphan_diagnostic(package_id: String, version: &str) -> InstallationDiagnostic {
     InstallationDiagnostic {
         package_id,
@@ -2251,7 +2595,7 @@ mod tests {
     use super::{
         CONTRIBUTOR_SCHEMA, Catalog, DiscoveryIndex, InstallationStore, InstalledRelease,
         Installer, MAX_CATALOG_BYTES, MAX_DISCOVERY_INDEX_BYTES, PUBLIC_CATALOG, PUBLIC_SCHEMA,
-        RemoteCatalogCache, Revocation, UpdateStatus, bundled_catalog,
+        PreparedPackage, RemoteCatalogCache, Revocation, UpdateStatus, bundled_catalog,
     };
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -2412,6 +2756,153 @@ mod tests {
             fs::read_to_string(installed.root.join("skills/SKILL.md")).expect("installed skill"),
             "# Review\n"
         );
+    }
+
+    #[test]
+    fn atomic_plan_installs_dependency_first_and_activates_once() {
+        let source = tempdir().expect("source tempdir");
+        fs::write(source.path().join("SKILL.md"), "# Review\n").expect("skill fixture");
+        let hash = format!("{:x}", Sha256::digest(b"# Review\n"));
+        let mut root = catalog(&hash, "SKILL.md").packages.remove(0);
+        let mut dependency = root.clone();
+        dependency.id = "crumb/base".to_owned();
+        dependency.display_name = "Base".to_owned();
+        root.kind = super::PackageKind::Bundle;
+        root.package_class = super::PackageClass::Composite;
+        root.dependencies.push(super::PackageDependency {
+            id: dependency.id.clone(),
+            version: dependency.version.clone(),
+        });
+        let plan = [
+            PreparedPackage::from_source(&dependency, source.path()).expect("prepared dependency"),
+            PreparedPackage::from_source(&root, source.path()).expect("prepared root"),
+        ];
+        let scope = tempdir().expect("scope tempdir");
+        let store = InstallationStore::new(scope.path());
+
+        let installed = store
+            .install_prepared_plan(&plan)
+            .expect("atomic plan should install");
+
+        assert_eq!(
+            installed
+                .iter()
+                .map(|release| release.package.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["crumb/base", "crumb/review"]
+        );
+        assert!(installed.iter().all(|release| release.active));
+        assert_eq!(store.list().expect("installation state").len(), 2);
+        assert!(
+            store
+                .packages_root()
+                .join("crumb--base/1.0.0/SKILL.md")
+                .is_file()
+        );
+        assert_eq!(
+            fs::read_to_string(source.path().join("SKILL.md")).expect("source is preserved"),
+            "# Review\n"
+        );
+    }
+
+    #[test]
+    fn atomic_plan_validates_every_member_before_staging() {
+        let body = b"# Review\n";
+        let hash = format!("{:x}", Sha256::digest(body));
+        let dependency = catalog(&hash, "SKILL.md").packages.remove(0);
+        let mut root = dependency.clone();
+        root.id = "crumb/root".to_owned();
+        root.kind = super::PackageKind::Bundle;
+        root.package_class = super::PackageClass::Composite;
+        root.dependencies.push(super::PackageDependency {
+            id: "crumb/missing".to_owned(),
+            version: "1.0.0".to_owned(),
+        });
+        let artifacts = BTreeMap::from([(PathBuf::from("SKILL.md"), body.to_vec())]);
+        let plan = [
+            PreparedPackage::from_artifacts(&dependency, artifacts.clone())
+                .expect("prepared dependency"),
+            PreparedPackage::from_artifacts(&root, artifacts).expect("prepared root"),
+        ];
+        let scope = tempdir().expect("scope tempdir");
+        let store = InstallationStore::new(scope.path());
+
+        assert!(store.install_prepared_plan(&plan).is_err());
+        assert!(!store.packages_root().exists());
+        assert_eq!(
+            store.list().expect("unchanged state"),
+            Vec::<InstalledRelease>::new()
+        );
+    }
+
+    #[test]
+    fn atomic_plan_rolls_back_published_releases_on_late_failures() {
+        let body = b"# Review\n";
+        let hash = format!("{:x}", Sha256::digest(body));
+        let mut prior = catalog(&hash, "SKILL.md").packages.remove(0);
+        prior.id = "crumb/root".to_owned();
+        prior.version = "0.9.0".to_owned();
+        let mut dependency = prior.clone();
+        dependency.id = "crumb/base".to_owned();
+        dependency.version = "1.0.0".to_owned();
+        let mut root = dependency.clone();
+        root.id = "crumb/root".to_owned();
+        root.kind = super::PackageKind::Bundle;
+        root.package_class = super::PackageClass::Composite;
+        root.dependencies.push(super::PackageDependency {
+            id: dependency.id.clone(),
+            version: dependency.version.clone(),
+        });
+        let artifacts = BTreeMap::from([(PathBuf::from("SKILL.md"), body.to_vec())]);
+        let plan = [
+            PreparedPackage::from_artifacts(&dependency, artifacts.clone())
+                .expect("prepared dependency"),
+            PreparedPackage::from_artifacts(&root, artifacts).expect("prepared root"),
+        ];
+        let scope = tempdir().expect("scope tempdir");
+        let store = InstallationStore::new(scope.path());
+        let prior_source = tempdir().expect("prior source");
+        fs::write(prior_source.path().join("SKILL.md"), body).expect("prior artifact");
+        let prior_install = Installer::new(store.packages_root())
+            .install(&prior, prior_source.path())
+            .expect("prior release install");
+        store.record(&prior_install).expect("prior active release");
+
+        let error = store
+            .install_prepared_plan_with(
+                &plan,
+                |index| {
+                    if index == 1 {
+                        anyhow::bail!("injected publish failure");
+                    }
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .expect_err("second publication should fail");
+        assert!(error.to_string().contains("injected publish failure"));
+        assert!(!store.packages_root().join("crumb--base/1.0.0").exists());
+        assert!(!store.packages_root().join("crumb--root/1.0.0").exists());
+        let releases = store.list().expect("unchanged state");
+        assert_eq!(releases.len(), 1);
+        assert!(releases[0].active);
+        assert_eq!(releases[0].package.version, "0.9.0");
+
+        let error = store
+            .install_prepared_plan_with(
+                &plan,
+                |_| Ok(()),
+                || anyhow::bail!("injected ledger failure"),
+            )
+            .expect_err("ledger publication should fail");
+        assert!(error.to_string().contains("injected ledger failure"));
+        assert!(!store.packages_root().join("crumb--base/1.0.0").exists());
+        assert!(!store.packages_root().join("crumb--root/1.0.0").exists());
+        let releases = store.list().expect("unchanged state");
+        assert_eq!(releases.len(), 1);
+        assert!(releases[0].active);
+        assert_eq!(releases[0].package.version, "0.9.0");
+        assert!(store.packages_root().join("crumb--root/0.9.0").exists());
     }
 
     #[test]
