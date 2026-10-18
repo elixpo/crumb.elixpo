@@ -36,7 +36,10 @@ use crumb_agent::{
     tool_activity_label, trash_session,
 };
 use crumb_auth::{CredentialSource, CredentialStore, OsCredentialStore, credential_status, login};
-use crumb_core::{AuthAction, BuiltInCommand, HistoryAction, InputEvent};
+use crumb_core::{
+    AuthAction, BlastRadiusAssessment, BuiltInCommand, HistoryAction, InputEvent, Severity,
+    assess_shell_command,
+};
 use crumb_graph::{
     EdgeConfidence, EvidenceFreshness, GraphEvidence, GraphLimits, GraphSettingsStore,
     GraphifyAdapter, NativeSearchEvidence, NativeSearchLimits, ProjectGraph, native_project_search,
@@ -2852,6 +2855,9 @@ fn resolve_tool_approval(
 ) -> Result<()> {
     let request = pending.request().clone();
     let detail = trusted_tool_detail(&request.tool, pending.arguments());
+    if let Some(assessment) = pending_shell_assessment(&pending) {
+        write_shell_impact(writer, &assessment)?;
+    }
     writeln!(
         writer,
         "{}",
@@ -3009,6 +3015,51 @@ fn trusted_tool_detail(name: &str, arguments: &serde_json::Value) -> Option<Stri
         "web_fetch" => format!("fetch: {detail}"),
         _ => detail,
     })
+}
+
+fn pending_shell_assessment(pending: &PendingApproval) -> Option<BlastRadiusAssessment> {
+    shell_blast_radius(&pending.request().tool, pending.arguments())
+}
+
+fn write_shell_impact(writer: &mut dyn Write, assessment: &BlastRadiusAssessment) -> Result<()> {
+    let severity = assessment
+        .highest_severity()
+        .expect("destructive assessments have a severity");
+    writeln!(
+        writer,
+        "⚠ Shell impact · {} · {}",
+        severity_label(severity),
+        assessment.summary()
+    )?;
+    let irreversible = assessment
+        .matches
+        .iter()
+        .filter(|matched| !matched.reversible)
+        .count();
+    if irreversible > 0 {
+        writeln!(
+            writer,
+            "  {irreversible} matched effect{} may be irreversible",
+            if irreversible == 1 { "" } else { "s" }
+        )?;
+    }
+    Ok(())
+}
+
+fn shell_blast_radius(tool: &str, arguments: &serde_json::Value) -> Option<BlastRadiusAssessment> {
+    if tool != "run_shell" {
+        return None;
+    }
+    let command = arguments.get("command")?.as_str()?;
+    let assessment = assess_shell_command(command);
+    assessment.is_destructive().then_some(assessment)
+}
+
+const fn severity_label(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Critical => "critical",
+        Severity::High => "high",
+    }
 }
 
 const fn approval_risk_label(risk: RiskClass) -> &'static str {
@@ -10128,10 +10179,11 @@ mod tests {
         parse_credential_reference, parse_paused_submission, parse_provider_header,
         parse_resume_session_argument, read_agent_config, read_bounded_response,
         register_local_skill, resolve_memory_keep, sanitize_transcript_output, set_skill_enabled,
-        shell_tool_config, should_auto_enable_rtk, show_graph, show_marketplace, show_memory,
-        show_profile_with_stores, suggestion_width, transcript_activity_row,
-        unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
-        visible_tool_activity, workspace_read_host, write_bounded_response_delta_for_width,
+        shell_blast_radius, shell_tool_config, should_auto_enable_rtk, show_graph,
+        show_marketplace, show_memory, show_profile_with_stores, suggestion_width,
+        transcript_activity_row, unregister_local_skill, validate_marketplace_path,
+        validate_marketplace_response, visible_tool_activity, workspace_read_host,
+        write_bounded_response_delta_for_width,
     };
 
     #[test]
@@ -10178,6 +10230,20 @@ mod tests {
                 .model,
             "nova"
         );
+    }
+
+    #[test]
+    fn destructive_shell_approvals_expose_the_blast_radius() {
+        let assessment =
+            shell_blast_radius("run_shell", &serde_json::json!({"command": "rm -rf build"}))
+                .expect("destructive shell command");
+
+        assert!(assessment.summary().contains("recursive forced delete"));
+        assert!(
+            shell_blast_radius("read_file", &serde_json::json!({"command": "rm -rf build"}))
+                .is_none()
+        );
+        assert!(shell_blast_radius("run_shell", &serde_json::json!({"command": "pwd"})).is_none());
     }
 
     #[test]
@@ -10518,9 +10584,10 @@ mod tests {
         let host = workspace_read_host(&workspace, &AgentConfig::default(), None)
             .expect("workspace tools are registered");
         let tools = host.tools().collect::<Vec<_>>();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
         for (name, risk) in [
             ("current_time", RiskClass::ReadOnly),
+            ("diagnose_last_failure", RiskClass::ReadOnly),
             ("detect_stack", RiskClass::ReadOnly),
             ("list_directory", RiskClass::ReadOnly),
             ("read_file", RiskClass::ReadOnly),
