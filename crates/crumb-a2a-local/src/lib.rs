@@ -12,7 +12,10 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use crumb_a2a::{MAX_WIRE_BYTES, PROTOCOL_VERSION, SendMessageRequest, Validate as _, to_json};
+use crumb_a2a::{
+    MAX_WIRE_BYTES, PROTOCOL_VERSION, SendMessageRequest, SendMessageResponse, Task, TaskState,
+    TaskStatus, Validate as _, to_json,
+};
 use crumb_instance::{InstanceMetadata, validate_instance_name};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
@@ -199,6 +202,26 @@ pub struct PendingDeliverySummary {
     pub artifact_count: usize,
 }
 
+/// Payload kind for a durable local delivery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryKind {
+    Request,
+    Response,
+}
+
+/// Content-free receiver view of any pending inbox delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeliverySummary {
+    pub delivery_id: String,
+    pub sender_instance_id: String,
+    pub recipient_instance_id: String,
+    pub enqueued_at_ms: u64,
+    pub kind: DeliveryKind,
+    pub in_reply_to_delivery_id: Option<String>,
+    pub part_count: usize,
+    pub artifact_count: usize,
+}
+
 /// A delivery atomically claimed from an inbox.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReceivedMessage {
@@ -207,6 +230,42 @@ pub struct ReceivedMessage {
     pub recipient_instance_id: String,
     pub enqueued_at_ms: u64,
     pub request: SendMessageRequest,
+}
+
+/// A correlated response atomically claimed from an inbox.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReceivedResponse {
+    pub delivery_id: String,
+    pub sender_instance_id: String,
+    pub recipient_instance_id: String,
+    pub enqueued_at_ms: u64,
+    pub in_reply_to_delivery_id: String,
+    pub response: SendMessageResponse,
+}
+
+/// Any delivery atomically claimed from an inbox.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReceivedDelivery {
+    Request(Box<ReceivedMessage>),
+    Response(Box<ReceivedResponse>),
+}
+
+impl ReceivedDelivery {
+    #[must_use]
+    pub fn kind(&self) -> DeliveryKind {
+        match self {
+            Self::Request(_) => DeliveryKind::Request,
+            Self::Response(_) => DeliveryKind::Response,
+        }
+    }
+
+    #[must_use]
+    pub fn delivery_id(&self) -> &str {
+        match self {
+            Self::Request(delivery) => &delivery.delivery_id,
+            Self::Response(delivery) => &delivery.delivery_id,
+        }
+    }
 }
 
 /// Immutable content-addressed file staged in the local bus.
@@ -228,7 +287,12 @@ struct DeliveryEnvelope {
     sender_instance_id: String,
     recipient_instance_id: String,
     enqueued_at_ms: u64,
-    request: SendMessageRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<SendMessageRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response: Option<SendMessageResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    in_reply_to_delivery_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -239,6 +303,8 @@ struct Acknowledgement {
     sender_instance_id: String,
     recipient_instance_id: String,
     acknowledged_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery_digest: Option<String>,
 }
 
 impl Acknowledgement {
@@ -248,7 +314,11 @@ impl Acknowledgement {
         }
         validate_delivery_id(&self.delivery_id)?;
         validate_instance_id(&self.sender_instance_id)?;
-        validate_instance_id(&self.recipient_instance_id)
+        validate_instance_id(&self.recipient_instance_id)?;
+        if let Some(digest) = &self.delivery_digest {
+            validate_lower_hex(digest, 64, "delivery digest")?;
+        }
+        Ok(())
     }
 }
 
@@ -263,37 +333,102 @@ impl DeliveryEnvelope {
         if self.enqueued_at_ms == 0 {
             bail!("local A2A delivery timestamp is invalid");
         }
-        self.request
-            .validate()
-            .context("local A2A request is invalid")?;
+        match (&self.request, &self.response, &self.in_reply_to_delivery_id) {
+            (Some(request), None, None) => {
+                request.validate().context("local A2A request is invalid")?;
+            }
+            (None, Some(response), Some(in_reply_to)) => {
+                response
+                    .validate()
+                    .context("local A2A response is invalid")?;
+                validate_delivery_id(in_reply_to)?;
+            }
+            _ => {
+                bail!("local A2A delivery must contain exactly one request or correlated response")
+            }
+        }
         Ok(())
     }
 
-    fn received(self) -> ReceivedMessage {
-        ReceivedMessage {
-            delivery_id: self.delivery_id,
-            sender_instance_id: self.sender_instance_id,
-            recipient_instance_id: self.recipient_instance_id,
-            enqueued_at_ms: self.enqueued_at_ms,
-            request: self.request,
+    fn kind(&self) -> DeliveryKind {
+        if self.request.is_some() {
+            DeliveryKind::Request
+        } else {
+            DeliveryKind::Response
         }
     }
 
-    fn summary(&self) -> PendingDeliverySummary {
-        PendingDeliverySummary {
+    fn received(self) -> ReceivedDelivery {
+        let Self {
+            delivery_id,
+            sender_instance_id,
+            recipient_instance_id,
+            enqueued_at_ms,
+            request,
+            response,
+            in_reply_to_delivery_id,
+            ..
+        } = self;
+        match (request, response, in_reply_to_delivery_id) {
+            (Some(request), None, None) => ReceivedDelivery::Request(Box::new(ReceivedMessage {
+                delivery_id,
+                sender_instance_id,
+                recipient_instance_id,
+                enqueued_at_ms,
+                request,
+            })),
+            (None, Some(response), Some(in_reply_to_delivery_id)) => {
+                ReceivedDelivery::Response(Box::new(ReceivedResponse {
+                    delivery_id,
+                    sender_instance_id,
+                    recipient_instance_id,
+                    enqueued_at_ms,
+                    in_reply_to_delivery_id,
+                    response,
+                }))
+            }
+            _ => unreachable!("validated local A2A envelope has exactly one payload"),
+        }
+    }
+
+    fn summary(&self) -> DeliverySummary {
+        let (part_count, artifact_count) = if let Some(request) = &self.request {
+            (
+                request.message.parts.len(),
+                request
+                    .message
+                    .parts
+                    .iter()
+                    .filter(|part| part.url.is_some())
+                    .count(),
+            )
+        } else if let Some(response) = &self.response {
+            response_counts(response)
+        } else {
+            (0, 0)
+        };
+        DeliverySummary {
             delivery_id: self.delivery_id.clone(),
             sender_instance_id: self.sender_instance_id.clone(),
             recipient_instance_id: self.recipient_instance_id.clone(),
             enqueued_at_ms: self.enqueued_at_ms,
-            part_count: self.request.message.parts.len(),
-            artifact_count: self
-                .request
-                .message
-                .parts
-                .iter()
-                .filter(|part| part.url.is_some())
-                .count(),
+            kind: self.kind(),
+            in_reply_to_delivery_id: self.in_reply_to_delivery_id.clone(),
+            part_count,
+            artifact_count,
         }
+    }
+
+    fn request_summary(&self) -> Option<PendingDeliverySummary> {
+        let summary = self.summary();
+        (summary.kind == DeliveryKind::Request).then_some(PendingDeliverySummary {
+            delivery_id: summary.delivery_id,
+            sender_instance_id: summary.sender_instance_id,
+            recipient_instance_id: summary.recipient_instance_id,
+            enqueued_at_ms: summary.enqueued_at_ms,
+            part_count: summary.part_count,
+            artifact_count: summary.artifact_count,
+        })
     }
 
     fn matches_delivery(&self, other: &Self) -> bool {
@@ -302,7 +437,63 @@ impl DeliveryEnvelope {
             && self.sender_instance_id == other.sender_instance_id
             && self.recipient_instance_id == other.recipient_instance_id
             && self.request == other.request
+            && self.response == other.response
+            && self.in_reply_to_delivery_id == other.in_reply_to_delivery_id
     }
+
+    fn content_digest(&self) -> Result<String> {
+        let mut digest = Sha256::new();
+        digest.update(b"crumb-a2a-delivery-content-v1");
+        digest.update([0]);
+        digest.update(self.sender_instance_id.as_bytes());
+        digest.update([0]);
+        digest.update(self.recipient_instance_id.as_bytes());
+        digest.update([0]);
+        if let Some(request) = &self.request {
+            digest.update(b"request");
+            digest.update([0]);
+            digest.update(serde_json::to_vec(request).context("request digest encoding failed")?);
+        } else if let Some(response) = &self.response {
+            digest.update(b"response");
+            digest.update([0]);
+            digest.update(
+                self.in_reply_to_delivery_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            digest.update([0]);
+            digest.update(serde_json::to_vec(response).context("response digest encoding failed")?);
+        }
+        Ok(format!("{:x}", digest.finalize()))
+    }
+}
+
+fn response_counts(response: &SendMessageResponse) -> (usize, usize) {
+    if let Some(message) = &response.message {
+        let artifacts = message
+            .parts
+            .iter()
+            .filter(|part| part.url.is_some())
+            .count();
+        return (message.parts.len(), artifacts);
+    }
+    let Some(task) = &response.task else {
+        return (0, 0);
+    };
+    let message_parts = task
+        .status
+        .message
+        .iter()
+        .chain(task.history.iter())
+        .map(|message| message.parts.len())
+        .sum::<usize>();
+    let artifact_parts = task
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.parts.len())
+        .sum::<usize>();
+    (message_parts + artifact_parts, task.artifacts.len())
 }
 
 /// Filesystem-backed local A2A bus rooted only at a caller-approved path.
@@ -522,66 +713,13 @@ impl LocalBus {
             sender_instance_id: sender.instance_id().to_owned(),
             recipient_instance_id: recipient_instance_id.to_owned(),
             enqueued_at_ms: now,
-            request: request.clone(),
+            request: Some(request.clone()),
+            response: None,
+            in_reply_to_delivery_id: None,
         };
         envelope.validate()?;
 
-        let (pending, processing, acknowledged) = self.queue_directories(recipient_instance_id)?;
-        let queued = count_visible_entries(&pending)? + count_visible_entries(&processing)?;
-        let filename = delivery_filename(&delivery_id)?;
-        let path = pending.join(&filename);
-        let processing_path = processing.join(&filename);
-        let acknowledged_path = acknowledged.join(&filename);
-        let receipt = EnqueueReceipt {
-            delivery_id: delivery_id.clone(),
-            recipient_instance_id: recipient_instance_id.to_owned(),
-        };
-        if path_exists_without_following(&acknowledged_path)? {
-            let existing: Acknowledgement = read_required_json(
-                &acknowledged_path,
-                MAX_REGISTRY_BYTES,
-                "local A2A acknowledgement",
-            )?;
-            existing.validate()?;
-            if existing.delivery_id != delivery_id
-                || existing.sender_instance_id != sender.instance_id()
-                || existing.recipient_instance_id != recipient_instance_id
-            {
-                bail!("local A2A acknowledgement does not match delivery");
-            }
-            return Ok(receipt);
-        }
-        for queued_path in [&path, &processing_path] {
-            if path_exists_without_following(queued_path)? {
-                let existing: DeliveryEnvelope =
-                    read_required_json(queued_path, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
-                existing.validate()?;
-                if !existing.matches_delivery(&envelope) {
-                    bail!("local A2A delivery identifier collision");
-                }
-                return Ok(receipt);
-            }
-        }
-        if queued >= MAX_INBOX_MESSAGES {
-            bail!("local A2A inbox is full");
-        }
-        match atomic_write_new_json(&pending, &path, &envelope, MAX_ENVELOPE_BYTES) {
-            Ok(()) => {}
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists) =>
-            {
-                let existing: DeliveryEnvelope =
-                    read_required_json(&path, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
-                existing.validate()?;
-                if !existing.matches_delivery(&envelope) {
-                    bail!("local A2A delivery identifier collision");
-                }
-            }
-            Err(error) => return Err(error),
-        }
-        Ok(receipt)
+        self.enqueue_envelope_locked(&envelope)
     }
 
     /// Atomically claims the oldest pending message for this runtime.
@@ -600,6 +738,13 @@ impl LocalBus {
             self.queue_directories(recipient.instance_id())?;
         let paths = visible_regular_entries(&pending, MAX_INBOX_MESSAGES, "pending inbox")?;
         for source in paths {
+            let envelope: DeliveryEnvelope =
+                read_required_json(&source, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+            envelope.validate()?;
+            validate_queued_envelope(&source, &envelope, recipient.instance_id())?;
+            if envelope.kind() != DeliveryKind::Request {
+                continue;
+            }
             let Some(filename) = source.file_name() else {
                 continue;
             };
@@ -611,10 +756,41 @@ impl LocalBus {
                 &processing,
                 recipient.instance_id(),
             )? {
-                return Ok(Some(received));
+                let ReceivedDelivery::Request(received) = received else {
+                    bail!("local A2A request claim changed delivery kind");
+                };
+                return Ok(Some(*received));
             }
         }
         Ok(None)
+    }
+
+    /// Lists all pending requests and responses without returning payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid ownership, unsafe storage, or malformed deliveries.
+    pub fn list_deliveries(&self, recipient: &Registration) -> Result<Vec<DeliverySummary>> {
+        self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
+        self.require_live_owner(recipient, now_ms()?)?;
+        let (pending, _processing, _acknowledged) =
+            self.queue_directories(recipient.instance_id())?;
+        let paths = visible_regular_entries(&pending, MAX_INBOX_MESSAGES, "pending inbox")?;
+        let mut summaries = Vec::with_capacity(paths.len());
+        for path in paths {
+            let envelope: DeliveryEnvelope =
+                read_required_json(&path, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+            envelope.validate()?;
+            validate_queued_envelope(&path, &envelope, recipient.instance_id())?;
+            summaries.push(envelope.summary());
+        }
+        summaries.sort_by(|left, right| {
+            left.enqueued_at_ms
+                .cmp(&right.enqueued_at_ms)
+                .then_with(|| left.delivery_id.cmp(&right.delivery_id))
+        });
+        Ok(summaries)
     }
 
     /// Lists pending deliveries for this receiver without returning payloads.
@@ -638,7 +814,9 @@ impl LocalBus {
                 read_required_json(&path, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
             envelope.validate()?;
             validate_queued_envelope(&path, &envelope, recipient.instance_id())?;
-            summaries.push(envelope.summary());
+            if let Some(summary) = envelope.request_summary() {
+                summaries.push(summary);
+            }
         }
         summaries.sort_by(|left, right| {
             left.enqueued_at_ms
@@ -659,6 +837,35 @@ impl LocalBus {
         recipient: &Registration,
         delivery_id: &str,
     ) -> Result<ReceivedMessage> {
+        self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
+        self.require_live_owner(recipient, now_ms()?)?;
+        validate_delivery_id(delivery_id)?;
+        let (pending, _processing, _acknowledged) =
+            self.queue_directories(recipient.instance_id())?;
+        let path = pending.join(delivery_filename(delivery_id)?);
+        let envelope: DeliveryEnvelope =
+            read_required_json(&path, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+        envelope.validate()?;
+        validate_queued_envelope(&path, &envelope, recipient.instance_id())?;
+        match envelope.received() {
+            ReceivedDelivery::Request(request) => Ok(*request),
+            ReceivedDelivery::Response(_) => {
+                bail!("local A2A delivery is a response, not a request")
+            }
+        }
+    }
+
+    /// Reads one exact pending request or response without changing queue state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid ownership, an unknown identifier, or unsafe storage.
+    pub fn inspect_delivery(
+        &self,
+        recipient: &Registration,
+        delivery_id: &str,
+    ) -> Result<ReceivedDelivery> {
         self.inspect_base_directories()?;
         let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
         self.require_live_owner(recipient, now_ms()?)?;
@@ -693,14 +900,147 @@ impl LocalBus {
         let filename = delivery_filename(delivery_id)?;
         let source = pending.join(&filename);
         let target = processing.join(filename);
-        claim_delivery_file(
+        let envelope: DeliveryEnvelope =
+            read_required_json(&source, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+        envelope.validate()?;
+        validate_queued_envelope(&source, &envelope, recipient.instance_id())?;
+        if envelope.kind() != DeliveryKind::Request {
+            bail!("local A2A delivery is a response, not a request");
+        }
+        let claimed = claim_delivery_file(
             &source,
             &target,
             &pending,
             &processing,
             recipient.instance_id(),
         )?
+        .context("local A2A pending delivery was not found")?;
+        match claimed {
+            ReceivedDelivery::Request(request) => Ok(*request),
+            ReceivedDelivery::Response(_) => bail!("local A2A request claim changed delivery kind"),
+        }
+    }
+
+    /// Atomically claims one exact pending request or response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid ownership, an unknown identifier, or unsafe storage.
+    pub fn claim_delivery(
+        &self,
+        recipient: &Registration,
+        delivery_id: &str,
+    ) -> Result<ReceivedDelivery> {
+        self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
+        self.require_live_owner(recipient, now_ms()?)?;
+        validate_delivery_id(delivery_id)?;
+        let (pending, processing, _acknowledged) =
+            self.queue_directories(recipient.instance_id())?;
+        let filename = delivery_filename(delivery_id)?;
+        claim_delivery_file(
+            &pending.join(&filename),
+            &processing.join(filename),
+            &pending,
+            &processing,
+            recipient.instance_id(),
+        )?
         .context("local A2A pending delivery was not found")
+    }
+
+    /// Completes a claimed request by durably queueing its correlated response
+    /// before acknowledging and removing the inbound request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid ownership, response, queue state, or storage.
+    pub fn complete_claimed_request(
+        &self,
+        recipient: &Registration,
+        delivery_id: &str,
+        response: &SendMessageResponse,
+    ) -> Result<EnqueueReceipt> {
+        self.inspect_base_directories()?;
+        validate_delivery_id(delivery_id)?;
+        response
+            .validate()
+            .context("local A2A response is invalid")?;
+
+        let sender_instance_id = self.claimed_request_sender(recipient, delivery_id)?;
+        let _locks =
+            self.acquire_instance_locks(&[recipient.instance_id(), sender_instance_id.as_str()])?;
+        self.require_live_owner(recipient, now_ms()?)?;
+
+        self.validate_claimed_or_acknowledged_request(
+            recipient.instance_id(),
+            delivery_id,
+            &sender_instance_id,
+        )?;
+        let response_id =
+            response_delivery_id(recipient.instance_id(), &sender_instance_id, delivery_id);
+        let envelope = DeliveryEnvelope {
+            schema_version: LOCAL_BUS_SCHEMA_VERSION,
+            delivery_id: response_id,
+            sender_instance_id: recipient.instance_id().to_owned(),
+            recipient_instance_id: sender_instance_id,
+            enqueued_at_ms: now_ms()?,
+            request: None,
+            response: Some(response.clone()),
+            in_reply_to_delivery_id: Some(delivery_id.to_owned()),
+        };
+        envelope.validate()?;
+        let receipt = self.enqueue_envelope_locked(&envelope)?;
+        self.acknowledge_locked(
+            recipient.instance_id(),
+            delivery_id,
+            Some(envelope.recipient_instance_id.as_str()),
+        )?;
+        Ok(receipt)
+    }
+
+    /// Rejects a claimed request with a minimal protocol task response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid ownership, queue state, or storage.
+    pub fn reject_claimed_request(
+        &self,
+        recipient: &Registration,
+        delivery_id: &str,
+    ) -> Result<EnqueueReceipt> {
+        let claimed = self.read_claimed_request(recipient, delivery_id)?;
+        let response = SendMessageResponse {
+            task: Some(Task {
+                id: rejected_task_id(delivery_id),
+                context_id: claimed.request.message.context_id,
+                status: TaskStatus {
+                    state: TaskState::Rejected,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: Vec::new(),
+                history: Vec::new(),
+                metadata: None,
+            }),
+            message: None,
+        };
+        self.complete_claimed_request(recipient, delivery_id, &response)
+    }
+
+    /// Acknowledges a claimed response. Requests are rejected by this API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid ownership, a request delivery, or unsafe storage.
+    pub fn acknowledge_response(&self, recipient: &Registration, delivery_id: &str) -> Result<()> {
+        self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
+        self.require_live_owner(recipient, now_ms()?)?;
+        let envelope = self.read_processing_delivery(recipient.instance_id(), delivery_id)?;
+        if envelope.kind() != DeliveryKind::Response {
+            bail!("local A2A delivery is a request, not a response");
+        }
+        self.acknowledge_locked(recipient.instance_id(), delivery_id, None)
     }
 
     /// Acknowledges and removes a previously claimed delivery.
@@ -803,6 +1143,245 @@ impl LocalBus {
         })
     }
 
+    fn enqueue_envelope_locked(&self, envelope: &DeliveryEnvelope) -> Result<EnqueueReceipt> {
+        envelope.validate()?;
+        let (pending, processing, acknowledged) =
+            self.queue_directories(&envelope.recipient_instance_id)?;
+        let queued = count_visible_entries(&pending)? + count_visible_entries(&processing)?;
+        let filename = delivery_filename(&envelope.delivery_id)?;
+        let path = pending.join(&filename);
+        let processing_path = processing.join(&filename);
+        let acknowledged_path = acknowledged.join(&filename);
+        let receipt = EnqueueReceipt {
+            delivery_id: envelope.delivery_id.clone(),
+            recipient_instance_id: envelope.recipient_instance_id.clone(),
+        };
+        if path_exists_without_following(&acknowledged_path)? {
+            let existing: Acknowledgement = read_required_json(
+                &acknowledged_path,
+                MAX_REGISTRY_BYTES,
+                "local A2A acknowledgement",
+            )?;
+            existing.validate()?;
+            let candidate_digest = envelope.content_digest()?;
+            if existing.delivery_id != envelope.delivery_id
+                || existing.sender_instance_id != envelope.sender_instance_id
+                || existing.recipient_instance_id != envelope.recipient_instance_id
+                || existing
+                    .delivery_digest
+                    .as_deref()
+                    .is_some_and(|digest| digest != candidate_digest)
+            {
+                bail!("local A2A acknowledgement does not match delivery");
+            }
+            return Ok(receipt);
+        }
+        for queued_path in [&path, &processing_path] {
+            if path_exists_without_following(queued_path)? {
+                let existing: DeliveryEnvelope =
+                    read_required_json(queued_path, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+                existing.validate()?;
+                if !existing.matches_delivery(envelope) {
+                    bail!("local A2A delivery identifier collision");
+                }
+                return Ok(receipt);
+            }
+        }
+        if queued >= MAX_INBOX_MESSAGES {
+            bail!("local A2A inbox is full");
+        }
+        match atomic_write_new_json(&pending, &path, envelope, MAX_ENVELOPE_BYTES) {
+            Ok(()) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists) =>
+            {
+                let existing: DeliveryEnvelope =
+                    read_required_json(&path, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+                existing.validate()?;
+                if !existing.matches_delivery(envelope) {
+                    bail!("local A2A delivery identifier collision");
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(receipt)
+    }
+
+    fn claimed_request_sender(
+        &self,
+        recipient: &Registration,
+        delivery_id: &str,
+    ) -> Result<String> {
+        let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
+        self.require_live_owner(recipient, now_ms()?)?;
+        let (_pending, processing, acknowledged) =
+            self.queue_directories(recipient.instance_id())?;
+        let filename = delivery_filename(delivery_id)?;
+        let source = processing.join(&filename);
+        if path_exists_without_following(&source)? {
+            let envelope: DeliveryEnvelope =
+                read_required_json(&source, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+            envelope.validate()?;
+            validate_queued_envelope(&source, &envelope, recipient.instance_id())?;
+            if envelope.kind() != DeliveryKind::Request {
+                bail!("local A2A claimed delivery is not a request");
+            }
+            return Ok(envelope.sender_instance_id);
+        }
+        let acknowledgement_path = acknowledged.join(filename);
+        let record: Acknowledgement = read_required_json(
+            &acknowledgement_path,
+            MAX_REGISTRY_BYTES,
+            "local A2A acknowledgement",
+        )?;
+        record.validate()?;
+        if record.delivery_id != delivery_id
+            || record.recipient_instance_id != recipient.instance_id()
+        {
+            bail!("local A2A acknowledgement does not match delivery");
+        }
+        Ok(record.sender_instance_id)
+    }
+
+    fn validate_claimed_or_acknowledged_request(
+        &self,
+        recipient_instance_id: &str,
+        delivery_id: &str,
+        sender_instance_id: &str,
+    ) -> Result<()> {
+        let (_pending, processing, acknowledged) = self.queue_directories(recipient_instance_id)?;
+        let filename = delivery_filename(delivery_id)?;
+        let source = processing.join(&filename);
+        if path_exists_without_following(&source)? {
+            let envelope: DeliveryEnvelope =
+                read_required_json(&source, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+            envelope.validate()?;
+            validate_queued_envelope(&source, &envelope, recipient_instance_id)?;
+            if envelope.kind() != DeliveryKind::Request
+                || envelope.sender_instance_id != sender_instance_id
+            {
+                bail!("local A2A claimed request does not match response recipient");
+            }
+            return Ok(());
+        }
+        let acknowledgement_path = acknowledged.join(filename);
+        let record: Acknowledgement = read_required_json(
+            &acknowledgement_path,
+            MAX_REGISTRY_BYTES,
+            "local A2A acknowledgement",
+        )?;
+        record.validate()?;
+        if record.delivery_id != delivery_id
+            || record.sender_instance_id != sender_instance_id
+            || record.recipient_instance_id != recipient_instance_id
+        {
+            bail!("local A2A acknowledgement does not match completed request");
+        }
+        Ok(())
+    }
+
+    fn read_claimed_request(
+        &self,
+        recipient: &Registration,
+        delivery_id: &str,
+    ) -> Result<ReceivedMessage> {
+        self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
+        self.require_live_owner(recipient, now_ms()?)?;
+        let envelope = self.read_processing_delivery(recipient.instance_id(), delivery_id)?;
+        match envelope.received() {
+            ReceivedDelivery::Request(request) => Ok(*request),
+            ReceivedDelivery::Response(_) => bail!("local A2A claimed delivery is not a request"),
+        }
+    }
+
+    fn read_processing_delivery(
+        &self,
+        recipient_instance_id: &str,
+        delivery_id: &str,
+    ) -> Result<DeliveryEnvelope> {
+        validate_delivery_id(delivery_id)?;
+        let (_pending, processing, _acknowledged) =
+            self.queue_directories(recipient_instance_id)?;
+        let path = processing.join(delivery_filename(delivery_id)?);
+        let envelope: DeliveryEnvelope =
+            read_required_json(&path, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+        envelope.validate()?;
+        validate_queued_envelope(&path, &envelope, recipient_instance_id)?;
+        Ok(envelope)
+    }
+
+    fn acknowledge_locked(
+        &self,
+        recipient_instance_id: &str,
+        delivery_id: &str,
+        expected_sender: Option<&str>,
+    ) -> Result<()> {
+        let (_pending, processing, acknowledged) = self.queue_directories(recipient_instance_id)?;
+        let filename = delivery_filename(delivery_id)?;
+        let source = processing.join(&filename);
+        let acknowledgement_path = acknowledged.join(&filename);
+        if path_exists_without_following(&acknowledgement_path)? {
+            let record: Acknowledgement = read_required_json(
+                &acknowledgement_path,
+                MAX_REGISTRY_BYTES,
+                "local A2A acknowledgement",
+            )?;
+            record.validate()?;
+            if record.delivery_id != delivery_id
+                || record.recipient_instance_id != recipient_instance_id
+                || expected_sender.is_some_and(|sender| record.sender_instance_id != sender)
+            {
+                bail!("local A2A acknowledgement does not match delivery");
+            }
+            if path_exists_without_following(&source)? {
+                remove_regular_file(&source, "local A2A delivery")?;
+                sync_directory(&processing).context("local A2A processing inbox could not sync")?;
+            }
+            return Ok(());
+        }
+        let envelope = self.read_processing_delivery(recipient_instance_id, delivery_id)?;
+        if expected_sender.is_some_and(|sender| envelope.sender_instance_id != sender) {
+            bail!("local A2A delivery sender does not match acknowledgement");
+        }
+        if count_visible_entries(&acknowledged)? >= MAX_ACKNOWLEDGEMENTS {
+            bail!("local A2A acknowledgement limit has been reached");
+        }
+        let delivery_digest = envelope.content_digest()?;
+        let record = Acknowledgement {
+            schema_version: LOCAL_BUS_SCHEMA_VERSION,
+            delivery_id: delivery_id.to_owned(),
+            sender_instance_id: envelope.sender_instance_id,
+            recipient_instance_id: envelope.recipient_instance_id,
+            acknowledged_at_ms: now_ms()?,
+            delivery_digest: Some(delivery_digest),
+        };
+        record.validate()?;
+        atomic_write_new_json(
+            &acknowledged,
+            &acknowledgement_path,
+            &record,
+            MAX_REGISTRY_BYTES,
+        )?;
+        remove_regular_file(&source, "local A2A delivery")?;
+        sync_directory(&processing).context("local A2A processing inbox could not sync")
+    }
+
+    fn release_locked(&self, recipient_instance_id: &str, delivery_id: &str) -> Result<()> {
+        let (pending, processing, _acknowledged) = self.queue_directories(recipient_instance_id)?;
+        let filename = delivery_filename(delivery_id)?;
+        let source = processing.join(&filename);
+        let target = pending.join(filename);
+        if path_exists_without_following(&target)? {
+            bail!("local A2A pending delivery already exists");
+        }
+        fs::rename(&source, &target).context("local A2A delivery could not be released")?;
+        sync_directory(&processing).context("local A2A processing inbox could not sync")?;
+        sync_directory(&pending).context("local A2A pending inbox could not sync")
+    }
+
     fn finish_delivery(
         &self,
         recipient: &Registration,
@@ -813,67 +1392,11 @@ impl LocalBus {
         let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
         self.require_live_owner(recipient, now_ms()?)?;
         validate_delivery_id(delivery_id)?;
-        let (pending, processing, acknowledged) =
-            self.queue_directories(recipient.instance_id())?;
-        let filename = delivery_filename(delivery_id)?;
-        let source = processing.join(&filename);
-        let acknowledgement_path = acknowledged.join(&filename);
-        if acknowledge && path_exists_without_following(&acknowledgement_path)? {
-            let record: Acknowledgement = read_required_json(
-                &acknowledgement_path,
-                MAX_REGISTRY_BYTES,
-                "local A2A acknowledgement",
-            )?;
-            record.validate()?;
-            if record.delivery_id != delivery_id
-                || record.recipient_instance_id != recipient.instance_id()
-            {
-                bail!("local A2A acknowledgement does not match delivery");
-            }
-            if path_exists_without_following(&source)? {
-                remove_regular_file(&source, "local A2A delivery")?;
-                sync_directory(&processing).context("local A2A processing inbox could not sync")?;
-            }
-            return Ok(());
-        }
-        let envelope: DeliveryEnvelope =
-            read_required_json(&source, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
-        envelope.validate()?;
-        if envelope.delivery_id != delivery_id
-            || envelope.recipient_instance_id != recipient.instance_id()
-        {
-            bail!("local A2A delivery does not match acknowledgement");
-        }
         if acknowledge {
-            if count_visible_entries(&acknowledged)? >= MAX_ACKNOWLEDGEMENTS {
-                bail!("local A2A acknowledgement limit has been reached");
-            }
-            let record = Acknowledgement {
-                schema_version: LOCAL_BUS_SCHEMA_VERSION,
-                delivery_id: delivery_id.to_owned(),
-                sender_instance_id: envelope.sender_instance_id,
-                recipient_instance_id: envelope.recipient_instance_id,
-                acknowledged_at_ms: now_ms()?,
-            };
-            record.validate()?;
-            atomic_write_new_json(
-                &acknowledged,
-                &acknowledgement_path,
-                &record,
-                MAX_REGISTRY_BYTES,
-            )?;
-            remove_regular_file(&source, "local A2A delivery")?;
-            sync_directory(&processing).context("local A2A processing inbox could not sync")?;
+            self.acknowledge_locked(recipient.instance_id(), delivery_id, None)
         } else {
-            let target = pending.join(filename);
-            if path_exists_without_following(&target)? {
-                bail!("local A2A pending delivery already exists");
-            }
-            fs::rename(&source, &target).context("local A2A delivery could not be released")?;
-            sync_directory(&processing).context("local A2A processing inbox could not sync")?;
-            sync_directory(&pending).context("local A2A pending inbox could not sync")?;
+            self.release_locked(recipient.instance_id(), delivery_id)
         }
-        Ok(())
     }
 
     fn inspect_base_directories(&self) -> Result<()> {
@@ -950,6 +1473,26 @@ impl LocalBus {
                     bail!("local A2A acknowledgement does not match delivery");
                 }
                 actions.push(RecoveryAction::Remove(source));
+            } else if envelope.kind() == DeliveryKind::Request
+                && self.correlated_response_is_durable(&envelope)?
+            {
+                if count_visible_entries(&acknowledged)? >= MAX_ACKNOWLEDGEMENTS {
+                    bail!("local A2A acknowledgement limit has been reached");
+                }
+                let record = Acknowledgement {
+                    schema_version: LOCAL_BUS_SCHEMA_VERSION,
+                    delivery_id: envelope.delivery_id.clone(),
+                    sender_instance_id: envelope.sender_instance_id.clone(),
+                    recipient_instance_id: envelope.recipient_instance_id.clone(),
+                    acknowledged_at_ms: now_ms()?,
+                    delivery_digest: Some(envelope.content_digest()?),
+                };
+                record.validate()?;
+                actions.push(RecoveryAction::Acknowledge {
+                    source,
+                    path: acknowledgement_path,
+                    record,
+                });
             } else if path_exists_without_following(&target)? {
                 let existing: DeliveryEnvelope =
                     read_required_json(&target, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
@@ -964,8 +1507,18 @@ impl LocalBus {
             }
         }
 
+        Self::apply_recovery_actions(&pending, &processing, &acknowledged, actions)
+    }
+
+    fn apply_recovery_actions(
+        pending: &Path,
+        processing: &Path,
+        acknowledged: &Path,
+        actions: Vec<RecoveryAction>,
+    ) -> Result<()> {
         let mut changed_processing = false;
         let mut changed_pending = false;
+        let mut changed_acknowledged = false;
         for action in actions {
             match action {
                 RecoveryAction::Remove(source) => {
@@ -978,15 +1531,77 @@ impl LocalBus {
                     changed_processing = true;
                     changed_pending = true;
                 }
+                RecoveryAction::Acknowledge {
+                    source,
+                    path,
+                    record,
+                } => {
+                    atomic_write_new_json(acknowledged, &path, &record, MAX_REGISTRY_BYTES)?;
+                    remove_regular_file(&source, "local A2A delivery")?;
+                    changed_processing = true;
+                    changed_acknowledged = true;
+                }
             }
         }
         if changed_processing {
-            sync_directory(&processing).context("local A2A processing inbox could not sync")?;
+            sync_directory(processing).context("local A2A processing inbox could not sync")?;
         }
         if changed_pending {
-            sync_directory(&pending).context("local A2A pending inbox could not sync")?;
+            sync_directory(pending).context("local A2A pending inbox could not sync")?;
+        }
+        if changed_acknowledged {
+            sync_directory(acknowledged)
+                .context("local A2A acknowledgement inbox could not sync")?;
         }
         Ok(())
+    }
+
+    fn correlated_response_is_durable(&self, request: &DeliveryEnvelope) -> Result<bool> {
+        if request.kind() != DeliveryKind::Request {
+            return Ok(false);
+        }
+        let response_id = response_delivery_id(
+            &request.recipient_instance_id,
+            &request.sender_instance_id,
+            &request.delivery_id,
+        );
+        let (pending, processing, acknowledged) =
+            self.queue_directories(&request.sender_instance_id)?;
+        let filename = delivery_filename(&response_id)?;
+        let acknowledgement_path = acknowledged.join(&filename);
+        if path_exists_without_following(&acknowledgement_path)? {
+            let record: Acknowledgement = read_required_json(
+                &acknowledgement_path,
+                MAX_REGISTRY_BYTES,
+                "local A2A acknowledgement",
+            )?;
+            record.validate()?;
+            if record.delivery_id != response_id
+                || record.sender_instance_id != request.recipient_instance_id
+                || record.recipient_instance_id != request.sender_instance_id
+            {
+                bail!("local A2A correlated response acknowledgement is invalid");
+            }
+            return Ok(true);
+        }
+        for path in [pending.join(&filename), processing.join(filename)] {
+            if !path_exists_without_following(&path)? {
+                continue;
+            }
+            let response: DeliveryEnvelope =
+                read_required_json(&path, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+            response.validate()?;
+            if response.delivery_id != response_id
+                || response.sender_instance_id != request.recipient_instance_id
+                || response.recipient_instance_id != request.sender_instance_id
+                || response.in_reply_to_delivery_id.as_deref() != Some(&request.delivery_id)
+                || response.kind() != DeliveryKind::Response
+            {
+                bail!("local A2A correlated response is invalid");
+            }
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn registry_path(&self, instance_id: &str) -> Result<PathBuf> {
@@ -1043,7 +1658,15 @@ struct InstanceLocks {
 
 enum RecoveryAction {
     Remove(PathBuf),
-    Move { source: PathBuf, target: PathBuf },
+    Move {
+        source: PathBuf,
+        target: PathBuf,
+    },
+    Acknowledge {
+        source: PathBuf,
+        path: PathBuf,
+        record: Acknowledgement,
+    },
 }
 
 fn claim_delivery_file(
@@ -1052,7 +1675,7 @@ fn claim_delivery_file(
     pending: &Path,
     processing: &Path,
     recipient_instance_id: &str,
-) -> Result<Option<ReceivedMessage>> {
+) -> Result<Option<ReceivedDelivery>> {
     if path_exists_without_following(target)? {
         bail!("local A2A delivery is already being processed");
     }
@@ -1164,6 +1787,17 @@ fn validate_prefixed_hex(value: &str, prefix: &str, hex_bytes: usize, label: &st
     Ok(())
 }
 
+fn validate_lower_hex(value: &str, bytes: usize, label: &str) -> Result<()> {
+    if value.len() != bytes
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("local A2A {label} is malformed");
+    }
+    Ok(())
+}
+
 fn delivery_id(sender: &str, recipient: &str, request_json: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(sender.as_bytes());
@@ -1172,6 +1806,26 @@ fn delivery_id(sender: &str, recipient: &str, request_json: &[u8]) -> String {
     digest.update([0]);
     digest.update(request_json);
     format!("{DELIVERY_ID_PREFIX}{:x}", digest.finalize())
+}
+
+fn response_delivery_id(responder: &str, original_sender: &str, inbound_delivery: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"crumb-a2a-response-v1");
+    digest.update([0]);
+    digest.update(responder.as_bytes());
+    digest.update([0]);
+    digest.update(original_sender.as_bytes());
+    digest.update([0]);
+    digest.update(inbound_delivery.as_bytes());
+    format!("{DELIVERY_ID_PREFIX}{:x}", digest.finalize())
+}
+
+fn rejected_task_id(delivery_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"crumb-a2a-rejected-task-v1");
+    digest.update([0]);
+    digest.update(delivery_id.as_bytes());
+    format!("task_{:x}", digest.finalize())
 }
 
 fn delivery_filename(delivery_id: &str) -> Result<String> {
@@ -1605,6 +2259,22 @@ mod tests {
         }
     }
 
+    fn response(id: &str, text: &str) -> SendMessageResponse {
+        SendMessageResponse {
+            task: None,
+            message: Some(Message {
+                message_id: id.to_owned(),
+                context_id: Some("ctx-local".to_owned()),
+                task_id: None,
+                role: Role::Agent,
+                parts: vec![Part::text(text)],
+                metadata: None,
+                extensions: Vec::new(),
+                reference_task_ids: Vec::new(),
+            }),
+        }
+    }
+
     fn process(number: u8) -> ProcessMetadata {
         ProcessMetadata {
             process_id: u32::from(number) + 100,
@@ -1851,6 +2521,287 @@ mod tests {
         assert!(
             bus.claim_pending(&second_registration, &receipt.delivery_id)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_request_envelope_decodes_without_response_fields() {
+        let encoded = serde_json::json!({
+            "schemaVersion": LOCAL_BUS_SCHEMA_VERSION,
+            "deliveryId": format!("delivery_{}", "a".repeat(64)),
+            "senderInstanceId": format!("crumb_{}", "b".repeat(32)),
+            "recipientInstanceId": format!("crumb_{}", "c".repeat(32)),
+            "enqueuedAtMs": 1,
+            "request": request("legacy-message", "legacy body")
+        });
+        let envelope: DeliveryEnvelope =
+            serde_json::from_value(encoded).expect("legacy envelope decode");
+        envelope.validate().expect("legacy envelope validation");
+        assert_eq!(envelope.kind(), DeliveryKind::Request);
+        assert!(envelope.response.is_none());
+        assert!(envelope.in_reply_to_delivery_id.is_none());
+    }
+
+    #[test]
+    fn envelope_requires_exactly_one_payload_and_response_correlation() {
+        let base = DeliveryEnvelope {
+            schema_version: LOCAL_BUS_SCHEMA_VERSION,
+            delivery_id: format!("delivery_{}", "a".repeat(64)),
+            sender_instance_id: format!("crumb_{}", "b".repeat(32)),
+            recipient_instance_id: format!("crumb_{}", "c".repeat(32)),
+            enqueued_at_ms: 1,
+            request: None,
+            response: None,
+            in_reply_to_delivery_id: None,
+        };
+        assert!(base.validate().is_err());
+
+        let mut uncorrelated = base.clone();
+        uncorrelated.response = Some(response("msg-uncorrelated", "answer"));
+        assert!(uncorrelated.validate().is_err());
+
+        let mut both = uncorrelated;
+        both.request = Some(request("msg-both", "request"));
+        both.in_reply_to_delivery_id = Some(format!("delivery_{}", "d".repeat(64)));
+        assert!(both.validate().is_err());
+    }
+
+    #[test]
+    fn completion_queues_correlated_response_before_acknowledging_request() {
+        let (_temporary, bus, first, second, first_registration, second_registration) = setup();
+        let request_receipt = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &request("msg-response", "please answer"),
+            )
+            .expect("request enqueue");
+        bus.claim_pending(&second_registration, &request_receipt.delivery_id)
+            .expect("request claim");
+
+        let answer = response("msg-answer", "done");
+        let response_receipt = bus
+            .complete_claimed_request(&second_registration, &request_receipt.delivery_id, &answer)
+            .expect("complete request");
+        assert_eq!(response_receipt.recipient_instance_id, first.instance_id);
+        assert!(
+            bus.dequeue(&second_registration)
+                .expect("receiver empty")
+                .is_none()
+        );
+        assert_eq!(
+            bus.list_pending(&second_registration)
+                .expect("requests")
+                .len(),
+            0
+        );
+
+        let summaries = bus
+            .list_deliveries(&first_registration)
+            .expect("sender deliveries");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].kind, DeliveryKind::Response);
+        assert_eq!(
+            summaries[0].in_reply_to_delivery_id.as_deref(),
+            Some(request_receipt.delivery_id.as_str())
+        );
+        assert_eq!(
+            bus.list_pending(&first_registration)
+                .expect("request view")
+                .len(),
+            0
+        );
+        assert!(
+            bus.inspect_pending(&first_registration, &response_receipt.delivery_id)
+                .is_err()
+        );
+        assert!(
+            bus.dequeue(&first_registration)
+                .expect("no response loop")
+                .is_none()
+        );
+
+        let claimed = bus
+            .claim_delivery(&first_registration, &response_receipt.delivery_id)
+            .expect("claim response");
+        let ReceivedDelivery::Response(claimed) = claimed else {
+            panic!("expected response delivery");
+        };
+        assert_eq!(claimed.response, answer);
+        assert_eq!(claimed.in_reply_to_delivery_id, request_receipt.delivery_id);
+        bus.acknowledge_response(&first_registration, &response_receipt.delivery_id)
+            .expect("ack response");
+        assert!(
+            bus.complete_claimed_request(
+                &second_registration,
+                &request_receipt.delivery_id,
+                &response("msg-answer-changed", "different answer")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn completion_is_idempotent_for_stale_sender_and_rejects_response_collision() {
+        let (_temporary, bus, first, second, first_registration, second_registration) = setup();
+        let inbound = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &request("msg-stale-sender", "answer after I leave"),
+            )
+            .expect("enqueue");
+        bus.claim_pending(&second_registration, &inbound.delivery_id)
+            .expect("claim");
+        bus.unregister(&first_registration)
+            .expect("sender unregister");
+
+        let answer = response("msg-stale-answer", "still delivered");
+        let first_receipt = bus
+            .complete_claimed_request(&second_registration, &inbound.delivery_id, &answer)
+            .expect("complete for stale sender");
+        let retry = bus
+            .complete_claimed_request(&second_registration, &inbound.delivery_id, &answer)
+            .expect("idempotent retry");
+        assert_eq!(first_receipt, retry);
+        assert!(
+            bus.complete_claimed_request(
+                &second_registration,
+                &inbound.delivery_id,
+                &response("msg-other-answer", "different")
+            )
+            .is_err()
+        );
+
+        let replacement = bus.register(&first, process(8)).expect("sender restart");
+        let deliveries = bus
+            .list_deliveries(&replacement)
+            .expect("stale sender inbox");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].delivery_id, first_receipt.delivery_id);
+    }
+
+    #[test]
+    fn concurrent_completion_converges_on_one_response() {
+        let (_temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let inbound = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &request("msg-complete-race", "complete once"),
+            )
+            .expect("enqueue");
+        bus.claim_pending(&second_registration, &inbound.delivery_id)
+            .expect("claim");
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let worker_bus = bus.clone();
+            let worker_registration = second_registration.clone();
+            let worker_delivery = inbound.delivery_id.clone();
+            let worker_barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                worker_barrier.wait();
+                worker_bus.complete_claimed_request(
+                    &worker_registration,
+                    &worker_delivery,
+                    &response("msg-race-answer", "one answer"),
+                )
+            }));
+        }
+        barrier.wait();
+        let receipts: Vec<_> = workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .expect("completion worker")
+                    .expect("completion")
+            })
+            .collect();
+        assert_eq!(receipts[0], receipts[1]);
+        let deliveries = bus
+            .list_deliveries(&first_registration)
+            .expect("response inbox");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].delivery_id, receipts[0].delivery_id);
+    }
+
+    #[test]
+    fn rejected_request_uses_rejected_task_state() {
+        let (_temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let inbound = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &request("msg-reject", "unsafe request"),
+            )
+            .expect("enqueue");
+        bus.claim_pending(&second_registration, &inbound.delivery_id)
+            .expect("claim");
+        let response_receipt = bus
+            .reject_claimed_request(&second_registration, &inbound.delivery_id)
+            .expect("reject");
+        let ReceivedDelivery::Response(rejected) = bus
+            .inspect_delivery(&first_registration, &response_receipt.delivery_id)
+            .expect("inspect rejected response")
+        else {
+            panic!("expected response");
+        };
+        assert_eq!(
+            rejected.response.task.expect("task").status.state,
+            TaskState::Rejected
+        );
+    }
+
+    #[test]
+    fn stale_recovery_acknowledges_request_when_response_is_already_durable() {
+        let (_temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let inbound = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &request("msg-fault", "simulate response-before-ack crash"),
+            )
+            .expect("enqueue");
+        bus.claim_pending(&second_registration, &inbound.delivery_id)
+            .expect("claim");
+        let response_envelope = DeliveryEnvelope {
+            schema_version: LOCAL_BUS_SCHEMA_VERSION,
+            delivery_id: response_delivery_id(
+                &second.instance_id,
+                first_registration.instance_id(),
+                &inbound.delivery_id,
+            ),
+            sender_instance_id: second.instance_id.clone(),
+            recipient_instance_id: first_registration.instance_id().to_owned(),
+            enqueued_at_ms: now_ms().expect("time"),
+            request: None,
+            response: Some(response("msg-fault-answer", "durable answer")),
+            in_reply_to_delivery_id: Some(inbound.delivery_id.clone()),
+        };
+        bus.enqueue_envelope_locked(&response_envelope)
+            .expect("inject durable response");
+
+        let registry_path = bus.registry_path(&second.instance_id).expect("registry");
+        let mut stale: PeerEntry =
+            read_required_json(&registry_path, MAX_REGISTRY_BYTES, "registry").expect("entry");
+        stale.process.started_at_ms = 1;
+        stale.lease_updated_at_ms = 1;
+        atomic_replace_json(&bus.registry, &registry_path, &stale, MAX_REGISTRY_BYTES)
+            .expect("stale lease");
+        let replacement = bus.register(&second, process(9)).expect("recover");
+        assert_eq!(bus.list_pending(&replacement).expect("no replay").len(), 0);
+        assert!(
+            bus.dequeue(&replacement)
+                .expect("no agent replay")
+                .is_none()
+        );
+        assert_eq!(
+            bus.list_deliveries(&first_registration)
+                .expect("durable response")
+                .len(),
+            1
         );
     }
 

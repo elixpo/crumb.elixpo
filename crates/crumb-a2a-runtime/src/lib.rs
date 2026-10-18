@@ -12,10 +12,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use crumb_a2a::SendMessageRequest;
+use crumb_a2a::{SendMessageRequest, SendMessageResponse};
 use crumb_a2a_local::{
-    EnqueueReceipt, LocalBus, LocalBusOptions, PeerEntry, PendingDeliverySummary, ProcessMetadata,
-    ReceivedMessage, Registration, StagedArtifact,
+    DeliverySummary, EnqueueReceipt, LocalBus, LocalBusOptions, PeerEntry, PendingDeliverySummary,
+    ProcessMetadata, ReceivedDelivery, ReceivedMessage, Registration, StagedArtifact,
 };
 use crumb_instance::{InstanceMetadata, InstanceStore};
 
@@ -287,6 +287,17 @@ impl A2aRuntime {
         self.inner.bus.list_pending(&registration)
     }
 
+    /// Lists all pending requests and responses without exposing payload data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after shutdown begins or when inbox validation fails.
+    pub fn list_deliveries(&self) -> Result<Vec<DeliverySummary>> {
+        self.inner.ensure_running()?;
+        let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
+        self.inner.bus.list_deliveries(&registration)
+    }
+
     /// Reads one exact pending delivery without changing queue state.
     ///
     /// # Errors
@@ -299,6 +310,17 @@ impl A2aRuntime {
         self.inner.bus.inspect_pending(&registration, delivery_id)
     }
 
+    /// Reads one exact pending request or response without changing queue state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after shutdown begins or when delivery validation fails.
+    pub fn inspect_delivery(&self, delivery_id: &str) -> Result<ReceivedDelivery> {
+        self.inner.ensure_running()?;
+        let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
+        self.inner.bus.inspect_delivery(&registration, delivery_id)
+    }
+
     /// Atomically claims one exact pending delivery by identifier.
     ///
     /// # Errors
@@ -309,6 +331,60 @@ impl A2aRuntime {
         self.inner.ensure_running()?;
         let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
         self.inner.bus.claim_pending(&registration, delivery_id)
+    }
+
+    /// Atomically claims one exact pending request or response by identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after shutdown begins or when the claim cannot be completed safely.
+    pub fn claim_delivery(&self, delivery_id: &str) -> Result<ReceivedDelivery> {
+        self.inner.ensure_running()?;
+        let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
+        self.inner.bus.claim_delivery(&registration, delivery_id)
+    }
+
+    /// Durably queues a correlated response before acknowledging a claimed request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after shutdown begins or when completion cannot be committed safely.
+    pub fn complete_claimed_request(
+        &self,
+        delivery_id: &str,
+        response: &SendMessageResponse,
+    ) -> Result<EnqueueReceipt> {
+        self.inner.ensure_running()?;
+        let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
+        self.inner
+            .bus
+            .complete_claimed_request(&registration, delivery_id, response)
+    }
+
+    /// Rejects a claimed request with a protocol-level rejected task response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after shutdown begins or when rejection cannot be committed safely.
+    pub fn reject_claimed_request(&self, delivery_id: &str) -> Result<EnqueueReceipt> {
+        self.inner.ensure_running()?;
+        let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
+        self.inner
+            .bus
+            .reject_claimed_request(&registration, delivery_id)
+    }
+
+    /// Acknowledges a claimed response without routing it through the agent loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after shutdown begins or for invalid response queue state.
+    pub fn acknowledge_response(&self, delivery_id: &str) -> Result<()> {
+        self.inner.ensure_running()?;
+        let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
+        self.inner
+            .bus
+            .acknowledge_response(&registration, delivery_id)
     }
 
     /// Acknowledges one claimed delivery.
