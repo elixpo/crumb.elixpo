@@ -901,6 +901,7 @@ fn compare_release_refs(left: &PackageReleaseRef, right: &PackageReleaseRef) -> 
         Version::parse(&left.version)
             .expect("validated release version")
             .cmp(&Version::parse(&right.version).expect("validated release version"))
+            .then_with(|| left.version.cmp(&right.version))
     })
 }
 
