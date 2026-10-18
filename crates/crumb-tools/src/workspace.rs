@@ -9,12 +9,14 @@ use crumb_agent::{
     CancellationToken, RiskClass, ToolDescriptor, ToolHandler, ToolHost, ToolOutput, ToolTransport,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::{CheckpointStore, bounded_text};
 
 const READ_FILE: &str = "read_file";
 const LIST_DIRECTORY: &str = "list_directory";
 const WRITE_FILE: &str = "write_file";
+const EDIT_FILE: &str = "edit_file";
 static NEXT_WRITE: AtomicU64 = AtomicU64::new(0);
 
 /// Runtime ceilings for workspace read tools.
@@ -58,7 +60,7 @@ pub fn register_workspace_read_tools(
     Ok(())
 }
 
-/// Registers a permission-gated UTF-8 write tool with mandatory checkpoints.
+/// Registers permission-gated UTF-8 write and surgical edit tools with mandatory checkpoints.
 ///
 /// # Errors
 ///
@@ -75,9 +77,20 @@ pub fn register_workspace_write_tool(
     let root = fs::canonicalize(workspace)
         .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
     let checkpoints = CheckpointStore::new(&root, limits.max_file_bytes)?;
+    if host.descriptor(WRITE_FILE).is_some() || host.descriptor(EDIT_FILE).is_some() {
+        bail!("workspace write tool is already registered");
+    }
     host.register(
         write_descriptor(),
         Arc::new(WriteFile {
+            root: root.clone(),
+            limits,
+            checkpoints: checkpoints.clone(),
+        }),
+    )?;
+    host.register(
+        edit_descriptor(),
+        Arc::new(EditFile {
             root,
             limits,
             checkpoints,
@@ -193,9 +206,25 @@ struct WriteFile {
     checkpoints: CheckpointStore,
 }
 
+struct EditFile {
+    root: PathBuf,
+    limits: WorkspaceWriteLimits,
+    checkpoints: CheckpointStore,
+}
+
 impl ToolHandler for WriteFile {
     fn call(&self, arguments: &Value, cancellation: &CancellationToken) -> Result<ToolOutput> {
         match write_file(self, arguments, cancellation) {
+            Ok(output) => Ok(output),
+            Err(error) if cancellation.is_cancelled() => Err(error),
+            Err(error) => Ok(ToolOutput::error(error.to_string())),
+        }
+    }
+}
+
+impl ToolHandler for EditFile {
+    fn call(&self, arguments: &Value, cancellation: &CancellationToken) -> Result<ToolOutput> {
+        match edit_file(self, arguments, cancellation) {
             Ok(output) => Ok(output),
             Err(error) if cancellation.is_cancelled() => Err(error),
             Err(error) => Ok(ToolOutput::error(error.to_string())),
@@ -244,6 +273,112 @@ fn write_file(
         })),
         is_error: false,
     })
+}
+
+fn edit_file(
+    tool: &EditFile,
+    arguments: &Value,
+    cancellation: &CancellationToken,
+) -> Result<ToolOutput> {
+    ensure_active(cancellation)?;
+    let requested = string_argument(arguments, "path")?;
+    let old_text = string_argument(arguments, "old_text")?;
+    let new_text = string_argument(arguments, "new_text")?;
+    if old_text.is_empty() {
+        bail!("old_text must not be empty");
+    }
+    if old_text.len() > tool.limits.max_file_bytes || new_text.len() > tool.limits.max_file_bytes {
+        bail!("edit text exceeds the configured write limit");
+    }
+    let expected_sha256 = optional_string(arguments, "expected_sha256")?;
+    if let Some(expected) = expected_sha256 {
+        validate_sha256(expected)?;
+    }
+
+    let (relative, target) = resolve_write_target(&tool.root, requested)?;
+    let before = read_optional_bounded(&target, tool.limits.max_file_bytes)?
+        .with_context(|| format!("edit target `{requested}` does not exist"))?;
+    let before_text = std::str::from_utf8(&before)
+        .with_context(|| format!("edit target `{requested}` is not valid UTF-8"))?;
+    let before_sha256 = sha256(&before);
+    if expected_sha256.is_some_and(|expected| !expected.eq_ignore_ascii_case(&before_sha256)) {
+        bail!("edit conflict: expected_sha256 does not match the current file");
+    }
+
+    let mut matches = before_text.match_indices(old_text);
+    let (start, _) = matches
+        .next()
+        .with_context(|| "edit conflict: old_text was not found in the current file")?;
+    if matches.next().is_some() {
+        bail!("edit conflict: old_text matches more than once; provide a larger unique block");
+    }
+    let end = start.saturating_add(old_text.len());
+    let resulting_len = before
+        .len()
+        .saturating_sub(old_text.len())
+        .saturating_add(new_text.len());
+    if resulting_len > tool.limits.max_file_bytes {
+        bail!("edited file exceeds the configured write limit");
+    }
+    let mut after = String::with_capacity(resulting_len);
+    after.push_str(&before_text[..start]);
+    after.push_str(new_text);
+    after.push_str(&before_text[end..]);
+    if after.as_bytes() == before {
+        bail!("edit does not change the file");
+    }
+
+    tool.checkpoints
+        .validate_edit(&relative, Some(&before), after.as_bytes())?;
+    ensure_active(cancellation)?;
+    ensure_preimage_unchanged(&target, &before)?;
+    let checkpoint = install_checkpointed_write(
+        &target,
+        &relative,
+        Some(&before),
+        after.as_bytes(),
+        &tool.checkpoints,
+        cancellation,
+    )?;
+    let (additions, deletions) = line_change_counts(Some(&before), after.as_bytes());
+    let after_sha256 = sha256(after.as_bytes());
+    Ok(ToolOutput {
+        text: format!(
+            "edited {} (+{additions} -{deletions})\ncheckpoint: {}",
+            relative.display(),
+            checkpoint.id
+        ),
+        structured: Some(json!({
+            "path": relative,
+            "bytes": after.len(),
+            "additions": additions,
+            "deletions": deletions,
+            "replacements": 1,
+            "before_sha256": before_sha256,
+            "after_sha256": after_sha256,
+            "checkpoint": checkpoint.id
+        })),
+        is_error: false,
+    })
+}
+
+fn ensure_preimage_unchanged(path: &Path, expected: &[u8]) -> Result<()> {
+    let current = fs::read(path).context("failed to verify edit preimage")?;
+    if current != expected {
+        bail!("edit conflict: file changed while the edit was being prepared");
+    }
+    Ok(())
+}
+
+fn sha256(content: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(content))
+}
+
+fn validate_sha256(digest: &str) -> Result<()> {
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("expected_sha256 must be a 64-character hexadecimal digest");
+    }
+    Ok(())
 }
 
 fn line_change_counts(before: Option<&[u8]>, after: &[u8]) -> (usize, usize) {
@@ -369,8 +504,22 @@ fn install_checkpointed_write(
         let _ = fs::remove_file(&temporary);
         bail!("tool call cancelled");
     }
-    if before.is_some() {
+    if let Some(before) = before {
         fs::rename(target, &backup).context("failed to stage write preimage")?;
+        let preimage_matches = file_matches(&backup, before);
+        match preimage_matches {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = fs::remove_file(&temporary);
+                fs::rename(&backup, target).context("failed to restore conflicting preimage")?;
+                bail!("edit conflict: file changed while the edit was being installed");
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                let _ = fs::rename(&backup, target);
+                return Err(error).context("failed to verify staged write preimage");
+            }
+        }
     }
     if let Err(error) = fs::rename(&temporary, target) {
         if before.is_some() {
@@ -393,6 +542,17 @@ fn install_checkpointed_write(
             Err(error).context("workspace write was rolled back because checkpointing failed")
         }
     }
+}
+
+fn file_matches(path: &Path, expected: &[u8]) -> Result<bool> {
+    let read_limit = u64::try_from(expected.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut actual = Vec::with_capacity(expected.len().min(64 * 1024));
+    File::open(path)?
+        .take(read_limit)
+        .read_to_end(&mut actual)?;
+    Ok(actual == expected)
 }
 
 fn write_temporary(path: &Path, content: &[u8], permissions_from: Option<&Path>) -> Result<()> {
@@ -495,6 +655,16 @@ fn optional_u64(arguments: &Value, name: &str) -> Result<Option<u64>> {
     }
 }
 
+fn optional_string<'a>(arguments: &'a Value, name: &str) -> Result<Option<&'a str>> {
+    match arguments.get(name) {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(Some)
+            .with_context(|| format!("{name} must be a string")),
+    }
+}
+
 fn read_descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: READ_FILE.to_owned(),
@@ -553,6 +723,30 @@ fn write_descriptor() -> ToolDescriptor {
     }
 }
 
+fn edit_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: EDIT_FILE.to_owned(),
+        description: "Surgically replace one unique UTF-8 text block in an existing workspace file. The old text is an optimistic concurrency check; expected_sha256 can additionally pin the complete preimage. Creates a mandatory review checkpoint."
+            .to_owned(),
+        input_schema: json!({
+            "type":"object",
+            "properties":{
+                "path":{"type":"string","minLength":1},
+                "old_text":{"type":"string","minLength":1},
+                "new_text":{"type":"string"},
+                "expected_sha256":{
+                    "type":"string",
+                    "pattern":"^[A-Fa-f0-9]{64}$"
+                }
+            },
+            "required":["path","old_text","new_text"],
+            "additionalProperties":false
+        }),
+        risk: RiskClass::WriteWorkspace,
+        transport: ToolTransport::Native,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -569,7 +763,7 @@ mod tests {
 
     use super::{
         WorkspaceToolLimits, WorkspaceWriteLimits, register_workspace_read_tools,
-        register_workspace_write_tool,
+        register_workspace_write_tool, sha256,
     };
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -794,6 +988,255 @@ mod tests {
         assert_eq!(structured["additions"], 2);
         assert_eq!(structured["deletions"], 2);
         assert!(output.text.contains("(+2 -2)"));
+    }
+
+    #[test]
+    fn approved_edit_replaces_one_unique_block_and_is_rewindable() {
+        let workspace = TempWorkspace::new();
+        fs::write(
+            workspace.path().join("notes.txt"),
+            "alpha\nold value\nomega\n",
+        )
+        .expect("fixture is written");
+        let output = write_host(workspace.path())
+            .call(
+                "edit_file",
+                &json!({
+                    "path":"notes.txt",
+                    "old_text":"old value",
+                    "new_text":"new value"
+                }),
+                AgentMode::Auto,
+                &AllowOnce,
+                &CancellationToken::default(),
+            )
+            .expect("approved edit succeeds");
+        assert!(!output.is_error);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("notes.txt")).expect("edited file is read"),
+            "alpha\nnew value\nomega\n"
+        );
+        let structured = output.structured.expect("edit metadata is returned");
+        assert_eq!(structured["path"], "notes.txt");
+        assert_eq!(structured["additions"], 1);
+        assert_eq!(structured["deletions"], 1);
+        assert_eq!(structured["replacements"], 1);
+        assert_eq!(
+            structured["before_sha256"],
+            sha256(b"alpha\nold value\nomega\n")
+        );
+        assert_eq!(
+            structured["after_sha256"],
+            sha256(b"alpha\nnew value\nomega\n")
+        );
+        assert!(output.text.contains("edited notes.txt (+1 -1)"));
+
+        let checkpoint = structured["checkpoint"]
+            .as_str()
+            .expect("checkpoint id is returned");
+        CheckpointStore::new(workspace.path(), 128)
+            .expect("store opens")
+            .decide(checkpoint, CheckpointDecision::Reject)
+            .expect("checkpoint rewinds");
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("notes.txt")).expect("rewound file is read"),
+            "alpha\nold value\nomega\n"
+        );
+    }
+
+    #[test]
+    fn edit_requires_workspace_write_approval() {
+        let workspace = TempWorkspace::new();
+        fs::write(workspace.path().join("notes.txt"), "before").expect("fixture is written");
+        let error = write_host(workspace.path())
+            .call(
+                "edit_file",
+                &json!({"path":"notes.txt","old_text":"before","new_text":"after"}),
+                AgentMode::Auto,
+                &DenyAllApprovals,
+                &CancellationToken::default(),
+            )
+            .expect_err("unapproved edit is denied");
+        assert_eq!(error.kind, ToolCallErrorKind::Denied);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("notes.txt")).expect("fixture is read"),
+            "before"
+        );
+    }
+
+    #[test]
+    fn edit_rejects_ambiguous_or_stale_old_text_without_mutation() {
+        let workspace = TempWorkspace::new();
+        let path = workspace.path().join("notes.txt");
+        fs::write(&path, "same\nmiddle\nsame\n").expect("fixture is written");
+        let host = write_host(workspace.path());
+        let ambiguous = host
+            .call(
+                "edit_file",
+                &json!({"path":"notes.txt","old_text":"same","new_text":"changed"}),
+                AgentMode::Auto,
+                &AllowOnce,
+                &CancellationToken::default(),
+            )
+            .expect("expected edit conflict is tool output");
+        assert!(ambiguous.is_error);
+        assert!(ambiguous.text.contains("matches more than once"));
+
+        let stale = host
+            .call(
+                "edit_file",
+                &json!({"path":"notes.txt","old_text":"missing","new_text":"changed"}),
+                AgentMode::Auto,
+                &AllowOnce,
+                &CancellationToken::default(),
+            )
+            .expect("expected edit conflict is tool output");
+        assert!(stale.is_error);
+        assert!(stale.text.contains("old_text was not found"));
+        assert_eq!(
+            fs::read_to_string(path).expect("fixture is read"),
+            "same\nmiddle\nsame\n"
+        );
+    }
+
+    #[test]
+    fn edit_honors_the_optional_full_file_digest() {
+        let workspace = TempWorkspace::new();
+        let path = workspace.path().join("notes.txt");
+        fs::write(&path, "before").expect("fixture is written");
+        let host = write_host(workspace.path());
+        let mismatch = host
+            .call(
+                "edit_file",
+                &json!({
+                    "path":"notes.txt",
+                    "old_text":"before",
+                    "new_text":"after",
+                    "expected_sha256":"0000000000000000000000000000000000000000000000000000000000000000"
+                }),
+                AgentMode::Auto,
+                &AllowOnce,
+                &CancellationToken::default(),
+            )
+            .expect("digest mismatch is tool output");
+        assert!(mismatch.is_error);
+        assert!(mismatch.text.contains("does not match"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("fixture is read"),
+            "before"
+        );
+
+        let output = host
+            .call(
+                "edit_file",
+                &json!({
+                    "path":"notes.txt",
+                    "old_text":"before",
+                    "new_text":"after",
+                    "expected_sha256":sha256(b"before").to_ascii_uppercase()
+                }),
+                AgentMode::Auto,
+                &AllowOnce,
+                &CancellationToken::default(),
+            )
+            .expect("matching digest permits the edit");
+        assert!(!output.is_error);
+        assert_eq!(
+            fs::read_to_string(path).expect("edited file is read"),
+            "after"
+        );
+    }
+
+    #[test]
+    fn edit_rejects_binary_missing_oversized_and_escaping_targets() {
+        let workspace = TempWorkspace::new();
+        fs::write(workspace.path().join("binary.bin"), [0xff, 0x00])
+            .expect("binary fixture is written");
+        fs::write(workspace.path().join("large.txt"), "a".repeat(128))
+            .expect("large fixture is written");
+        let host = write_host(workspace.path());
+        for (arguments, expected) in [
+            (
+                json!({"path":"binary.bin","old_text":"x","new_text":"y"}),
+                "not valid UTF-8",
+            ),
+            (
+                json!({"path":"missing.txt","old_text":"x","new_text":"y"}),
+                "does not exist",
+            ),
+            (
+                json!({"path":"large.txt","old_text":"a","new_text":"longer"}),
+                "matches more than once",
+            ),
+            (
+                json!({
+                    "path":"large.txt",
+                    "old_text":"a".repeat(128),
+                    "new_text":"a".repeat(129)
+                }),
+                "edit text exceeds",
+            ),
+            (
+                json!({"path":"../outside.txt","old_text":"x","new_text":"y"}),
+                "safe workspace-relative",
+            ),
+        ] {
+            let output = host
+                .call(
+                    "edit_file",
+                    &arguments,
+                    AgentMode::Auto,
+                    &AllowOnce,
+                    &CancellationToken::default(),
+                )
+                .expect("expected refusal is tool output");
+            assert!(output.is_error);
+            assert!(output.text.contains(expected), "{}", output.text);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_preserves_existing_file_permissions_and_rejects_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let workspace = TempWorkspace::new();
+        let script = workspace.path().join("script.sh");
+        fs::write(&script, "echo old\n").expect("fixture is written");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o751))
+            .expect("fixture permissions are set");
+        symlink(&script, workspace.path().join("linked.sh")).expect("symlink is created");
+        let host = write_host(workspace.path());
+        let linked = host
+            .call(
+                "edit_file",
+                &json!({"path":"linked.sh","old_text":"old","new_text":"new"}),
+                AgentMode::Auto,
+                &AllowOnce,
+                &CancellationToken::default(),
+            )
+            .expect("expected symlink refusal is tool output");
+        assert!(linked.is_error);
+        assert!(linked.text.contains("symlink"));
+
+        let output = host
+            .call(
+                "edit_file",
+                &json!({"path":"script.sh","old_text":"old","new_text":"new"}),
+                AgentMode::Auto,
+                &AllowOnce,
+                &CancellationToken::default(),
+            )
+            .expect("approved edit succeeds");
+        assert!(!output.is_error);
+        assert_eq!(
+            fs::metadata(script)
+                .expect("edited metadata is read")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
     }
 
     #[test]
