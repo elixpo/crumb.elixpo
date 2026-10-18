@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use crumb_agent::{OptimizerConfig, OutputKind, StructuredEncoding, TokenOptimizer};
+use crumb_core::redact_sensitive_text;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -257,49 +258,7 @@ fn native_filter(kind: OutputKind, input: &str) -> String {
 }
 
 fn redact(input: &str) -> (String, usize) {
-    let mut output = String::with_capacity(input.len());
-    let mut redacted_lines = 0;
-    let mut private_key = false;
-    for line in input.lines() {
-        let lower = line.to_ascii_lowercase();
-        let compact = lower
-            .chars()
-            .filter(|character| {
-                !character.is_ascii_whitespace() && !matches!(character, '"' | '\'')
-            })
-            .collect::<String>();
-        if lower.contains("-----begin private key-----") {
-            private_key = true;
-        }
-        let sensitive = private_key
-            || lower.contains("bearer ")
-            || compact.contains("sk_")
-            || [
-                "authorization:",
-                "api_key=",
-                "apikey=",
-                "password=",
-                "secret=",
-                "token=",
-                "access_token",
-                "refresh_token",
-            ]
-            .iter()
-            .any(|marker| compact.contains(marker));
-        if sensitive {
-            if output.lines().next_back() != Some("[sensitive output redacted]") {
-                output.push_str("[sensitive output redacted]\n");
-            }
-            redacted_lines += 1;
-        } else {
-            output.push_str(line);
-            output.push('\n');
-        }
-        if lower.contains("-----end private key-----") {
-            private_key = false;
-        }
-    }
-    (output, redacted_lines)
+    redact_sensitive_text(input)
 }
 
 fn is_diagnostic(line: &str) -> bool {
