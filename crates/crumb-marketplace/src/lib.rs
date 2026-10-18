@@ -44,6 +44,9 @@ const BUNDLED_CATALOG: &[u8] = include_bytes!("../../../marketplace/catalog.json
 const PUBLIC_CATALOG: &[u8] =
     include_bytes!("../../../crumb.elixpo/public/marketplace/catalog.json");
 #[cfg(test)]
+const PUBLIC_DISCOVERY: &[u8] =
+    include_bytes!("../../../crumb.elixpo/public/marketplace/discovery.json");
+#[cfg(test)]
 const CONTRIBUTOR_SCHEMA: &[u8] = include_bytes!("../../../marketplace/schema/catalog.schema.json");
 #[cfg(test)]
 const PUBLIC_SCHEMA: &[u8] =
@@ -2597,8 +2600,9 @@ fn current_platform() -> MarketplacePlatform {
 mod tests {
     use super::{
         CONTRIBUTOR_SCHEMA, Catalog, DiscoveryIndex, InstallationStore, InstalledRelease,
-        Installer, MAX_CATALOG_BYTES, MAX_DISCOVERY_INDEX_BYTES, PUBLIC_CATALOG, PUBLIC_SCHEMA,
-        PreparedPackage, RemoteCatalogCache, Revocation, UpdateStatus, bundled_catalog,
+        Installer, MAX_CATALOG_BYTES, MAX_DISCOVERY_INDEX_BYTES, PUBLIC_CATALOG, PUBLIC_DISCOVERY,
+        PUBLIC_SCHEMA, PreparedPackage, ReleaseTrust, RemoteCatalogCache, Revocation, UpdateStatus,
+        bundled_catalog,
     };
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -3274,10 +3278,40 @@ mod tests {
     #[test]
     fn bundled_catalog_and_artifacts_are_in_sync() {
         let catalog = bundled_catalog().expect("bundled catalog should be valid");
-        assert_eq!(
-            catalog,
-            Catalog::parse(PUBLIC_CATALOG).expect("public catalog should be valid")
-        );
+        let public = Catalog::parse(PUBLIC_CATALOG).expect("public catalog should be valid");
+        assert_eq!(catalog.publishers, public.publishers);
+        assert_eq!(catalog.revocations, public.revocations);
+        assert_eq!(catalog.packages.len(), public.packages.len());
+        for bundled in &catalog.packages {
+            let remote = public
+                .packages
+                .iter()
+                .find(|package| package.id == bundled.id && package.version == bundled.version)
+                .expect("public catalog should contain every bundled release");
+            assert_eq!(bundled.artifacts.len(), remote.artifacts.len());
+            assert_eq!(remote.provenance.trust, ReleaseTrust::SigstoreBundle);
+            assert!(
+                remote
+                    .source
+                    .starts_with("https://crumb.elixpo.com/marketplace/")
+            );
+            for (bundled_artifact, remote_artifact) in
+                bundled.artifacts.iter().zip(&remote.artifacts)
+            {
+                assert_eq!(bundled_artifact.path, remote_artifact.path);
+                assert_eq!(bundled_artifact.sha256, remote_artifact.sha256);
+                assert_eq!(bundled_artifact.size_bytes, remote_artifact.size_bytes);
+                assert!(remote_artifact.url.as_deref().is_some_and(|url| {
+                    url.starts_with("https://crumb.elixpo.com/marketplace/packages/")
+                }));
+                assert!(
+                    remote_artifact
+                        .bundle_url
+                        .as_deref()
+                        .is_some_and(|url| url.ends_with(".sigstore.json"))
+                );
+            }
+        }
         let cache = tempdir().expect("cache tempdir");
         let installer = Installer::new(cache.path());
         for package in catalog.packages {
@@ -3290,6 +3324,23 @@ mod tests {
         let public_schema: serde_json::Value =
             serde_json::from_slice(PUBLIC_SCHEMA).expect("public schema should parse");
         assert_eq!(contributor_schema, public_schema);
+    }
+
+    #[test]
+    fn published_discovery_pins_every_exact_remote_manifest() {
+        let catalog = Catalog::parse(PUBLIC_CATALOG).expect("public catalog should be valid");
+        let discovery = DiscoveryIndex::parse(PUBLIC_DISCOVERY)
+            .expect("public discovery index should be valid");
+        assert_eq!(catalog.packages.len(), discovery.releases.len());
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crumb.elixpo/public/marketplace/manifests");
+        for entry in discovery.releases {
+            let bytes = fs::read(root.join(format!("{}.json", entry.release.manifest_sha256)))
+                .expect("referenced public manifest should exist");
+            let package = super::Package::parse_referenced_manifest(&bytes, &entry.release)
+                .expect("public manifest should match its discovery reference");
+            assert_eq!(package.provenance.trust, ReleaseTrust::SigstoreBundle);
+        }
     }
 
     #[test]

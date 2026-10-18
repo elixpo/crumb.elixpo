@@ -1,7 +1,7 @@
 <h1 align="center">
   <img src="crumb.elixpo/public/favicon.png" width="42" height="42" alt="Crumb panda" />
   <br />
-  Crumb
+  Crumb CLI
 </h1>
 
 <p align="center">

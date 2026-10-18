@@ -47,7 +47,7 @@ export function accountsAuthorizeUrl(state: string, requestUrl: string): string 
   return url.toString()
 }
 
-export async function finishAccountsLogin(code: string, requestUrl: string): Promise<User> {
+export async function finishAccountsLogin(code: string, requestUrl: string, userAgent = ''): Promise<User> {
   const env = config()
   const accounts = env.accountsOrigin
   const tokenResponse = await fetch(new URL('/api/auth/token', accounts), {
@@ -77,8 +77,21 @@ export async function finishAccountsLogin(code: string, requestUrl: string): Pro
       updated_at = excluded.updated_at
   `).bind(user.id, user.email, user.displayName).run()
   const session = randomToken()
-  await db.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)')
-    .bind(session, user.id, Math.floor(Date.now() / 1000) + 15 * 86400).run()
+  const publicId = randomToken()
+  const now = Math.floor(Date.now() / 1000)
+  await db.prepare(`
+    INSERT INTO sessions
+      (id, user_id, expires_at, public_id, created_at, last_seen_at, user_agent)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    session,
+    user.id,
+    now + 15 * 86400,
+    publicId,
+    now,
+    now,
+    userAgent.slice(0, 512),
+  ).run()
   ;(await cookies()).set('crumb_session', session, {
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',

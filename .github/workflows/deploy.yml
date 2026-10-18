@@ -83,7 +83,7 @@ jobs:
             done < <(awk -F/ '/^packages\/[^/]+\// {print $2}' "$RUNNER_TEMP/changed-files" | sort -u)
             npm_packages="${npm_packages# }"
             vscode_packages="${vscode_packages# }"
-            if grep -Eq '^(crumb\.elixpo/|deploy\.sh$)' "$RUNNER_TEMP/changed-files"; then website=true; else website=false; fi
+            if grep -Eq '^(crumb\.elixpo/|deploy\.sh$|\.env$|\.sops\.yaml$|\.github/workflows/deploy\.yml$)' "$RUNNER_TEMP/changed-files"; then website=true; else website=false; fi
             if grep -Eq '^crumb\.elixpo/migrations/' "$RUNNER_TEMP/changed-files"; then migrations=true; else migrations=false; fi
           fi
           echo "npm_packages=$npm_packages" >> "$GITHUB_OUTPUT"
@@ -212,18 +212,34 @@ jobs:
           sudo install -m 0755 "$binary" /usr/local/bin/sops
       - name: Check deployment credentials
         run: |
-          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] && [ -z "${SOPS_AGE_KEY:-}" ]; then
-            echo "::error::Configure CLOUDFLARE_API_TOKEN or SOPS_AGE_KEY in the production environment."
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "::error::Configure CLOUDFLARE_API_TOKEN in the production environment."
             exit 1
           fi
-      - name: Sign marketplace catalog
-        run: >-
-          cosign sign-blob --yes
-          --bundle crumb.elixpo/public/marketplace/catalog.sigstore.json
-          crumb.elixpo/public/marketplace/catalog.json
-      - name: Build, migrate, and deploy website
+          if [ -z "${SOPS_AGE_KEY:-}" ]; then
+            echo "::error::Configure SOPS_AGE_KEY so application secrets can be decrypted before deployment."
+            exit 1
+          fi
+      - name: Publish marketplace indexes and exact manifests
+        run: node .github/scripts/publish-marketplace.mjs
+      - name: Sign marketplace catalog, discovery, and artifacts
         run: |
           set -euo pipefail
-          ./deploy.sh --worker build
+          cosign sign-blob --yes \
+            --bundle crumb.elixpo/public/marketplace/catalog.sigstore.json \
+            crumb.elixpo/public/marketplace/catalog.json
+          cosign sign-blob --yes \
+            --bundle crumb.elixpo/public/marketplace/discovery.sigstore.json \
+            crumb.elixpo/public/marketplace/discovery.json
+          while IFS= read -r -d '' artifact; do
+            cosign sign-blob --yes --bundle "${artifact}.sigstore.json" "$artifact"
+          done < <(find crumb.elixpo/public/marketplace/packages -type f ! -name '*.sigstore.json' -print0)
+      - name: Build website
+        run: ./deploy.sh --worker build
+      - name: Upload encrypted application secrets
+        run: ./deploy.sh --worker secrets
+      - name: Migrate and deploy website
+        run: |
+          set -euo pipefail
           if [ "$RUN_MIGRATIONS" = "true" ]; then ./deploy.sh --worker migrate; fi
           ./deploy.sh --worker deploy

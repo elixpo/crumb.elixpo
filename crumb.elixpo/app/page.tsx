@@ -22,7 +22,7 @@ export default function Home() {
       <div className="feature-grid">
         <article><span>01</span><div className="feature-icon">$_</div><h3>Your shell still works</h3><p>Keep using the commands, programs, shortcuts, and full-screen tools you already know.</p></article>
         <article><span>02</span><div className="feature-icon">◆</div><h3>Delegate the outcome</h3><p>Describe a goal and let Crumb's native harness plan, use approved tools, verify progress, and continue across multiple steps.</p></article>
-        <article><span>03</span><div className="feature-icon">⌁</div><h3>Connect accounts safely</h3><p>Sign in through the browser instead of pasting private keys into commands or chat.</p></article>
+        <article><span>03</span><div className="feature-icon">⌁</div><h3>Connect Pollinations safely</h3><p>Authorize Pollinations in the browser instead of pasting its private key into commands or chat.</p></article>
       </div>
     </section>
 
@@ -38,7 +38,7 @@ export default function Home() {
       <div className="namespace-cards"><article><code>/</code><span><b>Control the terminal</b><small>/skills · /mode · /connectors · /doctor</small></span></article><article><code>@</code><span><b>Reference context</b><small>@file · @folder · @skill · @connector</small></span></article><article><code>⌃C</code><span><b>Stop the whole chain</b><small>Cancel the model, Harness, and child process.</small></span></article></div>
     </section>
 
-    <section className="ecosystem-section"><div><p className="kicker">Make it yours</p><h2>Add the knowledge<br />and tools you need.</h2><p>Skills show Crumb how to approach a job. Plugins give it useful tools. Connectors let those tools use accounts you approve.</p><div><Link className="button" href="/skills">Explore skills</Link><Link className="button button-secondary" href="/plugins">Explore plugins</Link></div></div><aside><div><span>Skills</span><strong>Ways of working</strong><small>Clear · inspectable · reusable</small></div><div><span>Plugins</span><strong>Tools for the job</strong><small>Limited · permissioned · replaceable</small></div><div><span>Connectors</span><strong>Your approved accounts</strong><small>Secure · revocable · user-owned</small></div></aside></section>
+    <section className="ecosystem-section"><div><p className="kicker">Make it yours</p><h2>Add the knowledge<br />and tools you need.</h2><p>Skills show Crumb how to approach a job. Plugins provide local, permission-aware tools. Pollinations is the single external connector available in this release.</p><div><Link className="button" href="/skills">Explore skills</Link><Link className="button button-secondary" href="/plugins">Explore plugins</Link></div></div><aside><div><span>Skills</span><strong>Ways of working</strong><small>Clear · inspectable · reusable</small></div><div><span>Plugins</span><strong>Tools for the job</strong><small>Limited · permissioned · replaceable</small></div><div><span>Connector</span><strong>Pollinations</strong><small>Secure · revocable · user-owned</small></div></aside></section>
 
     <DynamicCta />
   </main><SiteFooter /></>
