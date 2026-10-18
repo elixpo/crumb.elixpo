@@ -977,6 +977,38 @@ impl Renderer {
         )
     }
 
+    /// Renders a one-shot peer-exchange approval without offering persistent
+    /// tool or permission-mode elevation.
+    #[must_use]
+    pub fn peer_approval_prompt(&self, name: &str, digest: &str, peer: Option<&str>) -> String {
+        let short_digest = digest.get(..12).unwrap_or(digest);
+        if self.settings.output == OutputMode::ScreenReader {
+            let mut prompt = format!(
+                "Peer communication approval required for {name}, request {short_digest}. Enter or y allows this exchange once; n or escape denies."
+            );
+            if let Some(peer) = peer {
+                let _ = write!(prompt, " Selected peer: {peer}.");
+            }
+            return prompt;
+        }
+        let peer_line = peer.map_or_else(String::new, |peer| {
+            format!("\n     {}", self.paint(&format!("peer {peer}"), "36;1"))
+        });
+        format!(
+            "  {}  {}\n  {} {}{}\n     {}\n     {}",
+            self.paint("[ CRUMB ]", "38;2;255;255;204;48;5;53;1"),
+            self.paint("Allow this peer exchange once?", "33;1"),
+            self.paint("╰──▶", "33;1"),
+            self.paint(name, "1"),
+            peer_line,
+            self.paint(
+                &format!("risk peer communication · request {short_digest}"),
+                "2"
+            ),
+            self.paint("Enter/y once · n/Esc deny", "2"),
+        )
+    }
+
     /// Starts a single-line terminal activity animation.
     #[must_use]
     pub fn activity(&self, label: &str) -> ActivityIndicator {
@@ -2014,6 +2046,10 @@ mod tests {
             renderer.agent_approval_required("spawn_agents"),
             "  [ CRUMB ]  Allow a parallel agent team?\n  ╰──▶ Koi · Nyx · Rune · Echo · user permission required"
         );
+        assert_eq!(
+            renderer.peer_approval_prompt("send_peer_message", "0123456789abcdef", Some("Miso")),
+            "  [ CRUMB ]  Allow this peer exchange once?\n  ╰──▶ send_peer_message\n     peer Miso\n     risk peer communication · request 0123456789ab\n     Enter/y once · n/Esc deny"
+        );
     }
 
     #[test]
@@ -2100,6 +2136,10 @@ mod tests {
                 None
             ),
             "Approval required for write_file, risk workspace write, request 0123456789ab. Enter or y allows once; a always allows this tool; s selects sensitive-only mode; f selects full access; n or escape denies."
+        );
+        assert_eq!(
+            renderer.peer_approval_prompt("share_peer_file", "fedcba9876543210", Some("Oreo")),
+            "Peer communication approval required for share_peer_file, request fedcba987654. Enter or y allows this exchange once; n or escape denies. Selected peer: Oreo."
         );
     }
 

@@ -24,6 +24,7 @@ use crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
     enable_raw_mode, size,
 };
+use crumb_a2a_runtime::A2aRuntime;
 use crumb_agent::{
     AgentConfig, AgentMode, ApprovalMode, BackendDiscovery, CacheRetention, CancellationToken,
     CommandCatalog, CompatibilityFlag, ConfiguredApprovals, CredentialReference, HarnessConfig,
@@ -73,7 +74,7 @@ use crumb_repl::{ReplOutcome, read_classified_line};
 use crumb_tools::{
     AgentShellConfig, CheckpointDecision, CheckpointStatus, CheckpointStore, DisposableToolConfig,
     GitHubIssueLimits, StackDetectionLimits, WebFetchLimits, WorkspaceToolLimits,
-    WorkspaceWriteLimits, register_current_time_tool, register_disposable_tool,
+    WorkspaceWriteLimits, register_a2a_tools, register_current_time_tool, register_disposable_tool,
     register_github_issue_tool, register_shell_tool_with_optimizer, register_stack_detection_tool,
     register_web_fetch_tool, register_workspace_read_tools, register_workspace_write_tool,
 };
@@ -277,6 +278,9 @@ fn run_agent_exec(cwd: &Path, request: &str, json: bool, writer: &mut dyn Write)
         .context("Crumb instance identity could not be initialized")?;
     let config = read_agent_config(cwd)?;
     let mut runtime = AgentRuntime::new()?;
+    if let (Ok(workspace), Ok(bus_root)) = (instance_workspace(cwd), local_a2a_bus_root()) {
+        let _ = runtime.initialize_peer_runtime(&workspace, &bus_root);
+    }
     let cancellation = CancellationToken::default();
     let result = runtime.run_local_job(request, &config, cwd, &cancellation)?;
     let response = crumb_ui::visible_agent_text(&result.final_response);
@@ -306,6 +310,9 @@ fn run_skill_job(cwd: &Path, selector: &str, request: &str, writer: &mut dyn Wri
     let config = effective_agent_config(cwd)?;
     let resolved = exact_skill_run_config(cwd, &config, selector)?;
     let mut runtime = AgentRuntime::new()?;
+    if let (Ok(workspace), Ok(bus_root)) = (instance_workspace(cwd), local_a2a_bus_root()) {
+        let _ = runtime.initialize_peer_runtime(&workspace, &bus_root);
+    }
     runtime.select_skills_for_next_turn(vec![resolved.receipt])?;
     let cancellation = CancellationToken::default();
     let result = runtime.run_local_job(request, &resolved.config, cwd, &cancellation)?;
@@ -561,6 +568,12 @@ fn run_job_worker(cwd: &Path, id: &str, writer: &mut dyn Write) -> Result<()> {
             return Err(error);
         }
     };
+    if let (Ok(workspace), Ok(bus_root)) = (
+        instance_workspace(&definition.workspace),
+        local_a2a_bus_root(),
+    ) {
+        let _ = runtime.initialize_peer_runtime(&workspace, &bus_root);
+    }
     let session_id = match runtime.prepare_local_job(definition.config.mode, &definition.workspace)
     {
         Ok(session_id) => session_id,
@@ -675,7 +688,7 @@ fn serve_mcp() -> Result<()> {
     let mut config = read_agent_config(&workspace)?;
     enforce_graphify_pin(&workspace, &mut config);
     let search_api_key = configured_pollinations_runtime_key(&config);
-    let mut host = workspace_read_host(&workspace, &config, search_api_key)?;
+    let mut host = workspace_read_host(&workspace, &config, search_api_key, None)?;
     let mut diagnostics = register_stdio_servers(
         &mut host,
         &config.mcp_servers,
@@ -733,6 +746,7 @@ fn workspace_read_host(
     workspace: &Path,
     config: &AgentConfig,
     search_api_key: Option<String>,
+    peer_runtime: Option<A2aRuntime>,
 ) -> Result<ToolHost> {
     let max_output_bytes = usize::try_from(config.limits.max_output_bytes)
         .map_err(|_| anyhow!("max_output_bytes exceeds this platform's address space"))?;
@@ -797,6 +811,9 @@ fn workspace_read_host(
         let search = search_route.map_or(search.clone(), |route| search.with_model(&route.model));
         register_web_search_tool(&mut host, search)?;
     }
+    if let Some(runtime) = peer_runtime {
+        register_a2a_tools(&mut host, runtime)?;
+    }
     Ok(host)
 }
 
@@ -837,8 +854,7 @@ fn shell_tool_config(config: &AgentConfig, max_output_bytes: usize) -> AgentShel
 }
 
 fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
-    let started_at = Instant::now();
-    let (stdin, stdout) = (io::stdin(), io::stdout());
+    let (started_at, stdin, stdout) = (Instant::now(), io::stdin(), io::stdout());
     let interactive = stdin.is_terminal() && stdout.is_terminal();
     let renderer = Renderer::new(UiSettings::from_environment(interactive));
     let fullscreen = interactive && std::env::var_os("CRUMB_INLINE").is_none();
@@ -851,6 +867,7 @@ fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
     let command_catalog = native_command_catalog(platform);
     let (mut session, mut agent_runtime) =
         (None, resume_agent_runtime(&initial_cwd, resume_session)?);
+    initialize_optional_peer_runtime(&mut agent_runtime, &initial_cwd, &mut stdout.lock())?;
     let (mut last_exit_code, mut command_context) = (None, SessionCommandContext::default());
     let history = open_history(&mut stdout.lock())?;
     let (header_rows, transcript_state) = initialize_transcript(
@@ -2407,6 +2424,50 @@ fn instance_store(cwd: &Path) -> InstanceStore {
     InstanceStore::for_workspace(&workspace)
 }
 
+fn instance_workspace(cwd: &Path) -> Result<PathBuf> {
+    let path = instance_store(cwd).path().to_path_buf();
+    path.parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .context("Crumb instance metadata has no workspace parent")
+}
+
+fn local_a2a_bus_root() -> Result<PathBuf> {
+    Ok(BaseDirs::new()
+        .context("home directory is unavailable")?
+        .home_dir()
+        .join(".crumb")
+        .join("a2a"))
+}
+
+fn initialize_optional_peer_runtime(
+    runtime: &mut Option<AgentRuntime>,
+    cwd: &Path,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    if runtime.is_none() {
+        match AgentRuntime::new() {
+            Ok(created) => *runtime = Some(created),
+            Err(error) => {
+                writeln!(writer, "warning: local A2A is unavailable: {error}")?;
+                return Ok(());
+            }
+        }
+    }
+    let setup = (|| -> Result<()> {
+        let workspace = instance_workspace(cwd)?;
+        let bus_root = local_a2a_bus_root()?;
+        runtime
+            .as_mut()
+            .context("agent runtime is unavailable")?
+            .initialize_peer_runtime(&workspace, &bus_root)
+    })();
+    if let Err(error) = setup {
+        writeln!(writer, "warning: local A2A is unavailable: {error}")?;
+    }
+    Ok(())
+}
+
 fn warn_if_instance_unavailable(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     if let Err(error) = instance_store(cwd).load_or_create() {
         writeln!(
@@ -2470,6 +2531,7 @@ fn handle_agent_boundary(
             }
         }
     }
+    initialize_optional_peer_runtime(runtime, workspace, writer)?;
 
     execute_agent_sequence(
         decision.payload.clone(),
@@ -3288,20 +3350,11 @@ fn resolve_tool_approval(
     workspace: &Path,
 ) -> Result<()> {
     let request = pending.request().clone();
-    let detail = trusted_tool_detail(&request.tool, pending.arguments());
     if let Some(assessment) = pending_shell_assessment(&pending) {
         write_shell_impact(writer, &assessment)?;
     }
-    writeln!(
-        writer,
-        "{}",
-        renderer.agent_approval_prompt(
-            &request.tool,
-            approval_risk_label(request.risk),
-            &request.arguments_digest,
-            detail.as_deref(),
-        )
-    )?;
+    let prompt = approval_prompt_for_request(renderer, &pending);
+    writeln!(writer, "{prompt}")?;
     writer.flush()?;
     if !interactive {
         let _ = pending.deny();
@@ -3334,7 +3387,7 @@ fn resolve_tool_approval(
                 )?;
                 return Ok(());
             }
-            TerminalKeyCode::Char('a') => {
+            TerminalKeyCode::Char('a') if request.risk != RiskClass::PeerCommunication => {
                 persist_tool_permission(workspace, &request)?;
                 let accepted = pending.allow_once();
                 writeln!(
@@ -3349,7 +3402,7 @@ fn resolve_tool_approval(
                 )?;
                 return Ok(());
             }
-            TerminalKeyCode::Char('s') => {
+            TerminalKeyCode::Char('s') if request.risk != RiskClass::PeerCommunication => {
                 persist_permission_mode(workspace, ApprovalMode::SensitiveOnly)?;
                 let accepted = pending.allow_once();
                 writeln!(
@@ -3359,7 +3412,7 @@ fn resolve_tool_approval(
                 )?;
                 return Ok(());
             }
-            TerminalKeyCode::Char('f') => {
+            TerminalKeyCode::Char('f') if request.risk != RiskClass::PeerCommunication => {
                 persist_permission_mode(workspace, ApprovalMode::FullAccess)?;
                 let accepted = pending.allow_once();
                 writeln!(
@@ -3386,6 +3439,23 @@ fn resolve_tool_approval(
             _ => {}
         }
     }
+}
+
+fn approval_prompt_for_request(renderer: Renderer, pending: &PendingApproval) -> String {
+    let request = pending.request();
+    if request.risk == RiskClass::PeerCommunication {
+        return renderer.peer_approval_prompt(
+            &request.tool,
+            &request.arguments_digest,
+            trusted_peer_selector(pending.arguments()).as_deref(),
+        );
+    }
+    renderer.agent_approval_prompt(
+        &request.tool,
+        approval_risk_label(request.risk),
+        &request.arguments_digest,
+        trusted_tool_detail(&request.tool, pending.arguments()).as_deref(),
+    )
 }
 
 fn persist_permission_mode(workspace: &Path, mode: ApprovalMode) -> Result<()> {
@@ -3451,6 +3521,26 @@ fn trusted_tool_detail(name: &str, arguments: &serde_json::Value) -> Option<Stri
         "github_issue" => format!("GitHub: {detail}"),
         _ => detail,
     })
+}
+
+fn trusted_peer_selector(arguments: &serde_json::Value) -> Option<String> {
+    let raw = arguments.get("peer")?.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut selector = String::with_capacity(raw.len().min(256));
+    for character in raw.chars() {
+        if selector.len() >= 256 {
+            selector.push('…');
+            break;
+        }
+        if character == '\n' || character == '\r' || character == '\t' {
+            selector.push(' ');
+        } else if !character.is_control() {
+            selector.push(character);
+        }
+    }
+    Some(selector)
 }
 
 fn pending_shell_assessment(pending: &PendingApproval) -> Option<BlastRadiusAssessment> {
@@ -4238,6 +4328,11 @@ fn visible_tool_activity(name: &str, detail: Option<&str>) -> String {
         ("web_search", Some(query)) => format!("Searching web · {query}"),
         ("web_fetch", Some(url)) => format!("Fetching page · {url}"),
         ("github_issue", Some(target)) => format!("Fetching GitHub item · {target}"),
+        ("list_peer_agents", _) => "Finding peer agents".to_owned(),
+        ("send_peer_message", Some(peer)) => format!("Sending to peer · {peer}"),
+        ("send_peer_message", None) => "Sending to peer".to_owned(),
+        ("share_peer_file", Some(peer)) => format!("Sharing file with peer · {peer}"),
+        ("share_peer_file", None) => "Sharing file with peer".to_owned(),
         (_, Some(detail)) => format!("{} · {detail}", tool_activity_label(name)),
         (_, None) => tool_activity_label(name),
     }
@@ -4260,6 +4355,12 @@ fn finished_tool_activity(
         ("github_issue", false) => "GitHub fetch failed",
         ("write_file", true) => "Edited file",
         ("write_file", false) => "Edit failed",
+        ("list_peer_agents", true) => "Listed peer agents",
+        ("list_peer_agents", false) => "Peer discovery failed",
+        ("send_peer_message", true) => "Sent to peer",
+        ("send_peer_message", false) => "Peer message failed",
+        ("share_peer_file", true) => "Shared file with peer",
+        ("share_peer_file", false) => "Peer file share failed",
         (_, true) => "Tool completed",
         (_, false) => "Tool failed",
     };
@@ -4567,6 +4668,9 @@ fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
                 "/model",
                 "/pack",
                 "/effort",
+                "/instance",
+                "/peers",
+                "/peer",
                 "/session",
                 "/review",
                 "/jobs",
@@ -5235,15 +5339,7 @@ fn show_reserved(
     writer: &mut dyn Write,
 ) -> Result<()> {
     match command {
-        "/mode" => {
-            let config = read_agent_config(cwd)?;
-            writeln!(writer, "◆ Agent mode")?;
-            writeln!(writer, "  {}", agent_mode_name(config.mode))?;
-            writeln!(
-                writer,
-                "  auto executes approved steps · negotiate pauses · plan is read-only"
-            )?;
-        }
+        "/mode" => show_agent_mode(cwd, writer)?,
         "/model" => show_models(cwd, writer)?,
         "/pack" => show_model_packs(cwd, writer)?,
         "/effort" => {
@@ -5325,14 +5421,27 @@ fn show_reserved(
             show_sessions(command, cwd, runtime, writer)?;
         }
         command if command == "/instance" || command.starts_with("/instance ") => {
-            show_instance(command, cwd, writer)?;
+            show_instance_command(command, cwd, runtime, writer)?;
         }
+        "/peers" | "/peer status" => show_peers(cwd, runtime, writer)?,
+        "/peer" => show_peer_help(writer)?,
         "/cost" => show_provider_usage(cwd, runtime.as_ref(), writer)?,
         _ => {
             writeln!(writer, "◇ {command}")?;
             writeln!(writer, "  Reserved by Crumb; not available in this build.")?;
         }
     }
+    Ok(())
+}
+
+fn show_agent_mode(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    writeln!(writer, "◆ Agent mode")?;
+    writeln!(writer, "  {}", agent_mode_name(config.mode))?;
+    writeln!(
+        writer,
+        "  auto executes approved steps · negotiate pauses · plan is read-only"
+    )?;
     Ok(())
 }
 
@@ -5359,6 +5468,66 @@ fn show_instance(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()
         writer,
         "  workspace sessions · memory · graph · jobs · checkpoints · a2a"
     )?;
+    Ok(())
+}
+
+fn show_instance_command(
+    command: &str,
+    cwd: &Path,
+    runtime: &mut Option<AgentRuntime>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    show_instance(command, cwd, writer)?;
+    if command.starts_with("/instance rename ") {
+        initialize_optional_peer_runtime(runtime, cwd, writer)?;
+    }
+    Ok(())
+}
+
+fn show_peer_help(writer: &mut dyn Write) -> Result<()> {
+    writeln!(writer, "◆ Local agent handoff")?;
+    writeln!(writer, "  /peers       list active Crumb instances")?;
+    writeln!(writer, "  /peer status show this instance and active peers")?;
+    writeln!(
+        writer,
+        "  Ask Crumb to message a peer or share a relative workspace file; each outbound exchange is approval-gated."
+    )?;
+    writeln!(
+        writer,
+        "  Received files remain quarantined until a separate import is approved."
+    )?;
+    Ok(())
+}
+
+fn show_peers(
+    cwd: &Path,
+    runtime: &mut Option<AgentRuntime>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    initialize_optional_peer_runtime(runtime, cwd, writer)?;
+    let metadata = instance_store(cwd).load_or_create()?;
+    let peers = runtime
+        .as_ref()
+        .context("local A2A runtime is unavailable")?
+        .peer_agents()?;
+    writeln!(writer, "◆ Local A2A · protocol 1.0")?;
+    writeln!(
+        writer,
+        "  this  {} · {}",
+        metadata.name, metadata.instance_id
+    )?;
+    if peers.is_empty() {
+        writeln!(writer, "  peers none active")?;
+    } else {
+        writeln!(writer, "  peers {} active", peers.len())?;
+        for peer in peers {
+            writeln!(
+                writer,
+                "    {} · {} · A2A {}",
+                peer.name, peer.instance_id, peer.protocol_version
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -11901,7 +12070,7 @@ mod tests {
     #[test]
     fn stdio_mcp_host_exposes_rust_owned_tool_risk() {
         let workspace = std::env::current_dir().expect("current directory is available");
-        let host = workspace_read_host(&workspace, &AgentConfig::default(), None)
+        let host = workspace_read_host(&workspace, &AgentConfig::default(), None, None)
             .expect("workspace tools are registered");
         let tools = host.tools().collect::<Vec<_>>();
         assert_eq!(tools.len(), 10);
@@ -11928,12 +12097,46 @@ mod tests {
     }
 
     #[test]
+    fn agent_host_adds_a2a_tools_only_with_a_live_peer_runtime() {
+        let temporary = tempfile::TempDir::new().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace directory");
+        let instance = crumb_instance::InstanceStore::for_workspace(&workspace)
+            .load_or_create_named("Integration Agent")
+            .expect("instance metadata");
+        let runtime = crumb_a2a_runtime::A2aRuntime::start(
+            &temporary.path().join("bus"),
+            &workspace,
+            &instance,
+            crumb_a2a_runtime::RuntimeOptions::default(),
+        )
+        .expect("A2A runtime");
+        let host = workspace_read_host(
+            &workspace,
+            &AgentConfig::default(),
+            None,
+            Some(runtime.clone()),
+        )
+        .expect("workspace and A2A tools are registered");
+
+        for (name, risk) in [
+            ("list_peer_agents", RiskClass::ReadOnly),
+            ("send_peer_message", RiskClass::PeerCommunication),
+            ("share_peer_file", RiskClass::PeerCommunication),
+        ] {
+            assert_eq!(host.descriptor(name).map(|tool| tool.risk), Some(risk));
+        }
+        runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
     fn pollinations_key_registers_web_search_without_an_explicit_search_route() {
         let workspace = std::env::current_dir().expect("current directory is available");
         let host = workspace_read_host(
             &workspace,
             &AgentConfig::default(),
             Some("fixture-key".to_owned()),
+            None,
         )
         .expect("workspace tools are registered");
 
@@ -12478,6 +12681,47 @@ mod tests {
             ),
             "Edited file · 1.2s · src/main.rs"
         );
+    }
+
+    #[test]
+    fn peer_tools_have_subdued_content_safe_activity_labels() {
+        assert_eq!(
+            visible_tool_activity("list_peer_agents", None),
+            "Finding peer agents"
+        );
+        assert_eq!(
+            visible_tool_activity("send_peer_message", Some("Miso")),
+            "Sending to peer · Miso"
+        );
+        assert_eq!(
+            visible_tool_activity("share_peer_file", Some("Oreo")),
+            "Sharing file with peer · Oreo"
+        );
+        assert_eq!(
+            finished_tool_activity(
+                "send_peer_message",
+                Some("Miso"),
+                true,
+                Duration::from_millis(250),
+            ),
+            "Sent to peer · 0.2s · Miso"
+        );
+        assert_eq!(
+            finished_tool_activity(
+                "share_peer_file",
+                Some("Oreo"),
+                false,
+                Duration::from_secs(2),
+            ),
+            "Peer file share failed · 2.0s · Oreo"
+        );
+
+        let selector = super::trusted_peer_selector(&serde_json::json!({
+            "peer": "Miso\nagent",
+            "message": "never expose this",
+            "path": "private/roadmap.md"
+        }));
+        assert_eq!(selector.as_deref(), Some("Miso agent"));
     }
 
     #[test]

@@ -1685,6 +1685,9 @@ fn tool_request_detail(name: &str, arguments: &serde_json::Value) -> Option<Stri
         "web_search" => "query",
         "web_fetch" => "url",
         "read_file" | "list_directory" | "write_file" => "path",
+        // Peer activity may identify the selected instance, but must never
+        // project the message body or a shared file's local path.
+        "send_peer_message" | "share_peer_file" => "peer",
         _ => return None,
     };
     let raw = arguments.get(field)?.as_str()?.trim();
@@ -3003,6 +3006,29 @@ mod tests {
                 &serde_json::json!({"script":"echo never-expose-this"})
             ),
             None
+        );
+        assert_eq!(
+            super::tool_request_detail(
+                "send_peer_message",
+                &serde_json::json!({
+                    "peer":"Miso",
+                    "message":"never expose this message"
+                })
+            )
+            .as_deref(),
+            Some("Miso")
+        );
+        assert_eq!(
+            super::tool_request_detail(
+                "share_peer_file",
+                &serde_json::json!({
+                    "peer":"Oreo",
+                    "path":"private/roadmap.md",
+                    "message":"never expose this caption"
+                })
+            )
+            .as_deref(),
+            Some("Oreo")
         );
     }
 

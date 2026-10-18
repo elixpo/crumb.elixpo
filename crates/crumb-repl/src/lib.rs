@@ -192,6 +192,18 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "rename this Crumb instance without changing its identity",
     },
     SlashCommand {
+        usage: "/peers",
+        description: "list active local Crumb agents",
+    },
+    SlashCommand {
+        usage: "/peer",
+        description: "show local agent handoff help",
+    },
+    SlashCommand {
+        usage: "/peer status",
+        description: "show this instance and active local peers",
+    },
+    SlashCommand {
         usage: "/review",
         description: "review Crumb-owned edits",
     },
@@ -753,6 +765,14 @@ mod tests {
         assert_eq!(
             classify_input("/skill search review"),
             InputEvent::BuiltIn(BuiltInCommand::Reserved("/skill search review".to_owned()))
+        );
+        assert_eq!(
+            classify_input("/peer status"),
+            InputEvent::BuiltIn(BuiltInCommand::Reserved("/peer status".to_owned()))
+        );
+        assert_eq!(
+            classify_input("/peers"),
+            InputEvent::BuiltIn(BuiltInCommand::Reserved("/peers".to_owned()))
         );
         assert_eq!(
             classify_input("?"),

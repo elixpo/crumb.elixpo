@@ -7,6 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use crumb_a2a_runtime::{A2aRuntime, RuntimeOptions};
 use crumb_agent::config::SkillConfig;
 use crumb_agent::session::TurnStatus;
 use crumb_agent::{
@@ -25,6 +26,7 @@ use crumb_harness_dsh::{
     HarnessActivity, HarnessEnvironment, HarnessIdentity, HarnessLaunch, HarnessSupervisor,
     Notification, RunResult, SupervisorLimits,
 };
+use crumb_instance::InstanceStore;
 use crumb_llm::ImageInput;
 use crumb_memory::{MemorySet, RetrievalPolicy};
 use crumb_pollinations::{PollinationsConfig, PollinationsProvider};
@@ -295,6 +297,20 @@ pub struct AgentRuntime {
     warm_session_states: VecDeque<WarmSessionState>,
     review_notes: Vec<ReviewNote>,
     review_note_bytes: usize,
+    peer: Option<PeerRuntimeState>,
+}
+
+struct PeerRuntimeState {
+    workspace: PathBuf,
+    runtime: A2aRuntime,
+}
+
+/// Public, non-secret identity for one active local peer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerAgentSummary {
+    pub instance_id: String,
+    pub name: String,
+    pub protocol_version: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -511,7 +527,76 @@ impl AgentRuntime {
             warm_session_states: VecDeque::with_capacity(MAX_WARM_SESSION_STATES),
             review_notes: Vec::new(),
             review_note_bytes: 0,
+            peer: None,
         })
+    }
+
+    /// Starts or reuses this process's local A2A lease for `workspace`.
+    ///
+    /// A workspace switch starts the replacement before dropping the previous
+    /// lease. The absolute workspace path remains process-local.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workspace, stable identity, bus root, or
+    /// process registration is unavailable.
+    pub fn initialize_peer_runtime(&mut self, workspace: &Path, bus_root: &Path) -> Result<()> {
+        let workspace = std::fs::canonicalize(workspace)
+            .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
+        let instance = InstanceStore::for_workspace(&workspace)
+            .load_or_create()
+            .context("Crumb instance identity could not be initialized")?;
+        let same_workspace = self
+            .peer
+            .as_ref()
+            .is_some_and(|peer| peer.workspace == workspace);
+        if same_workspace
+            && self.peer.as_ref().is_some_and(|peer| {
+                peer.runtime.own_peer().is_ok_and(|registered| {
+                    registered.instance_id == instance.instance_id
+                        && registered.name == instance.name
+                })
+            })
+        {
+            return Ok(());
+        }
+        if same_workspace && let Some(previous) = self.peer.take() {
+            previous.runtime.shutdown()?;
+        }
+        let runtime =
+            A2aRuntime::start(bus_root, &workspace, &instance, RuntimeOptions::default())?;
+        self.peer = Some(PeerRuntimeState { workspace, runtime });
+        Ok(())
+    }
+
+    /// Lists active local peers without exposing endpoints or process data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the local peer runtime is unavailable or its
+    /// bounded registry cannot be read.
+    pub fn peer_agents(&self) -> Result<Vec<PeerAgentSummary>> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        Ok(peer
+            .runtime
+            .list_peers()?
+            .into_iter()
+            .map(|entry| PeerAgentSummary {
+                instance_id: entry.instance_id,
+                name: entry.name,
+                protocol_version: entry.protocol_version,
+            })
+            .collect())
+    }
+
+    fn peer_runtime_for_workspace(&self, workspace: &Path) -> Option<A2aRuntime> {
+        self.peer
+            .as_ref()
+            .filter(|peer| workspace.starts_with(&peer.workspace))
+            .map(|peer| peer.runtime.clone())
     }
 
     /// Queues bounded review feedback for the next agent turn only.
@@ -883,6 +968,7 @@ impl AgentRuntime {
             &workspace,
             config,
             crate::configured_pollinations_runtime_key(config),
+            self.peer_runtime_for_workspace(&workspace),
         )?;
         let configured = configured_approvals(config);
         let approvals: Arc<dyn ApprovalBroker> = match interaction.interactive {
@@ -2051,7 +2137,37 @@ mod tests {
             ),
             review_notes: Vec::new(),
             review_note_bytes: 0,
+            peer: None,
         }
+    }
+
+    #[test]
+    fn peer_runtime_refreshes_a_renamed_workspace_identity() {
+        let temporary = tempfile::TempDir::new().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace directory");
+        let store = crumb_instance::InstanceStore::for_workspace(&workspace);
+        store
+            .load_or_create_named("First Name")
+            .expect("initial identity");
+        let mut runtime = isolated_runtime();
+        let bus = temporary.path().join("bus");
+        runtime
+            .initialize_peer_runtime(&workspace, &bus)
+            .expect("initial peer runtime");
+
+        store.rename("Second Name").expect("rename identity");
+        runtime
+            .initialize_peer_runtime(&workspace, &bus)
+            .expect("refresh peer runtime");
+        let registered = runtime
+            .peer
+            .as_ref()
+            .expect("peer runtime")
+            .runtime
+            .own_peer()
+            .expect("own peer");
+        assert_eq!(registered.name, "Second Name");
     }
 
     #[test]
