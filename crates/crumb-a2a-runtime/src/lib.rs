@@ -854,7 +854,18 @@ mod tests {
     fn options() -> RuntimeOptions {
         RuntimeOptions {
             local_bus: LocalBusOptions {
-                lease_ttl: Duration::from_millis(90),
+                // Filesystem-backed peer operations can take noticeably longer
+                // on loaded Windows runners. Keep ordinary lifecycle tests well
+                // clear of the stale-lease boundary.
+                lease_ttl: Duration::from_secs(5),
+            },
+        }
+    }
+
+    fn heartbeat_options() -> RuntimeOptions {
+        RuntimeOptions {
+            local_bus: LocalBusOptions {
+                lease_ttl: Duration::from_millis(300),
             },
         }
     }
@@ -1015,12 +1026,17 @@ mod tests {
         let bus = temporary.path().join("bus");
         let (first_workspace, first_instance) = workspace(temporary.path(), "Heartbeat One");
         let (second_workspace, second_instance) = workspace(temporary.path(), "Heartbeat Two");
-        let first = A2aRuntime::start(&bus, &first_workspace, &first_instance, options())
+        let first = A2aRuntime::start(&bus, &first_workspace, &first_instance, heartbeat_options())
             .expect("first runtime");
-        let second = A2aRuntime::start(&bus, &second_workspace, &second_instance, options())
-            .expect("second runtime");
+        let second = A2aRuntime::start(
+            &bus,
+            &second_workspace,
+            &second_instance,
+            heartbeat_options(),
+        )
+        .expect("second runtime");
 
-        thread::sleep(Duration::from_millis(240));
+        thread::sleep(Duration::from_millis(800));
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             if second.list_peers().expect("live peers").len() == 1 {
@@ -1079,7 +1095,8 @@ mod tests {
         let temporary = TempDir::new().expect("temporary root");
         let bus = temporary.path().join("bus");
         let (workspace, instance) = workspace(temporary.path(), "Health Runtime");
-        let runtime = A2aRuntime::start(&bus, &workspace, &instance, options()).expect("runtime");
+        let runtime =
+            A2aRuntime::start(&bus, &workspace, &instance, heartbeat_options()).expect("runtime");
         let registry = bus.join("registry");
         let unavailable = bus.join("registry-unavailable");
         fs::rename(&registry, &unavailable).expect("force registry failure");
