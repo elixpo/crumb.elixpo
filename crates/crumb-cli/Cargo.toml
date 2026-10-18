@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+arboard.workspace = true
 chrono.workspace = true
 crumb-agent = { path = "../crumb-agent" }
 crumb-a2a.workspace = true
@@ -40,6 +41,7 @@ crumb-ui = { path = "../crumb-ui" }
 crossterm.workspace = true
 ctrlc.workspace = true
 directories.workspace = true
+image.workspace = true
 nu-ansi-term.workspace = true
 reedline.workspace = true
 reqwest.workspace = true
