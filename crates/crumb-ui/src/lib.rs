@@ -27,6 +27,8 @@ const TRANSCRIPT_INPUT_MAX_ROWS: usize = 4;
 const CONTEXT_METER_WIDTH: usize = 12;
 const CRUMB_BADGE: &str = "[ CRUMB ]";
 const PARALLEL_TOOL: &str = "spawn_agents";
+const PEER_INSPECTION_MAX_BYTES: usize = 8 * 1024;
+const PEER_INSPECTION_MAX_LINES: usize = 80;
 
 const PUNCHLINES: &[&str] = &[
     "Broken biscuit. Working terminal.",
@@ -82,6 +84,38 @@ pub enum OutputMode {
 pub enum MotionMode {
     Full,
     Reduced,
+}
+
+/// Public lifecycle state for one agent-to-agent exchange.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeerActivityState {
+    Connecting,
+    Exchanging,
+    Waiting,
+    Completed,
+    Failed,
+}
+
+impl PeerActivityState {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Connecting => "connecting",
+            Self::Exchanging => "sharing context",
+            Self::Waiting => "waiting",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Bounded, non-secret summary shown while two Crumb instances communicate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerActivity<'a> {
+    pub local_name: &'a str,
+    pub remote_name: &'a str,
+    pub state: PeerActivityState,
+    pub elapsed: Duration,
+    pub artifact_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,6 +201,7 @@ pub struct PromptContext<'a> {
 pub struct StartupContext<'a> {
     pub version: &'a str,
     pub platform: Platform,
+    pub instance_name: Option<&'a str>,
     pub model: Option<&'a str>,
     pub mode: &'a str,
     pub effort: Option<&'a str>,
@@ -225,10 +260,13 @@ impl Renderer {
             WORDMARK
         };
         let pack = context.model.unwrap_or("not configured");
+        let instance = context
+            .instance_name
+            .map_or(String::new(), |name| format!(" · {name}"));
         let state = if context.agent_configured {
-            format!("Ready · pack {pack} · {}", context.mode)
+            format!("Ready{instance} · pack {pack} · {}", context.mode)
         } else {
-            "Native shell ready · run /auth login for AI".to_owned()
+            format!("Native shell ready{instance} · run /auth login for AI")
         };
         let copy = format!(
             "{wordmark}\nCrumb CLI v{} · Native commands stay native.\n{} · effort {}\nTip: type naturally · : forces AI · / opens actions",
@@ -331,12 +369,25 @@ impl Renderer {
     #[must_use]
     pub fn context_footer(&self, context: &StartupContext<'_>, terminal_width: u16) -> String {
         let pack = context.model.unwrap_or("native");
-        let text = format!(
-            "effort {} · pack {pack} · {} · {}",
-            context.effort.unwrap_or("default"),
-            context_meter(context),
-            context.mode
-        );
+        let instance = context
+            .instance_name
+            .map_or(String::new(), |name| format!(" · {name}"));
+        let effort = context.effort.unwrap_or("default");
+        let text = if terminal_width < 60 {
+            format!(
+                "{}/{} · effort {effort} · {}",
+                compact_tokens(context.context_tokens),
+                compact_tokens(context.session_budget_tokens),
+                context.mode
+            )
+        } else {
+            format!(
+                "{}{} · effort {effort} · {pack} · {}",
+                context_meter(context),
+                instance,
+                context.mode
+            )
+        };
         let text = fit_terminal_text(&text, usize::from(terminal_width.saturating_sub(2)));
         self.paint(&format!("  {text}"), "2")
     }
@@ -479,6 +530,7 @@ impl Renderer {
     #[must_use]
     pub fn startup_status(&self, context: &StartupContext<'_>) -> String {
         let pack = context.model.unwrap_or("not configured");
+        let instance = context.instance_name.unwrap_or("unnamed");
         let state = if context.agent_configured {
             "agent ready"
         } else {
@@ -486,7 +538,7 @@ impl Renderer {
         };
         if self.settings.output == OutputMode::ScreenReader {
             return format!(
-                "crumb {} on {}\n{state}; pack {pack}; mode {}",
+                "crumb {} on {}\n{state}; instance {instance}; pack {pack}; mode {}",
                 context.version, context.platform, context.mode
             );
         }
@@ -505,7 +557,13 @@ impl Renderer {
                 },
                 "36;1"
             ),
-            self.paint(&format!("{state} · pack {pack} · {}", context.mode), "2")
+            self.paint(
+                &format!(
+                    "{state} · instance {instance} · pack {pack} · {}",
+                    context.mode
+                ),
+                "2"
+            )
         )
     }
 
@@ -725,6 +783,68 @@ impl Renderer {
         }
     }
 
+    /// Renders one subdued, always-visible summary for an inter-agent exchange.
+    ///
+    /// Message bodies, tool output, and file paths are intentionally excluded;
+    /// a later transcript control can expose approved details independently.
+    #[must_use]
+    pub fn peer_activity(&self, activity: &PeerActivity<'_>) -> String {
+        let seconds = activity.elapsed.as_secs_f32();
+        let artifacts = match activity.artifact_count {
+            0 => String::new(),
+            1 => " · 1 artifact".to_owned(),
+            count => format!(" · {count} artifacts"),
+        };
+        let label = format!(
+            "{} ↔ {} · {} · {seconds:.1}s{artifacts}",
+            activity.local_name,
+            activity.remote_name,
+            activity.state.label(),
+        );
+        if self.settings.output == OutputMode::ScreenReader {
+            format!("Agent exchange: {label}")
+        } else {
+            format!(
+                "  {}  ⇄ {}",
+                self.paint("│", "38;5;245"),
+                self.paint(&label, "38;5;245")
+            )
+        }
+    }
+
+    /// Renders explicitly inspected peer content as bounded plain text.
+    ///
+    /// Peer input is never interpreted as terminal Markdown. ANSI sequences,
+    /// terminal controls, and bidirectional text controls are removed before
+    /// subdued rendering, and both source and rendered line counts are capped.
+    #[must_use]
+    pub fn peer_untrusted_text_for_width(&self, content: &str, terminal_width: u16) -> String {
+        let content = sanitize_peer_text(content);
+        let content_width = usize::from(terminal_width.saturating_sub(10)).max(1);
+        let lines = content
+            .lines()
+            .flat_map(|line| wrap_terminal_line(line, content_width))
+            .take(PEER_INSPECTION_MAX_LINES)
+            .collect::<Vec<_>>();
+        if self.settings.output == OutputMode::ScreenReader {
+            return format!("Peer delivery details:\n{}", lines.join("\n"));
+        }
+        let mut output = format!(
+            "  {}  {}",
+            self.paint("│", "38;5;245"),
+            self.paint("peer delivery details", "38;5;245")
+        );
+        for line in lines {
+            let _ = write!(
+                output,
+                "\n  {}    {}",
+                self.paint("│", "38;5;245"),
+                self.paint(&line, "38;5;245")
+            );
+        }
+        output
+    }
+
     /// Renders bounded tool output as a distinct transcript block.
     #[must_use]
     pub fn agent_tool_output_for_width(&self, content: &str, terminal_width: u16) -> String {
@@ -889,6 +1009,38 @@ impl Renderer {
                 "Enter/y once · a always allow tool · s sensitive · f full access · n/Esc deny",
                 "2",
             )
+        )
+    }
+
+    /// Renders a one-shot peer-exchange approval without offering persistent
+    /// tool or permission-mode elevation.
+    #[must_use]
+    pub fn peer_approval_prompt(&self, name: &str, digest: &str, peer: Option<&str>) -> String {
+        let short_digest = digest.get(..12).unwrap_or(digest);
+        if self.settings.output == OutputMode::ScreenReader {
+            let mut prompt = format!(
+                "Peer communication approval required for {name}, request {short_digest}. Enter or y allows this exchange once; n or escape denies."
+            );
+            if let Some(peer) = peer {
+                let _ = write!(prompt, " Selected peer: {peer}.");
+            }
+            return prompt;
+        }
+        let peer_line = peer.map_or_else(String::new, |peer| {
+            format!("\n     {}", self.paint(&format!("peer {peer}"), "36;1"))
+        });
+        format!(
+            "  {}  {}\n  {} {}{}\n     {}\n     {}",
+            self.paint("[ CRUMB ]", "38;2;255;255;204;48;5;53;1"),
+            self.paint("Allow this peer exchange once?", "33;1"),
+            self.paint("╰──▶", "33;1"),
+            self.paint(name, "1"),
+            peer_line,
+            self.paint(
+                &format!("risk peer communication · request {short_digest}"),
+                "2"
+            ),
+            self.paint("Enter/y once · n/Esc deny", "2"),
         )
     }
 
@@ -1406,6 +1558,91 @@ fn wrap_terminal_line(line: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
+#[derive(Clone, Copy)]
+enum PeerEscapeState {
+    Text,
+    Escape,
+    Csi,
+    String { escaped: bool },
+}
+
+fn sanitize_peer_text(input: &str) -> String {
+    let mut output = String::with_capacity(input.len().min(PEER_INSPECTION_MAX_BYTES));
+    let mut state = PeerEscapeState::Text;
+    let mut lines = 1_usize;
+    for character in input.chars() {
+        state = match state {
+            PeerEscapeState::Text if character == '\u{1b}' => PeerEscapeState::Escape,
+            PeerEscapeState::Text if character == '\u{9b}' => PeerEscapeState::Csi,
+            PeerEscapeState::Text
+                if matches!(character, '\u{90}' | '\u{98}' | '\u{9d}'..='\u{9f}') =>
+            {
+                PeerEscapeState::String { escaped: false }
+            }
+            PeerEscapeState::Text => {
+                if character == '\n' {
+                    if lines >= PEER_INSPECTION_MAX_LINES {
+                        break;
+                    }
+                    if output.len() + 1 > PEER_INSPECTION_MAX_BYTES {
+                        break;
+                    }
+                    output.push('\n');
+                    lines += 1;
+                } else if character == '\t' {
+                    if output.len() + 1 > PEER_INSPECTION_MAX_BYTES {
+                        break;
+                    }
+                    output.push(' ');
+                } else if !is_peer_control(character) && !is_bidi_control(character) {
+                    if output.len() + character.len_utf8() > PEER_INSPECTION_MAX_BYTES {
+                        break;
+                    }
+                    output.push(character);
+                }
+                PeerEscapeState::Text
+            }
+            PeerEscapeState::Escape => match character {
+                '[' => PeerEscapeState::Csi,
+                ']' | 'P' | 'X' | '^' | '_' => PeerEscapeState::String { escaped: false },
+                _ => PeerEscapeState::Text,
+            },
+            PeerEscapeState::Csi => {
+                if ('@'..='~').contains(&character) {
+                    PeerEscapeState::Text
+                } else {
+                    PeerEscapeState::Csi
+                }
+            }
+            PeerEscapeState::String { escaped: false } if character == '\u{7}' => {
+                PeerEscapeState::Text
+            }
+            PeerEscapeState::String { .. } if character == '\u{9c}' => PeerEscapeState::Text,
+            PeerEscapeState::String { escaped: false } if character == '\u{1b}' => {
+                PeerEscapeState::String { escaped: true }
+            }
+            PeerEscapeState::String { escaped: true } if character == '\\' => PeerEscapeState::Text,
+            PeerEscapeState::String { .. } => PeerEscapeState::String { escaped: false },
+        };
+    }
+    output.trim_end().to_owned()
+}
+
+fn is_peer_control(character: char) -> bool {
+    matches!(character as u32, 0x00..=0x1f | 0x7f..=0x9f)
+}
+
+fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
 fn render_markdown_line(renderer: Renderer, line: &str) -> String {
     let trimmed = line.trim_start();
     let indent = &line[..line.len() - trimmed.len()];
@@ -1558,8 +1795,8 @@ mod tests {
     use crumb_platform::Platform;
 
     use super::{
-        BrandingMode, COOKIE_SPINNER, GitSegment, MotionMode, OutputMode, PUNCHLINES,
-        PromptContext, Renderer, StartupContext, UiSettings,
+        BrandingMode, COOKIE_SPINNER, GitSegment, MotionMode, OutputMode, PUNCHLINES, PeerActivity,
+        PeerActivityState, PromptContext, Renderer, StartupContext, UiSettings,
     };
 
     #[test]
@@ -1806,6 +2043,7 @@ mod tests {
             &StartupContext {
                 version: "0.1.0",
                 platform: Platform::Linux,
+                instance_name: Some("Oreo"),
                 model: Some("Quick Crumb"),
                 mode: "auto",
                 effort: Some("high"),
@@ -1820,7 +2058,8 @@ mod tests {
         assert!(footer.contains("Model context"));
         assert!(footer.contains("12.8k / 64.0k"));
         assert!(footer.contains("effort high"));
-        assert!(footer.contains("pack Quick Crumb"));
+        assert!(footer.contains("· Oreo ·"));
+        assert!(footer.contains("Quick Crumb"));
         assert!(footer.contains("auto"));
         assert!(footer.chars().count() <= 100);
     }
@@ -1837,6 +2076,7 @@ mod tests {
             &StartupContext {
                 version: "0.1.0",
                 platform: Platform::Linux,
+                instance_name: None,
                 model: Some("Quick Crumb"),
                 mode: "auto",
                 effort: None,
@@ -1853,6 +2093,7 @@ mod tests {
             &StartupContext {
                 version: "0.1.0",
                 platform: Platform::Linux,
+                instance_name: None,
                 model: Some("Quick Crumb"),
                 mode: "auto",
                 effort: Some("extra high"),
@@ -1925,6 +2166,10 @@ mod tests {
             renderer.agent_approval_required("spawn_agents"),
             "  [ CRUMB ]  Allow a parallel agent team?\n  ╰──▶ Koi · Nyx · Rune · Echo · user permission required"
         );
+        assert_eq!(
+            renderer.peer_approval_prompt("send_peer_message", "0123456789abcdef", Some("Miso")),
+            "  [ CRUMB ]  Allow this peer exchange once?\n  ╰──▶ send_peer_message\n     peer Miso\n     risk peer communication · request 0123456789ab\n     Enter/y once · n/Esc deny"
+        );
     }
 
     #[test]
@@ -1942,6 +2187,73 @@ mod tests {
         assert!(searching.contains("\x1b[38;5;245mSearching web"));
         assert!(completed.contains("\x1b[38;5;245mTool completed"));
         assert!(!completed.contains("\x1b[32;1m"));
+    }
+
+    #[test]
+    fn peer_activity_is_subdued_and_excludes_internal_content() {
+        let renderer = Renderer::new(UiSettings {
+            color: true,
+            output: OutputMode::Rich,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let output = renderer.peer_activity(&PeerActivity {
+            local_name: "Oreo",
+            remote_name: "Miso",
+            state: PeerActivityState::Exchanging,
+            elapsed: Duration::from_millis(1_250),
+            artifact_count: 2,
+        });
+
+        assert!(output.contains("Oreo ↔ Miso"));
+        assert!(output.contains("sharing context · 1.2s · 2 artifacts"));
+        assert!(output.contains("\x1b[38;5;245m"));
+        assert!(!output.contains("message"));
+        assert!(!output.contains("tool output"));
+    }
+
+    #[test]
+    fn peer_inspection_is_plain_bounded_and_strips_terminal_controls() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let hostile = format!(
+            "**not markdown**\n\x1b[31mred\x1b[0m\n\u{9d}hidden\u{9c}shown\nleft\u{202e}right\n{}",
+            "x".repeat(10_000)
+        );
+        let output = renderer.peer_untrusted_text_for_width(&hostile, 80);
+
+        assert!(output.contains("**not markdown**"));
+        assert!(output.contains("red"));
+        assert!(output.contains("shown"));
+        assert!(!output.contains("hidden"));
+        assert!(output.contains("leftright"));
+        assert!(!output.contains('\x1b'));
+        assert!(!output.contains('\u{202e}'));
+        assert!(output.lines().count() <= 81);
+        assert!(!output.contains("10_000"));
+    }
+
+    #[test]
+    fn screen_reader_peer_activity_has_a_semantic_label() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::ScreenReader,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let output = renderer.peer_activity(&PeerActivity {
+            local_name: "Oreo",
+            remote_name: "Miso",
+            state: PeerActivityState::Waiting,
+            elapsed: Duration::from_secs(3),
+            artifact_count: 0,
+        });
+
+        assert_eq!(output, "Agent exchange: Oreo ↔ Miso · waiting · 3.0s");
     }
 
     #[test]
@@ -1970,6 +2282,10 @@ mod tests {
             ),
             "Approval required for write_file, risk workspace write, request 0123456789ab. Enter or y allows once; a always allows this tool; s selects sensitive-only mode; f selects full access; n or escape denies."
         );
+        assert_eq!(
+            renderer.peer_approval_prompt("share_peer_file", "fedcba9876543210", Some("Oreo")),
+            "Peer communication approval required for share_peer_file, request fedcba987654. Enter or y allows this exchange once; n or escape denies. Selected peer: Oreo."
+        );
     }
 
     #[test]
@@ -1997,6 +2313,7 @@ mod tests {
         let status = renderer.startup_status(&StartupContext {
             version: "0.1.0",
             platform: Platform::Linux,
+            instance_name: Some("Oreo"),
             model: Some("Balanced Crumb"),
             mode: "auto",
             effort: Some("medium"),
@@ -2008,12 +2325,13 @@ mod tests {
 
         assert_eq!(
             status,
-            " SESSION   crumb 0.1.0 · linux\n●  agent ready · pack Balanced Crumb · auto"
+            " SESSION   crumb 0.1.0 · linux\n●  agent ready · instance Oreo · pack Balanced Crumb · auto"
         );
         let welcome = renderer.welcome(
             &StartupContext {
                 version: "0.1.0",
                 platform: Platform::Linux,
+                instance_name: Some("Oreo"),
                 model: Some("Balanced Crumb"),
                 mode: "auto",
                 effort: Some("medium"),
@@ -2025,7 +2343,7 @@ mod tests {
             120,
         );
         assert!(welcome.contains("Crumb CLI v0.1.0 · Native commands stay native."));
-        assert!(welcome.contains("Ready · pack Balanced Crumb · auto"));
+        assert!(welcome.contains("Ready · Oreo · pack Balanced Crumb · auto"));
         assert!(!welcome.contains("Model context"));
         assert!(!welcome.contains("compact"));
         assert!(welcome.contains("╭▄█▄╮"));
@@ -2042,6 +2360,7 @@ mod tests {
         let context = StartupContext {
             version: "0.1.0",
             platform: Platform::Linux,
+            instance_name: Some("Oreo"),
             model: Some("Deep Crumb"),
             mode: "auto",
             effort: Some("extra high"),

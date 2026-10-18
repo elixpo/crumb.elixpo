@@ -390,6 +390,12 @@ pub struct ToolPermissions {
     pub allow_workspace_tools: BTreeSet<String>,
     /// Process-execution tools explicitly enabled by the user.
     pub allow_execution_tools: BTreeSet<String>,
+    /// Peer-communication tools explicitly enabled by the user.
+    ///
+    /// These grants remain required even when the global mode is full access,
+    /// because communicating with another agent crosses a distinct disclosure
+    /// boundary.
+    pub allow_peer_tools: BTreeSet<String>,
     /// Supervised MCP tools explicitly allowed by the user.
     #[serde(alias = "allow_process_tools")]
     pub allow_mcp_tools: BTreeSet<String>,
@@ -505,6 +511,7 @@ impl AgentConfig {
             .iter()
             .chain(&self.permissions.allow_workspace_tools)
             .chain(&self.permissions.allow_execution_tools)
+            .chain(&self.permissions.allow_peer_tools)
             .any(|tool| !valid_identifier(tool))
             || self
                 .permissions
@@ -1068,6 +1075,30 @@ mod tests {
         let encoded = serde_json::to_string(&config).expect("config serializes");
         assert!(encoded.contains("allow_mcp_tools"));
         assert!(!encoded.contains("allow_process_tools"));
+    }
+
+    #[test]
+    fn peer_tool_permissions_are_backward_compatible_and_validated() {
+        let legacy = serde_json::from_str::<AgentConfig>(
+            r#"{"permissions":{"mode":"full-access","allow_network_tools":["web_fetch"]}}"#,
+        )
+        .expect("legacy permissions parse without a peer field");
+        assert!(legacy.permissions.allow_peer_tools.is_empty());
+
+        let configured = serde_json::from_str::<AgentConfig>(
+            r#"{"permissions":{"allow_peer_tools":["send_peer_message"]}}"#,
+        )
+        .expect("peer permissions parse");
+        configured.validate().expect("peer tool grant validates");
+        let encoded = serde_json::to_string(&configured).expect("config serializes");
+        assert!(encoded.contains("allow_peer_tools"));
+        assert!(encoded.contains("send_peer_message"));
+
+        let invalid = serde_json::from_str::<AgentConfig>(
+            r#"{"permissions":{"allow_peer_tools":["peer/tool"]}}"#,
+        )
+        .expect("invalid grant has valid JSON shape");
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

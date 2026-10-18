@@ -514,6 +514,83 @@ dependencies = [
 ]
 
 [[package]]
+name = "crumb-a2a"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
+name = "crumb-a2a-exchanges"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "crumb-a2a-inbound"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crumb-a2a",
+ "crumb-a2a-exchanges",
+ "crumb-a2a-local",
+ "crumb-a2a-runtime",
+ "crumb-a2a-tasks",
+ "crumb-instance",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "crumb-a2a-local"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crumb-a2a",
+ "crumb-instance",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "crumb-a2a-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crumb-a2a",
+ "crumb-a2a-exchanges",
+ "crumb-a2a-local",
+ "crumb-instance",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "crumb-a2a-tasks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "crumb-agent"
 version = "0.1.0"
 dependencies = [
@@ -540,6 +617,10 @@ dependencies = [
  "anyhow",
  "chrono",
  "crossterm",
+ "crumb-a2a",
+ "crumb-a2a-exchanges",
+ "crumb-a2a-inbound",
+ "crumb-a2a-runtime",
  "crumb-agent",
  "crumb-auth",
  "crumb-core",
@@ -548,6 +629,7 @@ dependencies = [
  "crumb-harness-cli",
  "crumb-harness-dsh",
  "crumb-history",
+ "crumb-instance",
  "crumb-llm",
  "crumb-marketplace",
  "crumb-mcp",
@@ -631,6 +713,17 @@ dependencies = [
  "crumb-platform",
  "directories",
  "rusqlite",
+]
+
+[[package]]
+name = "crumb-instance"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -751,9 +844,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "crumb-a2a",
+ "crumb-a2a-runtime",
  "crumb-agent",
  "crumb-core",
+ "crumb-instance",
  "crumb-optimize",
+ "getrandom 0.4.3",
  "reqwest",
  "rustix",
  "serde",

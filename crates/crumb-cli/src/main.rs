@@ -24,6 +24,7 @@ use crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
     enable_raw_mode, size,
 };
+use crumb_a2a_runtime::A2aRuntime;
 use crumb_agent::{
     AgentConfig, AgentMode, ApprovalMode, BackendDiscovery, CacheRetention, CancellationToken,
     CommandCatalog, CompatibilityFlag, ConfiguredApprovals, CredentialReference, HarnessConfig,
@@ -47,6 +48,7 @@ use crumb_graph::{
 use crumb_harness::SelectedSkill;
 use crumb_harness_dsh::HarnessActivity;
 use crumb_history::{HistoryEntry, HistoryMode, HistoryStore, RecordContext};
+use crumb_instance::InstanceStore;
 use crumb_marketplace::{
     Catalog, DiscoveryEntry, DiscoveryIndex, InstallScope, InstallationStore, InstalledRelease,
     Installer, MAX_CATALOG_BYTES, MAX_DISCOVERY_INDEX_BYTES, MAX_PACKAGE_MANIFEST_BYTES,
@@ -72,11 +74,14 @@ use crumb_repl::{ReplOutcome, read_classified_line};
 use crumb_tools::{
     AgentShellConfig, CheckpointDecision, CheckpointStatus, CheckpointStore, DisposableToolConfig,
     GitHubIssueLimits, StackDetectionLimits, WebFetchLimits, WorkspaceToolLimits,
-    WorkspaceWriteLimits, register_current_time_tool, register_disposable_tool,
+    WorkspaceWriteLimits, register_a2a_tools, register_current_time_tool, register_disposable_tool,
     register_github_issue_tool, register_shell_tool_with_optimizer, register_stack_detection_tool,
     register_web_fetch_tool, register_workspace_read_tools, register_workspace_write_tool,
 };
-use crumb_ui::{GitSegment, PromptContext, Renderer, StartupContext, UiSettings};
+use crumb_ui::{
+    GitSegment, PeerActivity, PeerActivityState, PromptContext, Renderer, StartupContext,
+    UiSettings,
+};
 use directories::BaseDirs;
 use nu_ansi_term::{Color, Style};
 use reedline::{
@@ -97,7 +102,11 @@ mod provider_discovery;
 mod provider_projection;
 mod shell_completion;
 
-use agent_runtime::{AgentRuntime, ResumeContinuity, apply_selected_profile, validate_skill_path};
+use agent_runtime::{
+    AgentRuntime, PeerDeliveryInspection, PeerDiscardedFile, PeerImportedFile, PeerInspectionKind,
+    PeerInspectionPart, PeerQuarantinedFile, PeerResponseSummary, PeerTaskSummary, PeerTurnStatus,
+    ResumeContinuity, apply_selected_profile, validate_skill_path,
+};
 use completion::{COMPLETION_PALETTE_ROWS, CompletionWorkspace, CrumbCompleter};
 use context::{parse_attachment, resolve_request_context};
 use provider_discovery::{compatibility_diagnostics, discover_models};
@@ -271,8 +280,14 @@ fn parse_exec_request(arguments: &[OsString]) -> Result<Option<(bool, String)>> 
 }
 
 fn run_agent_exec(cwd: &Path, request: &str, json: bool, writer: &mut dyn Write) -> Result<()> {
+    instance_store(cwd)
+        .load_or_create()
+        .context("Crumb instance identity could not be initialized")?;
     let config = read_agent_config(cwd)?;
     let mut runtime = AgentRuntime::new()?;
+    if let (Ok(workspace), Ok(bus_root)) = (instance_workspace(cwd), local_a2a_bus_root()) {
+        let _ = runtime.initialize_peer_runtime(&workspace, &bus_root);
+    }
     let cancellation = CancellationToken::default();
     let result = runtime.run_local_job(request, &config, cwd, &cancellation)?;
     let response = crumb_ui::visible_agent_text(&result.final_response);
@@ -302,6 +317,9 @@ fn run_skill_job(cwd: &Path, selector: &str, request: &str, writer: &mut dyn Wri
     let config = effective_agent_config(cwd)?;
     let resolved = exact_skill_run_config(cwd, &config, selector)?;
     let mut runtime = AgentRuntime::new()?;
+    if let (Ok(workspace), Ok(bus_root)) = (instance_workspace(cwd), local_a2a_bus_root()) {
+        let _ = runtime.initialize_peer_runtime(&workspace, &bus_root);
+    }
     runtime.select_skills_for_next_turn(vec![resolved.receipt])?;
     let cancellation = CancellationToken::default();
     let result = runtime.run_local_job(request, &resolved.config, cwd, &cancellation)?;
@@ -557,6 +575,12 @@ fn run_job_worker(cwd: &Path, id: &str, writer: &mut dyn Write) -> Result<()> {
             return Err(error);
         }
     };
+    if let (Ok(workspace), Ok(bus_root)) = (
+        instance_workspace(&definition.workspace),
+        local_a2a_bus_root(),
+    ) {
+        let _ = runtime.initialize_peer_runtime(&workspace, &bus_root);
+    }
     let session_id = match runtime.prepare_local_job(definition.config.mode, &definition.workspace)
     {
         Ok(session_id) => session_id,
@@ -671,7 +695,7 @@ fn serve_mcp() -> Result<()> {
     let mut config = read_agent_config(&workspace)?;
     enforce_graphify_pin(&workspace, &mut config);
     let search_api_key = configured_pollinations_runtime_key(&config);
-    let mut host = workspace_read_host(&workspace, &config, search_api_key)?;
+    let mut host = workspace_read_host(&workspace, &config, search_api_key, None)?;
     let mut diagnostics = register_stdio_servers(
         &mut host,
         &config.mcp_servers,
@@ -710,6 +734,7 @@ fn serve_mcp() -> Result<()> {
                 .with_mode(config.permissions.mode)
                 .with_workspace_tools(config.permissions.allow_workspace_tools.clone())
                 .with_process_tools(config.permissions.allow_execution_tools.clone())
+                .with_peer_tools(config.permissions.allow_peer_tools.clone())
                 .with_mcp_tools(config.permissions.allow_mcp_tools.clone()),
         ),
         config.mode,
@@ -728,6 +753,7 @@ fn workspace_read_host(
     workspace: &Path,
     config: &AgentConfig,
     search_api_key: Option<String>,
+    peer_runtime: Option<A2aRuntime>,
 ) -> Result<ToolHost> {
     let max_output_bytes = usize::try_from(config.limits.max_output_bytes)
         .map_err(|_| anyhow!("max_output_bytes exceeds this platform's address space"))?;
@@ -792,6 +818,9 @@ fn workspace_read_host(
         let search = search_route.map_or(search.clone(), |route| search.with_model(&route.model));
         register_web_search_tool(&mut host, search)?;
     }
+    if let Some(runtime) = peer_runtime {
+        register_a2a_tools(&mut host, runtime)?;
+    }
     Ok(host)
 }
 
@@ -832,20 +861,20 @@ fn shell_tool_config(config: &AgentConfig, max_output_bytes: usize) -> AgentShel
 }
 
 fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
-    let started_at = Instant::now();
-    let (stdin, stdout) = (io::stdin(), io::stdout());
+    let (started_at, stdin, stdout) = (Instant::now(), io::stdin(), io::stdout());
     let interactive = stdin.is_terminal() && stdout.is_terminal();
     let renderer = Renderer::new(UiSettings::from_environment(interactive));
     let fullscreen = interactive && std::env::var_os("CRUMB_INLINE").is_none();
     let screen = AlternateScreenGuard::enter(fullscreen)?;
-    let platform = Platform::current();
-    let initial_cwd = current_process_dir()?;
+    let (platform, initial_cwd) = (Platform::current(), current_process_dir()?);
     if interactive && !confirm_folder_trust(renderer, &initial_cwd, fullscreen)? {
         return Ok(ReplOutcome::Exit);
     }
+    warn_if_instance_unavailable(&initial_cwd, &mut stdout.lock())?;
     let command_catalog = native_command_catalog(platform);
     let (mut session, mut agent_runtime) =
         (None, resume_agent_runtime(&initial_cwd, resume_session)?);
+    initialize_optional_peer_runtime(&mut agent_runtime, &initial_cwd, &mut stdout.lock())?;
     let (mut last_exit_code, mut command_context) = (None, SessionCommandContext::default());
     let history = open_history(&mut stdout.lock())?;
     let (header_rows, transcript_state) = initialize_transcript(
@@ -984,6 +1013,45 @@ fn handle_repl_event(
     context: &mut InputContext<'_>,
 ) -> Result<Option<ReplOutcome>> {
     match event {
+        InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
+            if command == "/peer tasks"
+                || command == "/peer task"
+                || command.starts_with("/peer task ") =>
+        {
+            show_peer_task_command(&command, context)?;
+            Ok(None)
+        }
+        InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
+            if command == "/peer inbox"
+                || command == "/peer responses"
+                || command == "/peer inspect"
+                || command.starts_with("/peer inspect ") =>
+        {
+            show_peer_read_command(&command, context)?;
+            Ok(None)
+        }
+        InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
+            if command == "/peer accept"
+                || command.starts_with("/peer accept ")
+                || command == "/peer reject"
+                || command.starts_with("/peer reject ")
+                || command == "/peer ack"
+                || command.starts_with("/peer ack ") =>
+        {
+            handle_peer_action(&command, context)?;
+            Ok(None)
+        }
+        InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
+            if command == "/peer file fetch"
+                || command.starts_with("/peer file fetch ")
+                || command == "/peer file import"
+                || command.starts_with("/peer file import ")
+                || command == "/peer file discard"
+                || command.starts_with("/peer file discard ") =>
+        {
+            handle_peer_file_command(&command, context)?;
+            Ok(None)
+        }
         InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
             if command == "/skill run" || command.starts_with("/skill run ") =>
         {
@@ -1620,6 +1688,7 @@ fn render_startup(
 ) -> Result<u16> {
     let cwd = current_process_dir()?;
     let config = read_agent_config(&cwd).unwrap_or_default();
+    let instance = instance_store(&cwd).load().ok();
     let text_route = config
         .models
         .get(&Modality::Text)
@@ -1628,6 +1697,7 @@ fn render_startup(
     let startup = StartupContext {
         version: env!("CARGO_PKG_VERSION"),
         platform,
+        instance_name: instance.as_ref().map(|metadata| metadata.name.as_str()),
         model: pack,
         mode: agent_mode_name(config.mode),
         effort: Some(
@@ -1750,6 +1820,7 @@ fn context_footer_status(
     context_tokens: u64,
 ) -> String {
     let config = read_agent_config(cwd).unwrap_or_default();
+    let instance = instance_store(cwd).load().ok();
     let text_route = config
         .models
         .get(&Modality::Text)
@@ -1758,6 +1829,7 @@ fn context_footer_status(
     let startup = StartupContext {
         version: env!("CARGO_PKG_VERSION"),
         platform,
+        instance_name: instance.as_ref().map(|metadata| metadata.name.as_str()),
         model: pack,
         mode: agent_mode_name(config.mode),
         effort: Some(
@@ -2388,6 +2460,70 @@ fn agent_config_location(cwd: &Path) -> (PathBuf, PathBuf) {
     (cwd.join(".crumb").join("agent.json"), cwd.to_path_buf())
 }
 
+fn instance_store(cwd: &Path) -> InstanceStore {
+    for directory in cwd.ancestors() {
+        if directory.join(".crumb").join("instance.json").is_file() {
+            return InstanceStore::for_workspace(directory);
+        }
+    }
+    let (_, workspace) = agent_config_location(cwd);
+    InstanceStore::for_workspace(&workspace)
+}
+
+fn instance_workspace(cwd: &Path) -> Result<PathBuf> {
+    let path = instance_store(cwd).path().to_path_buf();
+    path.parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .context("Crumb instance metadata has no workspace parent")
+}
+
+fn local_a2a_bus_root() -> Result<PathBuf> {
+    Ok(BaseDirs::new()
+        .context("home directory is unavailable")?
+        .home_dir()
+        .join(".crumb")
+        .join("a2a"))
+}
+
+fn initialize_optional_peer_runtime(
+    runtime: &mut Option<AgentRuntime>,
+    cwd: &Path,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    if runtime.is_none() {
+        match AgentRuntime::new() {
+            Ok(created) => *runtime = Some(created),
+            Err(error) => {
+                writeln!(writer, "warning: local A2A is unavailable: {error}")?;
+                return Ok(());
+            }
+        }
+    }
+    let setup = (|| -> Result<()> {
+        let workspace = instance_workspace(cwd)?;
+        let bus_root = local_a2a_bus_root()?;
+        runtime
+            .as_mut()
+            .context("agent runtime is unavailable")?
+            .initialize_peer_runtime(&workspace, &bus_root)
+    })();
+    if let Err(error) = setup {
+        writeln!(writer, "warning: local A2A is unavailable: {error}")?;
+    }
+    Ok(())
+}
+
+fn warn_if_instance_unavailable(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    if let Err(error) = instance_store(cwd).load_or_create() {
+        writeln!(
+            writer,
+            "warning: Crumb instance identity is unavailable: {error}"
+        )?;
+    }
+    Ok(())
+}
+
 fn handle_agent_boundary(
     decision: &RouteDecision,
     config: &AgentConfig,
@@ -2441,6 +2577,7 @@ fn handle_agent_boundary(
             }
         }
     }
+    initialize_optional_peer_runtime(runtime, workspace, writer)?;
 
     execute_agent_sequence(
         decision.payload.clone(),
@@ -3259,20 +3396,11 @@ fn resolve_tool_approval(
     workspace: &Path,
 ) -> Result<()> {
     let request = pending.request().clone();
-    let detail = trusted_tool_detail(&request.tool, pending.arguments());
     if let Some(assessment) = pending_shell_assessment(&pending) {
         write_shell_impact(writer, &assessment)?;
     }
-    writeln!(
-        writer,
-        "{}",
-        renderer.agent_approval_prompt(
-            &request.tool,
-            approval_risk_label(request.risk),
-            &request.arguments_digest,
-            detail.as_deref(),
-        )
-    )?;
+    let prompt = approval_prompt_for_request(renderer, &pending);
+    writeln!(writer, "{prompt}")?;
     writer.flush()?;
     if !interactive {
         let _ = pending.deny();
@@ -3305,7 +3433,7 @@ fn resolve_tool_approval(
                 )?;
                 return Ok(());
             }
-            TerminalKeyCode::Char('a') => {
+            TerminalKeyCode::Char('a') if request.risk != RiskClass::PeerCommunication => {
                 persist_tool_permission(workspace, &request)?;
                 let accepted = pending.allow_once();
                 writeln!(
@@ -3320,7 +3448,7 @@ fn resolve_tool_approval(
                 )?;
                 return Ok(());
             }
-            TerminalKeyCode::Char('s') => {
+            TerminalKeyCode::Char('s') if request.risk != RiskClass::PeerCommunication => {
                 persist_permission_mode(workspace, ApprovalMode::SensitiveOnly)?;
                 let accepted = pending.allow_once();
                 writeln!(
@@ -3330,7 +3458,7 @@ fn resolve_tool_approval(
                 )?;
                 return Ok(());
             }
-            TerminalKeyCode::Char('f') => {
+            TerminalKeyCode::Char('f') if request.risk != RiskClass::PeerCommunication => {
                 persist_permission_mode(workspace, ApprovalMode::FullAccess)?;
                 let accepted = pending.allow_once();
                 writeln!(
@@ -3357,6 +3485,23 @@ fn resolve_tool_approval(
             _ => {}
         }
     }
+}
+
+fn approval_prompt_for_request(renderer: Renderer, pending: &PendingApproval) -> String {
+    let request = pending.request();
+    if request.risk == RiskClass::PeerCommunication {
+        return renderer.peer_approval_prompt(
+            &request.tool,
+            &request.arguments_digest,
+            trusted_peer_selector(pending.arguments()).as_deref(),
+        );
+    }
+    renderer.agent_approval_prompt(
+        &request.tool,
+        approval_risk_label(request.risk),
+        &request.arguments_digest,
+        trusted_tool_detail(&request.tool, pending.arguments()).as_deref(),
+    )
 }
 
 fn persist_permission_mode(workspace: &Path, mode: ApprovalMode) -> Result<()> {
@@ -3424,6 +3569,26 @@ fn trusted_tool_detail(name: &str, arguments: &serde_json::Value) -> Option<Stri
     })
 }
 
+fn trusted_peer_selector(arguments: &serde_json::Value) -> Option<String> {
+    let raw = arguments.get("peer")?.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut selector = String::with_capacity(raw.len().min(256));
+    for character in raw.chars() {
+        if selector.len() >= 256 {
+            selector.push('…');
+            break;
+        }
+        if character == '\n' || character == '\r' || character == '\t' {
+            selector.push(' ');
+        } else if !character.is_control() {
+            selector.push(character);
+        }
+    }
+    Some(selector)
+}
+
 fn pending_shell_assessment(pending: &PendingApproval) -> Option<BlastRadiusAssessment> {
     shell_blast_radius(&pending.request().tool, pending.arguments())
 }
@@ -3475,6 +3640,7 @@ const fn approval_risk_label(risk: RiskClass) -> &'static str {
         RiskClass::NetworkAccess => "network access",
         RiskClass::WriteWorkspace => "workspace write",
         RiskClass::ProcessExecution => "process execution",
+        RiskClass::PeerCommunication => "peer communication",
         RiskClass::SystemMutation => "system mutation",
         RiskClass::Destructive => "destructive",
         RiskClass::CredentialSensitive => "credential sensitive",
@@ -4208,6 +4374,11 @@ fn visible_tool_activity(name: &str, detail: Option<&str>) -> String {
         ("web_search", Some(query)) => format!("Searching web · {query}"),
         ("web_fetch", Some(url)) => format!("Fetching page · {url}"),
         ("github_issue", Some(target)) => format!("Fetching GitHub item · {target}"),
+        ("list_peer_agents", _) => "Finding peer agents".to_owned(),
+        ("send_peer_message", Some(peer)) => format!("Sending to peer · {peer}"),
+        ("send_peer_message", None) => "Sending to peer".to_owned(),
+        ("share_peer_file", Some(peer)) => format!("Sharing file with peer · {peer}"),
+        ("share_peer_file", None) => "Sharing file with peer".to_owned(),
         (_, Some(detail)) => format!("{} · {detail}", tool_activity_label(name)),
         (_, None) => tool_activity_label(name),
     }
@@ -4230,6 +4401,12 @@ fn finished_tool_activity(
         ("github_issue", false) => "GitHub fetch failed",
         ("write_file", true) => "Edited file",
         ("write_file", false) => "Edit failed",
+        ("list_peer_agents", true) => "Listed peer agents",
+        ("list_peer_agents", false) => "Peer discovery failed",
+        ("send_peer_message", true) => "Sent to peer",
+        ("send_peer_message", false) => "Peer message failed",
+        ("share_peer_file", true) => "Shared file with peer",
+        ("share_peer_file", false) => "Peer file share failed",
         (_, true) => "Tool completed",
         (_, false) => "Tool failed",
     };
@@ -4537,6 +4714,9 @@ fn show_slash_help(writer: &mut dyn Write) -> Result<()> {
                 "/model",
                 "/pack",
                 "/effort",
+                "/instance",
+                "/peers",
+                "/peer",
                 "/session",
                 "/review",
                 "/jobs",
@@ -5205,15 +5385,7 @@ fn show_reserved(
     writer: &mut dyn Write,
 ) -> Result<()> {
     match command {
-        "/mode" => {
-            let config = read_agent_config(cwd)?;
-            writeln!(writer, "◆ Agent mode")?;
-            writeln!(writer, "  {}", agent_mode_name(config.mode))?;
-            writeln!(
-                writer,
-                "  auto executes approved steps · negotiate pauses · plan is read-only"
-            )?;
-        }
+        "/mode" => show_agent_mode(cwd, writer)?,
         "/model" => show_models(cwd, writer)?,
         "/pack" => show_model_packs(cwd, writer)?,
         "/effort" => {
@@ -5267,9 +5439,7 @@ fn show_reserved(
         command if command == "/config provider" || command.starts_with("/config provider ") => {
             configure_provider(command, cwd, writer)?;
         }
-        "/config harness native" => {
-            set_native_harness(cwd, writer)?;
-        }
+        "/config harness native" => set_native_harness(cwd, writer)?,
         "/doctor" => show_doctor(cwd, writer)?,
         "/plugins" => show_plugins(cwd, writer)?,
         command if command.starts_with("/plugins ") => {
@@ -5296,10 +5466,806 @@ fn show_reserved(
         command if command == "/session" || command.starts_with("/session ") => {
             show_sessions(command, cwd, runtime, writer)?;
         }
+        command if command == "/instance" || command.starts_with("/instance ") => {
+            show_instance_command(command, cwd, runtime, writer)?;
+        }
+        "/peers" | "/peer status" => show_peers(cwd, runtime, writer)?,
+        "/peer inbox" => show_peer_inbox(cwd, runtime, writer)?,
+        "/peer" | "/peer file" => show_peer_help(writer)?,
         "/cost" => show_provider_usage(cwd, runtime.as_ref(), writer)?,
         _ => {
             writeln!(writer, "◇ {command}")?;
             writeln!(writer, "  Reserved by Crumb; not available in this build.")?;
+        }
+    }
+    Ok(())
+}
+
+fn show_agent_mode(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    writeln!(writer, "◆ Agent mode")?;
+    writeln!(writer, "  {}", agent_mode_name(config.mode))?;
+    writeln!(
+        writer,
+        "  auto executes approved steps · negotiate pauses · plan is read-only"
+    )?;
+    Ok(())
+}
+
+fn show_instance(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<()> {
+    let store = instance_store(cwd);
+    let metadata = if let Some(name) = command.strip_prefix("/instance rename ") {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("usage: /instance rename <name>");
+        }
+        store.rename(name)?
+    } else if command == "/instance" {
+        store.load_or_create()?
+    } else {
+        bail!("usage: /instance [rename <name>]");
+    };
+
+    writeln!(writer, "◆ Crumb instance")?;
+    writeln!(writer, "  name      {}", metadata.name)?;
+    writeln!(writer, "  id        {}", metadata.instance_id)?;
+    writeln!(writer, "  protocol  A2A 1.0 foundation")?;
+    writeln!(writer, "  metadata  .crumb/instance.json")?;
+    writeln!(
+        writer,
+        "  workspace sessions · memory · graph · jobs · checkpoints · a2a"
+    )?;
+    Ok(())
+}
+
+fn show_instance_command(
+    command: &str,
+    cwd: &Path,
+    runtime: &mut Option<AgentRuntime>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    show_instance(command, cwd, writer)?;
+    if command.starts_with("/instance rename ") {
+        initialize_optional_peer_runtime(runtime, cwd, writer)?;
+    }
+    Ok(())
+}
+
+fn show_peer_help(writer: &mut dyn Write) -> Result<()> {
+    writeln!(writer, "◆ Local agent handoff")?;
+    writeln!(writer, "  /peers       list active Crumb instances")?;
+    writeln!(writer, "  /peer status show this instance and active peers")?;
+    writeln!(
+        writer,
+        "  /peer tasks  list durable redacted exchange state"
+    )?;
+    writeln!(writer, "  /peer task <delivery-id>")?;
+    writeln!(
+        writer,
+        "               inspect one redacted exchange across restarts"
+    )?;
+    writeln!(
+        writer,
+        "  /peer inbox  list pending deliveries without opening them"
+    )?;
+    writeln!(writer, "  /peer inspect <delivery-id>")?;
+    writeln!(writer, "               safely inspect a pending delivery")?;
+    writeln!(writer, "  /peer accept <delivery-id>")?;
+    writeln!(
+        writer,
+        "               run one exact request in an isolated read-only turn"
+    )?;
+    writeln!(writer, "  /peer reject <delivery-id>")?;
+    writeln!(
+        writer,
+        "               reject one exact request without invoking a model"
+    )?;
+    writeln!(writer, "  /peer responses")?;
+    writeln!(
+        writer,
+        "               list correlated replies without opening them"
+    )?;
+    writeln!(writer, "  /peer ack <response-id>")?;
+    writeln!(
+        writer,
+        "               acknowledge one reply without opening it"
+    )?;
+    writeln!(writer, "  /peer file fetch <delivery-id> <part-index>")?;
+    writeln!(
+        writer,
+        "               verify one 1-based file part into receiver quarantine"
+    )?;
+    writeln!(
+        writer,
+        "  /peer file import <delivery-id> <part-index> <relative-destination>"
+    )?;
+    writeln!(
+        writer,
+        "               import verified bytes without overwriting workspace files"
+    )?;
+    writeln!(writer, "  /peer file discard <delivery-id> <part-index>")?;
+    writeln!(
+        writer,
+        "               discard one exact quarantine artifact and receipt"
+    )?;
+    writeln!(
+        writer,
+        "  Ask Crumb to message a peer or share a relative workspace file; each outbound exchange is approval-gated."
+    )?;
+    writeln!(
+        writer,
+        "  Received files remain quarantined until a separate import is approved."
+    )?;
+    Ok(())
+}
+
+fn show_peer_read_command(command: &str, context: &mut InputContext<'_>) -> Result<()> {
+    let delivery_id = if matches!(command, "/peer inbox" | "/peer responses") {
+        None
+    } else {
+        Some(
+            command
+                .strip_prefix("/peer inspect ")
+                .map(str::trim)
+                .filter(|delivery_id| {
+                    !delivery_id.is_empty() && !delivery_id.contains(char::is_whitespace)
+                })
+                .context("usage: /peer inspect <delivery-id>")?,
+        )
+    };
+    let workspace = instance_workspace(context.cwd)?;
+    let local_name = instance_store(&workspace).load_or_create()?.name;
+    writeln!(
+        context.writer,
+        "{}",
+        context.renderer.peer_activity(&PeerActivity {
+            local_name: &local_name,
+            remote_name: "inbox",
+            state: PeerActivityState::Waiting,
+            elapsed: Duration::ZERO,
+            artifact_count: 0,
+        })
+    )?;
+    initialize_optional_peer_runtime(context.agent_runtime, context.cwd, context.writer)?;
+    let runtime = context
+        .agent_runtime
+        .as_ref()
+        .context("local A2A runtime is unavailable")?;
+    let details = if command == "/peer responses" {
+        format_peer_responses(runtime.peer_responses()?)
+    } else if let Some(delivery_id) = delivery_id {
+        format_peer_inspection(runtime.inspect_peer_delivery(delivery_id)?)
+    } else {
+        format_peer_inbox(runtime.peer_inbox()?)
+    };
+    let width = size().map_or(80, |(columns, _)| columns);
+    writeln!(
+        context.writer,
+        "{}",
+        context
+            .renderer
+            .peer_untrusted_text_for_width(&details, width)
+    )?;
+    Ok(())
+}
+
+fn show_peer_task_command(command: &str, context: &mut InputContext<'_>) -> Result<()> {
+    let delivery_id = if command == "/peer tasks" {
+        None
+    } else {
+        Some(
+            command
+                .strip_prefix("/peer task ")
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && !value.contains(char::is_whitespace))
+                .context("usage: /peer task <delivery-id>")?,
+        )
+    };
+    initialize_optional_peer_runtime(context.agent_runtime, context.cwd, context.writer)?;
+    let runtime = context
+        .agent_runtime
+        .as_ref()
+        .context("local A2A runtime is unavailable")?;
+    let details = delivery_id.map_or_else(
+        || runtime.peer_tasks().map(format_peer_tasks),
+        |delivery_id| runtime.peer_task(delivery_id).map(format_peer_task),
+    )?;
+    let width = size().map_or(80, |(columns, _)| columns);
+    writeln!(
+        context.writer,
+        "{}",
+        context
+            .renderer
+            .peer_untrusted_text_for_width(&details, width)
+    )?;
+    Ok(())
+}
+
+fn handle_peer_action(command: &str, context: &mut InputContext<'_>) -> Result<()> {
+    let (action, delivery_id) = if let Some(delivery_id) = command.strip_prefix("/peer accept ") {
+        ("accept", exact_peer_delivery_id(delivery_id)?)
+    } else if let Some(delivery_id) = command.strip_prefix("/peer reject ") {
+        ("reject", exact_peer_delivery_id(delivery_id)?)
+    } else if let Some(delivery_id) = command.strip_prefix("/peer ack ") {
+        ("ack", exact_peer_delivery_id(delivery_id)?)
+    } else if command == "/peer accept" {
+        bail!("usage: /peer accept <delivery-id>");
+    } else if command == "/peer ack" {
+        bail!("usage: /peer ack <response-id>");
+    } else {
+        bail!("usage: /peer reject <delivery-id>");
+    };
+
+    initialize_optional_peer_runtime(context.agent_runtime, context.cwd, context.writer)?;
+    let workspace = instance_workspace(context.cwd)?;
+    let local_name = instance_store(&workspace).load_or_create()?.name;
+    if action == "ack" {
+        let remote = context
+            .agent_runtime
+            .as_ref()
+            .context("local A2A runtime is unavailable")?
+            .acknowledge_peer_response(delivery_id)?;
+        writeln!(
+            context.writer,
+            "{}",
+            context.renderer.peer_activity(&PeerActivity {
+                local_name: &local_name,
+                remote_name: &remote,
+                state: PeerActivityState::Completed,
+                elapsed: Duration::ZERO,
+                artifact_count: 0,
+            })
+        )?;
+        writeln!(context.writer, "  Peer response acknowledged")?;
+        return Ok(());
+    }
+    if action == "reject" {
+        let remote = context
+            .agent_runtime
+            .as_ref()
+            .context("local A2A runtime is unavailable")?
+            .reject_peer_delivery(&workspace, delivery_id)?;
+        writeln!(
+            context.writer,
+            "{}",
+            context.renderer.peer_activity(&PeerActivity {
+                local_name: &local_name,
+                remote_name: &remote,
+                state: PeerActivityState::Completed,
+                elapsed: Duration::ZERO,
+                artifact_count: 0,
+            })
+        )?;
+        writeln!(
+            context.writer,
+            "  Peer request rejected · no model was invoked"
+        )?;
+        return Ok(());
+    }
+
+    let config = load_effective_agent_config(context.cwd, context.writer)?;
+    let activity_capacity = usize::try_from(config.limits.max_activity_events)
+        .context("max_activity_events exceeds this platform's address space")?;
+    let task = context
+        .agent_runtime
+        .as_ref()
+        .context("local A2A runtime is unavailable")?
+        .spawn_peer_turn(delivery_id, config, &workspace, activity_capacity)?;
+    let terminal = AgentTerminal::from_input(context);
+    observe_peer_turn(
+        task,
+        &local_name,
+        context.renderer,
+        context.writer,
+        &terminal,
+    )
+}
+
+fn handle_peer_file_command(command: &str, context: &mut InputContext<'_>) -> Result<()> {
+    let (action, delivery_id, part_index, destination) = parse_peer_file_command(command)?;
+    exact_peer_delivery_id(delivery_id)?;
+    initialize_optional_peer_runtime(context.agent_runtime, context.cwd, context.writer)?;
+    let workspace = instance_workspace(context.cwd)?;
+    let local_name = instance_store(&workspace).load_or_create()?.name;
+    writeln!(
+        context.writer,
+        "{}",
+        context.renderer.peer_activity(&PeerActivity {
+            local_name: &local_name,
+            remote_name: "quarantine",
+            state: PeerActivityState::Exchanging,
+            elapsed: Duration::ZERO,
+            artifact_count: 1,
+        })
+    )?;
+    let runtime = context
+        .agent_runtime
+        .as_ref()
+        .context("local A2A runtime is unavailable")?;
+    let details = match action {
+        "fetch" => format_peer_quarantined_file(
+            &runtime
+                .quarantine_peer_file(delivery_id, part_index)
+                .context("peer file could not be verified into quarantine")?,
+        ),
+        "import" => format_peer_imported_file(
+            &runtime
+                .import_peer_file(
+                    delivery_id,
+                    part_index,
+                    destination
+                        .as_deref()
+                        .context("peer import destination is unavailable")?,
+                )
+                .context("peer file could not be imported safely")?,
+        ),
+        "discard" => format_peer_discarded_file(
+            &runtime
+                .discard_peer_file(delivery_id, part_index)
+                .context("peer file could not be discarded safely")?,
+        ),
+        _ => unreachable!("validated peer file action"),
+    };
+    writeln!(
+        context.writer,
+        "{}",
+        context.renderer.peer_activity(&PeerActivity {
+            local_name: &local_name,
+            remote_name: "quarantine",
+            state: PeerActivityState::Completed,
+            elapsed: Duration::ZERO,
+            artifact_count: 1,
+        })
+    )?;
+    let width = size().map_or(80, |(columns, _)| columns);
+    writeln!(
+        context.writer,
+        "{}",
+        context
+            .renderer
+            .peer_untrusted_text_for_width(&details, width)
+    )?;
+    Ok(())
+}
+
+fn parse_peer_file_command(command: &str) -> Result<(&str, &str, usize, Option<PathBuf>)> {
+    let (action, arguments, usage) =
+        if let Some(arguments) = command.strip_prefix("/peer file fetch ") {
+            (
+                "fetch",
+                arguments,
+                "/peer file fetch <delivery-id> <part-index>",
+            )
+        } else if let Some(arguments) = command.strip_prefix("/peer file import ") {
+            (
+                "import",
+                arguments,
+                "/peer file import <delivery-id> <part-index> <relative-destination>",
+            )
+        } else if let Some(arguments) = command.strip_prefix("/peer file discard ") {
+            (
+                "discard",
+                arguments,
+                "/peer file discard <delivery-id> <part-index>",
+            )
+        } else if command == "/peer file import" {
+            bail!("usage: /peer file import <delivery-id> <part-index> <relative-destination>");
+        } else if command == "/peer file discard" {
+            bail!("usage: /peer file discard <delivery-id> <part-index>");
+        } else {
+            bail!("usage: /peer file fetch <delivery-id> <part-index>");
+        };
+    let mut fields = arguments.split_whitespace();
+    let delivery_id = fields.next().with_context(|| format!("usage: {usage}"))?;
+    let part_index = fields
+        .next()
+        .with_context(|| format!("usage: {usage}"))?
+        .parse::<usize>()
+        .context("peer file part index must be a positive integer")?;
+    let destination = if action == "import" {
+        fields.next().map(PathBuf::from)
+    } else {
+        None
+    };
+    if fields.next().is_some() || part_index == 0 || (action == "import" && destination.is_none()) {
+        bail!("usage: {usage}");
+    }
+    Ok((action, delivery_id, part_index, destination))
+}
+
+fn format_peer_quarantined_file(artifact: &PeerQuarantinedFile) -> String {
+    format!(
+        "delivery  {}\nsha256    {}\nsize      {} B\nquarantine {}",
+        artifact.delivery_id,
+        artifact.sha256,
+        artifact.size_bytes,
+        artifact.relative_path.display()
+    )
+}
+
+fn format_peer_imported_file(artifact: &PeerImportedFile) -> String {
+    format!(
+        "destination {}\nsha256     {}\nsize       {} B",
+        artifact.relative_destination.display(),
+        artifact.sha256,
+        artifact.size_bytes,
+    )
+}
+
+fn format_peer_discarded_file(artifact: &PeerDiscardedFile) -> String {
+    format!(
+        "delivery  {}\npart      {}\nsha256    {}\nsize      {} B",
+        artifact.delivery_id, artifact.part_index, artifact.sha256, artifact.size_bytes,
+    )
+}
+
+fn exact_peer_delivery_id(value: &str) -> Result<&str> {
+    let value = value.trim();
+    if value.is_empty() || value.contains(char::is_whitespace) {
+        bail!("peer delivery id must be one exact non-empty identifier");
+    }
+    Ok(value)
+}
+
+fn render_peer_turn_activity(
+    activity: HarnessActivity,
+    local_name: &str,
+    remote: &str,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    elapsed: Duration,
+) -> Result<()> {
+    let (remote_status, state) = match activity {
+        HarnessActivity::ToolStarted { name, .. } => {
+            (format!("{remote} · {name}"), PeerActivityState::Exchanging)
+        }
+        HarnessActivity::ToolFinished { name, success } => {
+            let result = if success { "completed" } else { "failed" };
+            (
+                format!("{remote} · {name} {result}"),
+                PeerActivityState::Waiting,
+            )
+        }
+        _ => return Ok(()),
+    };
+    writeln!(
+        writer,
+        "{}",
+        renderer.peer_activity(&PeerActivity {
+            local_name,
+            remote_name: &remote_status,
+            state,
+            elapsed,
+            artifact_count: 0,
+        })
+    )?;
+    writer.flush().context("failed to flush peer activity")
+}
+
+fn render_peer_turn_result(
+    result: &agent_runtime::PeerTurnResult,
+    local_name: &str,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    elapsed: Duration,
+) -> Result<()> {
+    let (state, summary) = match result.status {
+        PeerTurnStatus::Completed => (
+            PeerActivityState::Completed,
+            "Peer response queued securely",
+        ),
+        PeerTurnStatus::RetryableFailure => (
+            PeerActivityState::Failed,
+            "Peer turn stopped; request returned to the inbox",
+        ),
+        PeerTurnStatus::RecoveryRequired => (
+            PeerActivityState::Failed,
+            "Peer turn needs transport recovery; no peer content was exposed",
+        ),
+    };
+    writeln!(
+        writer,
+        "{}",
+        renderer.peer_activity(&PeerActivity {
+            local_name,
+            remote_name: &result.remote_instance_id,
+            state,
+            elapsed,
+            artifact_count: 0,
+        })
+    )?;
+    writeln!(writer, "  {summary}")?;
+    Ok(())
+}
+
+fn observe_peer_turn(
+    task: agent_runtime::PeerTurnTask,
+    local_name: &str,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    terminal: &AgentTerminal,
+) -> Result<()> {
+    let started = Instant::now();
+    let remote = task.remote_instance_id().to_owned();
+    writeln!(
+        writer,
+        "{}",
+        renderer.peer_activity(&PeerActivity {
+            local_name,
+            remote_name: &remote,
+            state: PeerActivityState::Connecting,
+            elapsed: started.elapsed(),
+            artifact_count: 0,
+        })
+    )?;
+    writeln!(
+        writer,
+        "  Peer turn active · Ctrl+B detach · Ctrl+C cancel · PgUp/PgDn scroll"
+    )?;
+    writer.flush()?;
+    refresh_active_footer(renderer, terminal.fullscreen)?;
+    let raw_mode = terminal
+        .interactive
+        .then(RawModeGuard::enable)
+        .transpose()?;
+    let enhanced_keys = terminal
+        .interactive
+        .then(KeyboardEnhancementGuard::enable)
+        .transpose()?;
+
+    while !task.is_finished() {
+        match task.recv_timeout(Duration::from_millis(25)) {
+            Ok(activity) => render_peer_turn_activity(
+                activity,
+                local_name,
+                &remote,
+                renderer,
+                writer,
+                started.elapsed(),
+            )?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if terminal.interactive && poll_terminal_event(Duration::ZERO)? {
+            let event = read_terminal_event()?;
+            if let Some(direction) = active_scroll_direction(&event) {
+                if terminal.fullscreen {
+                    let mut state = terminal
+                        .transcript
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.scroll(direction, terminal.header_rows);
+                    render_transcript_view(&state, renderer, terminal.header_rows)?;
+                    refresh_active_footer(renderer, true)?;
+                }
+            } else if let TerminalEvent::Key(key) = event
+                && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && key.code == TerminalKeyCode::Char('b')
+                && key.modifiers.contains(TerminalModifiers::CONTROL)
+            {
+                drop(enhanced_keys);
+                drop(raw_mode);
+                drop(task);
+                writeln!(
+                    writer,
+                    "  Peer turn detached · it will finish in the background"
+                )?;
+                refresh_active_footer(renderer, terminal.fullscreen)?;
+                return Ok(());
+            } else if let TerminalEvent::Key(key) = event
+                && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && key.code == TerminalKeyCode::Char('c')
+                && key.modifiers.contains(TerminalModifiers::CONTROL)
+            {
+                task.cancel();
+            } else if matches!(event, TerminalEvent::Resize(_, _)) {
+                refresh_active_footer(renderer, terminal.fullscreen)?;
+            }
+        }
+    }
+    while task.recv_timeout(Duration::ZERO).is_ok() {}
+    drop(enhanced_keys);
+    drop(raw_mode);
+    let result = task.finish()?;
+    render_peer_turn_result(&result, local_name, renderer, writer, started.elapsed())?;
+    refresh_active_footer(renderer, terminal.fullscreen)?;
+    Ok(())
+}
+
+fn show_peer_inbox(
+    cwd: &Path,
+    runtime: &mut Option<AgentRuntime>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    initialize_optional_peer_runtime(runtime, cwd, writer)?;
+    let pending = runtime
+        .as_ref()
+        .context("local A2A runtime is unavailable")?
+        .peer_inbox()?;
+    writeln!(writer, "{}", format_peer_inbox(pending))?;
+    Ok(())
+}
+
+fn format_peer_inbox(pending: Vec<agent_runtime::PeerInboxSummary>) -> String {
+    let mut output = String::from("Local A2A inbox · read only\n");
+    if pending.is_empty() {
+        output.push_str("pending  none");
+        return output;
+    }
+    let _ = write!(output, "pending  {}", pending.len());
+    for delivery in pending {
+        let _ = write!(
+            output,
+            "\n{} · from {} · {} parts · {} artifacts · {}",
+            delivery.delivery_id,
+            delivery.sender_instance_id,
+            delivery.part_count,
+            delivery.artifact_count,
+            peer_timestamp(delivery.enqueued_at_ms)
+        );
+    }
+    output
+}
+
+fn format_peer_responses(responses: Vec<PeerResponseSummary>) -> String {
+    let mut output = String::from("Local A2A responses · bodies remain unopened\n");
+    if responses.is_empty() {
+        output.push_str("pending  none");
+        return output;
+    }
+    let _ = write!(output, "pending  {}", responses.len());
+    for response in responses {
+        let _ = write!(
+            output,
+            "\n{} · from {} · reply to {} · {}",
+            response.delivery_id,
+            response.sender_instance_id,
+            response.in_reply_to_delivery_id,
+            peer_timestamp(response.enqueued_at_ms)
+        );
+    }
+    output
+}
+
+fn format_peer_tasks(tasks: Vec<PeerTaskSummary>) -> String {
+    let mut output = String::from("Durable peer tasks · content-free\n");
+    if tasks.is_empty() {
+        output.push_str("tasks  none");
+        return output;
+    }
+    let _ = write!(output, "tasks  {}", tasks.len());
+    for task in tasks {
+        let _ = write!(
+            output,
+            "\n{} · {} · {} · {} · {}",
+            task.delivery_id,
+            task.direction,
+            if task.retry_pending {
+                "retry pending"
+            } else {
+                task.state
+            },
+            task.peer_display_name,
+            peer_timestamp(task.updated_at_ms)
+        );
+    }
+    output
+}
+
+fn format_peer_task(task: PeerTaskSummary) -> String {
+    let mut output = format!(
+        "Durable peer task · content-free\ndelivery  {}\ndirection {}\nstate     {}\npeer      {}\npeer id   {}\ncreated   {}\nupdated   {}\nrequest   {} parts · {} artifacts\nreq hash  sha256:{}",
+        task.delivery_id,
+        task.direction,
+        if task.retry_pending {
+            "retry pending"
+        } else {
+            task.state
+        },
+        task.peer_display_name,
+        task.peer_instance_id,
+        peer_timestamp(task.created_at_ms),
+        peer_timestamp(task.updated_at_ms),
+        task.request_part_count,
+        task.request_artifact_count,
+        &task.request_digest[..12]
+    );
+    if let Some(delivery_id) = task.correlated_delivery_id {
+        let _ = write!(output, "\nresponse  {delivery_id}");
+    }
+    if let (Some(parts), Some(artifacts)) = (task.response_part_count, task.response_artifact_count)
+    {
+        let _ = write!(output, "\nresult    {parts} parts · {artifacts} artifacts");
+    }
+    if let Some(digest) = task.response_digest {
+        let _ = write!(output, "\nres hash  sha256:{}", &digest[..12]);
+    }
+    output
+}
+
+fn format_peer_inspection(delivery: PeerDeliveryInspection) -> String {
+    let kind = match delivery.kind {
+        PeerInspectionKind::Request => "request",
+        PeerInspectionKind::Response => "response",
+    };
+    let mut output = format!(
+        "Pending peer {kind} · read only · not acknowledged\ndelivery  {}\nfrom      {}\nenqueued  {}\nparts     {}",
+        delivery.delivery_id,
+        delivery.sender_instance_id,
+        peer_timestamp(delivery.enqueued_at_ms),
+        delivery.parts.len()
+    );
+    if let Some(in_reply_to) = delivery.in_reply_to_delivery_id {
+        let _ = write!(output, "\nreply to  {in_reply_to}");
+    }
+    if let Some(state) = delivery.response_state {
+        let _ = write!(output, "\nstate     {state}");
+    }
+    for (index, part) in delivery.parts.into_iter().enumerate() {
+        let number = index + 1;
+        match part {
+            PeerInspectionPart::Text(text) => {
+                let _ = write!(output, "\n\ntext {number}\n{text}");
+            }
+            PeerInspectionPart::Structured(data) => {
+                let _ = write!(output, "\n\nstructured data {number}\n{data}");
+            }
+            PeerInspectionPart::File {
+                filename,
+                media_type,
+                size_bytes,
+                digest,
+            } => {
+                let size = size_bytes
+                    .map_or_else(|| "size unknown".to_owned(), |bytes| format!("{bytes} B"));
+                let digest = digest.unwrap_or_else(|| "digest unavailable".to_owned());
+                let _ = write!(
+                    output,
+                    "\n\nfile {number}\npeer-claimed {filename} · {media_type} · {size} · {digest}"
+                );
+            }
+        }
+    }
+    output
+}
+
+fn peer_timestamp(timestamp_ms: u64) -> String {
+    i64::try_from(timestamp_ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map_or_else(
+            || format!("{timestamp_ms} ms"),
+            |timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+}
+
+fn show_peers(
+    cwd: &Path,
+    runtime: &mut Option<AgentRuntime>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    initialize_optional_peer_runtime(runtime, cwd, writer)?;
+    let metadata = instance_store(cwd).load_or_create()?;
+    let peers = runtime
+        .as_ref()
+        .context("local A2A runtime is unavailable")?
+        .peer_agents()?;
+    writeln!(writer, "◆ Local A2A · protocol 1.0")?;
+    writeln!(
+        writer,
+        "  this  {} · {}",
+        metadata.name, metadata.instance_id
+    )?;
+    if peers.is_empty() {
+        writeln!(writer, "  peers none active")?;
+    } else {
+        writeln!(writer, "  peers {} active", peers.len())?;
+        for peer in peers {
+            writeln!(
+                writer,
+                "    {} · {} · A2A {}",
+                peer.name, peer.instance_id, peer.protocol_version
+            )?;
         }
     }
     Ok(())
@@ -5487,6 +6453,7 @@ fn select_permission_mode(arguments: &[&str], cwd: &Path, writer: &mut dyn Write
         config.permissions.allow_network_tools.clear();
         config.permissions.allow_workspace_tools.clear();
         config.permissions.allow_execution_tools.clear();
+        config.permissions.allow_peer_tools.clear();
         config.permissions.allow_mcp_tools.clear();
         Ok(())
     })?;
@@ -5551,6 +6518,11 @@ fn show_permissions(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         writer,
         "  execution  {}",
         joined_or_none(&config.permissions.allow_execution_tools)
+    )?;
+    writeln!(
+        writer,
+        "  peers      {}",
+        joined_or_none(&config.permissions.allow_peer_tools)
     )?;
     writeln!(
         writer,
@@ -11173,18 +12145,23 @@ mod tests {
         composer_anchor_sequence, configure_permissions, configure_plugin, effort_display_name,
         effort_wire_name, ensure_single_release_skill_install, exact_skill_manifest_url,
         exact_skill_run_config, failed_command_recovery, finished_tool_activity,
-        fixed_footer_frame, handle_skill_command, initial_agent_activity,
-        install_marketplace_package, load_exact_skill_manifest, marketplace_update_blocker,
-        normalize_bundled_skill_install, openrouter_preset, parse_cli_skill_run,
-        parse_credential_reference, parse_exec_request, parse_interactive_skill_run,
-        parse_paused_submission, parse_provider_header, parse_resume_session_argument,
-        read_agent_config, read_bounded_response, register_local_skill,
-        render_skill_discovery_search, resolve_memory_keep, sanitize_transcript_output,
-        select_discovery_skill, set_skill_enabled, shell_blast_radius, shell_tool_config,
-        should_auto_enable_rtk, show_graph, show_marketplace, show_memory,
-        show_profile_with_stores, suggestion_width, transcript_activity_row,
+        fixed_footer_frame, format_peer_discarded_file, format_peer_imported_file,
+        format_peer_inbox, format_peer_inspection, format_peer_quarantined_file, format_peer_task,
+        handle_skill_command, initial_agent_activity, install_marketplace_package,
+        load_exact_skill_manifest, marketplace_update_blocker, normalize_bundled_skill_install,
+        openrouter_preset, parse_cli_skill_run, parse_credential_reference, parse_exec_request,
+        parse_interactive_skill_run, parse_paused_submission, parse_provider_header,
+        parse_resume_session_argument, read_agent_config, read_bounded_response,
+        register_local_skill, render_skill_discovery_search, resolve_memory_keep,
+        sanitize_transcript_output, select_discovery_skill, set_skill_enabled, shell_blast_radius,
+        shell_tool_config, should_auto_enable_rtk, show_graph, show_instance, show_marketplace,
+        show_memory, show_profile_with_stores, suggestion_width, transcript_activity_row,
         unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
         visible_tool_activity, workspace_read_host, write_bounded_response_delta_for_width,
+    };
+    use crate::agent_runtime::{
+        PeerDeliveryInspection, PeerDiscardedFile, PeerImportedFile, PeerInboxSummary,
+        PeerInspectionKind, PeerInspectionPart, PeerQuarantinedFile, PeerTaskSummary,
     };
 
     #[test]
@@ -11228,6 +12205,32 @@ mod tests {
                 .expect("non-exec arguments")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn instance_command_creates_and_renames_a_stable_identity() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut output = Vec::new();
+
+        show_instance("/instance", workspace.path(), &mut output).expect("create identity");
+        let first = crumb_instance::InstanceStore::for_workspace(workspace.path())
+            .load()
+            .expect("stored identity");
+        show_instance(
+            "/instance rename Build Buddy",
+            workspace.path(),
+            &mut output,
+        )
+        .expect("rename identity");
+        let renamed = crumb_instance::InstanceStore::for_workspace(workspace.path())
+            .load()
+            .expect("renamed identity");
+
+        assert_eq!(renamed.instance_id, first.instance_id);
+        assert_eq!(renamed.name, "Build Buddy");
+        let output = String::from_utf8(output).expect("UTF-8 output");
+        assert!(output.contains("A2A 1.0 foundation"));
+        assert!(output.contains(".crumb/instance.json"));
     }
 
     #[test]
@@ -11812,7 +12815,7 @@ mod tests {
     #[test]
     fn stdio_mcp_host_exposes_rust_owned_tool_risk() {
         let workspace = std::env::current_dir().expect("current directory is available");
-        let host = workspace_read_host(&workspace, &AgentConfig::default(), None)
+        let host = workspace_read_host(&workspace, &AgentConfig::default(), None, None)
             .expect("workspace tools are registered");
         let tools = host.tools().collect::<Vec<_>>();
         assert_eq!(tools.len(), 10);
@@ -11839,12 +12842,46 @@ mod tests {
     }
 
     #[test]
+    fn agent_host_adds_a2a_tools_only_with_a_live_peer_runtime() {
+        let temporary = tempfile::TempDir::new().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace directory");
+        let instance = crumb_instance::InstanceStore::for_workspace(&workspace)
+            .load_or_create_named("Integration Agent")
+            .expect("instance metadata");
+        let runtime = crumb_a2a_runtime::A2aRuntime::start(
+            &temporary.path().join("bus"),
+            &workspace,
+            &instance,
+            crumb_a2a_runtime::RuntimeOptions::default(),
+        )
+        .expect("A2A runtime");
+        let host = workspace_read_host(
+            &workspace,
+            &AgentConfig::default(),
+            None,
+            Some(runtime.clone()),
+        )
+        .expect("workspace and A2A tools are registered");
+
+        for (name, risk) in [
+            ("list_peer_agents", RiskClass::ReadOnly),
+            ("send_peer_message", RiskClass::PeerCommunication),
+            ("share_peer_file", RiskClass::PeerCommunication),
+        ] {
+            assert_eq!(host.descriptor(name).map(|tool| tool.risk), Some(risk));
+        }
+        runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
     fn pollinations_key_registers_web_search_without_an_explicit_search_route() {
         let workspace = std::env::current_dir().expect("current directory is available");
         let host = workspace_read_host(
             &workspace,
             &AgentConfig::default(),
             Some("fixture-key".to_owned()),
+            None,
         )
         .expect("workspace tools are registered");
 
@@ -12389,6 +13426,166 @@ mod tests {
             ),
             "Edited file · 1.2s · src/main.rs"
         );
+    }
+
+    #[test]
+    fn peer_tools_have_subdued_content_safe_activity_labels() {
+        assert_eq!(
+            visible_tool_activity("list_peer_agents", None),
+            "Finding peer agents"
+        );
+        assert_eq!(
+            visible_tool_activity("send_peer_message", Some("Miso")),
+            "Sending to peer · Miso"
+        );
+        assert_eq!(
+            visible_tool_activity("share_peer_file", Some("Oreo")),
+            "Sharing file with peer · Oreo"
+        );
+        assert_eq!(
+            finished_tool_activity(
+                "send_peer_message",
+                Some("Miso"),
+                true,
+                Duration::from_millis(250),
+            ),
+            "Sent to peer · 0.2s · Miso"
+        );
+        assert_eq!(
+            finished_tool_activity(
+                "share_peer_file",
+                Some("Oreo"),
+                false,
+                Duration::from_secs(2),
+            ),
+            "Peer file share failed · 2.0s · Oreo"
+        );
+
+        let selector = super::trusted_peer_selector(&serde_json::json!({
+            "peer": "Miso\nagent",
+            "message": "never expose this",
+            "path": "private/roadmap.md"
+        }));
+        assert_eq!(selector.as_deref(), Some("Miso agent"));
+    }
+
+    #[test]
+    fn peer_inbox_format_contains_only_content_free_summaries() {
+        let output = format_peer_inbox(vec![PeerInboxSummary {
+            delivery_id: "delivery_0123456789abcdef".to_owned(),
+            sender_instance_id: "crumb_0123456789abcdef0123456789abcdef".to_owned(),
+            enqueued_at_ms: 1_700_000_000_000,
+            part_count: 2,
+            artifact_count: 1,
+        }]);
+
+        assert!(output.contains("Local A2A inbox · read only"));
+        assert!(output.contains("2 parts · 1 artifacts"));
+        assert!(!output.contains("message body"));
+        assert!(!output.contains("/home/"));
+    }
+
+    #[test]
+    fn peer_task_format_is_content_free_and_restart_readable() {
+        let output = format_peer_task(PeerTaskSummary {
+            delivery_id: format!("delivery_{}", "a".repeat(64)),
+            direction: "inbound",
+            state: "running",
+            peer_instance_id: format!("crumb_{}", "b".repeat(32)),
+            peer_display_name: "Miso".to_owned(),
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_001_000,
+            request_part_count: 2,
+            request_artifact_count: 1,
+            correlated_delivery_id: None,
+            response_part_count: None,
+            response_artifact_count: None,
+            request_digest: "c".repeat(64),
+            response_digest: None,
+            retry_pending: true,
+        });
+
+        assert!(output.contains("retry pending"));
+        assert!(output.contains("Miso"));
+        assert!(output.contains("sha256:cccccccccccc"));
+        for forbidden in ["message body", "provider", "tool output", "/home/"] {
+            assert!(!output.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn peer_inspection_never_has_a_transport_url_or_path_field() {
+        let output = format_peer_inspection(PeerDeliveryInspection {
+            delivery_id: "delivery_0123456789abcdef".to_owned(),
+            sender_instance_id: "crumb_0123456789abcdef0123456789abcdef".to_owned(),
+            enqueued_at_ms: 1_700_000_000_000,
+            kind: PeerInspectionKind::Request,
+            in_reply_to_delivery_id: None,
+            response_state: None,
+            parts: vec![
+                PeerInspectionPart::Text("please review this".to_owned()),
+                PeerInspectionPart::File {
+                    filename: "notes.txt".to_owned(),
+                    media_type: "text/plain".to_owned(),
+                    size_bytes: Some(42),
+                    digest: Some("sha256:0123456789ab".to_owned()),
+                },
+            ],
+        });
+
+        assert!(output.contains("read only · not acknowledged"));
+        assert!(
+            output.contains("peer-claimed notes.txt · text/plain · 42 B · sha256:0123456789ab")
+        );
+        assert!(!output.contains("url"));
+        assert!(!output.contains("/home/"));
+    }
+
+    #[test]
+    fn quarantined_peer_file_output_contains_only_safe_receiver_fields() {
+        let output = format_peer_quarantined_file(&PeerQuarantinedFile {
+            delivery_id: "delivery_0123456789abcdef".to_owned(),
+            sha256: "ab".repeat(32),
+            size_bytes: 42,
+            relative_path: PathBuf::from(
+                ".crumb/a2a/quarantine/delivery_0123456789abcdef/abab/file.txt",
+            ),
+        });
+
+        assert!(output.contains("delivery_0123456789abcdef"));
+        assert!(output.contains(&"ab".repeat(32)));
+        assert!(output.contains("42 B"));
+        assert!(output.contains(".crumb/a2a/quarantine/"));
+        assert!(!output.contains("/home/"));
+        assert!(!output.contains("/tmp/local-a2a-bus"));
+        assert!(!output.contains("artifacts/"));
+    }
+
+    #[test]
+    fn peer_file_import_and_discard_output_never_expose_transport_paths() {
+        let imported = format_peer_imported_file(&PeerImportedFile {
+            relative_destination: PathBuf::from("imports/file.txt"),
+            sha256: "cd".repeat(32),
+            size_bytes: 91,
+        });
+        assert!(imported.contains("imports/file.txt"));
+        assert!(imported.contains(&"cd".repeat(32)));
+        assert!(imported.contains("91 B"));
+        assert!(!imported.contains("delivery_"));
+        assert!(!imported.contains("/home/"));
+        assert!(!imported.contains("artifacts/"));
+
+        let discarded = format_peer_discarded_file(&PeerDiscardedFile {
+            delivery_id: "delivery_0123456789abcdef".to_owned(),
+            part_index: 2,
+            sha256: "ef".repeat(32),
+            size_bytes: 91,
+        });
+        assert!(discarded.contains("delivery_0123456789abcdef"));
+        assert!(discarded.contains("part      2"));
+        assert!(!discarded.contains("/home/"));
+        assert!(!discarded.contains("artifacts/"));
+        assert!(!discarded.contains("quarantine/"));
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub enum RiskClass {
     WriteWorkspace,
     ProcessExecution,
     NetworkAccess,
+    PeerCommunication,
     SystemMutation,
     CredentialSensitive,
     Destructive,
@@ -182,6 +183,7 @@ pub struct ConfiguredApprovals {
     network: BTreeSet<String>,
     workspace: BTreeSet<String>,
     processes: BTreeSet<String>,
+    peers: BTreeSet<String>,
     mcp: BTreeSet<String>,
 }
 
@@ -193,6 +195,7 @@ impl ConfiguredApprovals {
             network: network_tools,
             workspace: BTreeSet::new(),
             processes: BTreeSet::new(),
+            peers: BTreeSet::new(),
             mcp: BTreeSet::new(),
         }
     }
@@ -215,6 +218,16 @@ impl ConfiguredApprovals {
         self
     }
 
+    /// Adds exact peer-communication tool grants.
+    ///
+    /// Peer grants are intentionally independent from the global approval
+    /// mode. In particular, full access alone never grants them.
+    #[must_use]
+    pub fn with_peer_tools(mut self, peer_tools: BTreeSet<String>) -> Self {
+        self.peers = peer_tools;
+        self
+    }
+
     #[must_use]
     pub fn with_mcp_tools(mut self, mcp_tools: BTreeSet<String>) -> Self {
         self.mcp = mcp_tools;
@@ -229,6 +242,13 @@ impl ApprovalBroker for ConfiguredApprovals {
         arguments: &serde_json::Value,
         _cancellation: &CancellationToken,
     ) -> ApprovalDecision {
+        if request.risk == RiskClass::PeerCommunication {
+            return if self.peers.contains(&request.tool) {
+                ApprovalDecision::AllowOnce
+            } else {
+                ApprovalDecision::Deny
+            };
+        }
         let explicitly_allowed = (request.tool.starts_with("mcp__")
             && self.mcp.contains(&request.tool))
             || (request.risk == RiskClass::NetworkAccess && self.network.contains(&request.tool))
@@ -267,7 +287,10 @@ fn sensitive_request(request: &ApprovalRequest, arguments: &serde_json::Value) -
                 .is_none_or(sensitive_shell_command),
             _ => true,
         },
-        RiskClass::SystemMutation | RiskClass::CredentialSensitive | RiskClass::Destructive => true,
+        RiskClass::PeerCommunication
+        | RiskClass::SystemMutation
+        | RiskClass::CredentialSensitive
+        | RiskClass::Destructive => true,
     }
 }
 
@@ -417,6 +440,37 @@ impl ToolHost {
             .iter()
             .filter(|descriptor| descriptor.risk == RiskClass::ReadOnly)
         {
+            if let Some(handler) = self.handlers.get(&descriptor.name) {
+                host.registry
+                    .tools
+                    .insert(descriptor.name.clone(), descriptor.clone());
+                host.handlers
+                    .insert(descriptor.name.clone(), Arc::clone(handler));
+            }
+        }
+        host
+    }
+
+    /// Clones the minimal native read-only surface available to an isolated
+    /// inbound peer turn.
+    ///
+    /// This is deliberately an allowlist instead of a risk-class filter:
+    /// peer discovery, subagent coordination, and third-party transports can
+    /// themselves be read-only while still crossing an isolation boundary.
+    #[must_use]
+    pub fn isolated_peer_read_only(&self) -> Self {
+        // Accepting peer-authored text is not permission to inspect the local
+        // workspace. File and directory reads need a separate receiver-owned
+        // approval boundary, so the default peer surface is intentionally
+        // limited to a context-free clock lookup.
+        const ALLOWED: [&str; 1] = ["current_time"];
+
+        let mut host = Self::default();
+        for descriptor in self.registry.iter().filter(|descriptor| {
+            descriptor.risk == RiskClass::ReadOnly
+                && descriptor.transport == ToolTransport::Native
+                && ALLOWED.contains(&descriptor.name.as_str())
+        }) {
             if let Some(handler) = self.handlers.get(&descriptor.name) {
                 host.registry
                     .tools
@@ -882,6 +936,123 @@ mod tests {
     }
 
     #[test]
+    fn peer_communication_requires_an_exact_peer_tool_grant() {
+        let cancellation = CancellationToken::default();
+        let request = ApprovalRequest {
+            tool: "send_peer_message".to_owned(),
+            risk: RiskClass::PeerCommunication,
+            arguments_digest: "digest".to_owned(),
+        };
+
+        for mode in [
+            ApprovalMode::AlwaysAsk,
+            ApprovalMode::SensitiveOnly,
+            ApprovalMode::FullAccess,
+        ] {
+            assert_eq!(
+                ConfiguredApprovals::default().with_mode(mode).decide(
+                    &request,
+                    &serde_json::json!({"peer":"fixture"}),
+                    &cancellation,
+                ),
+                ApprovalDecision::Deny,
+                "{mode:?} must not implicitly grant peer communication"
+            );
+        }
+
+        let granted = ConfiguredApprovals::default()
+            .with_peer_tools(BTreeSet::from(["send_peer_message".to_owned()]));
+        assert_eq!(
+            granted.decide(
+                &request,
+                &serde_json::json!({"peer":"fixture"}),
+                &cancellation,
+            ),
+            ApprovalDecision::AllowOnce
+        );
+        assert_eq!(
+            granted.decide(
+                &ApprovalRequest {
+                    tool: "share_peer_file".to_owned(),
+                    ..request.clone()
+                },
+                &serde_json::json!({"peer":"fixture"}),
+                &cancellation,
+            ),
+            ApprovalDecision::Deny
+        );
+        assert_eq!(
+            granted.decide(
+                &ApprovalRequest {
+                    risk: RiskClass::NetworkAccess,
+                    ..request
+                },
+                &serde_json::json!({}),
+                &cancellation,
+            ),
+            ApprovalDecision::Deny
+        );
+    }
+
+    #[test]
+    fn peer_tool_grant_executes_in_auto_and_negotiate_but_not_plan() {
+        let mut host = ToolHost::default();
+        host.register(
+            descriptor(RiskClass::PeerCommunication),
+            Arc::new(FixtureHandler),
+        )
+        .expect("registration succeeds");
+        let approvals =
+            ConfiguredApprovals::default().with_peer_tools(BTreeSet::from(["fixture".to_owned()]));
+        let cancellation = CancellationToken::default();
+
+        for mode in [AgentMode::Auto, AgentMode::Negotiate] {
+            let output = host
+                .call(
+                    "fixture",
+                    &serde_json::json!({"peer":"fixture"}),
+                    mode,
+                    &approvals,
+                    &cancellation,
+                )
+                .expect("exact peer tool grant executes");
+            assert_eq!(output.text, "called");
+        }
+
+        let denied = host
+            .call(
+                "fixture",
+                &serde_json::json!({"peer":"fixture"}),
+                AgentMode::Plan,
+                &approvals,
+                &cancellation,
+            )
+            .expect_err("plan mode remains non-executing");
+        assert_eq!(denied.kind, ToolCallErrorKind::Denied);
+    }
+
+    #[test]
+    fn peer_communication_never_auto_executes_without_a_grant() {
+        let mut host = ToolHost::default();
+        host.register(
+            descriptor(RiskClass::PeerCommunication),
+            Arc::new(FixtureHandler),
+        )
+        .expect("registration succeeds");
+
+        let denied = host
+            .call(
+                "fixture",
+                &serde_json::json!({"peer":"fixture"}),
+                AgentMode::Auto,
+                &ConfiguredApprovals::default().with_mode(ApprovalMode::FullAccess),
+                &CancellationToken::default(),
+            )
+            .expect_err("full access alone cannot grant peer communication");
+        assert_eq!(denied.kind, ToolCallErrorKind::Denied);
+    }
+
+    #[test]
     fn read_only_host_excludes_every_escalating_capability() {
         let mut host = ToolHost::default();
         for (name, risk) in [
@@ -889,6 +1060,7 @@ mod tests {
             ("write", RiskClass::WriteWorkspace),
             ("network", RiskClass::NetworkAccess),
             ("process", RiskClass::ProcessExecution),
+            ("peer", RiskClass::PeerCommunication),
         ] {
             host.register(
                 ToolDescriptor {

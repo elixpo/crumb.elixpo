@@ -184,6 +184,74 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "move a session to recoverable trash",
     },
     SlashCommand {
+        usage: "/instance",
+        description: "show this workspace's stable Crumb identity",
+    },
+    SlashCommand {
+        usage: "/instance rename ",
+        description: "rename this Crumb instance without changing its identity",
+    },
+    SlashCommand {
+        usage: "/peers",
+        description: "list active local Crumb agents",
+    },
+    SlashCommand {
+        usage: "/peer",
+        description: "show local agent handoff help",
+    },
+    SlashCommand {
+        usage: "/peer status",
+        description: "show this instance and active local peers",
+    },
+    SlashCommand {
+        usage: "/peer inbox",
+        description: "list pending peer deliveries without opening them",
+    },
+    SlashCommand {
+        usage: "/peer tasks",
+        description: "list durable redacted peer task state",
+    },
+    SlashCommand {
+        usage: "/peer task ",
+        description: "inspect one durable redacted peer task",
+    },
+    SlashCommand {
+        usage: "/peer inspect ",
+        description: "safely inspect one pending peer delivery",
+    },
+    SlashCommand {
+        usage: "/peer accept ",
+        description: "run one pending delivery in an isolated peer turn",
+    },
+    SlashCommand {
+        usage: "/peer reject ",
+        description: "reject one pending delivery without invoking a model",
+    },
+    SlashCommand {
+        usage: "/peer responses",
+        description: "list correlated peer responses without opening them",
+    },
+    SlashCommand {
+        usage: "/peer ack ",
+        description: "acknowledge one peer response without opening it",
+    },
+    SlashCommand {
+        usage: "/peer file",
+        description: "show verified peer file quarantine help",
+    },
+    SlashCommand {
+        usage: "/peer file fetch ",
+        description: "verify one pending file part into quarantine",
+    },
+    SlashCommand {
+        usage: "/peer file import ",
+        description: "import one fetched peer file into a new workspace path",
+    },
+    SlashCommand {
+        usage: "/peer file discard ",
+        description: "discard one exact fetched peer file and receipt",
+    },
+    SlashCommand {
         usage: "/review",
         description: "review Crumb-owned edits",
     },
@@ -745,6 +813,14 @@ mod tests {
         assert_eq!(
             classify_input("/skill search review"),
             InputEvent::BuiltIn(BuiltInCommand::Reserved("/skill search review".to_owned()))
+        );
+        assert_eq!(
+            classify_input("/peer status"),
+            InputEvent::BuiltIn(BuiltInCommand::Reserved("/peer status".to_owned()))
+        );
+        assert_eq!(
+            classify_input("/peers"),
+            InputEvent::BuiltIn(BuiltInCommand::Reserved("/peers".to_owned()))
         );
         assert_eq!(
             classify_input("?"),

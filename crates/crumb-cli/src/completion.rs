@@ -656,6 +656,56 @@ mod tests {
     }
 
     #[test]
+    fn peer_completion_exposes_inbox_and_nested_file_actions() {
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
+
+        let nested = completer.complete("/peer ", 6);
+
+        for command in [
+            "/peer status",
+            "/peer inbox",
+            "/peer tasks",
+            "/peer task ",
+            "/peer inspect ",
+            "/peer file",
+            "/peer file fetch ",
+            "/peer file import ",
+            "/peer file discard ",
+        ] {
+            assert!(
+                nested
+                    .suggestions()
+                    .iter()
+                    .any(|candidate| candidate.value == command),
+                "missing nested peer suggestion for {command}"
+            );
+        }
+
+        let files = completer.complete("/peer file ", 11);
+        for command in [
+            "/peer file fetch ",
+            "/peer file import ",
+            "/peer file discard ",
+        ] {
+            assert!(
+                files
+                    .suggestions()
+                    .iter()
+                    .any(|candidate| candidate.value == command),
+                "missing nested peer file suggestion for {command}"
+            );
+        }
+
+        let backspaced = completer.complete("/peer file im", 13);
+        assert!(
+            backspaced
+                .suggestions()
+                .iter()
+                .any(|candidate| candidate.value == "/peer file import ")
+        );
+    }
+
+    #[test]
     fn skill_completion_exposes_protocol_operations_after_backspacing() {
         let mut completer = CrumbCompleter::new(CompletionWorkspace::new(PathBuf::from(".")));
 

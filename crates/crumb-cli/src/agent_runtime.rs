@@ -1,12 +1,15 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use crumb_a2a_exchanges::{ExchangeDirection, ExchangeRecord, ExchangeState};
+use crumb_a2a_inbound::{ClaimedInbound, InboundCoordinator};
+use crumb_a2a_runtime::{A2aRuntime, ReceivedDelivery, RuntimeOptions};
 use crumb_agent::config::SkillConfig;
 use crumb_agent::session::TurnStatus;
 use crumb_agent::{
@@ -25,10 +28,12 @@ use crumb_harness_dsh::{
     HarnessActivity, HarnessEnvironment, HarnessIdentity, HarnessLaunch, HarnessSupervisor,
     Notification, RunResult, SupervisorLimits,
 };
+use crumb_instance::InstanceStore;
 use crumb_llm::ImageInput;
 use crumb_memory::{MemorySet, RetrievalPolicy};
 use crumb_pollinations::{PollinationsConfig, PollinationsProvider};
 use crumb_profile::{ProfileDocument, ProfileSelectionStore, ProfileStore};
+use crumb_tools::register_current_time_tool;
 use sha2::{Digest, Sha256};
 
 use crate::provider_projection::project_provider;
@@ -87,6 +92,7 @@ fn configured_approvals(config: &AgentConfig) -> ConfiguredApprovals {
         .with_mode(config.permissions.mode)
         .with_workspace_tools(config.permissions.allow_workspace_tools.clone())
         .with_process_tools(config.permissions.allow_execution_tools.clone())
+        .with_peer_tools(config.permissions.allow_peer_tools.clone())
         .with_mcp_tools(config.permissions.allow_mcp_tools.clone())
 }
 
@@ -224,6 +230,65 @@ pub struct AgentTurnTask {
     worker: JoinHandle<TurnThreadResult>,
 }
 
+/// Background, explicitly accepted inbound A2A turn.
+///
+/// This task never owns or mutates the foreground [`AgentRuntime`]. Its event
+/// channel omits peer text, response deltas, tool arguments/output, paths, and
+/// token accounting by construction.
+pub struct PeerTurnTask {
+    activities: Receiver<HarnessActivity>,
+    cancellation: CancellationToken,
+    worker: JoinHandle<PeerTurnResult>,
+    remote_instance_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeerTurnStatus {
+    Completed,
+    RetryableFailure,
+    RecoveryRequired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerTurnResult {
+    pub status: PeerTurnStatus,
+    pub remote_instance_id: String,
+}
+
+impl PeerTurnTask {
+    pub fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<HarnessActivity, RecvTimeoutError> {
+        self.activities.recv_timeout(timeout)
+    }
+
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.worker.is_finished()
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    #[must_use]
+    pub fn remote_instance_id(&self) -> &str {
+        &self.remote_instance_id
+    }
+
+    /// Rejoins the isolated worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the worker panicked.
+    pub fn finish(self) -> Result<PeerTurnResult> {
+        self.worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("isolated peer turn worker panicked"))
+    }
+}
+
 impl AgentTurnTask {
     /// Waits for one redacted activity state without blocking indefinitely.
     ///
@@ -294,6 +359,118 @@ pub struct AgentRuntime {
     warm_session_states: VecDeque<WarmSessionState>,
     review_notes: Vec<ReviewNote>,
     review_note_bytes: usize,
+    peer: Option<PeerRuntimeState>,
+}
+
+struct PeerRuntimeState {
+    workspace: PathBuf,
+    runtime: A2aRuntime,
+}
+
+/// Public, non-secret identity for one active local peer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerAgentSummary {
+    pub instance_id: String,
+    pub name: String,
+    pub protocol_version: String,
+}
+
+/// Content-free summary of one pending peer delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerInboxSummary {
+    pub delivery_id: String,
+    pub sender_instance_id: String,
+    pub enqueued_at_ms: u64,
+    pub part_count: usize,
+    pub artifact_count: usize,
+}
+
+/// Content-free summary of one pending response from a peer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerResponseSummary {
+    pub delivery_id: String,
+    pub sender_instance_id: String,
+    pub in_reply_to_delivery_id: String,
+    pub enqueued_at_ms: u64,
+}
+
+/// Content-free durable A2A exchange for terminal status views.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerTaskSummary {
+    pub delivery_id: String,
+    pub direction: &'static str,
+    pub state: &'static str,
+    pub peer_instance_id: String,
+    pub peer_display_name: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub request_part_count: u32,
+    pub request_artifact_count: u32,
+    pub correlated_delivery_id: Option<String>,
+    pub response_part_count: Option<u32>,
+    pub response_artifact_count: Option<u32>,
+    pub request_digest: String,
+    pub response_digest: Option<String>,
+    pub retry_pending: bool,
+}
+
+/// Verified, receiver-owned projection of one quarantined peer file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerQuarantinedFile {
+    pub delivery_id: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub relative_path: PathBuf,
+}
+
+/// Receiver-approved import result with no transport or absolute paths.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerImportedFile {
+    pub relative_destination: PathBuf,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+/// Content-free result of discarding one exact quarantine receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerDiscardedFile {
+    pub delivery_id: String,
+    pub part_index: usize,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+/// Safe, URL-free projection of one peer-provided message part.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PeerInspectionPart {
+    Text(String),
+    Structured(String),
+    File {
+        filename: String,
+        media_type: String,
+        size_bytes: Option<u64>,
+        digest: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeerInspectionKind {
+    Request,
+    Response,
+}
+
+/// Read-only projection of a pending peer delivery.
+///
+/// File transport URLs and bus paths are deliberately not representable here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerDeliveryInspection {
+    pub delivery_id: String,
+    pub sender_instance_id: String,
+    pub enqueued_at_ms: u64,
+    pub kind: PeerInspectionKind,
+    pub in_reply_to_delivery_id: Option<String>,
+    pub response_state: Option<String>,
+    pub parts: Vec<PeerInspectionPart>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -510,7 +687,419 @@ impl AgentRuntime {
             warm_session_states: VecDeque::with_capacity(MAX_WARM_SESSION_STATES),
             review_notes: Vec::new(),
             review_note_bytes: 0,
+            peer: None,
         })
+    }
+
+    /// Starts or reuses this process's local A2A lease for `workspace`.
+    ///
+    /// A workspace switch starts the replacement before dropping the previous
+    /// lease. The absolute workspace path remains process-local.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workspace, stable identity, bus root, or
+    /// process registration is unavailable.
+    pub fn initialize_peer_runtime(&mut self, workspace: &Path, bus_root: &Path) -> Result<()> {
+        let workspace = std::fs::canonicalize(workspace)
+            .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
+        let instance = InstanceStore::for_workspace(&workspace)
+            .load_or_create()
+            .context("Crumb instance identity could not be initialized")?;
+        let same_workspace = self
+            .peer
+            .as_ref()
+            .is_some_and(|peer| peer.workspace == workspace);
+        if same_workspace
+            && self.peer.as_ref().is_some_and(|peer| {
+                peer.runtime.own_peer().is_ok_and(|registered| {
+                    registered.instance_id == instance.instance_id
+                        && registered.name == instance.name
+                })
+            })
+        {
+            return Ok(());
+        }
+        if same_workspace && let Some(previous) = self.peer.take() {
+            previous.runtime.shutdown()?;
+        }
+        let runtime =
+            A2aRuntime::start(bus_root, &workspace, &instance, RuntimeOptions::default())?;
+        self.peer = Some(PeerRuntimeState { workspace, runtime });
+        Ok(())
+    }
+
+    /// Lists active local peers without exposing endpoints or process data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the local peer runtime is unavailable or its
+    /// bounded registry cannot be read.
+    pub fn peer_agents(&self) -> Result<Vec<PeerAgentSummary>> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        Ok(peer
+            .runtime
+            .list_peers()?
+            .into_iter()
+            .map(|entry| PeerAgentSummary {
+                instance_id: entry.instance_id,
+                name: entry.name,
+                protocol_version: entry.protocol_version,
+            })
+            .collect())
+    }
+
+    /// Lists pending peer deliveries without reading their payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the local peer runtime is unavailable or its
+    /// bounded inbox cannot be read safely.
+    pub fn peer_inbox(&self) -> Result<Vec<PeerInboxSummary>> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        Ok(peer
+            .runtime
+            .list_pending()?
+            .into_iter()
+            .map(|delivery| PeerInboxSummary {
+                delivery_id: delivery.delivery_id,
+                sender_instance_id: delivery.sender_instance_id,
+                enqueued_at_ms: delivery.enqueued_at_ms,
+                part_count: delivery.part_count,
+                artifact_count: delivery.artifact_count,
+            })
+            .collect())
+    }
+
+    /// Lists correlated peer responses without opening their payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the local runtime or bounded inbox is unavailable.
+    pub fn peer_responses(&self) -> Result<Vec<PeerResponseSummary>> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        Ok(peer
+            .runtime
+            .list_deliveries()?
+            .into_iter()
+            .filter_map(|delivery| {
+                delivery
+                    .in_reply_to_delivery_id
+                    .map(|in_reply_to_delivery_id| PeerResponseSummary {
+                        delivery_id: delivery.delivery_id,
+                        sender_instance_id: delivery.sender_instance_id,
+                        in_reply_to_delivery_id,
+                        enqueued_at_ms: delivery.enqueued_at_ms,
+                    })
+            })
+            .collect())
+    }
+
+    /// Lists durable, content-free peer task state across process restarts.
+    ///
+    /// Live registry names are presentation-only. A stable instance ID is
+    /// used when the peer is offline.
+    pub fn peer_tasks(&self) -> Result<Vec<PeerTaskSummary>> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        let live = peer
+            .runtime
+            .list_peers()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| (entry.instance_id, entry.name))
+            .collect::<BTreeMap<_, _>>();
+        let pending = peer
+            .runtime
+            .list_pending()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|delivery| delivery.delivery_id)
+            .collect::<BTreeSet<_>>();
+        Ok(peer
+            .runtime
+            .list_exchanges()?
+            .into_iter()
+            .map(|record| project_peer_task(record, &live, &pending))
+            .collect())
+    }
+
+    /// Loads one exact durable, content-free peer task.
+    pub fn peer_task(&self, delivery_id: &str) -> Result<PeerTaskSummary> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        let live = peer
+            .runtime
+            .list_peers()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| (entry.instance_id, entry.name))
+            .collect::<BTreeMap<_, _>>();
+        let pending = peer
+            .runtime
+            .list_pending()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|delivery| delivery.delivery_id)
+            .collect::<BTreeSet<_>>();
+        Ok(project_peer_task(
+            peer.runtime.exchange(delivery_id)?,
+            &live,
+            &pending,
+        ))
+    }
+
+    /// Acknowledges one exact correlated response without exposing its body.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown identifier or a request delivery.
+    pub fn acknowledge_peer_response(&self, delivery_id: &str) -> Result<String> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        peer.runtime.consume_response(delivery_id)
+    }
+
+    /// Inspects one pending peer delivery without claiming or moving it.
+    ///
+    /// The projection omits transport URLs and paths. File parts expose only
+    /// bounded display metadata supplied by the validated A2A envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime is unavailable or the delivery is
+    /// unknown, malformed, misdirected, or unsafe to inspect.
+    pub fn inspect_peer_delivery(&self, delivery_id: &str) -> Result<PeerDeliveryInspection> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        match peer.runtime.inspect_delivery(delivery_id)? {
+            ReceivedDelivery::Request(received) => Ok(PeerDeliveryInspection {
+                delivery_id: received.delivery_id,
+                sender_instance_id: received.sender_instance_id,
+                enqueued_at_ms: received.enqueued_at_ms,
+                kind: PeerInspectionKind::Request,
+                in_reply_to_delivery_id: None,
+                response_state: None,
+                parts: project_peer_parts(received.request.message.parts),
+            }),
+            ReceivedDelivery::Response(received) => {
+                let mut parts = Vec::new();
+                let mut response_state = None;
+                if let Some(message) = received.response.message {
+                    parts.extend(project_peer_parts(message.parts));
+                }
+                if let Some(task) = received.response.task {
+                    response_state = Some(peer_task_state_label(task.status.state).to_owned());
+                    if let Some(message) = task.status.message {
+                        parts.extend(project_peer_parts(message.parts));
+                    }
+                    for artifact in task.artifacts {
+                        parts.extend(project_peer_parts(artifact.parts));
+                    }
+                }
+                Ok(PeerDeliveryInspection {
+                    delivery_id: received.delivery_id,
+                    sender_instance_id: received.sender_instance_id,
+                    enqueued_at_ms: received.enqueued_at_ms,
+                    kind: PeerInspectionKind::Response,
+                    in_reply_to_delivery_id: Some(received.in_reply_to_delivery_id),
+                    response_state,
+                    parts,
+                })
+            }
+        }
+    }
+
+    /// Verifies one exact pending peer file into receiver-owned quarantine.
+    ///
+    /// The delivery remains pending and unacknowledged, and this method does
+    /// not register any tool capable of reading the quarantined bytes.
+    pub fn quarantine_peer_file(
+        &self,
+        delivery_id: &str,
+        part_index: usize,
+    ) -> Result<PeerQuarantinedFile> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        let artifact = peer.runtime.quarantine_artifact(delivery_id, part_index)?;
+        Ok(PeerQuarantinedFile {
+            delivery_id: delivery_id.to_owned(),
+            sha256: artifact.sha256,
+            size_bytes: artifact.size_bytes,
+            relative_path: artifact.relative_path,
+        })
+    }
+
+    /// Imports a previously fetched peer file into one safe relative workspace
+    /// destination without exposing the operation as a model tool.
+    pub fn import_peer_file(
+        &self,
+        delivery_id: &str,
+        part_index: usize,
+        relative_destination: &Path,
+    ) -> Result<PeerImportedFile> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        let imported = peer.runtime.import_quarantined_artifact(
+            delivery_id,
+            part_index,
+            relative_destination,
+        )?;
+        Ok(PeerImportedFile {
+            relative_destination: imported.relative_destination,
+            sha256: imported.sha256,
+            size_bytes: imported.size_bytes,
+        })
+    }
+
+    /// Discards one exact fetched peer file and durable receipt without
+    /// changing its original delivery or invoking a model.
+    pub fn discard_peer_file(
+        &self,
+        delivery_id: &str,
+        part_index: usize,
+    ) -> Result<PeerDiscardedFile> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        let discarded = peer
+            .runtime
+            .discard_quarantined_artifact(delivery_id, part_index)?;
+        Ok(PeerDiscardedFile {
+            delivery_id: discarded.delivery_id,
+            part_index: discarded.part_index,
+            sha256: discarded.sha256,
+            size_bytes: discarded.size_bytes,
+        })
+    }
+
+    /// Explicitly rejects one exact pending inbound request without invoking a
+    /// model. The protocol rejection is durably queued before the request is
+    /// acknowledged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime is unavailable, the identifier is not
+    /// exactly pending, or transport/ledger reconciliation fails.
+    pub fn reject_peer_delivery(&self, workspace: &Path, delivery_id: &str) -> Result<String> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        let coordinator = InboundCoordinator::new(peer.runtime.clone(), workspace);
+        let (claimed, _) = coordinator.claim(delivery_id)?;
+        let remote_instance_id = claimed.sender_instance_id().to_owned();
+        if coordinator.reject(&claimed).is_err()
+            && coordinator.reconcile_rejected(delivery_id).is_err()
+        {
+            let _ = coordinator.release_retryable(&claimed);
+            bail!("peer rejection could not be completed safely");
+        }
+        Ok(remote_instance_id)
+    }
+
+    /// Claims and runs one exact inbound request in a fresh native peer turn.
+    ///
+    /// The worker owns a separate digest-only session journal and conversation;
+    /// it cannot update the foreground session, conversation, token counters,
+    /// memory, profile, skills, images, or selected context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid capacity, unavailable transport, an exact
+    /// claim failure, or worker creation failure. Once started, retryable model
+    /// failures are returned through [`PeerTurnResult`] after releasing the
+    /// delivery back to the pending queue.
+    pub fn spawn_peer_turn(
+        &self,
+        delivery_id: &str,
+        config: AgentConfig,
+        workspace: &Path,
+        activity_capacity: usize,
+    ) -> Result<PeerTurnTask> {
+        if activity_capacity == 0 {
+            bail!("peer activity channel capacity must be positive");
+        }
+        let workspace = std::fs::canonicalize(workspace)
+            .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
+        let peer = self
+            .peer
+            .as_ref()
+            .context("local A2A runtime is unavailable")?;
+        let coordinator = InboundCoordinator::new(peer.runtime.clone(), &workspace);
+        let (claimed, _) = coordinator.claim(delivery_id)?;
+        let remote_instance_id = claimed.sender_instance_id().to_owned();
+        let task_remote_instance_id = remote_instance_id.clone();
+        let (activity_sender, activities) = sync_channel(activity_capacity);
+        let cancellation = CancellationToken::default();
+        let worker_cancellation = cancellation.clone();
+        let cancellation_slot = Arc::clone(&self.active_cancellation);
+        let worker_coordinator = coordinator.clone();
+        let worker_claimed = claimed.clone();
+        let worker = match thread::Builder::new()
+            .name("crumb-peer-turn".to_owned())
+            .spawn(move || {
+                let Ok(_active) =
+                    ActiveCancellation::new(&cancellation_slot, worker_cancellation.clone())
+                else {
+                    let _ = worker_coordinator.release_retryable(&worker_claimed);
+                    return PeerTurnResult {
+                        status: PeerTurnStatus::RetryableFailure,
+                        remote_instance_id: task_remote_instance_id,
+                    };
+                };
+                run_claimed_peer_turn(
+                    &worker_coordinator,
+                    &worker_claimed,
+                    &config,
+                    &workspace,
+                    &worker_cancellation,
+                    activity_sender,
+                )
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                coordinator.release_retryable(&claimed).with_context(
+                    || "failed to release inbound request after worker creation failed",
+                )?;
+                return Err(error).context("failed to start isolated peer turn worker");
+            }
+        };
+        Ok(PeerTurnTask {
+            activities,
+            cancellation,
+            worker,
+            remote_instance_id,
+        })
+    }
+
+    fn peer_runtime_for_workspace(&self, workspace: &Path) -> Option<A2aRuntime> {
+        self.peer
+            .as_ref()
+            .filter(|peer| workspace.starts_with(&peer.workspace))
+            .map(|peer| peer.runtime.clone())
     }
 
     /// Queues bounded review feedback for the next agent turn only.
@@ -882,6 +1471,7 @@ impl AgentRuntime {
             &workspace,
             config,
             crate::configured_pollinations_runtime_key(config),
+            self.peer_runtime_for_workspace(&workspace),
         )?;
         let configured = configured_approvals(config);
         let approvals: Arc<dyn ApprovalBroker> = match interaction.interactive {
@@ -1350,6 +1940,285 @@ impl AgentRuntime {
         self.supervisor_limits = None;
         Ok(())
     }
+}
+
+struct PeerEventBridge {
+    sender: SyncSender<HarnessActivity>,
+}
+
+impl EventSink for PeerEventBridge {
+    fn emit(&mut self, event: HarnessEvent) {
+        let activity = match event {
+            HarnessEvent::TurnStarted => Some(HarnessActivity::RequestAccepted),
+            HarnessEvent::ToolRequested { name, .. } => {
+                Some(HarnessActivity::ToolStarted { name, detail: None })
+            }
+            HarnessEvent::ToolFinished { name, success, .. } => {
+                Some(HarnessActivity::ToolFinished { name, success })
+            }
+            // Peer text, response deltas, tool arguments/output, progress
+            // labels, paths, edits, usage, and completion bodies stay inside
+            // the isolated worker.
+            HarnessEvent::TextDelta(_)
+            | HarnessEvent::ToolProgress { .. }
+            | HarnessEvent::ToolOutput { .. }
+            | HarnessEvent::FileChanged { .. }
+            | HarnessEvent::TurnFinished
+            | HarnessEvent::Usage(_) => None,
+        };
+        if let Some(activity) = activity {
+            let _ = self.sender.send(activity);
+        }
+    }
+}
+
+fn run_claimed_peer_turn(
+    coordinator: &InboundCoordinator,
+    claimed: &ClaimedInbound,
+    config: &AgentConfig,
+    workspace: &Path,
+    cancellation: &CancellationToken,
+    activity_sender: SyncSender<HarnessActivity>,
+) -> PeerTurnResult {
+    let remote_instance_id = claimed.sender_instance_id().to_owned();
+    if coordinator.mark_running(claimed).is_err() {
+        let _ = coordinator.release_retryable(claimed);
+        return PeerTurnResult {
+            status: PeerTurnStatus::RetryableFailure,
+            remote_instance_id,
+        };
+    }
+
+    let response =
+        execute_isolated_peer_turn(claimed, config, workspace, cancellation, activity_sender);
+    let status = match response {
+        Ok(output) => {
+            if coordinator.complete(claimed, &output).is_ok()
+                || coordinator
+                    .reconcile_completed(claimed.delivery_id())
+                    .is_ok()
+            {
+                PeerTurnStatus::Completed
+            } else if coordinator.release_retryable(claimed).is_ok() {
+                PeerTurnStatus::RetryableFailure
+            } else {
+                PeerTurnStatus::RecoveryRequired
+            }
+        }
+        Err(_) => {
+            if coordinator.release_retryable(claimed).is_ok() {
+                PeerTurnStatus::RetryableFailure
+            } else {
+                PeerTurnStatus::RecoveryRequired
+            }
+        }
+    };
+    PeerTurnResult {
+        status,
+        remote_instance_id,
+    }
+}
+
+fn execute_isolated_peer_turn(
+    claimed: &ClaimedInbound,
+    config: &AgentConfig,
+    workspace: &Path,
+    cancellation: &CancellationToken,
+    activity_sender: SyncSender<HarnessActivity>,
+) -> Result<String> {
+    config.validate()?;
+    let route = peer_router_route(config)
+        .context("agent config has no peer router model")?
+        .clone();
+    if route.provider != "pollinations" {
+        bail!("isolated peer turns require the Pollinations provider");
+    }
+    let provider_config = config
+        .providers
+        .get(&route.provider)
+        .context("native Harness provider is not configured")?;
+    let credential = provider_config
+        .credential
+        .as_ref()
+        .map(crate::provider_projection::resolve_credential_secret)
+        .transpose()?
+        .map_or_else(crate::pollinations_runtime_key, |secret| {
+            Some(secret.expose().to_owned())
+        })
+        .context("Pollinations credential is unavailable")?;
+    let base_url = provider_config
+        .base_url
+        .trim_end_matches('/')
+        .strip_suffix("/v1")
+        .unwrap_or(provider_config.base_url.trim_end_matches('/'));
+    let provider: Arc<dyn crumb_llm::LlmProvider> = Arc::new(PollinationsProvider::new(
+        PollinationsConfig::new(credential)?.with_base_url(base_url)?,
+    )?);
+
+    let mut tools = ToolHost::default();
+    register_current_time_tool(&mut tools)?;
+    let approvals: Arc<dyn ApprovalBroker> = Arc::new(configured_approvals(config));
+    let harness = NativeHarness::new(provider, tools, approvals, native_harness_limits(config)?);
+
+    let session_id = peer_session_id(claimed.delivery_id())?;
+    let journal = SessionJournal::open(
+        &workspace.join(".crumb").join("a2a").join("sessions"),
+        &session_id,
+    )?;
+    let mut session = AgentSession::start(
+        session_id,
+        AgentMode::Auto,
+        workspace.to_path_buf(),
+        journal,
+    )?;
+    session.record_model_selection(
+        route.provider.clone(),
+        route.model.clone(),
+        config.reasoning_effort_for(&route).map(str::to_owned),
+    )?;
+    let turn = HarnessTurn {
+        model: route.model.clone(),
+        user_message: claimed.projection().as_str().to_owned(),
+        images: Vec::new(),
+        persona: None,
+        static_context: Vec::new(),
+        selected_skills: Vec::new(),
+        trusted_context: Vec::new(),
+        max_output_tokens: configured_max_output_tokens(config, &route),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to start isolated peer runtime")?;
+    let mut events = PeerEventBridge {
+        sender: activity_sender,
+    };
+    let outcome = runtime
+        .block_on(harness.run_isolated_peer_turn(&mut session, turn, cancellation, &mut events))
+        .map_err(anyhow::Error::new)?;
+    Ok(outcome.text)
+}
+
+fn peer_router_route(config: &AgentConfig) -> Option<&crumb_agent::ModelRoute> {
+    config
+        .active_model_pack
+        .as_ref()
+        .and_then(|id| config.model_packs.get(id))
+        .map(|pack| &pack.router)
+        .or_else(|| {
+            config
+                .models
+                .get(&Modality::Text)
+                .and_then(|routes| routes.first())
+        })
+}
+
+fn peer_session_id(delivery_id: &str) -> Result<SessionId> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_millis();
+    let digest = format!("{:x}", Sha256::digest(delivery_id.as_bytes()));
+    SessionId::new(format!("peer_{}_{}", &digest[..16], now))
+}
+
+fn project_peer_parts(parts: Vec<crumb_a2a::Part>) -> Vec<PeerInspectionPart> {
+    parts
+        .into_iter()
+        .map(|part| {
+            if let Some(text) = part.text {
+                return PeerInspectionPart::Text(text);
+            }
+            if let Some(data) = part.data {
+                return PeerInspectionPart::Structured(
+                    serde_json::to_string_pretty(&data)
+                        .unwrap_or_else(|_| "[invalid structured data]".to_owned()),
+                );
+            }
+            let metadata = part.metadata.as_ref();
+            let size_bytes = metadata
+                .and_then(|value| value.get("sizeBytes"))
+                .and_then(serde_json::Value::as_u64);
+            let digest = metadata
+                .and_then(|value| value.get("sha256"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(short_peer_digest);
+            PeerInspectionPart::File {
+                filename: part.filename.unwrap_or_else(|| "unnamed file".to_owned()),
+                media_type: part
+                    .media_type
+                    .unwrap_or_else(|| "application/octet-stream".to_owned()),
+                size_bytes,
+                digest,
+            }
+        })
+        .collect()
+}
+
+const fn peer_task_state_label(state: crumb_a2a::TaskState) -> &'static str {
+    match state {
+        crumb_a2a::TaskState::Unspecified => "unspecified",
+        crumb_a2a::TaskState::Submitted => "submitted",
+        crumb_a2a::TaskState::Working => "working",
+        crumb_a2a::TaskState::Completed => "completed",
+        crumb_a2a::TaskState::Failed => "failed",
+        crumb_a2a::TaskState::Canceled => "canceled",
+        crumb_a2a::TaskState::InputRequired => "input_required",
+        crumb_a2a::TaskState::Rejected => "rejected",
+        crumb_a2a::TaskState::AuthRequired => "auth_required",
+    }
+}
+
+fn project_peer_task(
+    record: ExchangeRecord,
+    live_names: &BTreeMap<String, String>,
+    pending: &BTreeSet<String>,
+) -> PeerTaskSummary {
+    let direction = match record.direction {
+        ExchangeDirection::Outbound => "outbound",
+        ExchangeDirection::Inbound => "inbound",
+    };
+    let state = match record.state {
+        ExchangeState::OutboundSent => "sent",
+        ExchangeState::OutboundResponseAvailable => "response available",
+        ExchangeState::OutboundAcknowledged => "acknowledged",
+        ExchangeState::InboundClaimed => "claimed",
+        ExchangeState::InboundRunning => "running",
+        ExchangeState::InboundCompleted => "completed",
+        ExchangeState::InboundRejected => "rejected",
+    };
+    let peer_display_name = live_names
+        .get(&record.peer_instance_id)
+        .cloned()
+        .unwrap_or_else(|| record.peer_instance_id.clone());
+    let retry_pending = record.direction == ExchangeDirection::Inbound
+        && pending.contains(&record.delivery_id)
+        && matches!(
+            record.state,
+            ExchangeState::InboundClaimed | ExchangeState::InboundRunning
+        );
+    PeerTaskSummary {
+        delivery_id: record.delivery_id,
+        direction,
+        state,
+        peer_instance_id: record.peer_instance_id,
+        peer_display_name,
+        created_at_ms: record.created_at_ms,
+        updated_at_ms: record.updated_at_ms,
+        request_part_count: record.request_part_count,
+        request_artifact_count: record.request_artifact_count,
+        correlated_delivery_id: record.correlated_delivery_id,
+        response_part_count: record.response_part_count,
+        response_artifact_count: record.response_artifact_count,
+        request_digest: record.request_digest,
+        response_digest: record.response_digest,
+        retry_pending,
+    }
+}
+
+fn short_peer_digest(value: &str) -> Option<String> {
+    (value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| format!("sha256:{}", value[..12].to_ascii_lowercase()))
 }
 
 fn select_request_route<'a>(
@@ -1995,11 +2864,14 @@ mod tests {
     use std::collections::BTreeMap;
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc::sync_channel;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crumb_a2a::{Message, Part, Role, SendMessageRequest};
+    use crumb_a2a_runtime::{A2aRuntime, RuntimeOptions};
     use crumb_agent::{
         AgentConfig, AgentMode, AgentSession, Modality, ModelPack, ModelRoute, SessionId,
-        SessionJournal, SkillConfig,
+        SessionJournal, SkillConfig, ToolHost,
     };
     use crumb_harness::{Conversation, EventSink, HarnessEvent};
     use crumb_harness_dsh::HarnessActivity;
@@ -2007,11 +2879,328 @@ mod tests {
     use crumb_profile::{ProfileDocument, ProfileReference, ProfileSelectionStore, ProfileStore};
 
     use super::{
-        AgentRuntime, NativeEventBridge, ResumeContinuity, SessionRuntimeKey, SessionRuntimeState,
-        apply_profile_effort, apply_profile_model, apply_profile_selection, apply_profile_skills,
-        attach_profile_context, attach_skill_context, load_enabled_skill_context,
-        load_request_images, request_needs_coder, select_request_route, validate_skill_path,
+        AgentRuntime, NativeEventBridge, PeerEventBridge, PeerInspectionKind, PeerInspectionPart,
+        ResumeContinuity, SessionRuntimeKey, SessionRuntimeState, apply_profile_effort,
+        apply_profile_model, apply_profile_selection, apply_profile_skills, attach_profile_context,
+        attach_skill_context, load_enabled_skill_context, load_request_images,
+        peer_task_state_label, request_needs_coder, select_request_route, short_peer_digest,
+        validate_skill_path,
     };
+
+    #[test]
+    fn peer_task_states_use_canonical_labels() {
+        use crumb_a2a::TaskState;
+
+        assert_eq!(peer_task_state_label(TaskState::Unspecified), "unspecified");
+        assert_eq!(peer_task_state_label(TaskState::Submitted), "submitted");
+        assert_eq!(peer_task_state_label(TaskState::Working), "working");
+        assert_eq!(peer_task_state_label(TaskState::Completed), "completed");
+        assert_eq!(peer_task_state_label(TaskState::Failed), "failed");
+        assert_eq!(peer_task_state_label(TaskState::Canceled), "canceled");
+        assert_eq!(
+            peer_task_state_label(TaskState::InputRequired),
+            "input_required"
+        );
+        assert_eq!(peer_task_state_label(TaskState::Rejected), "rejected");
+        assert_eq!(
+            peer_task_state_label(TaskState::AuthRequired),
+            "auth_required"
+        );
+    }
+
+    #[test]
+    fn peer_event_bridge_exposes_only_lifecycle_and_tool_names() {
+        let (sender, receiver) = sync_channel(8);
+        let mut bridge = PeerEventBridge { sender };
+        bridge.emit(HarnessEvent::TurnStarted);
+        bridge.emit(HarnessEvent::TextDelta("secret response".to_owned()));
+        bridge.emit(HarnessEvent::ToolRequested {
+            id: "call_1".to_owned(),
+            name: "read_file".to_owned(),
+            detail: Some("private/path".to_owned()),
+        });
+        bridge.emit(HarnessEvent::ToolOutput {
+            id: "call_1".to_owned(),
+            name: "read_file".to_owned(),
+            content: "secret file body".to_owned(),
+        });
+        bridge.emit(HarnessEvent::ToolFinished {
+            id: "call_1".to_owned(),
+            name: "read_file".to_owned(),
+            success: true,
+        });
+        drop(bridge);
+
+        assert_eq!(
+            receiver.into_iter().collect::<Vec<_>>(),
+            vec![
+                HarnessActivity::RequestAccepted,
+                HarnessActivity::ToolStarted {
+                    name: "read_file".to_owned(),
+                    detail: None,
+                },
+                HarnessActivity::ToolFinished {
+                    name: "read_file".to_owned(),
+                    success: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn peer_digest_projection_accepts_only_exact_sha256_hex() {
+        assert_eq!(
+            short_peer_digest(&"Ab".repeat(32)).as_deref(),
+            Some("sha256:abababababab")
+        );
+        assert_eq!(short_peer_digest("abc"), None);
+        assert_eq!(short_peer_digest(&"z".repeat(64)), None);
+    }
+
+    #[test]
+    fn peer_inspection_is_read_only_and_omits_file_transport_reference() {
+        let root = tempfile::tempdir().expect("temporary A2A root");
+        let bus = root.path().join("bus");
+        let receiver_workspace = root.path().join("receiver");
+        let sender_workspace = root.path().join("sender");
+        std::fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        std::fs::create_dir(&sender_workspace).expect("sender workspace");
+
+        let mut receiver = isolated_runtime();
+        receiver
+            .initialize_peer_runtime(&receiver_workspace, &bus)
+            .expect("receiver starts");
+        let sender_identity = crumb_instance::InstanceStore::for_workspace(&sender_workspace)
+            .load_or_create_named("Sender")
+            .expect("sender identity");
+        let sender = A2aRuntime::start(
+            &bus,
+            &sender_workspace,
+            &sender_identity,
+            RuntimeOptions::default(),
+        )
+        .expect("sender starts");
+        let receiver_id = receiver
+            .peer
+            .as_ref()
+            .expect("receiver runtime")
+            .runtime
+            .own_peer()
+            .expect("receiver entry")
+            .instance_id;
+        let mut file = Part::file(
+            "artifacts/0123456789abcdef/notes.txt",
+            "notes.txt",
+            "text/plain",
+        );
+        file.metadata = Some(serde_json::json!({
+            "sha256": "ab".repeat(32),
+            "sizeBytes": 42,
+        }));
+        let request = SendMessageRequest {
+            tenant: None,
+            message: Message {
+                message_id: "msg_0123456789abcdef".to_owned(),
+                context_id: None,
+                task_id: None,
+                role: Role::User,
+                parts: vec![Part::text("hello"), file],
+                metadata: None,
+                extensions: Vec::new(),
+                reference_task_ids: Vec::new(),
+            },
+            configuration: None,
+            metadata: None,
+        };
+        let receipt = sender
+            .enqueue(&receiver_id, &request)
+            .expect("delivery enqueued");
+
+        assert_eq!(receiver.peer_inbox().expect("first inbox").len(), 1);
+        let inspected = receiver
+            .inspect_peer_delivery(&receipt.delivery_id)
+            .expect("delivery inspected");
+        assert_eq!(inspected.parts.len(), 2);
+        assert_eq!(
+            inspected.parts[1],
+            PeerInspectionPart::File {
+                filename: "notes.txt".to_owned(),
+                media_type: "text/plain".to_owned(),
+                size_bytes: Some(42),
+                digest: Some("sha256:abababababab".to_owned()),
+            }
+        );
+        assert_eq!(receiver.peer_inbox().expect("still pending").len(), 1);
+        sender.shutdown().expect("sender stops");
+    }
+
+    #[test]
+    fn peer_file_quarantine_keeps_delivery_pending_and_agent_inaccessible() {
+        let root = tempfile::tempdir().expect("temporary A2A root");
+        let bus = root.path().join("bus");
+        let receiver_workspace = root.path().join("receiver");
+        let sender_workspace = root.path().join("sender");
+        std::fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        std::fs::create_dir(&sender_workspace).expect("sender workspace");
+        std::fs::write(sender_workspace.join("notes.txt"), b"peer file\n").expect("peer source");
+
+        let mut receiver = isolated_runtime();
+        receiver
+            .initialize_peer_runtime(&receiver_workspace, &bus)
+            .expect("receiver starts");
+        let sender_identity = crumb_instance::InstanceStore::for_workspace(&sender_workspace)
+            .load_or_create_named("Sender")
+            .expect("sender identity");
+        let sender = A2aRuntime::start(
+            &bus,
+            &sender_workspace,
+            &sender_identity,
+            RuntimeOptions::default(),
+        )
+        .expect("sender starts");
+        let receiver_id = receiver
+            .peer
+            .as_ref()
+            .expect("receiver runtime")
+            .runtime
+            .own_peer()
+            .expect("receiver entry")
+            .instance_id;
+        let staged = sender
+            .stage_artifact(Path::new("notes.txt"))
+            .expect("stage peer file");
+        let mut file = Part::file(staged.relative_url, staged.filename, "text/plain");
+        file.metadata = Some(serde_json::json!({
+            "sha256": staged.sha256,
+            "sizeBytes": staged.size_bytes,
+        }));
+        let request = SendMessageRequest {
+            tenant: None,
+            message: Message {
+                message_id: "msg_quarantine_fixture".to_owned(),
+                context_id: None,
+                task_id: None,
+                role: Role::User,
+                parts: vec![Part::text("take this"), file],
+                metadata: None,
+                extensions: Vec::new(),
+                reference_task_ids: Vec::new(),
+            },
+            configuration: None,
+            metadata: None,
+        };
+        let receipt = sender.enqueue(&receiver_id, &request).expect("enqueue");
+
+        let quarantined = receiver
+            .quarantine_peer_file(&receipt.delivery_id, 2)
+            .expect("quarantine peer file");
+        assert!(
+            quarantined
+                .relative_path
+                .starts_with(".crumb/a2a/quarantine")
+        );
+        assert_eq!(
+            std::fs::read(receiver_workspace.join(&quarantined.relative_path))
+                .expect("quarantined bytes"),
+            b"peer file\n"
+        );
+        assert_eq!(receiver.peer_inbox().expect("still pending").len(), 1);
+        assert_eq!(
+            ToolHost::default()
+                .isolated_peer_read_only()
+                .descriptor("read_file"),
+            None
+        );
+        let host = ToolHost::default();
+        assert!(host.descriptor("import_peer_file").is_none());
+        assert!(host.descriptor("discard_peer_file").is_none());
+        sender.shutdown().expect("sender stops");
+    }
+
+    #[test]
+    fn explicit_rejection_is_listed_and_acknowledged_as_a_response() {
+        let root = tempfile::tempdir().expect("temporary A2A root");
+        let bus = root.path().join("bus");
+        let receiver_workspace = root.path().join("receiver");
+        let sender_workspace = root.path().join("sender");
+        std::fs::create_dir(&receiver_workspace).expect("receiver workspace");
+        std::fs::create_dir(&sender_workspace).expect("sender workspace");
+
+        let mut receiver = isolated_runtime();
+        receiver
+            .initialize_peer_runtime(&receiver_workspace, &bus)
+            .expect("receiver starts");
+        let mut sender = isolated_runtime();
+        sender
+            .initialize_peer_runtime(&sender_workspace, &bus)
+            .expect("sender starts");
+        let receiver_id = receiver
+            .peer
+            .as_ref()
+            .expect("receiver runtime")
+            .runtime
+            .own_peer()
+            .expect("receiver entry")
+            .instance_id;
+        let request = SendMessageRequest {
+            tenant: None,
+            message: Message {
+                message_id: "msg_reject_01234567".to_owned(),
+                context_id: None,
+                task_id: None,
+                role: Role::User,
+                parts: vec![Part::text("do not execute this")],
+                metadata: None,
+                extensions: Vec::new(),
+                reference_task_ids: Vec::new(),
+            },
+            configuration: None,
+            metadata: None,
+        };
+        let receipt = sender
+            .peer
+            .as_ref()
+            .expect("sender runtime")
+            .runtime
+            .enqueue(&receiver_id, &request)
+            .expect("delivery enqueued");
+
+        let sender_id = receiver
+            .reject_peer_delivery(&receiver_workspace, &receipt.delivery_id)
+            .expect("delivery rejected");
+        assert_eq!(
+            sender_id,
+            sender
+                .peer
+                .as_ref()
+                .expect("sender runtime")
+                .runtime
+                .own_peer()
+                .expect("sender entry")
+                .instance_id
+        );
+        assert_eq!(receiver.peer_inbox().expect("receiver inbox"), Vec::new());
+        let responses = sender.peer_responses().expect("sender responses");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].in_reply_to_delivery_id, receipt.delivery_id);
+        let response_id = responses[0].delivery_id.clone();
+        let inspected = sender
+            .inspect_peer_delivery(&response_id)
+            .expect("response inspected without acknowledgement");
+        assert_eq!(inspected.kind, PeerInspectionKind::Response);
+        assert_eq!(inspected.response_state.as_deref(), Some("rejected"));
+        assert_eq!(sender.peer_responses().expect("still pending").len(), 1);
+        assert_eq!(
+            sender
+                .acknowledge_peer_response(&response_id)
+                .expect("response acknowledged"),
+            receiver_id
+        );
+        assert_eq!(
+            sender.peer_responses().expect("empty responses"),
+            Vec::new()
+        );
+    }
 
     fn route(model: &str) -> ModelRoute {
         ModelRoute {
@@ -2050,7 +3239,37 @@ mod tests {
             ),
             review_notes: Vec::new(),
             review_note_bytes: 0,
+            peer: None,
         }
+    }
+
+    #[test]
+    fn peer_runtime_refreshes_a_renamed_workspace_identity() {
+        let temporary = tempfile::TempDir::new().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace directory");
+        let store = crumb_instance::InstanceStore::for_workspace(&workspace);
+        store
+            .load_or_create_named("First Name")
+            .expect("initial identity");
+        let mut runtime = isolated_runtime();
+        let bus = temporary.path().join("bus");
+        runtime
+            .initialize_peer_runtime(&workspace, &bus)
+            .expect("initial peer runtime");
+
+        store.rename("Second Name").expect("rename identity");
+        runtime
+            .initialize_peer_runtime(&workspace, &bus)
+            .expect("refresh peer runtime");
+        let registered = runtime
+            .peer
+            .as_ref()
+            .expect("peer runtime")
+            .runtime
+            .own_peer()
+            .expect("own peer");
+        assert_eq!(registered.name, "Second Name");
     }
 
     #[test]
