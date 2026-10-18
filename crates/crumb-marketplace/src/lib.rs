@@ -341,6 +341,9 @@ impl Catalog {
     ///
     /// Returns an error for malformed, duplicate, unsafe, or unsupported metadata.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() || bytes.len() > MAX_CATALOG_BYTES {
+            bail!("marketplace catalog exceeds the size limit");
+        }
         let catalog: Self = serde_json::from_slice(bytes).context("invalid marketplace catalog")?;
         catalog.validate()?;
         Ok(catalog)

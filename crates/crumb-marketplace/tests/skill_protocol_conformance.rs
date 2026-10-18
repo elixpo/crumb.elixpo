@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crumb_marketplace::{
-    Artifact, Capability, Catalog, Compatibility, Disclosures, DiscoveryIndex,
+    Artifact, Capability, Catalog, Compatibility, Disclosures, DiscoveryIndex, MAX_CATALOG_BYTES,
     MAX_CATALOG_SEARCH_PAGE_SIZE, MAX_CATALOG_SEARCH_QUERY_BYTES, MAX_CATALOG_SEARCH_TERMS,
     MAX_DISCOVERY_INDEX_BYTES, MAX_PACKAGE_MANIFEST_BYTES, MarketplacePlatform, Package,
     PackageClass, PackageDependency, PackageKind, PackageReleaseRef, Publisher, PublisherIdentity,
@@ -118,6 +118,7 @@ fn plan_ids(catalog: &Catalog, root: &str) -> Vec<String> {
 
 #[test]
 fn manifests_and_discovery_indexes_enforce_public_bounds() {
+    assert!(Catalog::parse(&vec![b' '; MAX_CATALOG_BYTES + 1]).is_err());
     let catalog = parsed(&fixture_catalog(vec![package("bounded")]));
     let index = catalog.discovery_index().expect("build discovery index");
     let bytes = index.to_bytes().expect("serialize discovery index");
