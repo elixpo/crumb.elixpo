@@ -352,8 +352,9 @@ impl NativeHarness {
         let mut output_bytes = 0_usize;
         let mut retries = RequiredToolRetries::new(&definitions);
         let mut require_tool = initial_tool_requirement(&definitions, &turn.user_message);
-        let (mut successful_tool_evidence, mut grounding_retry_used, mut suppress_tools_once) =
-            (false, false, false);
+        let (mut successful_tool_evidence, mut grounding_retry_used) = (false, false);
+        let mut completeness_retry_used = false;
+        let mut suppress_tools_once = false;
 
         loop {
             if metrics.model_rounds == self.limits.max_model_rounds.get() {
@@ -374,18 +375,18 @@ impl NativeHarness {
             if round.calls.is_empty() {
                 match round.finish {
                     Some(FinishReason::Stop | FinishReason::Other(_)) => {
-                        if prepare_grounding_retry(
+                        if let Some((next_required, next_suppressed)) = prepare_response_retry(
                             &mut messages,
                             &round.text,
                             &turn.user_message,
                             successful_tool_evidence,
                             &mut grounding_retry_used,
+                            &mut completeness_retry_used,
                             &mut suppress_tools_once,
+                            &mut retries,
                         ) {
-                            continue;
-                        }
-                        if retries.prepare(&mut messages, &turn.user_message, &round.text) {
-                            require_tool = true;
+                            require_tool = next_required;
+                            suppress_tools_once = next_suppressed;
                             continue;
                         }
                         return Ok(finish_turn(round, turn, conversation, sink, usage, metrics));
@@ -875,6 +876,35 @@ fn initial_tool_requirement(definitions: &[crumb_llm::ToolDefinition], user_mess
         && user_requires_execution(user_message)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn prepare_response_retry(
+    messages: &mut Vec<ChatMessage>,
+    response: &str,
+    user_message: &str,
+    successful_tool_evidence: bool,
+    grounding_retry_used: &mut bool,
+    completeness_retry_used: &mut bool,
+    suppress_tools_once: &mut bool,
+    retries: &mut RequiredToolRetries,
+) -> Option<(bool, bool)> {
+    if prepare_grounding_retry(
+        messages,
+        response,
+        user_message,
+        successful_tool_evidence,
+        grounding_retry_used,
+        suppress_tools_once,
+    ) {
+        return Some((false, *suppress_tools_once));
+    }
+    if prepare_completeness_retry(messages, response, user_message, completeness_retry_used) {
+        return Some((true, false));
+    }
+    retries
+        .prepare(messages, user_message, response)
+        .then_some((true, false))
+}
+
 fn prepare_grounding_retry(
     messages: &mut Vec<ChatMessage>,
     response: &str,
@@ -959,11 +989,78 @@ fn user_requires_host_shell(user_message: &str) -> bool {
         "outside this workspace",
         "outside the repo",
         "outside this repo",
+        "authenticated via github",
+        "authenticated with github",
+        "github authentication",
+        "github auth status",
+        "logged in to github",
+        "logged into github",
         "find me the",
         "locate the",
     ]
     .iter()
     .any(|phrase| user_message.contains(phrase))
+}
+
+fn prepare_completeness_retry(
+    messages: &mut Vec<ChatMessage>,
+    response: &str,
+    user_message: &str,
+    retry_used: &mut bool,
+) -> bool {
+    if *retry_used || !user_requires_execution(user_message) {
+        return false;
+    }
+    let missing = missing_requested_checks(user_message, response);
+    if missing.is_empty() {
+        return false;
+    }
+    messages.push(ChatMessage::text(ChatRole::Assistant, response));
+    messages.push(ChatMessage::text(
+        ChatRole::System,
+        format!(
+            "The draft omitted requested result(s): {}. Use the available tool to verify every missing item, then give one concise answer covering all requested checks. Do not silently drop an item.",
+            missing.join(", ")
+        ),
+    ));
+    *retry_used = true;
+    true
+}
+
+fn missing_requested_checks(user_message: &str, response: &str) -> Vec<&'static str> {
+    let request = user_message.to_ascii_lowercase();
+    let response = response.to_ascii_lowercase();
+    let asks_github_auth = request.contains("github")
+        && [
+            "authenticat",
+            "logged in",
+            "logged into",
+            "login status",
+            "auth status",
+        ]
+        .iter()
+        .any(|term| request.contains(term));
+    let answers_github_auth = response.contains("github")
+        && [
+            "authenticat",
+            "logged in",
+            "logged into",
+            "not logged",
+            "not authenticat",
+            "credential",
+        ]
+        .iter()
+        .any(|term| response.contains(term));
+    let asks_branch = request.contains("branch");
+    let answers_branch = response.contains("branch");
+    let mut missing = Vec::new();
+    if asks_github_auth && !answers_github_auth {
+        missing.push("GitHub authentication status");
+    }
+    if asks_branch && !answers_branch {
+        missing.push("current Git branch");
+    }
+    missing
 }
 
 fn prepare_research_retry(
@@ -2021,9 +2118,33 @@ mod tests {
         assert!(super::user_requires_host_shell(
             "Can you see a folder named elixpo_projects in my home directory?"
         ));
+        assert!(super::user_requires_host_shell(
+            "check i am authenticated via github in this session and tell me which branch i am in"
+        ));
         assert!(!super::user_requires_host_shell(
             "Can you see a folder named src in this project?"
         ));
+    }
+
+    #[test]
+    fn github_and_branch_checks_cannot_silently_drop_half_the_request() {
+        let request = "check i am authenticated via github and tell me which branch i am in";
+
+        assert_eq!(
+            super::missing_requested_checks(request, "You are currently in the feat/agent branch."),
+            ["GitHub authentication status"]
+        );
+        assert_eq!(
+            super::missing_requested_checks(request, "GitHub CLI is authenticated as elixpo."),
+            ["current Git branch"]
+        );
+        assert_eq!(
+            super::missing_requested_checks(
+                request,
+                "GitHub CLI is authenticated as elixpo; the current branch is feat/agent."
+            ),
+            Vec::<&'static str>::new()
+        );
     }
 
     #[test]

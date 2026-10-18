@@ -869,7 +869,7 @@ impl AgentRuntime {
         self.session_tokens_estimate = self.session_tokens_estimate.saturating_add(turn_tokens);
         let reported_context = result.map_or(0, |result| result.context_tokens);
         self.context_tokens_estimate = if reported_context > 0 {
-            reported_context
+            self.context_tokens_estimate.max(reported_context)
         } else {
             self.context_tokens_estimate.saturating_add(estimated)
         };
@@ -1162,9 +1162,12 @@ fn select_request_route<'a>(
         .active_model_pack
         .as_ref()
         .and_then(|id| config.model_packs.get(id))
-        && request_needs_coder(request)
     {
-        return Some(&pack.coder);
+        return Some(if request_needs_coder(request) {
+            &pack.coder
+        } else {
+            &pack.router
+        });
     }
     config
         .models
@@ -1778,7 +1781,9 @@ mod tests {
             active_model_pack: Some("balanced".to_owned()),
             ..AgentConfig::default()
         };
-        config.models.insert(Modality::Text, vec![route("router")]);
+        config
+            .models
+            .insert(Modality::Text, vec![route("fallback")]);
         config.model_packs.insert(
             "balanced".to_owned(),
             ModelPack {
@@ -2058,6 +2063,26 @@ mod tests {
         let mut unmanaged = AgentRuntime::new().expect("runtime");
         unmanaged.record_token_estimate(&"x".repeat(400), None, 100, false);
         assert_eq!(unmanaged.token_usage(), (100, 100, 0));
+    }
+
+    #[test]
+    fn reported_context_never_moves_backwards_without_compaction() {
+        let mut runtime = AgentRuntime::new().expect("runtime");
+        runtime.context_tokens_estimate = 5_700;
+        let result = crumb_harness_dsh::RunResult {
+            session_id: "fixture".to_owned(),
+            final_response: "done".to_owned(),
+            finish_reason: Some("stop".to_owned()),
+            input_tokens: 4_300,
+            output_tokens: 100,
+            context_tokens: 4_400,
+            events: Vec::new(),
+            notifications: Vec::new(),
+        };
+
+        runtime.record_token_estimate("request", Some(&result), 64_000, false);
+
+        assert_eq!(runtime.token_usage().0, 5_700);
     }
 
     #[test]

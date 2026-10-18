@@ -5610,9 +5610,14 @@ fn apply_builtin_model_packs(config: &mut AgentConfig) {
         model: model.to_owned(),
         reasoning_effort: None,
     };
+    let balanced_router = if has_model("nova") {
+        "nova"
+    } else {
+        "qwen-coder"
+    };
     for (id, label, router, image) in [
         ("quick", "Quick Crumb", "nova-fast", "flux"),
-        ("balanced", "Balanced Crumb", "nova-fast", "klein"),
+        ("balanced", "Balanced Crumb", balanced_router, "klein"),
         ("deep", "Deep Crumb", "Circuit-Overtime/OreoLook", "klein"),
     ] {
         config
@@ -5630,7 +5635,7 @@ fn apply_builtin_model_packs(config: &mut AgentConfig) {
             });
     }
     if config.active_model_pack.is_none() {
-        config.active_model_pack = Some("quick".to_owned());
+        config.active_model_pack = Some("balanced".to_owned());
     }
 }
 
@@ -9891,7 +9896,7 @@ mod tests {
     };
     use crumb_agent::{
         AgentConfig, ApprovalMode, CredentialReference, HarnessConfig, OptimizerConfig,
-        ProviderHeader, ProviderProtocol, RiskClass, SkillConfig,
+        ProviderConfig, ProviderHeader, ProviderModel, ProviderProtocol, RiskClass, SkillConfig,
     };
     use crumb_marketplace::UpdateStatus;
     use crumb_memory::{MemoryScope, MemorySet, MemoryStore};
@@ -9901,9 +9906,9 @@ mod tests {
         CrumbEditMode, ExitGesture, MarketplaceContent, PausedSubmission, Renderer,
         SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
         TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
-        agent_config_location, completion_footer_frame, composer_anchor_sequence,
-        configure_permissions, configure_plugin, effort_display_name, effort_wire_name,
-        failed_command_recovery, finished_tool_activity, fixed_footer_frame,
+        agent_config_location, apply_builtin_model_packs, completion_footer_frame,
+        composer_anchor_sequence, configure_permissions, configure_plugin, effort_display_name,
+        effort_wire_name, failed_command_recovery, finished_tool_activity, fixed_footer_frame,
         initial_agent_activity, marketplace_update_blocker, openrouter_preset,
         parse_credential_reference, parse_paused_submission, parse_provider_header,
         parse_resume_session_argument, read_agent_config, read_bounded_response,
@@ -9923,6 +9928,41 @@ mod tests {
             Some("crumb-session-1")
         );
         assert!(parse_resume_session_argument(&["--resume".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn builtin_model_packs_default_to_the_stronger_balanced_router() {
+        let mut config = AgentConfig::default();
+        let mut provider = ProviderConfig::new(
+            "Pollinations",
+            ProviderProtocol::OpenAiCompletions,
+            "https://example.invalid/v1",
+        );
+        provider.models = [
+            "nova-fast",
+            "nova",
+            "qwen-coder",
+            "Circuit-Overtime/OreoLook",
+            "flux",
+            "klein",
+        ]
+        .into_iter()
+        .map(ProviderModel::new)
+        .collect();
+        config.providers.insert("pollinations".to_owned(), provider);
+
+        apply_builtin_model_packs(&mut config);
+
+        assert_eq!(config.active_model_pack.as_deref(), Some("balanced"));
+        assert_eq!(
+            config
+                .model_packs
+                .get("balanced")
+                .expect("balanced pack")
+                .router
+                .model,
+            "nova"
+        );
     }
 
     #[test]
