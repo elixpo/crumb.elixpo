@@ -56,6 +56,46 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "unload a skill from agent context",
     },
     SlashCommand {
+        usage: "/skill",
+        description: "discover and manage skill packages",
+    },
+    SlashCommand {
+        usage: "/skill search ",
+        description: "search compact offline skill metadata",
+    },
+    SlashCommand {
+        usage: "/skill inspect ",
+        description: "inspect provenance and requirements before install",
+    },
+    SlashCommand {
+        usage: "/skill install ",
+        description: "explicitly install a verified skill package disabled",
+    },
+    SlashCommand {
+        usage: "/skill enable ",
+        description: "enable one installed or bundled skill",
+    },
+    SlashCommand {
+        usage: "/skill disable ",
+        description: "remove one skill from agent context",
+    },
+    SlashCommand {
+        usage: "/skill update ",
+        description: "explicitly update a verified skill package",
+    },
+    SlashCommand {
+        usage: "/skill rollback ",
+        description: "roll back a verified skill package",
+    },
+    SlashCommand {
+        usage: "/skill remove ",
+        description: "remove a disabled installed skill package",
+    },
+    SlashCommand {
+        usage: "/skill doctor",
+        description: "verify installed skill package state",
+    },
+    SlashCommand {
         usage: "/context",
         description: "show inline reference syntax",
     },
@@ -697,6 +737,10 @@ mod tests {
         assert_eq!(
             classify_input("/skills"),
             InputEvent::BuiltIn(BuiltInCommand::Skills)
+        );
+        assert_eq!(
+            classify_input("/skill search review"),
+            InputEvent::BuiltIn(BuiltInCommand::Reserved("/skill search review".to_owned()))
         );
         assert_eq!(
             classify_input("?"),

@@ -22,6 +22,12 @@ Adding a marketplace never happens during terminal startup.
 The schema lives at `marketplace/schema/catalog.schema.json`. The initial public catalog contains
 two inspectable skills and one descriptor for Crumb's built-in policy-controlled workspace MCP.
 
+The user-facing skill protocol is available both as `crumb skill ...` and the
+interactive `/skill ...` namespace. Search is metadata-only; inspect performs
+no mutation; install leaves every component disabled; and enable/disable stays
+separate from package installation and removal. The plural `/skills` namespace
+remains as a compatibility surface for local registrations.
+
 ## Memory lifecycle
 
 Durable memory has two scopes:
