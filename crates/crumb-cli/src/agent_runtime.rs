@@ -1578,6 +1578,16 @@ fn skill_is_relevant(skill: &SkillConfig, request: &str) -> bool {
             "search", "web", "online", "current", "latest", "today", "weather", "news", "price",
             "festival", "who is", "what is",
         ]),
+        "github-workflow" => {
+            contains_any(&[
+                "github",
+                "github.com",
+                "gh",
+                "pull request",
+                "pr",
+                "workflow run",
+            ]) || (request.contains('#') && contains_any(&["issue", "pr"]))
+        }
         "karpathy-guidelines" => contains_any(&[
             "code",
             "coding",
@@ -2045,6 +2055,29 @@ mod tests {
         assert_eq!(code_context.len(), 1);
         assert!(code_context[0].contains("codebase-map"));
         assert!(!code_context[0].contains("web-research"));
+    }
+
+    #[test]
+    fn github_skill_loads_only_for_github_work() {
+        let skills = [SkillConfig {
+            id: "github-workflow".to_owned(),
+            path: crate::bundled_skills::path("github-workflow"),
+            enabled: true,
+        }];
+
+        let github = load_enabled_skill_context(
+            &skills,
+            Path::new("."),
+            "fetch https://github.com/elixpo/crumb.elixpo/issues/148",
+        )
+        .expect("GitHub skill loads");
+        let unrelated =
+            load_enabled_skill_context(&skills, Path::new("."), "explain this local Rust function")
+                .expect("unrelated request is accepted");
+
+        assert_eq!(github.len(), 1);
+        assert!(github[0].contains("## Skill: github-workflow"));
+        assert_eq!(unrelated, Vec::<String>::new());
     }
 
     #[test]

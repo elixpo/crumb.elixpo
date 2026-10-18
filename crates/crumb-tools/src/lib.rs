@@ -3,6 +3,7 @@
 mod checkpoint;
 mod clock;
 mod disposable;
+mod github;
 mod shell;
 mod stack_detection;
 mod web;
@@ -13,6 +14,7 @@ pub use checkpoint::{
 };
 pub use clock::register_current_time_tool;
 pub use disposable::{DisposableToolConfig, register_disposable_tool};
+pub use github::{GitHubIssueLimits, register_github_issue_tool};
 pub use shell::{AgentShellConfig, register_shell_tool, register_shell_tool_with_optimizer};
 pub use stack_detection::{
     DetectedStack, LanguageDetection, StackConfidence, StackDetectionLimits,

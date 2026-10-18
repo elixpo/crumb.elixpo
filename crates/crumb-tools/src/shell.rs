@@ -640,7 +640,7 @@ fn terminate(child: &mut Child) {
 fn descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: RUN_SHELL.to_owned(),
-        description: "Run bounded Bash from the workspace. Parent/absolute paths, pipelines, installed programs, authenticated CLIs, builds, tests, Git, and system inspection are supported; user policy gates approval."
+        description: "Run bounded Bash from the workspace. Parent/absolute paths, pipelines, installed programs, authenticated CLIs, builds, tests, Git, system inspection, and bounded wait/watch polling are supported; user policy gates approval."
             .to_owned(),
         input_schema: json!({
             "type":"object",
