@@ -337,10 +337,10 @@ impl Renderer {
             .next()
             .unwrap_or("native");
         let text = format!(
-            "{} · {model} · {} · {}",
+            "effort {} · {} · {model} · {}",
+            context.effort.unwrap_or("default"),
             context_meter(context),
-            context.mode,
-            context.effort.unwrap_or("default")
+            context.mode
         );
         let text = fit_terminal_text(&text, usize::from(terminal_width.saturating_sub(2)));
         self.paint(&format!("  {text}"), "2")
@@ -1824,9 +1824,51 @@ mod tests {
 
         assert!(footer.contains("Model context"));
         assert!(footer.contains("12.8k / 64.0k"));
-        assert!(footer.contains("nova-fast · auto · high"));
+        assert!(footer.contains("effort high"));
+        assert!(footer.contains("nova-fast · auto"));
         assert!(!footer.contains("pollinations/"));
         assert!(footer.chars().count() <= 100);
+    }
+
+    #[test]
+    fn context_footer_always_labels_default_effort() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let footer = renderer.context_footer(
+            &StartupContext {
+                version: "0.1.0",
+                platform: Platform::Linux,
+                model: Some("pollinations/nova-fast"),
+                mode: "auto",
+                effort: None,
+                session_budget_tokens: 64_000,
+                context_tokens: 0,
+                auto_compaction: false,
+                agent_configured: true,
+            },
+            100,
+        );
+
+        assert!(footer.contains("effort default"));
+        let narrow = renderer.context_footer(
+            &StartupContext {
+                version: "0.1.0",
+                platform: Platform::Linux,
+                model: Some("pollinations/nova-fast"),
+                mode: "auto",
+                effort: Some("extra high"),
+                session_budget_tokens: 64_000,
+                context_tokens: 0,
+                auto_compaction: false,
+                agent_configured: true,
+            },
+            38,
+        );
+        assert!(narrow.contains("effort extra high"));
     }
 
     #[test]
