@@ -3222,7 +3222,7 @@ fn render_fullscreen_file_change(
         indicator.finish();
     }
     record_file_change(render_state, path, additions, deletions);
-    let line = renderer.agent_activity(&format!("Edited · {path} · +{additions} -{deletions}"));
+    let line = renderer.agent_file_change(path, additions, deletions);
     let mut state = transcript
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4297,7 +4297,7 @@ fn render_file_change_activity(
     writeln!(
         writer,
         "{}",
-        renderer.agent_activity(&format!("Edited · {path} · +{additions} -{deletions}"))
+        renderer.agent_file_change(path, additions, deletions)
     )?;
     writer.flush()?;
     replace_activity(indicator, renderer, "Thinking", fullscreen);
@@ -4432,17 +4432,11 @@ fn render_coding_summary(
     if edits.is_empty() {
         return Ok(());
     }
-    let additions = edits.values().map(|counts| counts.0).sum::<u64>();
-    let deletions = edits.values().map(|counts| counts.1).sum::<u64>();
-    let noun = if edits.len() == 1 { "file" } else { "files" };
-    let mut summary = format!(
-        "Changes · {} {noun} · +{additions} -{deletions}",
-        edits.len()
-    );
-    for (path, (added, deleted)) in edits {
-        let _ = write!(summary, "\n  {path}  +{added} -{deleted}");
-    }
-    let activity_line = renderer.agent_activity(&summary);
+    let edits = edits
+        .iter()
+        .map(|(path, (added, deleted))| (path.as_str(), *added, *deleted))
+        .collect::<Vec<_>>();
+    let activity_line = renderer.agent_change_summary(&edits);
     if terminal.fullscreen {
         let mut state = terminal
             .transcript

@@ -783,6 +783,49 @@ impl Renderer {
         }
     }
 
+    /// Renders one edited-file activity with semantic diff colors.
+    #[must_use]
+    pub fn agent_file_change(&self, path: &str, additions: u64, deletions: u64) -> String {
+        self.agent_change_activity(&format!("Edited · {path}"), additions, deletions)
+    }
+
+    /// Renders the final per-turn edit summary with green additions and red deletions.
+    #[must_use]
+    pub fn agent_change_summary(&self, edits: &[(&str, u64, u64)]) -> String {
+        let additions = edits.iter().map(|(_, additions, _)| additions).sum::<u64>();
+        let deletions = edits.iter().map(|(_, _, deletions)| deletions).sum::<u64>();
+        let noun = if edits.len() == 1 { "file" } else { "files" };
+        let mut output = self.agent_change_activity(
+            &format!("Changes · {} {noun}", edits.len()),
+            additions,
+            deletions,
+        );
+        for (path, added, deleted) in edits {
+            let _ = write!(
+                output,
+                "\n    {}  {} {}",
+                self.paint(path, "38;5;245"),
+                self.paint(&format!("+{added}"), "32"),
+                self.paint(&format!("-{deleted}"), "31")
+            );
+        }
+        output
+    }
+
+    fn agent_change_activity(&self, label: &str, additions: u64, deletions: u64) -> String {
+        let counts = format!("+{additions} -{deletions}");
+        if self.settings.output == OutputMode::ScreenReader {
+            return format!("Activity: {label} · {counts}");
+        }
+        format!(
+            "  {}  ↳ {} · {} {}",
+            self.paint("│", "35"),
+            self.paint(label, "38;5;245"),
+            self.paint(&format!("+{additions}"), "32"),
+            self.paint(&format!("-{deletions}"), "31")
+        )
+    }
+
     /// Renders one subdued, always-visible summary for an inter-agent exchange.
     ///
     /// Message bodies, tool output, and file paths are intentionally excluded;
@@ -2187,6 +2230,24 @@ mod tests {
         assert!(searching.contains("\x1b[38;5;245mSearching web"));
         assert!(completed.contains("\x1b[38;5;245mTool completed"));
         assert!(!completed.contains("\x1b[32;1m"));
+    }
+
+    #[test]
+    fn file_change_counts_use_semantic_diff_colors() {
+        let renderer = Renderer::new(UiSettings {
+            color: true,
+            output: OutputMode::Rich,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+
+        let activity = renderer.agent_file_change("src/main.rs", 7, 2);
+        assert!(activity.contains("\x1b[32m+7\x1b[0m"));
+        assert!(activity.contains("\x1b[31m-2\x1b[0m"));
+
+        let summary = renderer.agent_change_summary(&[("src/main.rs", 7, 2)]);
+        assert!(summary.contains("\x1b[32m+7\x1b[0m"));
+        assert!(summary.contains("\x1b[31m-2\x1b[0m"));
     }
 
     #[test]
