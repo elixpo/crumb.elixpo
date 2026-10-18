@@ -11128,13 +11128,9 @@ impl PendingPasteArtifacts {
             let digest = marker
                 .strip_prefix("@paste:sha256-")
                 .context("paste artifact marker is invalid")?;
-            let relative = PathBuf::from(".crumb")
-                .join("artifacts")
-                .join("pastes")
-                .join(format!("sha256-{digest}.txt"));
-            persist_paste_artifact(workspace, &relative, content.as_bytes())?;
-            materialized =
-                materialized.replace(&marker, &format!("@file:{}", relative.to_string_lossy()));
+            let relative = format!(".crumb/artifacts/pastes/sha256-{digest}.txt");
+            persist_paste_artifact(workspace, Path::new(&relative), content.as_bytes())?;
+            materialized = materialized.replace(&marker, &format!("@file:{relative}"));
         }
         Ok(materialized)
     }
