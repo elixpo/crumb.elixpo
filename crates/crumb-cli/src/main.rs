@@ -2106,9 +2106,18 @@ fn write_bounded_response_delta(
     text: &str,
     column: &mut usize,
 ) -> io::Result<()> {
+    let terminal_width = size().map_or(80, |(columns, _)| columns);
+    write_bounded_response_delta_for_width(writer, text, column, terminal_width)
+}
+
+fn write_bounded_response_delta_for_width(
+    writer: &mut dyn Write,
+    text: &str,
+    column: &mut usize,
+    terminal_width: u16,
+) -> io::Result<()> {
     const RESPONSE_INDENT: &str = "        ";
-    let right_boundary =
-        usize::from(size().map_or(80, |(columns, _)| columns).saturating_sub(2)).max(9);
+    let right_boundary = usize::from(terminal_width.saturating_sub(2)).max(9);
     for character in text.chars() {
         if character == '\n' {
             write!(writer, "\n{RESPONSE_INDENT}")?;
@@ -10122,7 +10131,7 @@ mod tests {
         shell_tool_config, should_auto_enable_rtk, show_graph, show_marketplace, show_memory,
         show_profile_with_stores, suggestion_width, transcript_activity_row,
         unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
-        visible_tool_activity, workspace_read_host, write_bounded_response_delta,
+        visible_tool_activity, workspace_read_host, write_bounded_response_delta_for_width,
     };
 
     #[test]
@@ -10598,7 +10607,7 @@ mod tests {
     fn streamed_agent_text_stays_inside_the_ui_margin() {
         let mut output = Vec::new();
         let mut column = 8;
-        write_bounded_response_delta(&mut output, &"word ".repeat(40), &mut column)
+        write_bounded_response_delta_for_width(&mut output, &"word ".repeat(40), &mut column, 80)
             .expect("response delta renders");
         let output = String::from_utf8(output).expect("terminal output is utf-8");
 
