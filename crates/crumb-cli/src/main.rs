@@ -12203,17 +12203,24 @@ impl Prompt for CrumbPrompt {
         if !self.anchor_to_composer {
             return Cow::Borrowed(&self.rendered);
         }
-        let rows = size().map_or(FULLSCREEN_COMPOSER_ROWS, |(_, rows)| rows);
+        let (columns, rows) = size().unwrap_or((80, FULLSCREEN_COMPOSER_ROWS));
         let input_rows = self.composer_input_rows.load(Ordering::Relaxed);
-        Cow::Owned(format!(
-            "{}{}",
-            composer_anchor_sequence(rows, input_rows),
-            self.rendered
+        Cow::Owned(aligned_composer_prompt(
+            &self.rendered,
+            &self.right,
+            columns,
+            rows,
+            input_rows,
+            std::env::var_os("NO_COLOR").is_none(),
         ))
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
-        Cow::Borrowed(&self.right)
+        if self.anchor_to_composer {
+            Cow::Borrowed("")
+        } else {
+            Cow::Borrowed(&self.right)
+        }
     }
 
     fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
@@ -12409,6 +12416,36 @@ fn position_composer(renderer: Renderer, header_rows: u16) -> io::Result<()> {
 fn composer_anchor_sequence(terminal_rows: u16, input_rows: u16) -> String {
     let composer_row = composer_anchor_row(terminal_rows, input_rows);
     format!("\x1b[{};1H", composer_row.saturating_add(1))
+}
+
+fn aligned_composer_prompt(
+    rendered: &str,
+    right: &str,
+    terminal_columns: u16,
+    terminal_rows: u16,
+    input_rows: u16,
+    color: bool,
+) -> String {
+    let anchor = composer_anchor_sequence(terminal_rows, input_rows);
+    let Some((first, rest)) = rendered.split_once('\n') else {
+        return format!("{anchor}{rendered}");
+    };
+    let right = right.trim_end();
+    let right_width = u16::try_from(right.chars().count()).unwrap_or(u16::MAX);
+    let left_width =
+        u16::try_from(sanitize_terminal_text(first, false).chars().count()).unwrap_or(u16::MAX);
+    if right.is_empty()
+        || left_width.saturating_add(right_width).saturating_add(4) > terminal_columns
+    {
+        return format!("{anchor}{rendered}");
+    }
+    let column = terminal_columns.saturating_sub(right_width).max(1);
+    let right = if color {
+        Style::new().fg(Color::Magenta).paint(right).to_string()
+    } else {
+        right.to_owned()
+    };
+    format!("{anchor}{first}\x1b[{column}G{right}\n{rest}")
 }
 
 fn composer_anchor_row(terminal_rows: u16, input_rows: u16) -> u16 {
@@ -12859,16 +12896,17 @@ mod tests {
         ExitGesture, MarketplaceContent, PausedSubmission, PendingComposerArtifacts, Renderer,
         SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
         TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
-        agent_config_location, apply_builtin_model_packs, artifact_modal_action, bundled_catalog,
-        completion_footer_frame, composer_anchor_sequence, composer_visual_rows,
-        configure_permissions, configure_plugin, effort_display_name, effort_wire_name,
-        ensure_single_release_skill_install, exact_skill_manifest_url, exact_skill_run_config,
-        failed_command_recovery, finished_tool_activity, fixed_footer_frame,
-        follow_up_cursor_sequence, format_peer_discarded_file, format_peer_imported_file,
-        format_peer_inbox, format_peer_inspection, format_peer_quarantined_file, format_peer_task,
-        handle_skill_command, initial_agent_activity, install_marketplace_package,
-        load_exact_skill_manifest, marketplace_update_blocker, normalize_bundled_skill_install,
-        openrouter_preset, parse_cli_skill_run, parse_credential_reference, parse_exec_request,
+        agent_config_location, aligned_composer_prompt, apply_builtin_model_packs,
+        artifact_modal_action, bundled_catalog, completion_footer_frame, composer_anchor_sequence,
+        composer_visual_rows, configure_permissions, configure_plugin, effort_display_name,
+        effort_wire_name, ensure_single_release_skill_install, exact_skill_manifest_url,
+        exact_skill_run_config, failed_command_recovery, finished_tool_activity,
+        fixed_footer_frame, follow_up_cursor_sequence, format_peer_discarded_file,
+        format_peer_imported_file, format_peer_inbox, format_peer_inspection,
+        format_peer_quarantined_file, format_peer_task, handle_skill_command,
+        initial_agent_activity, install_marketplace_package, load_exact_skill_manifest,
+        marketplace_update_blocker, normalize_bundled_skill_install, openrouter_preset,
+        parse_cli_skill_run, parse_credential_reference, parse_exec_request,
         parse_interactive_skill_run, parse_paused_submission, parse_provider_header,
         parse_resume_session_argument, read_agent_config, read_bounded_response,
         register_local_skill, render_skill_discovery_search, resolve_memory_keep,
@@ -14516,6 +14554,21 @@ mod tests {
         assert_eq!(composer_anchor_sequence(4, 1), "\x1b[1;1H");
         assert_eq!(transcript_activity_row(12, 40), 12);
         assert_eq!(transcript_activity_row(39, 40), 31);
+    }
+
+    #[test]
+    fn composer_pack_status_shares_the_workspace_row() {
+        let prompt = aligned_composer_prompt(
+            "workspace git:main\n╭─╮\n│ ",
+            "pack Balanced Crumb",
+            80,
+            40,
+            1,
+            false,
+        );
+
+        assert!(prompt.starts_with("\x1b[35;1Hworkspace git:main\x1b[61Gpack Balanced Crumb\n"));
+        assert_eq!(prompt.matches("pack Balanced Crumb").count(), 1);
     }
 
     #[test]
