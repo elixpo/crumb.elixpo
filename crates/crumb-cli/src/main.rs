@@ -9387,7 +9387,10 @@ impl CrumbEditMode {
 
     fn is_transcript_row(&self, row: u16) -> bool {
         self.transcript_header_rows
-            .and_then(|header_rows| fullscreen_rows(header_rows).ok())
+            .map(|header_rows| {
+                fullscreen_rows(header_rows)
+                    .unwrap_or_else(|_| fullscreen_rows_for_height(header_rows, 24))
+            })
             .is_some_and(|(top, bottom, _, _)| row >= top && row <= bottom)
     }
 }
@@ -9635,15 +9638,19 @@ const FULLSCREEN_COMPOSER_ROWS: u16 = 6;
 
 fn fullscreen_rows(header_rows: u16) -> io::Result<(u16, u16, u16, u16)> {
     let (_, rows) = size()?;
+    Ok(fullscreen_rows_for_height(header_rows, rows))
+}
+
+fn fullscreen_rows_for_height(header_rows: u16, rows: u16) -> (u16, u16, u16, u16) {
     let composer_row = rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
     let transcript_bottom = composer_row.saturating_sub(1);
     let transcript_top = header_rows.min(transcript_bottom);
-    Ok((
+    (
         transcript_top,
         transcript_bottom,
         composer_row,
         rows.saturating_sub(1),
-    ))
+    )
 }
 
 fn set_transcript_scroll_region(
