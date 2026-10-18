@@ -1476,7 +1476,12 @@ fn clear_activity_line(row: Option<u16>) {
 #[must_use]
 pub fn visible_agent_text(response: &str) -> String {
     let mut visible = response.to_owned();
-    for (opening, closing) in [("<thinking>", "</thinking>"), ("<think>", "</think>")] {
+    for (opening, closing) in [
+        ("<thinking>", "</thinking>"),
+        ("<think>", "</think>"),
+        ("<TASK>", "</TASK>"),
+        ("<task>", "</task>"),
+    ] {
         while let Some(start) = visible.find(opening) {
             let tail = &visible[start + opening.len()..];
             let end = tail.find(closing).map_or(visible.len(), |offset| {
@@ -2473,6 +2478,12 @@ mod tests {
         assert_eq!(
             super::visible_agent_text("<response>\nexact answer\n</response>"),
             "exact answer"
+        );
+        assert_eq!(
+            super::visible_agent_text(
+                "<TASK>Processing</TASK><TASK>Analyzing image</TASK>\nImage result"
+            ),
+            "Image result"
         );
     }
 

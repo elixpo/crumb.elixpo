@@ -12294,7 +12294,7 @@ fn context_token_budget(config: &AgentConfig, route: Option<&ModelRoute>) -> u64
     })
 }
 
-const FULLSCREEN_COMPOSER_ROWS: u16 = 10;
+const FULLSCREEN_COMPOSER_ROWS: u16 = 8;
 
 const fn composer_status_row(composer_row: u16) -> u16 {
     composer_row.saturating_add(FULLSCREEN_COMPOSER_ROWS.saturating_sub(3))
@@ -14433,7 +14433,7 @@ mod tests {
 
     #[test]
     fn active_follow_up_cursor_is_placed_inside_the_composer() {
-        assert_eq!(follow_up_cursor_sequence(40), "\x1b[31;5H");
+        assert_eq!(follow_up_cursor_sequence(40), "\x1b[33;5H");
         assert_eq!(follow_up_cursor_sequence(4), "\x1b[1;5H");
     }
 
@@ -14450,17 +14450,17 @@ mod tests {
         assert!(frame.contains("Ready"));
         assert!(frame.contains("Model context · 3.3k / 64.0k"));
         assert!(frame.contains("Enter send"));
-        assert!(frame.contains("\x1b[38;1H\x1b[2K"));
-        assert!(frame.contains("\x1b[39;1H\x1b[2K"));
+        assert!(frame.contains("\x1b[36;1H\x1b[2K"));
+        assert!(frame.contains("\x1b[37;1H\x1b[2K"));
         assert!(frame.contains("\x1b[40;1H\x1b[2K"));
     }
 
     #[test]
     fn fullscreen_prompt_is_anchored_above_the_fixed_footer() {
-        assert_eq!(composer_anchor_sequence(40), "\x1b[31;1H");
+        assert_eq!(composer_anchor_sequence(40), "\x1b[33;1H");
         assert_eq!(composer_anchor_sequence(4), "\x1b[1;1H");
         assert_eq!(transcript_activity_row(12, 40), 12);
-        assert_eq!(transcript_activity_row(39, 40), 29);
+        assert_eq!(transcript_activity_row(39, 40), 31);
     }
 
     #[test]
