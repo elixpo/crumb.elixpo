@@ -12027,6 +12027,17 @@ fn suggestion_width(terminal_columns: u16) -> usize {
     usize::from(terminal_columns.saturating_sub(4).max(1))
 }
 
+fn composer_visual_rows(line: &str, artifact_width: usize, terminal_columns: u16) -> u16 {
+    let available = usize::from(terminal_columns.saturating_sub(4).max(1));
+    let mut rows = 0_usize;
+    for (index, segment) in line.split('\n').enumerate() {
+        let prefix = usize::from(index == 0 && artifact_width > 0) * (artifact_width + 1);
+        let width = prefix.saturating_add(segment.chars().count());
+        rows = rows.saturating_add(width.max(1).div_ceil(available));
+    }
+    u16::try_from(rows.max(1)).unwrap_or(u16::MAX)
+}
+
 struct CrumbPrompt {
     rendered: String,
     right: String,
@@ -12061,7 +12072,7 @@ impl CrumbHinter {
         }
     }
 
-    fn with_dock(&self, hint: String) -> String {
+    fn with_dock(&self, hint: String, input_rows: u16) -> String {
         let Some(dock) = &self.dock else {
             return hint;
         };
@@ -12081,8 +12092,13 @@ impl CrumbHinter {
             "Ctrl+V attach clipboard · Enter send · PgUp/PgDn scroll · ? help"
         };
         let hotkeys = truncate_chars(hotkeys, usize::from(columns));
+        let input_capacity = FULLSCREEN_COMPOSER_ROWS.saturating_sub(5).max(1);
+        let footer_spacing = input_capacity
+            .saturating_sub(input_rows.min(input_capacity))
+            .saturating_add(1);
         format!(
-            "{hint}\n{}\n{}\n{}",
+            "{hint}{}{}\n{}\n{}",
+            "\n".repeat(usize::from(footer_spacing)),
             dock.renderer.composer_idle_status(),
             state.footer_context,
             hotkeys
@@ -12100,11 +12116,15 @@ impl Hinter for CrumbHinter {
         cwd: &str,
     ) -> String {
         self.placeholder_visible = line.is_empty();
-        let has_artifacts = self
-            .paste_artifacts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .has_artifacts();
+        let (has_artifacts, artifact_width) = {
+            let artifacts = self
+                .paste_artifacts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (artifacts.has_artifacts(), artifacts.composer_prefix_width())
+        };
+        let columns = size().map_or(80, |(columns, _)| columns);
+        let input_rows = composer_visual_rows(line, artifact_width, columns);
         if self.placeholder_visible && !has_artifacts {
             let placeholder =
                 "Ask Crumb anything or type a command · @ context · / commands · Tab complete";
@@ -12117,16 +12137,16 @@ impl Hinter for CrumbHinter {
             } else {
                 placeholder.to_owned()
             };
-            return self.with_dock(hint);
+            return self.with_dock(hint, input_rows);
         }
         if self.placeholder_visible {
             let placeholder = "Ask Crumb anything…";
-            return self.with_dock(placeholder.to_owned());
+            return self.with_dock(placeholder.to_owned(), input_rows);
         }
         let hint = self
             .history
             .handle(line, pos, history, use_ansi_coloring, cwd);
-        self.with_dock(hint)
+        self.with_dock(hint, input_rows)
     }
 
     fn complete_hint(&self) -> String {
@@ -12814,12 +12834,12 @@ mod tests {
         SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
         TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
         agent_config_location, apply_builtin_model_packs, artifact_modal_action, bundled_catalog,
-        completion_footer_frame, composer_anchor_sequence, configure_permissions, configure_plugin,
-        effort_display_name, effort_wire_name, ensure_single_release_skill_install,
-        exact_skill_manifest_url, exact_skill_run_config, failed_command_recovery,
-        finished_tool_activity, fixed_footer_frame, follow_up_cursor_sequence,
-        format_peer_discarded_file, format_peer_imported_file, format_peer_inbox,
-        format_peer_inspection, format_peer_quarantined_file, format_peer_task,
+        completion_footer_frame, composer_anchor_sequence, composer_visual_rows,
+        configure_permissions, configure_plugin, effort_display_name, effort_wire_name,
+        ensure_single_release_skill_install, exact_skill_manifest_url, exact_skill_run_config,
+        failed_command_recovery, finished_tool_activity, fixed_footer_frame,
+        follow_up_cursor_sequence, format_peer_discarded_file, format_peer_imported_file,
+        format_peer_inbox, format_peer_inspection, format_peer_quarantined_file, format_peer_task,
         handle_skill_command, initial_agent_activity, install_marketplace_package,
         load_exact_skill_manifest, marketplace_update_blocker, normalize_bundled_skill_install,
         openrouter_preset, parse_cli_skill_run, parse_credential_reference, parse_exec_request,
@@ -14435,6 +14455,14 @@ mod tests {
     fn active_follow_up_cursor_is_placed_inside_the_composer() {
         assert_eq!(follow_up_cursor_sequence(40), "\x1b[33;5H");
         assert_eq!(follow_up_cursor_sequence(4), "\x1b[1;5H");
+    }
+
+    #[test]
+    fn composer_spacing_accounts_for_wrapped_and_explicit_lines() {
+        assert_eq!(composer_visual_rows("", 0, 80), 1);
+        assert_eq!(composer_visual_rows(&"x".repeat(77), 0, 80), 2);
+        assert_eq!(composer_visual_rows("question", 67, 80), 1);
+        assert_eq!(composer_visual_rows("first\nsecond", 0, 80), 2);
     }
 
     #[test]

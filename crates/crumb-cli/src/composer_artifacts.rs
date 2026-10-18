@@ -349,6 +349,19 @@ impl PendingComposerArtifacts {
         if use_ansi_coloring { styled } else { plain }
     }
 
+    pub(crate) fn composer_prefix_width(&self) -> usize {
+        let artifact_width = self
+            .artifacts
+            .iter()
+            .enumerate()
+            .map(|(index, artifact)| artifact.chip().chars().count() + 2 + usize::from(index > 0))
+            .sum::<usize>();
+        self.notice.as_ref().map_or(artifact_width, |notice| {
+            let prefix = if self.artifacts.is_empty() { 2 } else { 1 };
+            artifact_width + prefix + truncate_label(notice, 48).chars().count() + 4
+        })
+    }
+
     pub(crate) fn display_submission(&self, question: &str) -> String {
         let mut display = question.trim().to_owned();
         for artifact in &self.artifacts {
