@@ -387,7 +387,7 @@ mod tests {
     fn plain_git_status_is_not_destructive() {
         let assessment = assess_shell_command("git status");
         assert!(!assessment.is_destructive());
-        assert!(assessment.matches.is_empty());
+        assert_eq!(assessment.matches, Vec::new());
     }
 
     #[test]

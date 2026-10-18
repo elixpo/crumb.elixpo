@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -340,23 +341,43 @@ fn run_shell(
     let stdout_text = String::from_utf8_lossy(&stdout.bytes).into_owned();
     let stderr_text = String::from_utf8_lossy(&stderr.bytes).into_owned();
 
-    let (exit_status, output) = match outcome {
+    let (exit_status, output) = finish_shell_output(
+        &outcome,
+        command,
+        &stdout,
+        &stderr,
+        optimizer,
+        config.max_output_bytes,
+    )?;
+
+    Ok(ShellRunResult {
+        output,
+        exit_status,
+        stdout_text,
+        stderr_text,
+        started_at,
+    })
+}
+
+fn finish_shell_output(
+    outcome: &ProcessOutcome,
+    command: &str,
+    stdout: &CapturedStream,
+    stderr: &CapturedStream,
+    optimizer: Option<&OptimizationPipeline>,
+    max_output_bytes: usize,
+) -> Result<(String, ToolOutput)> {
+    Ok(match outcome {
         ProcessOutcome::Cancelled => bail!("tool call cancelled"),
         ProcessOutcome::TimedOut => {
             let exit_status = "timed_out".to_owned();
-            let text = render_output(
-                &exit_status,
-                &stdout,
-                &stderr,
-                true,
-                config.max_output_bytes,
-            );
+            let text = render_output(&exit_status, stdout, stderr, true, max_output_bytes);
             let output = render_tool_output(
                 text,
                 true,
                 optimizer,
                 classify_output(command),
-                config.max_output_bytes,
+                max_output_bytes,
             );
             (exit_status, output)
         }
@@ -365,30 +386,16 @@ fn run_shell(
             let exit_status = status
                 .code()
                 .map_or_else(|| "signal".to_owned(), |code| code.to_string());
-            let text = render_output(
-                &exit_status,
-                &stdout,
-                &stderr,
-                failed,
-                config.max_output_bytes,
-            );
+            let text = render_output(&exit_status, stdout, stderr, failed, max_output_bytes);
             let output = render_tool_output(
                 text,
                 failed,
                 optimizer,
                 classify_output(command),
-                config.max_output_bytes,
+                max_output_bytes,
             );
             (exit_status, output)
         }
-    };
-
-    Ok(ShellRunResult {
-        output,
-        exit_status,
-        stdout_text,
-        stderr_text,
-        started_at,
     })
 }
 
@@ -574,7 +581,7 @@ fn modified_since(workspace: &Path, since: std::time::SystemTime) -> Result<Vec<
             if file_type.is_dir() {
                 if matches!(
                     path.file_name().and_then(|name| name.to_str()),
-                    Some(".git") | Some("target") | Some("node_modules")
+                    Some(".git" | "target" | "node_modules")
                 ) {
                     continue;
                 }
@@ -681,7 +688,7 @@ fn render_last_failure(failure: &LastFailure) -> String {
     } else {
         let mut listing = String::from("modified files:\n");
         for path in &failure.modified_files {
-            listing.push_str(&format!("  {}\n", path.display()));
+            let _ = writeln!(listing, "  {}", path.display());
         }
         if failure.modified_files_truncated {
             listing.push_str("  ... (truncated)\n");
