@@ -431,12 +431,23 @@ impl SseDecoder {
         Ok(events)
     }
 
-    pub(crate) fn finish(self) -> ProviderResult<()> {
-        if self.done && self.pending.iter().all(u8::is_ascii_whitespace) {
-            Ok(())
-        } else {
-            Err(protocol_error("stream ended before the SSE done marker"))
+    pub(crate) fn finish(mut self) -> ProviderResult<Vec<ChatEvent>> {
+        let mut events = Vec::new();
+        if !self.pending.iter().all(u8::is_ascii_whitespace) {
+            let pending = std::mem::take(&mut self.pending);
+            self.decode_event(&pending, &mut events)?;
         }
+        if self.done {
+            return Ok(events);
+        }
+        let Some(reason) = self.finish_reason.take() else {
+            return Err(protocol_error(
+                "stream ended before a completion marker or finish reason",
+            ));
+        };
+        self.emit_tool_calls(&mut events)?;
+        events.push(ChatEvent::Finished(reason));
+        Ok(events)
     }
 
     fn decode_event(&mut self, event: &[u8], output: &mut Vec<ChatEvent>) -> ProviderResult<()> {
@@ -760,7 +771,13 @@ mod tests {
                 .push(&payload.as_bytes()[split..])
                 .expect("remaining events should decode"),
         );
-        decoder.finish().expect("stream should finish cleanly");
+        assert_eq!(
+            decoder
+                .finish()
+                .expect("stream should finish cleanly")
+                .len(),
+            0
+        );
 
         assert_eq!(
             events,
@@ -786,5 +803,20 @@ mod tests {
 
         assert_eq!(error.kind, ProviderErrorKind::Protocol);
         assert!(!error.retryable);
+    }
+
+    #[test]
+    fn decoder_accepts_finish_reason_when_provider_omits_done_sentinel() {
+        let mut decoder = SseDecoder::default();
+        let events = decoder
+            .push(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"seen\"},\"finish_reason\":\"stop\"}]}\n\n",
+            )
+            .expect("completion chunk");
+        assert_eq!(events, vec![ChatEvent::TextDelta("seen".to_owned())]);
+        assert_eq!(
+            decoder.finish().expect("finish reason closes stream"),
+            vec![ChatEvent::Finished(FinishReason::Stop)]
+        );
     }
 }

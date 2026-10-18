@@ -283,7 +283,8 @@ impl ChatStream for PollinationsChatStream {
                     Some(Err(error)) => return Err(map_reqwest_error(&error)),
                     None => {
                         self.source_finished = true;
-                        std::mem::take(&mut self.decoder).finish()?;
+                        self.queued
+                            .extend(std::mem::take(&mut self.decoder).finish()?);
                     }
                 }
             }
