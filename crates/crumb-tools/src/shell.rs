@@ -12,7 +12,7 @@ use crumb_agent::{
     CancellationToken, OutputKind, RiskClass, ToolDescriptor, ToolHandler, ToolHost, ToolOutput,
     ToolTransport,
 };
-use crumb_core::UndoLedger;
+use crumb_core::{UndoLedger, redact_sensitive_text};
 use crumb_optimize::{OptimizationPipeline, OptimizationResult};
 use serde_json::{Value, json};
 
@@ -246,10 +246,10 @@ impl ShellTool {
             };
         if let Ok(mut last_failure) = self.last_failure.lock() {
             *last_failure = Some(LastFailure {
-                command: command.to_owned(),
+                command: redact_sensitive_text(command).0.trim_end().to_owned(),
                 exit_status: result.exit_status.clone(),
-                stdout_tail: result.stdout_text.clone(),
-                stderr_tail: result.stderr_text.clone(),
+                stdout_tail: redact_sensitive_text(&result.stdout_text).0,
+                stderr_tail: redact_sensitive_text(&result.stderr_text).0,
                 modified_files,
                 modified_files_truncated,
             });

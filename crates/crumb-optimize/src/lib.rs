@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use crumb_agent::{OptimizerConfig, OutputKind, StructuredEncoding, TokenOptimizer};
-use crumb_core::SecretScanner;
+use crumb_core::redact_sensitive_text;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -258,21 +258,7 @@ fn native_filter(kind: OutputKind, input: &str) -> String {
 }
 
 fn redact(input: &str) -> (String, usize) {
-    let mut output = String::with_capacity(input.len());
-    let mut redacted_lines = 0;
-    let mut scanner = SecretScanner::new();
-    for line in input.lines() {
-        if scanner.scan_line(line).is_some() {
-            if output.lines().next_back() != Some("[sensitive output redacted]") {
-                output.push_str("[sensitive output redacted]\n");
-            }
-            redacted_lines += 1;
-        } else {
-            output.push_str(line);
-            output.push('\n');
-        }
-    }
-    (output, redacted_lines)
+    redact_sensitive_text(input)
 }
 
 fn is_diagnostic(line: &str) -> bool {

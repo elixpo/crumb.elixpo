@@ -108,6 +108,27 @@ impl SecretScanner {
     }
 }
 
+/// Redacts every secret-bearing line while preserving non-sensitive context.
+/// The returned count records how many input lines were removed.
+#[must_use]
+pub fn redact_sensitive_text(input: &str) -> (String, usize) {
+    let mut output = String::with_capacity(input.len());
+    let mut redacted_lines = 0;
+    let mut scanner = SecretScanner::new();
+    for line in input.lines() {
+        if scanner.scan_line(line).is_some() {
+            if output.lines().next_back() != Some("[sensitive output redacted]") {
+                output.push_str("[sensitive output redacted]\n");
+            }
+            redacted_lines += 1;
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    (output, redacted_lines)
+}
+
 fn is_key_block_marker(lower_line: &str, prefix: &str) -> bool {
     lower_line.contains(prefix) && lower_line.contains("private key")
 }
@@ -220,7 +241,17 @@ fn shannon_entropy_bits_per_char(token: &str) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{SecretKind, SecretScanner};
+    use super::{SecretKind, SecretScanner, redact_sensitive_text};
+
+    #[test]
+    fn shared_redactor_removes_secret_lines_and_preserves_context() {
+        let token = ["ghp_", "A1b2C3d4E5f6G7h8I9j0"].concat();
+        let (redacted, count) = redact_sensitive_text(&format!("before\n{token}\nafter\n"));
+
+        assert_eq!(count, 1);
+        assert_eq!(redacted, "before\n[sensitive output redacted]\nafter\n");
+        assert!(!redacted.contains(&token));
+    }
 
     fn scan_all(lines: &[&str]) -> Vec<Option<SecretKind>> {
         let mut scanner = SecretScanner::new();

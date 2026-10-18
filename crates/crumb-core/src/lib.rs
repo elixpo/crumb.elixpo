@@ -4,7 +4,7 @@ mod dry_run;
 pub use dry_run::{BlastRadiusAssessment, MatchedPattern, Severity, assess_shell_command};
 
 mod secrets;
-pub use secrets::{SecretKind, SecretMatch, SecretScanner};
+pub use secrets::{SecretKind, SecretMatch, SecretScanner, redact_sensitive_text};
 
 mod undo_ledger;
 pub use undo_ledger::{LedgerEntry, UndoLedger};

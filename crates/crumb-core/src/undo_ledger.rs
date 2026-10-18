@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 
 use crate::dry_run::{BlastRadiusAssessment, assess_shell_command};
+use crate::secrets::redact_sensitive_text;
 
 /// One recorded state-changing command.
 #[derive(Clone, Debug, PartialEq)]
@@ -58,7 +59,7 @@ impl UndoLedger {
         }
         let entry = LedgerEntry {
             sequence: self.next_sequence,
-            command: command.to_owned(),
+            command: redact_sensitive_text(command).0.trim_end().to_owned(),
             assessment,
         };
         self.next_sequence += 1;
@@ -115,6 +116,17 @@ mod tests {
         assert!(recorded.is_none());
         assert!(ledger.is_empty());
         assert_eq!(ledger.most_recent(), None);
+    }
+
+    #[test]
+    fn destructive_commands_are_redacted_before_retention() {
+        let mut ledger = ledger(10);
+        let token = ["ghp_", "A1b2C3d4E5f6G7h8I9j0"].concat();
+        ledger.record(&format!("rm -rf build # {token}"));
+
+        let retained = &ledger.most_recent().unwrap().command;
+        assert!(!retained.contains(&token));
+        assert!(retained.contains("[sensitive output redacted]"));
     }
 
     #[test]
