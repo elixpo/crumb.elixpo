@@ -714,6 +714,7 @@ fn serve_mcp() -> Result<()> {
                 .with_mode(config.permissions.mode)
                 .with_workspace_tools(config.permissions.allow_workspace_tools.clone())
                 .with_process_tools(config.permissions.allow_execution_tools.clone())
+                .with_peer_tools(config.permissions.allow_peer_tools.clone())
                 .with_mcp_tools(config.permissions.allow_mcp_tools.clone()),
         ),
         config.mode,
@@ -3503,6 +3504,7 @@ const fn approval_risk_label(risk: RiskClass) -> &'static str {
         RiskClass::NetworkAccess => "network access",
         RiskClass::WriteWorkspace => "workspace write",
         RiskClass::ProcessExecution => "process execution",
+        RiskClass::PeerCommunication => "peer communication",
         RiskClass::SystemMutation => "system mutation",
         RiskClass::Destructive => "destructive",
         RiskClass::CredentialSensitive => "credential sensitive",
@@ -5542,6 +5544,7 @@ fn select_permission_mode(arguments: &[&str], cwd: &Path, writer: &mut dyn Write
         config.permissions.allow_network_tools.clear();
         config.permissions.allow_workspace_tools.clear();
         config.permissions.allow_execution_tools.clear();
+        config.permissions.allow_peer_tools.clear();
         config.permissions.allow_mcp_tools.clear();
         Ok(())
     })?;
@@ -5606,6 +5609,11 @@ fn show_permissions(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         writer,
         "  execution  {}",
         joined_or_none(&config.permissions.allow_execution_tools)
+    )?;
+    writeln!(
+        writer,
+        "  peers      {}",
+        joined_or_none(&config.permissions.allow_peer_tools)
     )?;
     writeln!(
         writer,

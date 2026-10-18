@@ -87,6 +87,7 @@ fn configured_approvals(config: &AgentConfig) -> ConfiguredApprovals {
         .with_mode(config.permissions.mode)
         .with_workspace_tools(config.permissions.allow_workspace_tools.clone())
         .with_process_tools(config.permissions.allow_execution_tools.clone())
+        .with_peer_tools(config.permissions.allow_peer_tools.clone())
         .with_mcp_tools(config.permissions.allow_mcp_tools.clone())
 }
 
