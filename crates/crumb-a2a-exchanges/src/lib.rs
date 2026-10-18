@@ -821,8 +821,14 @@ fn set_private_directory_permissions(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -949,13 +955,15 @@ mod tests {
         let workspace = TempDir::new().expect("workspace");
         std::fs::create_dir(workspace.path().join(".crumb")).expect("crumb");
         std::fs::create_dir(workspace.path().join(".crumb/a2a")).expect("a2a");
-        let outside = TempDir::new().expect("outside");
         #[cfg(unix)]
-        std::os::unix::fs::symlink(
-            outside.path(),
-            workspace.path().join(".crumb/a2a/exchanges"),
-        )
-        .expect("symlink");
+        {
+            let outside = TempDir::new().expect("outside");
+            std::os::unix::fs::symlink(
+                outside.path(),
+                workspace.path().join(".crumb/a2a/exchanges"),
+            )
+            .expect("symlink");
+        }
         #[cfg(unix)]
         assert!(
             ExchangeStore::for_workspace(workspace.path())

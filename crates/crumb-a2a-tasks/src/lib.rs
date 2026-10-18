@@ -819,11 +819,17 @@ fn set_private_directory_permissions(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)
         .context("A2A task directory could not be opened")?
         .sync_all()
         .context("A2A task directory could not sync")
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]

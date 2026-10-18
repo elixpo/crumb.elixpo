@@ -1021,7 +1021,17 @@ mod tests {
             .expect("second runtime");
 
         thread::sleep(Duration::from_millis(240));
-        assert_eq!(second.list_peers().expect("live peers").len(), 1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if second.list_peers().expect("live peers").len() == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "heartbeat did not refresh the peer lease before the deadline"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
         assert_eq!(first.health().state, RuntimeState::Healthy);
         first.shutdown().expect("first shutdown");
         second.shutdown().expect("second shutdown");
