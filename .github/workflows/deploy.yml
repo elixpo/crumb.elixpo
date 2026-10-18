@@ -212,8 +212,12 @@ jobs:
           sudo install -m 0755 "$binary" /usr/local/bin/sops
       - name: Check deployment credentials
         run: |
-          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] && [ -z "${SOPS_AGE_KEY:-}" ]; then
-            echo "::error::Configure CLOUDFLARE_API_TOKEN or SOPS_AGE_KEY in the production environment."
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "::error::Configure CLOUDFLARE_API_TOKEN in the production environment."
+            exit 1
+          fi
+          if [ -z "${SOPS_AGE_KEY:-}" ]; then
+            echo "::error::Configure SOPS_AGE_KEY so application secrets can be decrypted before deployment."
             exit 1
           fi
       - name: Publish marketplace indexes and exact manifests
