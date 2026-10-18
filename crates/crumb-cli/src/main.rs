@@ -2963,14 +2963,7 @@ fn observe_agent_turn(
     ));
     let mut render_state = HarnessRenderState::default();
     let mut input = SteeringInput::new(renderer, steering_bytes, terminal.fullscreen);
-    let raw_mode = terminal
-        .interactive
-        .then(RawModeGuard::enable)
-        .transpose()?;
-    let enhanced_keys = terminal
-        .interactive
-        .then(KeyboardEnhancementGuard::enable)
-        .transpose()?;
+    let (raw_mode, enhanced_keys) = enable_active_terminal_input(terminal.interactive)?;
     if terminal.interactive {
         input.redraw(writer)?;
     }
@@ -3057,6 +3050,16 @@ fn observe_agent_turn(
         interruption,
         render_state.streamed_response,
     ))
+}
+
+fn enable_active_terminal_input(
+    interactive: bool,
+) -> Result<(Option<RawModeGuard>, Option<KeyboardEnhancementGuard>)> {
+    let raw_mode = interactive.then(RawModeGuard::enable).transpose()?;
+    let enhanced_keys = interactive
+        .then(KeyboardEnhancementGuard::enable)
+        .transpose()?;
+    Ok((raw_mode, enhanced_keys))
 }
 
 #[allow(clippy::too_many_arguments)]

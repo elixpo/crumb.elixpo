@@ -112,6 +112,21 @@ fn configured_approvals(config: &AgentConfig) -> ConfiguredApprovals {
         .with_mcp_tools(config.permissions.allow_mcp_tools.clone())
 }
 
+fn turn_approvals(
+    config: &AgentConfig,
+    interactive: Option<InteractiveApprovalBroker>,
+) -> Arc<dyn ApprovalBroker> {
+    let configured = configured_approvals(config);
+    match interactive {
+        Some(interactive) => Arc::new(TurnApprovals {
+            configured,
+            interactive,
+            approved: Mutex::new(BTreeSet::new()),
+        }),
+        None => Arc::new(configured),
+    }
+}
+
 fn native_harness_limits(config: &AgentConfig) -> Result<HarnessLimits> {
     Ok(HarnessLimits {
         max_model_rounds: NonZeroUsize::new(
@@ -1489,15 +1504,7 @@ impl AgentRuntime {
             crate::configured_pollinations_runtime_key(config),
             self.peer_runtime_for_workspace(&workspace),
         )?;
-        let configured = configured_approvals(config);
-        let approvals: Arc<dyn ApprovalBroker> = match interaction.interactive {
-            Some(interactive) => Arc::new(TurnApprovals {
-                configured,
-                interactive,
-                approved: Mutex::new(BTreeSet::new()),
-            }),
-            None => Arc::new(configured),
-        };
+        let approvals = turn_approvals(config, interaction.interactive);
         self.ensure_session(&workspace, config.mode)?;
         let route = select_request_route(config, request)
             .context("agent config has no text model route")?;
@@ -1573,12 +1580,7 @@ impl AgentRuntime {
                 Some(HarnessConfig::Native | HarnessConfig::Process { .. })
             ),
         );
-        if compacted
-            && native
-            && let Some(conversation) = self.native_conversation.as_mut()
-        {
-            conversation.compact_history();
-        }
+        self.compact_native_conversation_if(compacted && native);
         if !native {
             self.session
                 .as_mut()
@@ -1586,6 +1588,12 @@ impl AgentRuntime {
                 .record_turn_end(status, 0, 0)?;
         }
         result
+    }
+
+    fn compact_native_conversation_if(&mut self, compacted: bool) {
+        if compacted && let Some(conversation) = self.native_conversation.as_mut() {
+            conversation.compact_history();
+        }
     }
 
     fn load_skill_context_for_turn(
