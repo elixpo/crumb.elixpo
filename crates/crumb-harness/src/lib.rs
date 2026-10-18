@@ -1167,12 +1167,15 @@ fn finish_turn(
         &sanitize_agent_response(&round.text, &turn.user_message),
         &metrics.successful_tool_outputs,
     );
-    let final_text =
-        if !metrics.successful_tool_outputs.is_empty() && response_is_generic_idle(&grounded) {
-            render_successful_tool_fallback(&metrics.successful_tool_outputs)
-        } else {
-            grounded
-        };
+    let final_text = if !metrics.successful_tool_outputs.is_empty()
+        && (response_is_generic_idle(&grounded)
+            || response_lacks_substantive_answer(&grounded)
+            || !missing_requested_checks(&turn.user_message, &grounded).is_empty())
+    {
+        render_successful_tool_fallback(&metrics.successful_tool_outputs)
+    } else {
+        grounded
+    };
     let chunks = if final_text == round.text {
         round.text_chunks
     } else {
@@ -1339,7 +1342,20 @@ fn response_needs_grounding_correction(response: &str, user_message: &str) -> bo
     let persona_only = strip_persona_boilerplate(&response, asks_about_identity(user_message))
         .trim()
         .is_empty();
-    contradicts_evidence || persona_only || response_is_generic_idle(&response)
+    contradicts_evidence
+        || persona_only
+        || response_is_generic_idle(&response)
+        || response_lacks_substantive_answer(&response)
+        || !missing_requested_checks(user_message, &response).is_empty()
+}
+
+fn response_lacks_substantive_answer(response: &str) -> bool {
+    response
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .take(2)
+        .count()
+        < 2
 }
 
 fn response_is_generic_idle(response: &str) -> bool {
@@ -3269,6 +3285,48 @@ mod tests {
         assert!(events.iter().any(|event| {
             matches!(event, HarnessEvent::TextDelta(text) if text == "Verified result:\n\n24 C")
         }));
+    }
+
+    #[tokio::test]
+    async fn content_free_reply_after_successful_tool_falls_back_to_verified_evidence() {
+        let emoji_round = || {
+            vec![
+                ChatEvent::TextDelta("🌧️".to_owned()),
+                ChatEvent::Finished(FinishReason::Stop),
+            ]
+        };
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_round(),
+            emoji_round(),
+            emoji_round(),
+        ]));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let harness = NativeHarness::new(
+            provider.clone(),
+            tools(calls.clone()),
+            Arc::new(DenyAllApprovals),
+            HarnessLimits::default(),
+        );
+        let (_root, mut session) = session(AgentMode::Auto);
+        let mut conversation = harness.conversation();
+        let mut events = Vec::new();
+
+        let outcome = harness
+            .run_turn(
+                &mut session,
+                &mut conversation,
+                turn(),
+                &CancellationToken::default(),
+                &mut events,
+            )
+            .await
+            .expect("verified evidence replaces a content-free model reply");
+
+        assert_eq!(outcome.text, "Verified result:\n\n24 C");
+        assert_eq!(outcome.model_rounds, 3);
+        assert_eq!(outcome.tool_calls, 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.requests.lock().expect("request lock").len(), 3);
     }
 
     #[tokio::test]

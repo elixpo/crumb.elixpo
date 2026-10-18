@@ -86,10 +86,10 @@ use crumb_ui::{
 use directories::BaseDirs;
 use nu_ansi_term::{Color, Style};
 use reedline::{
-    Completer, DefaultHinter, EditCommand, EditMode, Editor, Emacs, FileBackedHistory, Hinter,
-    History, HistoryItem, IdeMenu, KeyCode, KeyModifiers, Menu, MenuBuilder, MenuEvent,
+    Completer, DefaultHinter, EditCommand, EditMode, Editor, Emacs, FileBackedHistory, Highlighter,
+    Hinter, History, HistoryItem, IdeMenu, KeyCode, KeyModifiers, Menu, MenuBuilder, MenuEvent,
     MenuSettings, Painter, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus,
-    Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent, Signal, Suggestion,
+    Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent, Signal, StyledText, Suggestion,
     default_emacs_keybindings,
 };
 use sha2::{Digest, Sha256};
@@ -1634,6 +1634,7 @@ fn read_repl_submission(
         prompt.to_owned(),
         format!("{status}  "),
         fullscreen,
+        editor.dock.clone(),
         Arc::clone(&editor.paste_artifacts),
         Arc::clone(&editor.composer_input_rows),
     ))?;
@@ -3136,6 +3137,7 @@ fn render_observed_activity(
         output_tokens,
     } = event
     {
+        let activity_row = activity.as_ref().and_then(crumb_ui::ActivityIndicator::row);
         if let Some(indicator) = activity.take() {
             indicator.finish();
         }
@@ -3150,7 +3152,12 @@ fn render_observed_activity(
             &terminal.transcript,
             terminal.header_rows,
         )?;
-        *activity = Some(start_activity(renderer, "Thinking", terminal.fullscreen));
+        *activity = Some(start_activity_at(
+            renderer,
+            "Thinking",
+            terminal.fullscreen,
+            activity_row,
+        ));
     } else {
         render_harness_activity(
             event,
@@ -4526,10 +4533,13 @@ fn replace_activity(
     label: &str,
     fullscreen: bool,
 ) {
+    let row = indicator
+        .as_ref()
+        .and_then(crumb_ui::ActivityIndicator::row);
     if let Some(active) = indicator.take() {
         active.finish();
     }
-    *indicator = Some(start_activity(renderer, label, fullscreen));
+    *indicator = Some(start_activity_at(renderer, label, fullscreen, row));
 }
 
 fn start_activity(
@@ -4537,10 +4547,21 @@ fn start_activity(
     label: &str,
     fullscreen: bool,
 ) -> crumb_ui::ActivityIndicator {
+    start_activity_at(renderer, label, fullscreen, None)
+}
+
+fn start_activity_at(
+    renderer: Renderer,
+    label: &str,
+    fullscreen: bool,
+    pinned_row: Option<u16>,
+) -> crumb_ui::ActivityIndicator {
     if fullscreen {
-        let row = size().map_or(0, |(_, rows)| {
-            let cursor_row = cursor_position().map_or(0, |(_, row)| row);
-            transcript_activity_row(cursor_row, rows)
+        let row = pinned_row.unwrap_or_else(|| {
+            size().map_or(0, |(_, rows)| {
+                let cursor_row = cursor_position().map_or(0, |(_, row)| row);
+                transcript_activity_row(cursor_row, rows)
+            })
         });
         renderer.activity_at(label, row)
     } else {
@@ -11061,6 +11082,7 @@ fn stdin_ready(_stdin: &io::Stdin) -> io::Result<bool> {
 struct InteractiveLineEditor {
     editor: Reedline,
     workspace: CompletionWorkspace,
+    dock: Option<ComposerDock>,
     paste_artifacts: Arc<Mutex<PendingComposerArtifacts>>,
     composer_input_rows: Arc<AtomicU16>,
 }
@@ -11145,6 +11167,27 @@ struct CompletionOverlay {
     renderer: Renderer,
     header_rows: u16,
     transcript: Arc<Mutex<TranscriptState>>,
+    paste_artifacts: Arc<Mutex<PendingComposerArtifacts>>,
+    composer_line: String,
+}
+
+struct CrumbHighlighter;
+
+impl Highlighter for CrumbHighlighter {
+    fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
+        let mut text = StyledText::new();
+        // Never inherit the terminal's previous foreground. Some emulators
+        // restore the color saved while Crumb repaints its fixed footer,
+        // making an otherwise unstyled Reedline buffer match the background.
+        text.push((Style::new().fg(Color::Fixed(252)), line.to_owned()));
+        text
+    }
+}
+
+fn sanitize_completion_menu_body(body: &str) -> String {
+    // Reedline's borderless `IdeMenu` currently uses `char::default()` for
+    // its absent vertical borders, which places NUL bytes in terminal output.
+    body.replace('\0', "")
 }
 
 impl CompletionOverlay {
@@ -11153,13 +11196,42 @@ impl CompletionOverlay {
         renderer: Renderer,
         header_rows: u16,
         transcript: Arc<Mutex<TranscriptState>>,
+        paste_artifacts: Arc<Mutex<PendingComposerArtifacts>>,
     ) -> Self {
         Self {
             menu,
             renderer,
             header_rows,
             transcript,
+            paste_artifacts,
+            composer_line: String::new(),
         }
+    }
+
+    fn track_composer_line(&mut self, editor: &Editor) {
+        self.composer_line.clear();
+        self.composer_line.push_str(editor.get_buffer());
+    }
+
+    fn paint_composer(&self, frame: &mut String, columns: u16, rows: u16) {
+        let color = std::env::var_os("NO_COLOR").is_none();
+        let mut artifacts = self
+            .paste_artifacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let artifact_width = artifacts.composer_prefix_width();
+        let input_rows = composer_visual_rows(&self.composer_line, artifact_width, columns);
+        let input_row = composer_anchor_row(rows, input_rows).saturating_add(2);
+        let artifact_prefix = artifacts.composer_prefix(color, Some(input_row));
+        frame.push_str(&completion_menu_composer_frame(
+            self.renderer,
+            rows,
+            columns,
+            &artifact_prefix,
+            artifact_width,
+            &self.composer_line,
+            color,
+        ));
     }
 
     fn overlay_rows(&self) -> (u16, u16, u16) {
@@ -11193,6 +11265,7 @@ impl CompletionOverlay {
             composer_row,
             terminal_rows,
         ));
+        self.paint_composer(&mut frame, columns, terminal_rows);
         frame
     }
 
@@ -11235,6 +11308,7 @@ impl CompletionOverlay {
             composer_row,
             terminal_rows,
         ));
+        self.paint_composer(&mut frame, columns, terminal_rows);
         frame
     }
 }
@@ -11245,6 +11319,17 @@ fn completion_footer_frame(
     columns: u16,
     composer_row: u16,
     terminal_rows: u16,
+) -> String {
+    idle_composer_footer_frame(state, renderer, columns, composer_row, terminal_rows, false)
+}
+
+fn idle_composer_footer_frame(
+    state: &TranscriptState,
+    renderer: Renderer,
+    columns: u16,
+    composer_row: u16,
+    terminal_rows: u16,
+    has_artifacts: bool,
 ) -> String {
     let mut frame = String::new();
     let status_row = composer_status_row(composer_row).saturating_add(1);
@@ -11270,9 +11355,35 @@ fn completion_footer_frame(
     let _ = write!(
         frame,
         "\x1b[{terminal_rows};1H\x1b[2K{}",
-        renderer.composer_hotkeys(columns)
+        if has_artifacts {
+            renderer.composer_artifact_hotkeys(columns)
+        } else {
+            renderer.composer_hotkeys(columns)
+        }
     );
     frame
+}
+
+fn pinned_composer_footer_frame(
+    state: &TranscriptState,
+    renderer: Renderer,
+    columns: u16,
+    header_rows: u16,
+    terminal_rows: u16,
+    has_artifacts: bool,
+) -> String {
+    let (_, _, composer_row, _) = fullscreen_rows_for_height(header_rows, terminal_rows);
+    format!(
+        "\x1b7{}\x1b8",
+        idle_composer_footer_frame(
+            state,
+            renderer,
+            columns,
+            composer_row,
+            terminal_rows,
+            has_artifacts,
+        )
+    )
 }
 
 impl Menu for CompletionOverlay {
@@ -11323,11 +11434,13 @@ impl Menu for CompletionOverlay {
         editor: &mut Editor,
         completer: &mut dyn Completer,
     ) -> bool {
+        self.track_composer_line(editor);
         self.menu
             .can_partially_complete(values_updated, editor, completer)
     }
 
     fn update_values(&mut self, editor: &mut Editor, completer: &mut dyn Completer) {
+        self.track_composer_line(editor);
         self.menu.update_values(editor, completer);
     }
 
@@ -11341,6 +11454,7 @@ impl Menu for CompletionOverlay {
         completer: &mut dyn Completer,
         painter: &Painter,
     ) {
+        self.track_composer_line(editor);
         self.menu.update_working_details(editor, completer, painter);
     }
 
@@ -11356,11 +11470,11 @@ impl Menu for CompletionOverlay {
         if self.menu.get_values().is_empty() {
             return self.restore_overlay_frame();
         }
-        self.paint_overlay(
-            &self
-                .menu
-                .menu_string(COMPLETION_PALETTE_ROWS, use_ansi_coloring),
-        )
+        let menu = self
+            .menu
+            .menu_string(COMPLETION_PALETTE_ROWS, use_ansi_coloring);
+        let body = sanitize_completion_menu_body(&menu);
+        self.paint_overlay(&body)
     }
 
     fn min_rows(&self) -> u16 {
@@ -11426,6 +11540,8 @@ fn create_line_editor(
         }
     }
     let keybindings = crumb_keybindings();
+    let (paste_artifacts, composer_dock) =
+        composer_artifact_state(fullscreen, renderer, Arc::clone(&transcript), header_rows);
     let menu_width = u16::try_from(suggestion_width(size()?.0)).unwrap_or(1);
     let menu = IdeMenu::default()
         .with_name("completion_menu")
@@ -11451,9 +11567,13 @@ fn create_line_editor(
         .with_padding(0)
         .with_cursor_offset(i16::try_from(FULLSCREEN_SIDE_GUTTER).unwrap_or(2))
         .with_correct_cursor_pos(true);
-    let menu = CompletionOverlay::new(menu, renderer, header_rows, Arc::clone(&transcript));
-    let (paste_artifacts, composer_dock) =
-        composer_artifact_state(fullscreen, renderer, transcript, header_rows);
+    let menu = CompletionOverlay::new(
+        menu,
+        renderer,
+        header_rows,
+        transcript,
+        Arc::clone(&paste_artifacts),
+    );
     let composer_input_rows = Arc::new(AtomicU16::new(1));
     let edit_mode = CrumbEditMode::new(
         keybindings,
@@ -11462,8 +11582,8 @@ fn create_line_editor(
     );
     let editor = Reedline::create()
         .with_history(Box::new(interactive_history))
+        .with_highlighter(Box::new(CrumbHighlighter))
         .with_hinter(Box::new(CrumbHinter::new(
-            composer_dock,
             Arc::clone(&paste_artifacts),
             Arc::clone(&composer_input_rows),
         )))
@@ -11474,6 +11594,7 @@ fn create_line_editor(
     Ok(InteractiveLineEditor {
         editor,
         workspace,
+        dock: composer_dock,
         paste_artifacts,
         composer_input_rows,
     })
@@ -12066,10 +12187,76 @@ fn composer_placeholder_hint(line: &str, has_artifacts: bool) -> Option<&'static
     }
 }
 
+fn completion_menu_composer_frame(
+    renderer: Renderer,
+    terminal_rows: u16,
+    terminal_columns: u16,
+    artifact_prefix: &str,
+    artifact_width: usize,
+    line: &str,
+    color: bool,
+) -> String {
+    // Reedline clears from its calculated menu anchor after painting the
+    // prompt. Crumb's prompt is absolutely anchored, so that calculation may
+    // overlap the composer in wide terminals. Repaint both owned composer rows
+    // after the palette and replace Reedline's stale saved cursor position.
+    let buffer_column = 4_usize
+        .saturating_add(artifact_width)
+        .saturating_add(usize::from(artifact_width > 0));
+    let available_width = usize::from(terminal_columns).saturating_sub(buffer_column);
+    if terminal_columns == 0 || available_width == 0 {
+        return String::new();
+    }
+    let line = truncate_chars(line, available_width);
+    let rendered_line = if color {
+        Style::new().fg(Color::Fixed(252)).paint(&line).to_string()
+    } else {
+        line.clone()
+    };
+    let placeholder = composer_placeholder_hint(&line, artifact_width > 0).unwrap_or_default();
+    let placeholder = truncate_chars(
+        placeholder,
+        available_width.saturating_sub(line.chars().count()),
+    );
+    let rendered_placeholder = if color {
+        Style::new()
+            .fg(Color::DarkGray)
+            .bold()
+            .paint(placeholder)
+            .to_string()
+    } else {
+        placeholder
+    };
+    let input_rows = composer_visual_rows(&line, artifact_width, terminal_columns);
+    let anchor = composer_anchor_row(terminal_rows, input_rows);
+    let border_row = anchor.saturating_add(2);
+    let input_row = anchor.saturating_add(3);
+    let artifact_gap = if artifact_prefix.is_empty() { "" } else { " " };
+    let border_width = usize::from(terminal_columns.saturating_sub(6));
+    let border = format!("  ╭{}╮", "─".repeat(border_width));
+    let border = if color {
+        Style::new().fg(Color::DarkGray).paint(border).to_string()
+    } else {
+        border
+    };
+    let cursor_offset = buffer_column.saturating_add(line.chars().count());
+    let cursor_row = input_row.saturating_add(
+        u16::try_from(cursor_offset / usize::from(terminal_columns)).unwrap_or(u16::MAX),
+    );
+    let cursor_column = u16::try_from(cursor_offset % usize::from(terminal_columns))
+        .unwrap_or(u16::MAX)
+        .saturating_add(1);
+    format!(
+        "\x1b[{border_row};1H\x1b[2K{border}\x1b[{input_row};1H\x1b[2K  {} {artifact_prefix}{artifact_gap}{rendered_line}{rendered_placeholder}\x1b[{cursor_row};{cursor_column}H\x1b7",
+        renderer.composer_side_border()
+    )
+}
+
 struct CrumbPrompt {
     rendered: String,
     right: String,
     anchor_to_composer: bool,
+    dock: Option<ComposerDock>,
     paste_artifacts: Arc<Mutex<PendingComposerArtifacts>>,
     composer_input_rows: Arc<AtomicU16>,
 }
@@ -12077,7 +12264,6 @@ struct CrumbPrompt {
 struct CrumbHinter {
     history: DefaultHinter,
     placeholder_visible: bool,
-    dock: Option<ComposerDock>,
     paste_artifacts: Arc<Mutex<PendingComposerArtifacts>>,
     composer_input_rows: Arc<AtomicU16>,
 }
@@ -12091,45 +12277,15 @@ struct ComposerDock {
 
 impl CrumbHinter {
     fn new(
-        dock: Option<ComposerDock>,
         paste_artifacts: Arc<Mutex<PendingComposerArtifacts>>,
         composer_input_rows: Arc<AtomicU16>,
     ) -> Self {
         Self {
             history: DefaultHinter::default().with_style(Style::new().fg(Color::DarkGray)),
             placeholder_visible: false,
-            dock,
             paste_artifacts,
             composer_input_rows,
         }
-    }
-
-    fn with_dock(&self, hint: String) -> String {
-        let Some(dock) = &self.dock else {
-            return hint;
-        };
-        let columns = size().map_or(80, |(columns, _)| columns);
-        let state = dock
-            .transcript
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let has_artifacts = self
-            .paste_artifacts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .has_artifacts();
-        let hotkeys = if has_artifacts {
-            "Ctrl+V attach · Alt+P preview · Alt+X remove · Enter send"
-        } else {
-            "Ctrl+V attach clipboard · Enter send · PgUp/PgDn scroll · ? help"
-        };
-        let hotkeys = truncate_chars(hotkeys, usize::from(columns));
-        format!(
-            "{hint}\n{}\n{}\n{}",
-            dock.renderer.composer_idle_status(),
-            state.footer_context,
-            hotkeys
-        )
     }
 }
 
@@ -12166,13 +12322,11 @@ impl Hinter for CrumbHinter {
             } else {
                 placeholder.to_owned()
             };
-            return self.with_dock(hint);
+            return hint;
         }
         self.placeholder_visible = false;
-        let hint = self
-            .history
-            .handle(line, pos, history, use_ansi_coloring, cwd);
-        self.with_dock(hint)
+        self.history
+            .handle(line, pos, history, use_ansi_coloring, cwd)
     }
 
     fn complete_hint(&self) -> String {
@@ -12197,6 +12351,7 @@ impl CrumbPrompt {
         rendered: String,
         right: String,
         anchor_to_composer: bool,
+        dock: Option<ComposerDock>,
         paste_artifacts: Arc<Mutex<PendingComposerArtifacts>>,
         composer_input_rows: Arc<AtomicU16>,
     ) -> Self {
@@ -12204,6 +12359,7 @@ impl CrumbPrompt {
             rendered,
             right,
             anchor_to_composer,
+            dock,
             paste_artifacts,
             composer_input_rows,
         }
@@ -12217,14 +12373,34 @@ impl Prompt for CrumbPrompt {
         }
         let (columns, rows) = size().unwrap_or((80, FULLSCREEN_COMPOSER_ROWS));
         let input_rows = self.composer_input_rows.load(Ordering::Relaxed);
-        Cow::Owned(aligned_composer_prompt(
+        let mut prompt = aligned_composer_prompt(
             &self.rendered,
             &self.right,
             columns,
             rows,
             input_rows,
             std::env::var_os("NO_COLOR").is_none(),
-        ))
+        );
+        if let Some(dock) = &self.dock {
+            let state = dock
+                .transcript
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let has_artifacts = self
+                .paste_artifacts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .has_artifacts();
+            prompt.push_str(&pinned_composer_footer_frame(
+                &state,
+                dock.renderer,
+                columns,
+                dock.header_rows,
+                rows,
+                has_artifacts,
+            ));
+        }
+        Cow::Owned(prompt)
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
@@ -12483,8 +12659,11 @@ fn render_idle_composer(
     status: &str,
 ) -> io::Result<()> {
     position_composer(renderer, header_rows)?;
-    let (columns, _) = size()?;
-    let (_, _, composer_row, _) = fullscreen_rows(header_rows)?;
+    let (columns, rows) = size()?;
+    // Reedline anchors a one-line idle composer here as well. Reuse that row
+    // after submission so switching into an active turn cannot grow the dock
+    // or move the placeholder by two terminal rows.
+    let composer_row = follow_up_composer_row(rows);
     let mut writer = io::stdout();
     crossterm::execute!(writer, MoveTo(0, composer_row))?;
     write!(
@@ -12590,26 +12769,13 @@ fn render_transcript_footer_with_writer(
     renderer: Renderer,
     header_rows: u16,
 ) -> io::Result<()> {
-    let (columns, _) = size()?;
-    let (_, _, composer_row, footer_row) = fullscreen_rows(header_rows)?;
-    crossterm::execute!(
+    let (columns, rows) = size()?;
+    let (_, _, composer_row, _) = fullscreen_rows_for_height(header_rows, rows);
+    write!(
         writer,
-        MoveTo(0, composer_status_row(composer_row)),
-        Clear(ClearType::CurrentLine)
-    )?;
-    write!(writer, "{}", renderer.composer_idle_status())?;
-    if let Some((column, indicator)) = transcript_new_content_indicator(state, renderer, columns) {
-        crossterm::execute!(writer, MoveTo(column, composer_status_row(composer_row)))?;
-        write!(writer, "{indicator}")?;
-    }
-    crossterm::execute!(
-        writer,
-        MoveTo(0, composer_context_row(composer_row)),
-        Clear(ClearType::CurrentLine)
-    )?;
-    write!(writer, "{}", state.footer_context)?;
-    crossterm::execute!(writer, MoveTo(0, footer_row), Clear(ClearType::CurrentLine))?;
-    write!(writer, "{}", renderer.composer_hotkeys(columns))
+        "{}",
+        idle_composer_footer_frame(state, renderer, columns, composer_row, rows, false)
+    )
 }
 
 fn transcript_new_content_indicator(
@@ -12909,28 +13075,32 @@ mod tests {
 
     use super::{
         ArtifactModalAction, ArtifactModalBounds, COMPOSER_PLACEHOLDER, CaptureOutcome,
-        CrumbEditMode, DiscoverySource, ExitGesture, MarketplaceContent, PausedSubmission,
-        PendingComposerArtifacts, Renderer, SessionCommandContext, SteeringAction,
-        TerminalModeTracker, TranscriptCapture, TranscriptScroll, TranscriptState, UiSettings,
-        active_scroll_direction, agent_config_location, aligned_composer_prompt,
-        apply_builtin_model_packs, artifact_modal_action, bundled_catalog, completion_footer_frame,
-        composer_anchor_sequence, composer_placeholder_hint, composer_visual_rows,
-        configure_permissions, configure_plugin, effort_display_name, effort_wire_name,
+        ComposerDock, CrumbEditMode, CrumbHighlighter, CrumbPrompt, DiscoverySource, ExitGesture,
+        MarketplaceContent, PausedSubmission, PendingComposerArtifacts, Renderer,
+        SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
+        TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
+        agent_config_location, aligned_composer_prompt, apply_builtin_model_packs,
+        artifact_modal_action, bundled_catalog, completion_footer_frame,
+        completion_menu_composer_frame, composer_anchor_row, composer_anchor_sequence,
+        composer_placeholder_hint, composer_visual_rows, configure_permissions, configure_plugin,
+        crumb_keybindings, effort_display_name, effort_wire_name,
         ensure_single_release_skill_install, exact_skill_manifest_url, exact_skill_run_config,
         failed_command_recovery, finished_tool_activity, fixed_footer_frame,
-        follow_up_cursor_sequence, format_peer_discarded_file, format_peer_imported_file,
-        format_peer_inbox, format_peer_inspection, format_peer_quarantined_file, format_peer_task,
-        handle_skill_command, initial_agent_activity, install_marketplace_package,
-        load_exact_skill_manifest, marketplace_update_blocker, normalize_bundled_skill_install,
-        openrouter_preset, parse_cli_skill_run, parse_credential_reference, parse_exec_request,
+        follow_up_composer_row, follow_up_cursor_sequence, format_peer_discarded_file,
+        format_peer_imported_file, format_peer_inbox, format_peer_inspection,
+        format_peer_quarantined_file, format_peer_task, handle_skill_command,
+        initial_agent_activity, install_marketplace_package, load_exact_skill_manifest,
+        marketplace_update_blocker, normalize_bundled_skill_install, openrouter_preset,
+        parse_cli_skill_run, parse_credential_reference, parse_exec_request,
         parse_interactive_skill_run, parse_paused_submission, parse_provider_header,
         parse_resume_session_argument, read_agent_config, read_bounded_response,
         register_local_skill, render_skill_discovery_search, resolve_memory_keep,
-        sanitize_transcript_output, select_discovery_skill, set_skill_enabled, shell_blast_radius,
-        shell_tool_config, should_auto_enable_rtk, show_graph, show_instance, show_marketplace,
-        show_memory, show_profile_with_stores, suggestion_width, transcript_activity_row,
-        unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
-        visible_tool_activity, workspace_read_host, write_bounded_response_delta_for_width,
+        sanitize_completion_menu_body, sanitize_transcript_output, select_discovery_skill,
+        set_skill_enabled, shell_blast_radius, shell_tool_config, should_auto_enable_rtk,
+        show_graph, show_instance, show_marketplace, show_memory, show_profile_with_stores,
+        suggestion_width, transcript_activity_row, unregister_local_skill,
+        validate_marketplace_path, validate_marketplace_response, visible_tool_activity,
+        workspace_read_host, write_bounded_response_delta_for_width,
     };
     use crate::agent_runtime::{
         PeerDeliveryInspection, PeerDiscardedFile, PeerImportedFile, PeerInboxSummary,
@@ -14535,6 +14705,7 @@ mod tests {
     fn active_follow_up_cursor_is_placed_inside_the_composer() {
         assert_eq!(follow_up_cursor_sequence(40), "\x1b[35;5H");
         assert_eq!(follow_up_cursor_sequence(4), "\x1b[1;5H");
+        assert_eq!(follow_up_composer_row(40), composer_anchor_row(40, 1));
     }
 
     #[test]
@@ -14564,6 +14735,63 @@ mod tests {
     }
 
     #[test]
+    fn completion_triggers_open_the_same_guarded_menu_path() {
+        let keybindings = crumb_keybindings();
+        for trigger in ['?', '@', '/'] {
+            assert!(
+                keybindings
+                    .find_binding(KeyModifiers::NONE, KeyCode::Char(trigger))
+                    .is_some()
+            );
+        }
+        assert!(
+            keybindings
+                .find_binding(KeyModifiers::NONE, KeyCode::Tab)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn composer_input_has_an_explicit_visible_foreground() {
+        let input = "efF?Ef?e?FeF?eF?e?FEF?";
+        let highlighted = <CrumbHighlighter as reedline::Highlighter>::highlight(
+            &CrumbHighlighter,
+            input,
+            input.len(),
+        );
+
+        assert_eq!(highlighted.buffer.len(), 1);
+        assert_eq!(highlighted.buffer[0].1, input);
+        assert_eq!(
+            highlighted.buffer[0].0.foreground,
+            Some(nu_ansi_term::Color::Fixed(252))
+        );
+    }
+
+    #[test]
+    fn every_completion_menu_repaints_the_complete_composer_and_cursor() {
+        let renderer = Renderer::new(UiSettings::from_environment(false));
+        for trigger in ["?", "@", "/"] {
+            let frame = completion_menu_composer_frame(renderer, 40, 120, "", 0, trigger, false);
+            assert!(frame.starts_with("\x1b[36;1H\x1b[2K  ╭"));
+            assert!(frame.contains(&format!("\x1b[37;1H\x1b[2K  │ {trigger}")));
+            assert!(frame.ends_with("\x1b[37;6H\x1b7"));
+        }
+
+        let artifact_frame =
+            completion_menu_composer_frame(renderer, 40, 120, "[IMG1 10×10 ×]", 14, "@", false);
+        assert!(artifact_frame.contains("\x1b[37;1H\x1b[2K  │ [IMG1 10×10 ×] @"));
+        assert!(artifact_frame.ends_with("\x1b[37;21H\x1b7"));
+    }
+
+    #[test]
+    fn completion_palette_never_emits_nul_control_bytes() {
+        let body = sanitize_completion_menu_body("\0? help\0\r\n\0? skills\0");
+        assert_eq!(body, "? help\r\n? skills");
+        assert!(!body.as_bytes().contains(&0));
+    }
+
+    #[test]
     fn completion_palette_preserves_every_fixed_footer_row() {
         let renderer = Renderer::new(UiSettings::from_environment(false));
         let state = TranscriptState {
@@ -14579,6 +14807,35 @@ mod tests {
         assert!(frame.contains("\x1b[36;1H\x1b[2K"));
         assert!(frame.contains("\x1b[37;1H\x1b[2K"));
         assert!(frame.contains("\x1b[40;1H\x1b[2K"));
+    }
+
+    #[test]
+    fn history_navigation_prompt_repaints_the_fixed_footer() {
+        let renderer = Renderer::new(UiSettings::from_environment(false));
+        let transcript = Arc::new(Mutex::new(TranscriptState {
+            footer_context: "Model context · 0 / 256.0k".to_owned(),
+            ..TranscriptState::default()
+        }));
+        let prompt = CrumbPrompt::new(
+            "workspace git:main\n╭─╮\n│ ".to_owned(),
+            "pack Balanced Crumb".to_owned(),
+            true,
+            Some(ComposerDock {
+                renderer,
+                transcript,
+                header_rows: 6,
+            }),
+            Arc::new(Mutex::new(PendingComposerArtifacts::default())),
+            Arc::new(std::sync::atomic::AtomicU16::new(1)),
+        );
+
+        let frame = <CrumbPrompt as reedline::Prompt>::render_prompt_left(&prompt);
+
+        assert!(frame.contains("Ready"));
+        assert!(frame.contains("Model context · 0 / 256.0k"));
+        assert!(frame.contains("Enter send"));
+        assert!(frame.contains("\x1b7"));
+        assert!(frame.contains("\x1b8"));
     }
 
     #[test]

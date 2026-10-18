@@ -345,6 +345,18 @@ impl Renderer {
         self.paint(&format!("  {guide}"), "2")
     }
 
+    /// Renders the persistent keyboard guide when the composer owns artifacts.
+    #[must_use]
+    pub fn composer_artifact_hotkeys(&self, terminal_width: u16) -> String {
+        let guide = if terminal_width < 52 {
+            "^V attach · Alt+X remove · Enter send"
+        } else {
+            "Ctrl+V attach · Alt+P preview · Alt+X remove · Enter send"
+        };
+        let guide = fit_terminal_text(guide, usize::from(terminal_width.saturating_sub(2)));
+        self.paint(&format!("  {guide}"), "2")
+    }
+
     /// Renders the fixed keyboard guide while an agent turn is active.
     #[must_use]
     pub fn composer_active_hotkeys(&self, terminal_width: u16) -> String {
@@ -1405,6 +1417,15 @@ impl ActivityIndicator {
         self.started.elapsed()
     }
 
+    /// Returns the pinned terminal row used by a fullscreen activity.
+    ///
+    /// Replacements reuse this row so moving the input cursor into the
+    /// composer cannot make an in-flight status jump to the footer.
+    #[must_use]
+    pub const fn row(&self) -> Option<u16> {
+        self.row
+    }
+
     /// Stops and clears the activity line before another message is rendered.
     pub fn finish(mut self) {
         self.stop();
@@ -1500,29 +1521,42 @@ pub fn visible_agent_text(response: &str) -> String {
 fn render_terminal_markdown(ui: Renderer, markdown: &str, content_width: usize) -> String {
     let mut output_lines = Vec::new();
     let mut fence: Option<String> = None;
+    let mut mermaid_source = Vec::new();
 
     for line in markdown.lines() {
         let trimmed = line.trim_start();
         if let Some(info) = trimmed.strip_prefix("```") {
-            if fence.is_some() {
-                output_lines.push(ui.paint("└─", "2"));
-                fence = None;
+            if let Some(language) = fence.take() {
+                if language.eq_ignore_ascii_case("mermaid") {
+                    render_mermaid_block(ui, &mermaid_source, content_width, &mut output_lines);
+                    mermaid_source.clear();
+                } else {
+                    output_lines.push(ui.paint("└─", "2"));
+                }
             } else {
                 let language = info.trim();
-                let label = if language.eq_ignore_ascii_case("mermaid") {
-                    "mermaid diagram · source".to_owned()
-                } else if language.is_empty() {
-                    "code".to_owned()
-                } else {
-                    format!("code · {language}")
-                };
-                output_lines.push(format!(
-                    "{} {}",
-                    ui.paint("┌─", "2"),
-                    ui.paint(&label, "35;1")
-                ));
+                if !language.eq_ignore_ascii_case("mermaid") {
+                    let label = if language.is_empty() {
+                        "code".to_owned()
+                    } else {
+                        format!("code · {language}")
+                    };
+                    output_lines.push(format!(
+                        "{} {}",
+                        ui.paint("┌─", "2"),
+                        ui.paint(&label, "35;1")
+                    ));
+                }
                 fence = Some(language.to_owned());
             }
+            continue;
+        }
+
+        if fence
+            .as_deref()
+            .is_some_and(|language| language.eq_ignore_ascii_case("mermaid"))
+        {
+            mermaid_source.push(line.to_owned());
             continue;
         }
 
@@ -1538,10 +1572,137 @@ fn render_terminal_markdown(ui: Renderer, markdown: &str, content_width: usize) 
         }
     }
 
-    if fence.is_some() {
-        output_lines.push(ui.paint("└─", "2"));
+    if let Some(language) = fence {
+        if language.eq_ignore_ascii_case("mermaid") {
+            render_mermaid_block(ui, &mermaid_source, content_width, &mut output_lines);
+        } else {
+            output_lines.push(ui.paint("└─", "2"));
+        }
     }
     output_lines.join("\n")
+}
+
+fn render_mermaid_block(
+    ui: Renderer,
+    source: &[String],
+    content_width: usize,
+    output: &mut Vec<String>,
+) {
+    output.push(format!(
+        "{} {}",
+        ui.paint("┌─", "2"),
+        ui.paint("mermaid diagram · preview", "35;1")
+    ));
+    if let Some(preview) = mermaid_terminal_preview(source) {
+        for line in preview {
+            for chunk in wrap_terminal_line(&line, content_width.saturating_sub(2).max(1)) {
+                output.push(format!("{} {chunk}", ui.paint("│", "2")));
+            }
+        }
+    } else {
+        output.push(format!(
+            "{} {}",
+            ui.paint("│", "2"),
+            ui.paint("Preview unavailable for this Mermaid syntax", "2")
+        ));
+    }
+    output.push(format!(
+        "{} {}",
+        ui.paint("├─", "2"),
+        ui.paint("source", "35;1")
+    ));
+    for line in source {
+        for chunk in wrap_terminal_line(line, content_width.saturating_sub(2).max(1)) {
+            output.push(format!("{} {chunk}", ui.paint("│", "2")));
+        }
+    }
+    output.push(ui.paint("└─", "2"));
+}
+
+fn mermaid_terminal_preview(source: &[String]) -> Option<Vec<String>> {
+    let diagram = source
+        .iter()
+        .map(|line| line.trim())
+        .find(|line| !line.is_empty() && !line.starts_with("%%"))?;
+    let sequence = diagram.eq_ignore_ascii_case("sequenceDiagram");
+    let flow = diagram
+        .split_whitespace()
+        .next()
+        .is_some_and(|word| matches!(word.to_ascii_lowercase().as_str(), "graph" | "flowchart"));
+    if !sequence && !flow {
+        return None;
+    }
+
+    let mut preview = Vec::new();
+    for line in source.iter().map(|line| line.trim()).filter(|line| {
+        !line.is_empty()
+            && !line.starts_with("%%")
+            && !line.eq_ignore_ascii_case("sequenceDiagram")
+            && !line.starts_with("graph ")
+            && !line.starts_with("flowchart ")
+    }) {
+        let Some((left, arrow, right)) = split_mermaid_edge(line) else {
+            continue;
+        };
+        let (right, message) = if sequence {
+            right
+                .split_once(':')
+                .map_or((right, ""), |(node, message)| (node, message.trim()))
+        } else {
+            (right, "")
+        };
+        let left = mermaid_node_label(left);
+        let right = mermaid_node_label(right);
+        if left.is_empty() || right.is_empty() {
+            continue;
+        }
+        let connector = match arrow {
+            "==>" => "══▶",
+            "-.->" => "┄─▶",
+            "---" => "───",
+            _ => "──▶",
+        };
+        if message.is_empty() {
+            preview.push(format!("〔{left}〕 {connector} 〔{right}〕"));
+        } else {
+            preview.push(format!("〔{left}〕 ── {message} ──▶ 〔{right}〕"));
+        }
+    }
+    (!preview.is_empty()).then_some(preview)
+}
+
+fn split_mermaid_edge(line: &str) -> Option<(&str, &str, &str)> {
+    ["-.->", "-->>", "->>", "-->", "==>", "---"]
+        .into_iter()
+        .find_map(|arrow| {
+            line.split_once(arrow)
+                .map(|(left, right)| (left.trim(), arrow, right.trim()))
+        })
+}
+
+fn mermaid_node_label(node: &str) -> String {
+    let node = node.trim();
+    let node = if node.starts_with('|') {
+        node.get(1..)
+            .and_then(|tail| tail.split_once('|').map(|(_, node)| node))
+            .unwrap_or(node)
+    } else {
+        node
+    };
+    for (opening, closing) in [('[', ']'), ('(', ')'), ('{', '}')] {
+        if let Some(start) = node.find(opening)
+            && let Some(end) = node[start + 1..].find(closing)
+        {
+            return node[start + 1..start + 1 + end]
+                .trim_matches(['"', '\''])
+                .to_owned();
+        }
+    }
+    node.split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(';')
+        .to_owned()
 }
 
 fn wrap_markdown_source_line(line: &str, width: usize) -> Vec<String> {
@@ -1971,7 +2132,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_output_renders_terminal_markdown_and_mermaid_source() {
+    fn agent_output_renders_terminal_markdown_and_mermaid_preview() {
         let renderer = Renderer::new(UiSettings {
             color: false,
             output: OutputMode::Plain,
@@ -1986,9 +2147,28 @@ mod tests {
         assert!(output.contains("• checks passed"));
         assert!(output.contains("┌─ code · rust"));
         assert!(output.contains("│ fn main() {}"));
-        assert!(output.contains("┌─ mermaid diagram · source"));
+        assert!(output.contains("┌─ mermaid diagram · preview"));
+        assert!(output.contains("│ 〔A〕 ──▶ 〔B〕"));
+        assert!(output.contains("├─ source"));
         assert!(output.contains("│ graph TD"));
         assert!(!output.contains("```"));
+    }
+
+    #[test]
+    fn mermaid_sequence_diagram_gets_a_terminal_preview_and_keeps_source() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Plain,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let response = "```mermaid\nsequenceDiagram\n  User->>Crumb: Run tests\n  Crumb-->>User: 618 passed\n```";
+
+        let output = renderer.agent_response(response);
+
+        assert!(output.contains("〔User〕 ── Run tests ──▶ 〔Crumb〕"));
+        assert!(output.contains("〔Crumb〕 ── 618 passed ──▶ 〔User〕"));
+        assert!(output.contains("│ sequenceDiagram"));
     }
 
     #[test]
