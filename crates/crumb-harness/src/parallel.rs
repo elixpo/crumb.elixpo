@@ -21,6 +21,10 @@ use crate::{EventSink, HarnessEvent, HarnessLimits, HarnessTurn, NativeHarness};
 
 const SPAWN_AGENTS: &str = "spawn_agents";
 const NAMES: [&str; 8] = ["Koi", "Nyx", "Rune", "Echo", "Lux", "Mica", "Rook", "Zed"];
+const LOGOS: [&str; 4] = ["◆", "●", "▲", "■"];
+const HARD_MAX_AGENTS: usize = 4;
+const MAX_AGENT_NAME_BYTES: usize = 32;
+const MAX_AGENT_LOGO_BYTES: usize = 16;
 static NEXT_TEAM: AtomicU64 = AtomicU64::new(1);
 
 /// Hard ceilings for one parallel-analysis request.
@@ -65,6 +69,9 @@ pub fn register_parallel_agent_tool(
     provider: Arc<dyn LlmProvider>,
     config: ParallelAgentConfig,
 ) -> Result<()> {
+    if config.team_limits.max_agents.get() > HARD_MAX_AGENTS {
+        bail!("parallel agent limit cannot exceed the hard maximum of {HARD_MAX_AGENTS}");
+    }
     if config.model.trim().is_empty() {
         bail!("parallel agent model must not be empty");
     }
@@ -131,15 +138,10 @@ fn run_team(
     ensure_active(cancellation)?;
     let request = parse_request(arguments, tool.config.team_limits)?;
     let team = team_id();
-    let assignments = request
-        .tasks
-        .iter()
-        .enumerate()
-        .map(|(index, task)| (NAMES[index].to_owned(), task.clone()))
-        .collect::<Vec<_>>();
+    let assignments = request.assignments;
     let (activity_tx, activity_rx) = mpsc::sync_channel(64);
     let mut workers = Vec::with_capacity(assignments.len());
-    for (index, (name, task)) in assignments.iter().cloned().enumerate() {
+    for (index, assignment) in assignments.iter().cloned().enumerate() {
         let provider = Arc::clone(&tool.provider);
         let child_tools = tool.child_tools.clone();
         let config = tool.config.clone();
@@ -148,8 +150,9 @@ fn run_team(
             objective: request.objective.clone(),
             assignments: assignments.clone(),
             index,
-            name,
-            task,
+            name: assignment.name,
+            logo: assignment.logo,
+            task: assignment.task,
             provider,
             tools: child_tools,
             config,
@@ -188,7 +191,8 @@ fn run_team(
         .iter()
         .map(|finding| {
             format!(
-                "{} [{}]:\n{}",
+                "{} {} [{}]:\n{}",
+                finding.logo,
                 finding.name,
                 if finding.failed { "failed" } else { "complete" },
                 finding.text
@@ -211,6 +215,7 @@ fn run_team(
             "status": if findings.iter().any(|finding| finding.failed) { "partial" } else { "complete" },
             "agents": findings.iter().map(|finding| json!({
                 "name": finding.name,
+                "logo": finding.logo,
                 "session_id": finding.session_id,
                 "status": if finding.failed { "failed" } else { "complete" },
                 "finding": finding.text,
@@ -222,6 +227,7 @@ fn run_team(
 
 struct Finding {
     name: String,
+    logo: String,
     session_id: String,
     text: String,
     failed: bool,
@@ -230,9 +236,10 @@ struct Finding {
 struct WorkerSpec {
     team: String,
     objective: String,
-    assignments: Vec<(String, String)>,
+    assignments: Vec<AgentAssignment>,
     index: usize,
     name: String,
+    logo: String,
     task: String,
     provider: Arc<dyn LlmProvider>,
     tools: ToolHost,
@@ -248,6 +255,7 @@ fn run_worker(worker: WorkerSpec) -> Result<Finding> {
         assignments,
         index,
         name,
+        logo,
         task,
         provider,
         tools,
@@ -255,12 +263,11 @@ fn run_worker(worker: WorkerSpec) -> Result<Finding> {
         cancellation,
         activity,
     } = worker;
-    publish_activity(&activity, format!("{name} · Inspecting assignment"));
-    let session_id = SessionId::new(format!(
-        "agent-{team}-{}-{}",
-        index + 1,
-        name.to_ascii_lowercase()
-    ))?;
+    publish_activity(&activity, format!("{logo} {name} · Inspecting assignment"));
+    // Display identities are user-facing Unicode. Durable identifiers are
+    // generated independently so spaces, emoji, and punctuation cannot make
+    // a valid display name fail SessionId validation.
+    let session_id = SessionId::new(format!("agent-{team}-{}", index + 1))?;
     let journal = SessionJournal::open(&config.journal_root, &session_id)?;
     let mut session = AgentSession::start(
         session_id.clone(),
@@ -278,13 +285,18 @@ fn run_worker(worker: WorkerSpec) -> Result<Finding> {
     let mut events = TeamEvents::new(name.clone(), activity.clone());
     let roster = assignments
         .iter()
-        .map(|(agent, assignment)| format!("- {agent}: {assignment}"))
+        .map(|assignment| {
+            format!(
+                "- {} {}: {}",
+                assignment.logo, assignment.name, assignment.task
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let turn = HarnessTurn {
         model: config.model,
         user_message: format!(
-            "You are {name}, one read-only member of a Crumb agent team supervised by the parent Harness. Work only on your assignment, avoid duplicating sibling scopes, cite concrete paths or evidence, and flag dependencies, disagreements, or uncertainty for parent synthesis. Do not request mutations or claim to be the final answer.\n\nShared objective:\n{objective}\n\nTeam assignments:\n{roster}\n\nYour assignment:\n{task}"
+            "You are {logo} {name}, one read-only member of a Crumb agent team supervised by the parent Harness. Work only on your assignment, avoid duplicating sibling scopes, cite concrete paths or evidence, and flag dependencies, disagreements, or uncertainty for parent synthesis. Do not request mutations or claim to be the final answer.\n\nShared objective:\n{objective}\n\nTeam assignments:\n{roster}\n\nYour assignment:\n{task}"
         ),
         images: Vec::new(),
         persona: None,
@@ -306,19 +318,20 @@ fn run_worker(worker: WorkerSpec) -> Result<Finding> {
     ));
     let (text, failed) = match outcome {
         Ok(outcome) => {
-            publish_activity(&activity, format!("{name} · Reported findings"));
+            publish_activity(&activity, format!("{logo} {name} · Reported findings"));
             (
                 bounded_text(outcome.text, config.team_limits.max_result_bytes.get()),
                 false,
             )
         }
         Err(error) => {
-            publish_activity(&activity, format!("{name} · Failed safely"));
+            publish_activity(&activity, format!("{logo} {name} · Failed safely"));
             (format!("analysis failed: {error}"), true)
         }
     };
     Ok(Finding {
         name,
+        logo,
         session_id: session_id.as_str().to_owned(),
         text,
         failed,
@@ -335,7 +348,14 @@ fn team_id() -> String {
 
 struct TeamRequest {
     objective: String,
-    tasks: Vec<String>,
+    assignments: Vec<AgentAssignment>,
+}
+
+#[derive(Clone)]
+struct AgentAssignment {
+    name: String,
+    logo: String,
+    task: String,
 }
 
 fn parse_request(arguments: &Value, limits: ParallelAgentLimits) -> Result<TeamRequest> {
@@ -354,23 +374,78 @@ fn parse_request(arguments: &Value, limits: ParallelAgentLimits) -> Result<TeamR
     if tasks.len() < 2 {
         bail!("parallel analysis requires at least two tasks");
     }
-    if tasks.len() > limits.max_agents.get() {
+    let maximum = limits.max_agents.get().min(HARD_MAX_AGENTS);
+    if tasks.len() > maximum {
         bail!("parallel analysis exceeds the configured agent limit");
     }
-    let tasks = tasks
+    let assignments = tasks
         .iter()
-        .map(|task| {
-            let task = task.as_str().context("each task must be a string")?.trim();
+        .enumerate()
+        .map(|(index, value)| {
+            let (name, logo, task) = if let Some(task) = value.as_str() {
+                (NAMES[index], LOGOS[index], task)
+            } else {
+                let object = value
+                    .as_object()
+                    .context("each agent must be a task string or an agent object")?;
+                let name = object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .context("agent name must be a string")?
+                    .trim();
+                let logo = object
+                    .get("logo")
+                    .and_then(Value::as_str)
+                    .context("agent logo must be a string")?
+                    .trim();
+                let task = object
+                    .get("task")
+                    .and_then(Value::as_str)
+                    .context("agent task must be a string")?;
+                (name, logo, task)
+            };
+            validate_agent_identity(name, logo)?;
+            let task = task.trim();
             if task.is_empty() || task.len() > limits.max_task_bytes.get() {
                 bail!("parallel agent task is empty or exceeds the byte limit");
             }
-            Ok(task.to_owned())
+            Ok(AgentAssignment {
+                name: name.to_owned(),
+                logo: logo.to_owned(),
+                task: task.to_owned(),
+            })
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut names = std::collections::BTreeSet::new();
+    if assignments
+        .iter()
+        .any(|assignment| !names.insert(assignment.name.to_lowercase()))
+    {
+        bail!("parallel agent names must be unique");
+    }
     Ok(TeamRequest {
         objective: objective.to_owned(),
-        tasks,
+        assignments,
     })
+}
+
+fn validate_agent_identity(name: &str, logo: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > MAX_AGENT_NAME_BYTES
+        || name.chars().any(|character| {
+            character.is_control() || matches!(character, '/' | '\\' | ':' | '[' | ']')
+        })
+    {
+        bail!("agent name must be 1-{MAX_AGENT_NAME_BYTES} safe display bytes");
+    }
+    if logo.is_empty()
+        || logo.len() > MAX_AGENT_LOGO_BYTES
+        || logo.chars().count() > 4
+        || logo.chars().any(char::is_control)
+    {
+        bail!("agent logo must be 1-4 visible characters");
+    }
+    Ok(())
 }
 
 fn bounded_text(mut text: String, limit: usize) -> String {
@@ -457,8 +532,23 @@ fn descriptor(limits: ParallelAgentLimits) -> ToolDescriptor {
                 "tasks": {
                     "type": "array",
                     "minItems": 2,
-                    "maxItems": limits.max_agents.get(),
-                    "items": {"type": "string", "minLength": 1, "maxLength": limits.max_task_bytes.get()}
+                    "maxItems": limits.max_agents.get().min(HARD_MAX_AGENTS),
+                    "description": "Two to four independent assignments. Use agent objects when custom terminal names and logos help distinguish roles.",
+                    "items": {
+                        "oneOf": [
+                            {"type": "string", "minLength": 1, "maxLength": limits.max_task_bytes.get()},
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string", "minLength": 1, "maxLength": MAX_AGENT_NAME_BYTES},
+                                    "logo": {"type": "string", "minLength": 1, "maxLength": 4},
+                                    "task": {"type": "string", "minLength": 1, "maxLength": limits.max_task_bytes.get()}
+                                },
+                                "required": ["name", "logo", "task"],
+                                "additionalProperties": false
+                            }
+                        ]
+                    }
                 }
             },
             "required": ["tasks"],
@@ -510,6 +600,56 @@ mod tests {
         assert!(parse_request(&json!({"tasks":["one"]}), limits).is_err());
         assert!(parse_request(&json!({"tasks":["one", "two", "three"]}), limits).is_err());
         assert!(parse_request(&json!({"tasks":["too long!", "two"]}), limits).is_err());
+
+        let permissive = ParallelAgentLimits {
+            max_agents: NonZeroUsize::new(8).unwrap(),
+            ..limits
+        };
+        assert!(
+            parse_request(
+                &json!({"tasks":["one", "two", "tri", "four", "five"]}),
+                permissive
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn custom_agent_identities_are_bounded_and_unique() {
+        let limits = ParallelAgentLimits::default();
+        let request = parse_request(
+            &json!({
+                "tasks":[
+                    {"name":"UI Scout", "logo":"🖼️", "task":"inspect auth"},
+                    {"name":"Builder", "logo":"🛠️", "task":"inspect UI"}
+                ]
+            }),
+            limits,
+        )
+        .expect("custom identities");
+        assert_eq!(request.assignments[0].name, "UI Scout");
+        assert_eq!(request.assignments[0].logo, "🖼️");
+        assert_eq!(request.assignments[1].name, "Builder");
+        assert!(
+            parse_request(
+                &json!({"tasks":[
+                    {"name":"Scout", "logo":"🔎", "task":"one"},
+                    {"name":"scout", "logo":"🛠️", "task":"two"}
+                ]}),
+                limits
+            )
+            .is_err()
+        );
+        assert!(
+            parse_request(
+                &json!({"tasks":[
+                    {"name":"bad/name", "logo":"🔎", "task":"one"},
+                    {"name":"Builder", "logo":"🛠️", "task":"two"}
+                ]}),
+                limits
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -552,7 +692,10 @@ mod tests {
                 "spawn_agents",
                 &json!({
                     "objective":"map both surfaces",
-                    "tasks":["inspect one", "inspect two"]
+                    "tasks":[
+                        {"name":"UI Scout", "logo":"🖼️", "task":"inspect one"},
+                        {"name":"Builder", "logo":"🛠️", "task":"inspect two"}
+                    ]
                 }),
                 AgentMode::Auto,
                 &approvals,
@@ -563,8 +706,8 @@ mod tests {
 
         assert!(!output.is_error);
         assert!(output.text.contains("Objective: map both surfaces"));
-        assert!(output.text.contains("Koi [complete]:\nevidence"));
-        assert!(output.text.contains("Nyx [complete]:\nevidence"));
+        assert!(output.text.contains("🖼️ UI Scout [complete]:\nevidence"));
+        assert!(output.text.contains("🛠️ Builder [complete]:\nevidence"));
         assert!(output.text.contains("Parent action: reconcile"));
         assert_eq!(
             output
@@ -575,6 +718,13 @@ mod tests {
             Some("complete")
         );
         assert_eq!(
+            output
+                .structured
+                .as_ref()
+                .and_then(|value| value["agents"][0]["logo"].as_str()),
+            Some("🖼️")
+        );
+        assert_eq!(
             std::fs::read_dir(journal_root)
                 .expect("journals exist")
                 .count(),
@@ -583,12 +733,12 @@ mod tests {
         assert!(
             progress
                 .iter()
-                .any(|label| label == "Koi · Inspecting assignment")
+                .any(|label| label == "🖼️ UI Scout · Inspecting assignment")
         );
         assert!(
             progress
                 .iter()
-                .any(|label| label == "Nyx · Reporting findings")
+                .any(|label| label.starts_with("🛠️ Builder ·"))
         );
     }
 }
