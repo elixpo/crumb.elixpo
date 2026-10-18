@@ -406,6 +406,9 @@ fn reference_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Sugges
 }
 
 fn native_path_suggestions(line: &str, pos: usize, workspace: &Path) -> Vec<Suggestion> {
+    if line.trim_start().starts_with(':') {
+        return Vec::new();
+    }
     let (start, token) = current_token(line);
     if start == 0 || token.starts_with('-') || token.contains('=') || token.contains('\n') {
         return Vec::new();
@@ -832,6 +835,16 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.value == "docs/")
         );
+    }
+
+    #[test]
+    fn forced_agent_text_does_not_offer_native_paths() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut completer = CrumbCompleter::new(CompletionWorkspace::new(workspace));
+        let line = ": what's todays ";
+        let result = completer.complete(line, line.len());
+
+        assert_eq!(result.suggestions(), []);
     }
 
     #[test]

@@ -9094,14 +9094,6 @@ fn create_line_editor(
     }
     keybindings.add_binding(
         KeyModifiers::NONE,
-        KeyCode::Backspace,
-        ReedlineEvent::Multiple(vec![
-            ReedlineEvent::Edit(vec![EditCommand::Backspace]),
-            ReedlineEvent::Menu("completion_menu".to_owned()),
-        ]),
-    );
-    keybindings.add_binding(
-        KeyModifiers::NONE,
         KeyCode::Tab,
         ReedlineEvent::UntilFound(vec![
             ReedlineEvent::Menu("completion_menu".to_owned()),
