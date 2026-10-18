@@ -303,6 +303,15 @@ fn looks_like_agent_imperative(first: &str, words: &[&str]) -> bool {
             | "inspect"
             | "investigate"
             | "fix"
+            | "edit"
+            | "modify"
+            | "change"
+            | "replace"
+            | "rename"
+            | "write"
+            | "implement"
+            | "refactor"
+            | "debug"
             | "update"
             | "add"
             | "remove"
@@ -537,11 +546,19 @@ mod tests {
 
     #[test]
     fn sentence_shape_wins_over_an_accidental_executable_name_collision() {
-        let catalog = CommandCatalog::with_commands(["what".to_owned()]);
-        let decision = catalog.route("what is the folder about", &RoutePolicy::default());
-
-        assert_eq!(decision.route, InputRoute::Agent);
-        assert_eq!(decision.reason, RouteReason::NaturalLanguageCandidate);
+        let catalog = CommandCatalog::with_commands(["what".to_owned(), "edit".to_owned()]);
+        for request in [
+            "what is the folder about",
+            "edit the readme file and change the top line from Crumb to Crumb CLI",
+        ] {
+            let decision = catalog.route(request, &RoutePolicy::default());
+            assert_eq!(decision.route, InputRoute::Agent, "{request}");
+            assert_eq!(
+                decision.reason,
+                RouteReason::NaturalLanguageCandidate,
+                "{request}"
+            );
+        }
     }
 
     #[test]
