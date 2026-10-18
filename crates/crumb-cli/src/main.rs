@@ -144,6 +144,15 @@ fn parse_resume_session_argument(arguments: &[String]) -> Result<Option<String>>
 
 fn run_command_line_action() -> Result<bool> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if let Some((json, request)) = parse_exec_request(&arguments)? {
+        run_agent_exec(
+            &current_process_dir()?,
+            &request,
+            json,
+            &mut io::stdout().lock(),
+        )?;
+        return Ok(true);
+    }
     if matches!(arguments.as_slice(), [group, action] if group == "mcp" && action == "serve") {
         serve_mcp()?;
         return Ok(true);
@@ -190,12 +199,68 @@ fn run_command_line_action() -> Result<bool> {
         [group, action] if group == "auth" && action == "logout" => AuthAction::Logout,
         _ => {
             return Err(anyhow!(
-                "usage: crumb [auth <login|status|logout> | mcp serve | review export <id|all> | completions <shell> | jobs <list|run <id>|tick>]"
+                "usage: crumb [exec [--json] <request> | auth <login|status|logout> | mcp serve | review export <id|all> | completions <shell> | jobs <list|run <id>|tick>]"
             ));
         }
     };
     handle_auth(action, &mut io::stdout().lock())?;
     Ok(true)
+}
+
+fn parse_exec_request(arguments: &[OsString]) -> Result<Option<(bool, String)>> {
+    let Some(command) = arguments.first() else {
+        return Ok(None);
+    };
+    if command != "exec" {
+        return Ok(None);
+    }
+    let mut request = &arguments[1..];
+    let json = request.first().is_some_and(|argument| argument == "--json");
+    let separator = request.first().is_some_and(|argument| argument == "--");
+    if json || separator {
+        request = &request[1..];
+    }
+    if request.is_empty() {
+        bail!("usage: crumb exec [--json] <request>");
+    }
+    let request = request
+        .iter()
+        .map(|argument| {
+            argument
+                .to_str()
+                .context("exec request arguments must be UTF-8")
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join(" ");
+    Ok(Some((json, request)))
+}
+
+fn run_agent_exec(cwd: &Path, request: &str, json: bool, writer: &mut dyn Write) -> Result<()> {
+    let config = read_agent_config(cwd)?;
+    let mut runtime = AgentRuntime::new()?;
+    let cancellation = CancellationToken::default();
+    let result = runtime.run_local_job(request, &config, cwd, &cancellation)?;
+    let response = crumb_ui::visible_agent_text(&result.final_response);
+    if json {
+        serde_json::to_writer(
+            &mut *writer,
+            &serde_json::json!({
+                "session_id": result.session_id,
+                "response": response,
+                "finish_reason": result.finish_reason,
+                "usage": {
+                    "input_tokens": result.input_tokens,
+                    "cached_input_tokens": result.cached_input_tokens,
+                    "output_tokens": result.output_tokens,
+                    "context_tokens": result.context_tokens,
+                }
+            }),
+        )?;
+        writeln!(writer)?;
+    } else {
+        writeln!(writer, "{response}")?;
+    }
+    Ok(())
 }
 
 fn export_reviews(cwd: &Path, id: &str, writer: &mut dyn Write) -> Result<()> {
@@ -10152,6 +10217,7 @@ impl Drop for RawModeGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::io::{Cursor, Write};
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -10176,14 +10242,14 @@ mod tests {
         composer_anchor_sequence, configure_permissions, configure_plugin, effort_display_name,
         effort_wire_name, failed_command_recovery, finished_tool_activity, fixed_footer_frame,
         initial_agent_activity, marketplace_update_blocker, openrouter_preset,
-        parse_credential_reference, parse_paused_submission, parse_provider_header,
-        parse_resume_session_argument, read_agent_config, read_bounded_response,
-        register_local_skill, resolve_memory_keep, sanitize_transcript_output, set_skill_enabled,
-        shell_blast_radius, shell_tool_config, should_auto_enable_rtk, show_graph,
-        show_marketplace, show_memory, show_profile_with_stores, suggestion_width,
-        transcript_activity_row, unregister_local_skill, validate_marketplace_path,
-        validate_marketplace_response, visible_tool_activity, workspace_read_host,
-        write_bounded_response_delta_for_width,
+        parse_credential_reference, parse_exec_request, parse_paused_submission,
+        parse_provider_header, parse_resume_session_argument, read_agent_config,
+        read_bounded_response, register_local_skill, resolve_memory_keep,
+        sanitize_transcript_output, set_skill_enabled, shell_blast_radius, shell_tool_config,
+        should_auto_enable_rtk, show_graph, show_marketplace, show_memory,
+        show_profile_with_stores, suggestion_width, transcript_activity_row,
+        unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
+        visible_tool_activity, workspace_read_host, write_bounded_response_delta_for_width,
     };
 
     #[test]
@@ -10195,6 +10261,38 @@ mod tests {
             Some("crumb-session-1")
         );
         assert!(parse_resume_session_argument(&["--resume".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn exec_arguments_support_plain_json_and_flag_like_requests() {
+        let parsed = parse_exec_request(&[
+            OsString::from("exec"),
+            OsString::from("--json"),
+            OsString::from("inspect"),
+            OsString::from("this workspace"),
+        ])
+        .expect("valid exec request")
+        .expect("exec action");
+        assert_eq!(parsed, (true, "inspect this workspace".to_owned()));
+
+        let escaped = parse_exec_request(&[
+            OsString::from("exec"),
+            OsString::from("--"),
+            OsString::from("--json is part of this request"),
+        ])
+        .expect("escaped exec request")
+        .expect("exec action");
+        assert_eq!(
+            escaped,
+            (false, "--json is part of this request".to_owned())
+        );
+
+        assert!(parse_exec_request(&[OsString::from("exec")]).is_err());
+        assert!(
+            parse_exec_request(&[OsString::from("auth"), OsString::from("status")])
+                .expect("non-exec arguments")
+                .is_none()
+        );
     }
 
     #[test]
