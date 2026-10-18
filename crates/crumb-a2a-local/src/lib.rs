@@ -6,7 +6,7 @@
 //! process metadata. Message bodies live transiently in inbox queue files and
 //! are removed when acknowledged.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,6 +35,8 @@ pub const MAX_ENVELOPE_BYTES: usize = MAX_WIRE_BYTES + 16 * 1024;
 pub const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
 
 const REGISTRY_DIRECTORY: &str = "registry";
+const LOCK_DIRECTORY: &str = ".locks";
+const LOCK_GATE_FILE: &str = ".gate";
 const INBOX_DIRECTORY: &str = "inboxes";
 const ARTIFACT_DIRECTORY: &str = "artifacts";
 const PENDING_DIRECTORY: &str = "pending";
@@ -308,6 +310,7 @@ impl DeliveryEnvelope {
 pub struct LocalBus {
     root: PathBuf,
     registry: PathBuf,
+    locks: PathBuf,
     inboxes: PathBuf,
     artifacts: PathBuf,
     options: LocalBusOptions,
@@ -329,14 +332,17 @@ impl LocalBus {
         let options = options.validate()?;
         ensure_private_directory(root)?;
         let registry = root.join(REGISTRY_DIRECTORY);
+        let locks = registry.join(LOCK_DIRECTORY);
         let inboxes = root.join(INBOX_DIRECTORY);
         let artifacts = root.join(ARTIFACT_DIRECTORY);
         ensure_private_directory(&registry)?;
+        ensure_private_directory(&locks)?;
         ensure_private_directory(&inboxes)?;
         ensure_private_directory(&artifacts)?;
         Ok(Self {
             root: root.to_path_buf(),
             registry,
+            locks,
             inboxes,
             artifacts,
             options,
@@ -368,25 +374,36 @@ impl LocalBus {
             .context("Crumb instance metadata is invalid")?;
         process.validate()?;
         self.inspect_base_directories()?;
+        let endpoint = inbox_endpoint(&instance.instance_id)?;
+        self.ensure_inbox(&instance.instance_id)?;
+        let _locks = self.acquire_instance_locks(&[&instance.instance_id])?;
         let now = now_ms()?;
         if process.started_at_ms > now.saturating_add(MAX_CLOCK_SKEW_MS) {
             bail!("local A2A process start is implausibly far in the future");
         }
-        let endpoint = inbox_endpoint(&instance.instance_id)?;
-        self.ensure_inbox(&instance.instance_id)?;
 
         let path = self.registry_path(&instance.instance_id)?;
+        let mut recover_processing = false;
         if let Some(existing) =
             read_optional_json::<PeerEntry>(&path, MAX_REGISTRY_BYTES, "local A2A registry entry")?
         {
             existing.validate(now)?;
+            if existing.instance_id != instance.instance_id {
+                bail!("local A2A registry entry does not match its filename");
+            }
             let ttl = self.options.lease_ttl_ms()?;
             let same_runtime = existing.process == process;
-            if !same_runtime && !existing.is_stale(now, ttl) {
+            let stale = existing.is_stale(now, ttl);
+            if !same_runtime && !stale {
                 bail!("Crumb instance already has an active local A2A runtime");
             }
+            recover_processing = stale;
         } else if count_visible_entries(&self.registry)? >= MAX_PEERS {
             bail!("local A2A registry is full");
+        }
+
+        if recover_processing {
+            self.recover_processing(&instance.instance_id)?;
         }
 
         let entry = PeerEntry {
@@ -411,6 +428,7 @@ impl LocalBus {
     /// malformed or unsafe.
     pub fn heartbeat(&self, registration: &mut Registration) -> Result<()> {
         self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[registration.instance_id()])?;
         let path = self.registry_path(registration.instance_id())?;
         let mut current: PeerEntry =
             read_required_json(&path, MAX_REGISTRY_BYTES, "local A2A registry entry")?;
@@ -432,6 +450,7 @@ impl LocalBus {
     /// Returns an error if the lease changed owners or storage is unsafe.
     pub fn unregister(&self, registration: &Registration) -> Result<()> {
         self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[registration.instance_id()])?;
         let path = self.registry_path(registration.instance_id())?;
         let current: PeerEntry =
             read_required_json(&path, MAX_REGISTRY_BYTES, "local A2A registry entry")?;
@@ -491,6 +510,7 @@ impl LocalBus {
         self.inspect_base_directories()?;
         validate_instance_id(recipient_instance_id)?;
         request.validate().context("local A2A request is invalid")?;
+        let _locks = self.acquire_instance_locks(&[sender.instance_id(), recipient_instance_id])?;
         let now = now_ms()?;
         self.require_live_owner(sender, now)?;
         self.require_live_peer(recipient_instance_id, now)?;
@@ -574,6 +594,7 @@ impl LocalBus {
     /// Returns an error if ownership, queue storage, or a delivery is invalid.
     pub fn dequeue(&self, recipient: &Registration) -> Result<Option<ReceivedMessage>> {
         self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
         self.require_live_owner(recipient, now_ms()?)?;
         let (pending, processing, _acknowledged) =
             self.queue_directories(recipient.instance_id())?;
@@ -606,6 +627,7 @@ impl LocalBus {
     /// queued envelope are invalid.
     pub fn list_pending(&self, recipient: &Registration) -> Result<Vec<PendingDeliverySummary>> {
         self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
         self.require_live_owner(recipient, now_ms()?)?;
         let (pending, _processing, _acknowledged) =
             self.queue_directories(recipient.instance_id())?;
@@ -626,6 +648,31 @@ impl LocalBus {
         Ok(summaries)
     }
 
+    /// Reads one exact pending delivery without changing queue state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid or unknown delivery identifier, wrong
+    /// ownership, unsafe storage, or a malformed/misdirected envelope.
+    pub fn inspect_pending(
+        &self,
+        recipient: &Registration,
+        delivery_id: &str,
+    ) -> Result<ReceivedMessage> {
+        self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
+        self.require_live_owner(recipient, now_ms()?)?;
+        validate_delivery_id(delivery_id)?;
+        let (pending, _processing, _acknowledged) =
+            self.queue_directories(recipient.instance_id())?;
+        let path = pending.join(delivery_filename(delivery_id)?);
+        let envelope: DeliveryEnvelope =
+            read_required_json(&path, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+        envelope.validate()?;
+        validate_queued_envelope(&path, &envelope, recipient.instance_id())?;
+        Ok(envelope.received())
+    }
+
     /// Atomically claims one exact pending delivery for this receiver.
     ///
     /// # Errors
@@ -638,6 +685,7 @@ impl LocalBus {
         delivery_id: &str,
     ) -> Result<ReceivedMessage> {
         self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
         self.require_live_owner(recipient, now_ms()?)?;
         validate_delivery_id(delivery_id)?;
         let (pending, processing, _acknowledged) =
@@ -694,6 +742,7 @@ impl LocalBus {
         relative_source: &Path,
     ) -> Result<StagedArtifact> {
         self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[sender.instance_id()])?;
         self.require_live_owner(sender, now_ms()?)?;
         inspect_directory(workspace_root, "artifact workspace root")?;
         validate_relative_path(relative_source)?;
@@ -761,6 +810,7 @@ impl LocalBus {
         acknowledge: bool,
     ) -> Result<()> {
         self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
         self.require_live_owner(recipient, now_ms()?)?;
         validate_delivery_id(delivery_id)?;
         let (pending, processing, acknowledged) =
@@ -829,8 +879,114 @@ impl LocalBus {
     fn inspect_base_directories(&self) -> Result<()> {
         inspect_directory(&self.root, "local A2A bus root")?;
         inspect_directory(&self.registry, "local A2A registry")?;
+        inspect_directory(&self.locks, "local A2A lease lock root")?;
         inspect_directory(&self.inboxes, "local A2A inbox root")
             .and_then(|()| inspect_directory(&self.artifacts, "local A2A artifact root"))
+    }
+
+    fn acquire_instance_locks(&self, instance_ids: &[&str]) -> Result<InstanceLocks> {
+        let mut instance_ids = instance_ids.to_vec();
+        instance_ids.sort_unstable();
+        instance_ids.dedup();
+
+        let gate = open_lock_file(&self.locks.join(LOCK_GATE_FILE))?;
+        gate.lock()
+            .context("local A2A lease lock gate could not be acquired")?;
+        let mut files = Vec::with_capacity(instance_ids.len());
+        for instance_id in instance_ids {
+            validate_instance_id(instance_id)?;
+            inspect_directory(&self.locks, "local A2A lease lock root")?;
+            let path = self.locks.join(format!("{instance_id}.lock"));
+            let existed = path_exists_without_following(&path)?;
+            if !existed
+                && visible_regular_entries(&self.locks, MAX_PEERS, "lease lock root")?.len()
+                    >= MAX_PEERS
+            {
+                bail!("local A2A lease lock limit has been reached");
+            }
+            let file = open_lock_file(&path)?;
+            file.lock()
+                .context("local A2A lease lock could not be acquired")?;
+            files.push(file);
+        }
+        drop(gate);
+        Ok(InstanceLocks { _files: files })
+    }
+
+    fn recover_processing(&self, instance_id: &str) -> Result<()> {
+        let (pending, processing, acknowledged) = self.queue_directories(instance_id)?;
+        let pending_paths = visible_regular_entries(&pending, MAX_INBOX_MESSAGES, "pending inbox")?;
+        let processing_paths =
+            visible_regular_entries(&processing, MAX_INBOX_MESSAGES, "processing inbox")?;
+        visible_regular_entries(&acknowledged, MAX_ACKNOWLEDGEMENTS, "acknowledgement inbox")?;
+        let queued = pending_paths
+            .len()
+            .checked_add(processing_paths.len())
+            .context("local A2A inbox count overflowed")?;
+        if queued > MAX_INBOX_MESSAGES {
+            bail!("local A2A inbox exceeds its entry limit");
+        }
+
+        let mut actions = Vec::with_capacity(processing_paths.len());
+        for source in processing_paths {
+            let envelope: DeliveryEnvelope =
+                read_required_json(&source, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+            envelope.validate()?;
+            validate_queued_envelope(&source, &envelope, instance_id)?;
+            let filename = delivery_filename(&envelope.delivery_id)?;
+            let target = pending.join(&filename);
+            let acknowledgement_path = acknowledged.join(&filename);
+            if path_exists_without_following(&acknowledgement_path)? {
+                let record: Acknowledgement = read_required_json(
+                    &acknowledgement_path,
+                    MAX_REGISTRY_BYTES,
+                    "local A2A acknowledgement",
+                )?;
+                record.validate()?;
+                if record.delivery_id != envelope.delivery_id
+                    || record.sender_instance_id != envelope.sender_instance_id
+                    || record.recipient_instance_id != envelope.recipient_instance_id
+                {
+                    bail!("local A2A acknowledgement does not match delivery");
+                }
+                actions.push(RecoveryAction::Remove(source));
+            } else if path_exists_without_following(&target)? {
+                let existing: DeliveryEnvelope =
+                    read_required_json(&target, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
+                existing.validate()?;
+                validate_queued_envelope(&target, &existing, instance_id)?;
+                if !existing.matches_delivery(&envelope) {
+                    bail!("local A2A delivery identifier collision");
+                }
+                actions.push(RecoveryAction::Remove(source));
+            } else {
+                actions.push(RecoveryAction::Move { source, target });
+            }
+        }
+
+        let mut changed_processing = false;
+        let mut changed_pending = false;
+        for action in actions {
+            match action {
+                RecoveryAction::Remove(source) => {
+                    remove_regular_file(&source, "local A2A delivery")?;
+                    changed_processing = true;
+                }
+                RecoveryAction::Move { source, target } => {
+                    fs::rename(&source, &target)
+                        .context("local A2A processing delivery could not be recovered")?;
+                    changed_processing = true;
+                    changed_pending = true;
+                }
+            }
+        }
+        if changed_processing {
+            sync_directory(&processing).context("local A2A processing inbox could not sync")?;
+        }
+        if changed_pending {
+            sync_directory(&pending).context("local A2A pending inbox could not sync")?;
+        }
+        Ok(())
     }
 
     fn registry_path(&self, instance_id: &str) -> Result<PathBuf> {
@@ -879,6 +1035,15 @@ impl LocalBus {
         ensure_owner(&entry, registration)?;
         Ok(entry)
     }
+}
+
+struct InstanceLocks {
+    _files: Vec<File>,
+}
+
+enum RecoveryAction {
+    Remove(PathBuf),
+    Move { source: PathBuf, target: PathBuf },
 }
 
 fn claim_delivery_file(
@@ -1220,6 +1385,43 @@ fn count_visible_entries(directory: &Path) -> Result<usize> {
     Ok(count)
 }
 
+fn open_lock_file(path: &Path) -> Result<File> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path)
+                .context("local A2A lease lock could not be inspected")?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                bail!("local A2A lease lock must be a regular file, not a symlink");
+            }
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .context("local A2A lease lock could not be opened")?
+        }
+        Err(error) => return Err(error).context("local A2A lease lock could not be created"),
+    };
+    let path_metadata =
+        fs::symlink_metadata(path).context("local A2A lease lock could not be inspected")?;
+    let file_metadata = file
+        .metadata()
+        .context("local A2A lease lock could not be inspected after opening")?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.file_type().is_file()
+        || !file_metadata.is_file()
+    {
+        bail!("local A2A lease lock must be a regular file, not a symlink");
+    }
+    set_private_permissions(&file)?;
+    Ok(file)
+}
+
 fn visible_regular_entries(directory: &Path, max: usize, label: &str) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for entry in
@@ -1498,6 +1700,73 @@ mod tests {
             .expect("dequeue again")
             .expect("message again");
         assert_eq!(first.delivery_id, second_delivery.delivery_id);
+    }
+
+    #[test]
+    fn stale_restart_recovers_claimed_delivery_before_publishing_new_lease() {
+        let (_temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let sent = request("msg-restart", "recover after crash");
+        let receipt = bus
+            .enqueue(&first_registration, &second.instance_id, &sent)
+            .expect("enqueue");
+        let claimed = bus
+            .claim_pending(&second_registration, &receipt.delivery_id)
+            .expect("claim");
+        assert_eq!(claimed.request, sent);
+
+        let registry_path = bus
+            .registry_path(&second.instance_id)
+            .expect("registry path");
+        let mut stale: PeerEntry =
+            read_required_json(&registry_path, MAX_REGISTRY_BYTES, "registry entry")
+                .expect("registry entry");
+        stale.process.started_at_ms = 1;
+        stale.lease_updated_at_ms = 1;
+        atomic_replace_json(&bus.registry, &registry_path, &stale, MAX_REGISTRY_BYTES)
+            .expect("stale lease");
+
+        let replacement = bus
+            .register(&second, process(9))
+            .expect("replacement registration");
+        let pending = bus.list_pending(&replacement).expect("recovered pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery_id, receipt.delivery_id);
+        let inspected = bus
+            .inspect_pending(&replacement, &receipt.delivery_id)
+            .expect("inspect recovered delivery");
+        assert_eq!(inspected.request, sent);
+        assert_eq!(
+            bus.list_pending(&replacement).expect("still pending").len(),
+            1
+        );
+        let reclaimed = bus
+            .claim_pending(&replacement, &receipt.delivery_id)
+            .expect("reclaim recovered delivery");
+        assert_eq!(reclaimed.delivery_id, receipt.delivery_id);
+        assert!(bus.list_pending(&second_registration).is_err());
+    }
+
+    #[test]
+    fn live_second_runtime_is_rejected_without_stealing_claimed_delivery() {
+        let (_temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let receipt = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &request("msg-live-owner", "do not steal"),
+            )
+            .expect("enqueue");
+        bus.claim_pending(&second_registration, &receipt.delivery_id)
+            .expect("claim");
+
+        assert!(bus.register(&second, process(9)).is_err());
+        bus.release(&second_registration, &receipt.delivery_id)
+            .expect("original owner still controls delivery");
+        let pending = bus
+            .list_pending(&second_registration)
+            .expect("original owner pending queue");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery_id, receipt.delivery_id);
     }
 
     #[test]
@@ -1829,5 +2098,13 @@ mod tests {
             bus.stage_artifact(&first_registration, &workspace, Path::new("linked.txt"))
                 .is_err()
         );
+
+        let lock_path = bus
+            .locks
+            .join(format!("{}.lock", second_registration.instance_id()));
+        fs::remove_file(&lock_path).expect("remove lease lock");
+        symlink("missing", &lock_path).expect("lease lock symlink");
+        let mut registration = second_registration;
+        assert!(bus.heartbeat(&mut registration).is_err());
     }
 }

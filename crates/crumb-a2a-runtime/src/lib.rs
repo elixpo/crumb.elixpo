@@ -287,6 +287,18 @@ impl A2aRuntime {
         self.inner.bus.list_pending(&registration)
     }
 
+    /// Reads one exact pending delivery without changing queue state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after shutdown begins or for invalid/unknown delivery
+    /// identifiers, wrong ownership, or unsafe queue storage.
+    pub fn inspect_pending(&self, delivery_id: &str) -> Result<ReceivedMessage> {
+        self.inner.ensure_running()?;
+        let registration = lock(&self.inner.registration, "A2A runtime registration")?.clone();
+        self.inner.bus.inspect_pending(&registration, delivery_id)
+    }
+
     /// Atomically claims one exact pending delivery by identifier.
     ///
     /// # Errors
