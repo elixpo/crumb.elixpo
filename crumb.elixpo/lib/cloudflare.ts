@@ -4,17 +4,24 @@ export async function bindings(): Promise<CloudflareEnv> {
   return (await getCloudflareContext({ async: true })).env
 }
 
-export function config() {
-  const env = process.env
+export async function config() {
+  const runtime = await bindings()
+    .then(env => env as unknown as Record<string, unknown>)
+    .catch(() => undefined)
+  const value = (name: string): string => {
+    const candidate = runtime?.[name] ?? process.env[name]
+    if (typeof candidate !== 'string' || candidate.startsWith('ENC[')) return ''
+    return candidate
+  }
   return {
-    accountsOrigin: env.ACCOUNTS_ORIGIN || process.env.ACCOUNTS_ORIGIN || 'https://accounts.elixpo.com',
-    accountsClientId: env.NEXT_PUBLIC_ELIXPO_CLIENT_ID || process.env.NEXT_PUBLIC_ELIXPO_CLIENT_ID || '',
-    accountsCliClientId: env.NEXT_PUBLIC_ELIXPO_CLIENT_ID_CLI || process.env.NEXT_PUBLIC_ELIXPO_CLIENT_ID_CLI || '',
-    accountsClientSecret: env.ELIXPO_CLIENT_SECRET || process.env.ELIXPO_CLIENT_SECRET || '',
-    accountsWebhookSecret: env.ELIXPO_ACCOUNTS_WEBHOOK_SECRET || process.env.ELIXPO_ACCOUNTS_WEBHOOK_SECRET || '',
-    accountsCliAudience: env.ACCOUNTS_CLI_AUDIENCE || process.env.ACCOUNTS_CLI_AUDIENCE || 'crumb.elixpo.com',
-    pollinationsAppKey: env.POLLINATIONS_APP_KEY || process.env.POLLINATIONS_APP_KEY || '',
-    connectorEncryptionKey: env.CONNECTOR_ENCRYPTION_KEY || process.env.CONNECTOR_ENCRYPTION_KEY || '',
+    accountsOrigin: value('ACCOUNTS_ORIGIN') || 'https://accounts.elixpo.com',
+    accountsClientId: value('NEXT_PUBLIC_ELIXPO_CLIENT_ID'),
+    accountsCliClientId: value('NEXT_PUBLIC_ELIXPO_CLIENT_ID_CLI'),
+    accountsClientSecret: value('ELIXPO_CLIENT_SECRET'),
+    accountsWebhookSecret: value('ELIXPO_ACCOUNTS_WEBHOOK_SECRET'),
+    accountsCliAudience: value('ACCOUNTS_CLI_AUDIENCE') || 'crumb.elixpo.com',
+    pollinationsAppKey: value('POLLINATIONS_APP_KEY'),
+    connectorEncryptionKey: value('CONNECTOR_ENCRYPTION_KEY'),
   }
 }
 

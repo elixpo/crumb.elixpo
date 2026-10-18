@@ -5,7 +5,7 @@ import { AccountMenu } from './AccountMenu'
 
 export async function SiteHeader() {
   const user = await currentUser().catch(() => null)
-  const accountsOrigin = config().accountsOrigin
+  const accountsOrigin = (await config()).accountsOrigin
   return <header className="site-header">
     <div className="nav-shell">
       <Link className="brand" href="/" aria-label="Crumb home">

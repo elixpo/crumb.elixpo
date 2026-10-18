@@ -32,7 +32,7 @@ function decodeClaims(token: string): DeviceClaims | null {
 }
 
 export async function verifyDeviceToken(token: string): Promise<{ id: string; email: string }> {
-  const env = config()
+  const env = await config()
   const claims = decodeClaims(token)
   const audiences = typeof claims?.aud === 'string' ? [claims.aud] : claims?.aud || []
   const scopes = claims?.scopes || []
