@@ -1707,7 +1707,10 @@ fn render_startup(
         ),
         session_budget_tokens: context_token_budget(&config, text_route),
         context_tokens,
-        auto_compaction: matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
+        auto_compaction: matches!(
+            config.harness.as_ref(),
+            Some(HarnessConfig::Native | HarnessConfig::Process { .. })
+        ),
         agent_configured: config.harness.is_some() && text_route.is_some(),
     };
     let terminal_width = if interactive {
@@ -1839,7 +1842,10 @@ fn context_footer_status(
         ),
         session_budget_tokens: context_token_budget(&config, text_route),
         context_tokens,
-        auto_compaction: matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
+        auto_compaction: matches!(
+            config.harness.as_ref(),
+            Some(HarnessConfig::Native | HarnessConfig::Process { .. })
+        ),
         agent_configured: config.harness.is_some() && text_route.is_some(),
     };
     renderer.context_footer(&startup, size().map_or(100, |(columns, _)| columns))

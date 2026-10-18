@@ -165,6 +165,16 @@ impl Conversation {
         self.turns.is_empty()
     }
 
+    /// Compacts completed chat history while preserving the most recent turn
+    /// and the durable action/skill continuity records used by follow-ups.
+    pub fn compact_history(&mut self) -> usize {
+        let removed = self.turns.len().saturating_sub(1);
+        if removed > 0 {
+            self.turns.drain(..removed);
+        }
+        removed
+    }
+
     fn messages(&self) -> Vec<ChatMessage> {
         if self.turns.is_empty() && self.action_facts.is_empty() && self.selected_skills.is_empty()
         {
@@ -3529,6 +3539,41 @@ mod tests {
 
         assert_eq!(conversation.len(), 1);
         assert_eq!(conversation.messages()[0].content, "second");
+    }
+
+    #[test]
+    fn conversation_compaction_keeps_latest_turn_and_continuity_records() {
+        let mut conversation = Conversation::new(NonZeroUsize::new(3).expect("non-zero"));
+        conversation.commit(
+            "first".to_owned(),
+            "one".to_owned(),
+            vec!["created /tmp/example".to_owned()],
+        );
+        conversation.commit("latest".to_owned(), "kept".to_owned(), Vec::new());
+        conversation.retain_selected_skills(&[SelectedSkill {
+            identity: "workspace-search".to_owned(),
+            version: None,
+            provenance: None,
+            digest: None,
+            capabilities: Vec::new(),
+            grants: Vec::new(),
+        }]);
+
+        assert_eq!(conversation.compact_history(), 1);
+        assert_eq!(conversation.len(), 1);
+        let messages = conversation.messages();
+        assert_eq!(messages[0].content, "latest");
+        assert_eq!(messages[1].content, "kept");
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content.contains("created /tmp/example"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content.contains("workspace-search"))
+        );
     }
 
     #[test]

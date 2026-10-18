@@ -340,7 +340,7 @@ impl Default for AgentLimits {
             max_steps: 24,
             max_tool_calls: 48,
             max_wall_time_seconds: 900,
-            max_context_tokens: 64_000,
+            max_context_tokens: 256_000,
             max_output_bytes: 1_048_576,
             max_directory_entries: 4_096,
             max_harness_initialize_seconds: 30,

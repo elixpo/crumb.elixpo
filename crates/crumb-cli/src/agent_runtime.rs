@@ -1547,12 +1547,21 @@ impl AgentRuntime {
             Err(_) if cancellation.is_cancelled() => TurnStatus::Cancelled,
             Err(_) => TurnStatus::Failed,
         };
-        self.record_token_estimate(
+        let compacted = self.record_token_estimate(
             &prepared_request,
             result.as_ref().ok(),
             context_token_budget(config, route),
-            matches!(config.harness.as_ref(), Some(HarnessConfig::Process { .. })),
+            matches!(
+                config.harness.as_ref(),
+                Some(HarnessConfig::Native | HarnessConfig::Process { .. })
+            ),
         );
+        if compacted
+            && native
+            && let Some(conversation) = self.native_conversation.as_mut()
+        {
+            conversation.compact_history();
+        }
         if !native {
             self.session
                 .as_mut()
@@ -1634,7 +1643,7 @@ impl AgentRuntime {
         result: Option<&RunResult>,
         limit: u64,
         auto_compaction: bool,
-    ) {
+    ) -> bool {
         self.last_response = result
             .map(|result| result.final_response.trim().to_owned())
             .filter(|response| !response.is_empty());
@@ -1666,7 +1675,9 @@ impl AgentRuntime {
         if auto_compaction && threshold > 0 && self.context_tokens_estimate >= threshold {
             self.context_tokens_estimate = limit.saturating_mul(16) / 100;
             self.compactions = self.compactions.saturating_add(1);
+            return true;
         }
+        false
     }
 
     #[must_use]
