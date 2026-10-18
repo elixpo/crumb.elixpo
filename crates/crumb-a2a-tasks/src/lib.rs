@@ -18,6 +18,10 @@ use serde::{Deserialize, Serialize};
 pub const TASK_SCHEMA_VERSION: u32 = 1;
 /// Maximum retained task records in one workspace.
 pub const MAX_TASK_RECORDS: usize = 1_024;
+/// Minimum age of terminal records reclaimed automatically when the ledger is full.
+pub const AUTOMATIC_TASK_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+/// Newest terminal records protected during automatic compaction.
+pub const AUTOMATIC_TASK_RETAIN_LATEST: usize = 256;
 /// Maximum accepted encoded size of one task record.
 pub const MAX_TASK_RECORD_BYTES: usize = 16 * 1024;
 /// A2A 1.0 bounds a message to at most 32 parts.
@@ -29,6 +33,46 @@ const DELIVERY_ID_PREFIX: &str = "delivery_";
 const DELIVERY_ID_HEX_BYTES: usize = 64;
 const SHA256_HEX_BYTES: usize = 64;
 const TASK_LOCK_FILE: &str = ".ledger.lock";
+
+/// Explicit, time-safe task retention policy.
+///
+/// Only terminal records updated strictly before `compact_before_ms` may be
+/// removed. In addition, the newest `retain_latest` terminal records are
+/// always retained, regardless of age. Active records are never eligible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskRetentionPolicy {
+    compact_before_ms: u64,
+    retain_latest: usize,
+}
+
+impl TaskRetentionPolicy {
+    /// Creates a validated retention policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero cutoff or a retained generation larger
+    /// than the bounded ledger itself.
+    pub fn new(compact_before_ms: u64, retain_latest: usize) -> Result<Self> {
+        if compact_before_ms == 0 {
+            bail!("A2A task compaction cutoff must be nonzero");
+        }
+        if retain_latest > MAX_TASK_RECORDS {
+            bail!("A2A task retained generation exceeds the record limit");
+        }
+        Ok(Self {
+            compact_before_ms,
+            retain_latest,
+        })
+    }
+}
+
+/// Content-free result of one task-ledger compaction pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskCompaction {
+    pub examined: usize,
+    pub removed: usize,
+    pub retained: usize,
+}
 
 /// Persisted lifecycle state. Transitions are monotonic and terminal states
 /// cannot be reopened.
@@ -219,7 +263,17 @@ impl TaskStore {
         if path_exists_without_following(&path)? {
             return load_compatible(&root, new_task);
         }
-        if inspect_record_paths(&root)?.len() >= MAX_TASK_RECORDS {
+        let mut record_count = inspect_record_paths(&root)?.len();
+        if record_count >= MAX_TASK_RECORDS {
+            let now = now_ms()?;
+            let policy = TaskRetentionPolicy::new(
+                now.saturating_sub(AUTOMATIC_TASK_RETENTION_MS).max(1),
+                AUTOMATIC_TASK_RETAIN_LATEST,
+            )?;
+            compact_locked(&root, policy)?;
+            record_count = inspect_record_paths(&root)?.len();
+        }
+        if record_count >= MAX_TASK_RECORDS {
             bail!("A2A task ledger reached the {MAX_TASK_RECORDS} record limit");
         }
         let now = now_ms()?;
@@ -292,6 +346,24 @@ impl TaskStore {
                 .then_with(|| left.delivery_id.cmp(&right.delivery_id))
         });
         Ok(records)
+    }
+
+    /// Removes old terminal records under an explicit retention horizon.
+    ///
+    /// Compaction is serialized with creates and transitions. Every record is
+    /// validated before deletion begins. Claimed/running records, records at
+    /// or after the cutoff, and the newest retained generation are never
+    /// removed. Retrying a compaction is safe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid policy, unsafe ledger, malformed
+    /// record, or filesystem failure.
+    pub fn compact(&self, policy: TaskRetentionPolicy) -> Result<TaskCompaction> {
+        let policy = TaskRetentionPolicy::new(policy.compact_before_ms, policy.retain_latest)?;
+        let root = self.inspect_root()?;
+        let _lock = acquire_ledger_lock(&root)?;
+        compact_locked(&root, policy)
     }
 
     /// Advances a claimed task to running.
@@ -414,6 +486,39 @@ fn load_compatible(root: &Path, new_task: &NewTask) -> Result<TaskRecord> {
         bail!("A2A task delivery already exists with different metadata");
     }
     Ok(record)
+}
+
+fn compact_locked(root: &Path, policy: TaskRetentionPolicy) -> Result<TaskCompaction> {
+    let paths = inspect_record_paths(root)?;
+    let examined = paths.len();
+    let mut terminal = Vec::new();
+    for path in paths {
+        let record = read_record(&path)?;
+        if path != record_path(root, &record.delivery_id)? {
+            bail!("A2A task record does not match its filename");
+        }
+        if record.state.is_terminal() {
+            terminal.push((record.updated_at_ms, record.delivery_id, path));
+        }
+    }
+    terminal.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let removable_generation = terminal.len().saturating_sub(policy.retain_latest);
+    let mut removed = 0;
+    for (updated_at_ms, _delivery_id, path) in terminal.into_iter().take(removable_generation) {
+        if updated_at_ms >= policy.compact_before_ms {
+            continue;
+        }
+        remove_record(&path)?;
+        removed += 1;
+    }
+    if removed > 0 {
+        sync_directory(root).context("A2A task ledger could not sync after compaction")?;
+    }
+    Ok(TaskCompaction {
+        examined,
+        removed,
+        retained: examined.saturating_sub(removed),
+    })
 }
 
 fn valid_transition(current: TaskState, target: TaskState) -> bool {
@@ -672,6 +777,14 @@ fn path_exists_without_following(path: &Path) -> Result<bool> {
     }
 }
 
+fn remove_record(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).context("A2A task record is unavailable")?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("A2A task record must be a regular file, not a symlink");
+    }
+    fs::remove_file(path).context("A2A task record could not be compacted")
+}
+
 fn next_timestamp(previous: u64) -> Result<u64> {
     Ok(now_ms()?.max(previous.saturating_add(1)))
 }
@@ -758,6 +871,35 @@ mod tests {
 
     fn response(byte: char) -> ResponseRecord {
         ResponseRecord::new(delivery(byte), digest(&format!("response-{byte}"))).expect("response")
+    }
+
+    fn numbered_task(number: usize) -> NewTask {
+        NewTask {
+            delivery_id: numbered_delivery(number),
+            request_digest: digest(&format!("request-{number}")),
+            sender_instance_id: instance('a'),
+            text_part_count: 1,
+            artifact_count: 0,
+        }
+    }
+
+    fn write_record_for_task(root: &Path, task: &NewTask, state: TaskState, updated_at_ms: u64) {
+        let record = TaskRecord {
+            schema_version: TASK_SCHEMA_VERSION,
+            delivery_id: task.delivery_id.clone(),
+            request_digest: task.request_digest.clone(),
+            sender_instance_id: task.sender_instance_id.clone(),
+            created_at_ms: 1,
+            updated_at_ms,
+            text_part_count: task.text_part_count,
+            artifact_count: task.artifact_count,
+            state,
+            failure_category: (state == TaskState::Failed).then_some(FailureCategory::Internal),
+            response: None,
+        };
+        record.validate().expect("valid fixture record");
+        let path = record_path(root, &record.delivery_id).expect("record path");
+        fs::write(path, serde_json::to_vec(&record).expect("encode")).expect("write record");
     }
 
     #[test]
@@ -924,6 +1066,64 @@ mod tests {
         };
         assert!(store.create_claimed(&extra).is_err());
         drop(workspace);
+    }
+
+    #[test]
+    fn compaction_removes_only_old_terminal_records_and_preserves_recent_idempotency() {
+        let (_workspace, store) = fixture();
+        let root = store.ensure_root().expect("ledger root");
+        let old = numbered_task(1);
+        let recent = numbered_task(2);
+        let active = numbered_task(3);
+        write_record_for_task(&root, &old, TaskState::Failed, 10);
+        write_record_for_task(&root, &recent, TaskState::Failed, 100);
+        write_record_for_task(&root, &active, TaskState::Running, 5);
+
+        let report = store
+            .compact(TaskRetentionPolicy::new(50, 0).expect("policy"))
+            .expect("compact");
+        assert_eq!(
+            report,
+            TaskCompaction {
+                examined: 3,
+                removed: 1,
+                retained: 2,
+            }
+        );
+        assert!(store.load(&old.delivery_id).is_err());
+        assert_eq!(
+            store.load(&active.delivery_id).expect("active").state,
+            TaskState::Running
+        );
+        let duplicate = store.create_claimed(&recent).expect("recent duplicate");
+        assert_eq!(duplicate.state, TaskState::Failed);
+        assert_eq!(
+            store
+                .compact(TaskRetentionPolicy::new(50, 0).expect("policy"))
+                .expect("repeat")
+                .removed,
+            0
+        );
+    }
+
+    #[test]
+    fn full_ledger_reclaims_only_old_terminal_generation() {
+        let (_workspace, store) = fixture();
+        let root = store.ensure_root().expect("ledger root");
+        for index in 0..MAX_TASK_RECORDS {
+            write_record_for_task(&root, &numbered_task(index), TaskState::Failed, 1);
+        }
+        let extra = numbered_task(MAX_TASK_RECORDS);
+        store
+            .create_claimed(&extra)
+            .expect("create after automatic compaction");
+        let records = store.list().expect("compacted ledger");
+        assert_eq!(records.len(), AUTOMATIC_TASK_RETAIN_LATEST + 1);
+        assert!(
+            records
+                .iter()
+                .any(|record| record.delivery_id == extra.delivery_id)
+        );
     }
 
     #[test]

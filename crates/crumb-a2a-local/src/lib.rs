@@ -28,6 +28,10 @@ pub const MAX_PEERS: usize = 128;
 pub const MAX_INBOX_MESSAGES: usize = 256;
 /// Maximum retained payload-free acknowledgement records per inbox.
 pub const MAX_ACKNOWLEDGEMENTS: usize = 1024;
+/// Minimum age of acknowledgement tombstones reclaimed automatically at capacity.
+pub const AUTOMATIC_ACKNOWLEDGEMENT_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+/// Newest acknowledgement tombstones protected during automatic compaction.
+pub const AUTOMATIC_ACKNOWLEDGEMENT_RETAIN_LATEST: usize = 256;
 /// Maximum immutable staged artifact files per sender instance.
 pub const MAX_STAGED_ARTIFACTS: usize = 64;
 /// Maximum encoded registry entry size.
@@ -52,6 +56,46 @@ const RUNTIME_ID_HEX_BYTES: usize = 32;
 const DELIVERY_ID_PREFIX: &str = "delivery_";
 const DELIVERY_ID_HEX_BYTES: usize = 64;
 const MAX_CLOCK_SKEW_MS: u64 = 60_000;
+
+/// Explicit, time-safe acknowledgement retention policy.
+///
+/// Only tombstones acknowledged strictly before `compact_before_ms` may be
+/// removed. The newest `retain_latest` tombstones are protected regardless of
+/// age, preserving a deterministic retry generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcknowledgementRetentionPolicy {
+    compact_before_ms: u64,
+    retain_latest: usize,
+}
+
+impl AcknowledgementRetentionPolicy {
+    /// Creates a validated acknowledgement retention policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero cutoff or a retained generation larger
+    /// than the acknowledgement bound.
+    pub fn new(compact_before_ms: u64, retain_latest: usize) -> Result<Self> {
+        if compact_before_ms == 0 {
+            bail!("local A2A acknowledgement compaction cutoff must be nonzero");
+        }
+        if retain_latest > MAX_ACKNOWLEDGEMENTS {
+            bail!("local A2A retained acknowledgement generation exceeds the limit");
+        }
+        Ok(Self {
+            compact_before_ms,
+            retain_latest,
+        })
+    }
+}
+
+/// Content-free result of one acknowledgement compaction pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcknowledgementCompaction {
+    pub examined: usize,
+    pub removed: usize,
+    pub retained: usize,
+}
 
 /// Bounds and lease policy for a local bus.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1129,6 +1173,34 @@ impl LocalBus {
         self.finish_delivery(recipient, delivery_id, true)
     }
 
+    /// Removes old payload-free acknowledgement tombstones under an explicit
+    /// retention horizon.
+    ///
+    /// Compaction is serialized with queue operations. Every tombstone is
+    /// validated before deletion begins, and records at or after the cutoff
+    /// plus the newest retained generation are never removed. Callers should
+    /// choose a cutoff older than their maximum retry and crash-recovery
+    /// window. Retrying a compaction is safe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid policy, stale ownership, unsafe or
+    /// malformed storage, or a filesystem failure.
+    pub fn compact_acknowledgements(
+        &self,
+        recipient: &Registration,
+        policy: AcknowledgementRetentionPolicy,
+    ) -> Result<AcknowledgementCompaction> {
+        let policy =
+            AcknowledgementRetentionPolicy::new(policy.compact_before_ms, policy.retain_latest)?;
+        self.inspect_base_directories()?;
+        let _locks = self.acquire_instance_locks(&[recipient.instance_id()])?;
+        self.require_live_owner(recipient, now_ms()?)?;
+        let (_pending, _processing, acknowledged) =
+            self.queue_directories(recipient.instance_id())?;
+        compact_acknowledgements_locked(&acknowledged, recipient.instance_id(), policy)
+    }
+
     /// Returns a claimed delivery to the pending queue for retry.
     ///
     /// # Errors
@@ -1492,7 +1564,16 @@ impl LocalBus {
         if expected_sender.is_some_and(|sender| envelope.sender_instance_id != sender) {
             bail!("local A2A delivery sender does not match acknowledgement");
         }
-        if count_visible_entries(&acknowledged)? >= MAX_ACKNOWLEDGEMENTS {
+        let mut acknowledgement_count = count_visible_entries(&acknowledged)?;
+        if acknowledgement_count >= MAX_ACKNOWLEDGEMENTS {
+            compact_acknowledgements_locked(
+                &acknowledged,
+                recipient_instance_id,
+                automatic_acknowledgement_policy()?,
+            )?;
+            acknowledgement_count = count_visible_entries(&acknowledged)?;
+        }
+        if acknowledgement_count >= MAX_ACKNOWLEDGEMENTS {
             bail!("local A2A acknowledgement limit has been reached");
         }
         let delivery_digest = envelope.content_digest()?;
@@ -1587,7 +1668,9 @@ impl LocalBus {
         let pending_paths = visible_regular_entries(&pending, MAX_INBOX_MESSAGES, "pending inbox")?;
         let processing_paths =
             visible_regular_entries(&processing, MAX_INBOX_MESSAGES, "processing inbox")?;
-        visible_regular_entries(&acknowledged, MAX_ACKNOWLEDGEMENTS, "acknowledgement inbox")?;
+        let mut acknowledgement_count =
+            visible_regular_entries(&acknowledged, MAX_ACKNOWLEDGEMENTS, "acknowledgement inbox")?
+                .len();
         let queued = pending_paths
             .len()
             .checked_add(processing_paths.len())
@@ -1622,7 +1705,15 @@ impl LocalBus {
             } else if envelope.kind() == DeliveryKind::Request
                 && self.correlated_response_is_durable(&envelope)?
             {
-                if count_visible_entries(&acknowledged)? >= MAX_ACKNOWLEDGEMENTS {
+                if acknowledgement_count >= MAX_ACKNOWLEDGEMENTS {
+                    compact_acknowledgements_locked(
+                        &acknowledged,
+                        instance_id,
+                        automatic_acknowledgement_policy()?,
+                    )?;
+                    acknowledgement_count = count_visible_entries(&acknowledged)?;
+                }
+                if acknowledgement_count >= MAX_ACKNOWLEDGEMENTS {
                     bail!("local A2A acknowledgement limit has been reached");
                 }
                 let record = Acknowledgement {
@@ -1639,6 +1730,7 @@ impl LocalBus {
                     path: acknowledgement_path,
                     record,
                 });
+                acknowledgement_count += 1;
             } else if path_exists_without_following(&target)? {
                 let existing: DeliveryEnvelope =
                     read_required_json(&target, MAX_ENVELOPE_BYTES, "local A2A delivery")?;
@@ -2185,6 +2277,56 @@ fn count_visible_entries(directory: &Path) -> Result<usize> {
     Ok(count)
 }
 
+fn automatic_acknowledgement_policy() -> Result<AcknowledgementRetentionPolicy> {
+    AcknowledgementRetentionPolicy::new(
+        now_ms()?
+            .saturating_sub(AUTOMATIC_ACKNOWLEDGEMENT_RETENTION_MS)
+            .max(1),
+        AUTOMATIC_ACKNOWLEDGEMENT_RETAIN_LATEST,
+    )
+}
+
+fn compact_acknowledgements_locked(
+    acknowledged: &Path,
+    recipient_instance_id: &str,
+    policy: AcknowledgementRetentionPolicy,
+) -> Result<AcknowledgementCompaction> {
+    let paths =
+        visible_regular_entries(acknowledged, MAX_ACKNOWLEDGEMENTS, "acknowledgement inbox")?;
+    let examined = paths.len();
+    let mut records = Vec::with_capacity(examined);
+    for path in paths {
+        let record: Acknowledgement =
+            read_required_json(&path, MAX_REGISTRY_BYTES, "local A2A acknowledgement")?;
+        record.validate()?;
+        if record.recipient_instance_id != recipient_instance_id
+            || path != acknowledged.join(delivery_filename(&record.delivery_id)?)
+        {
+            bail!("local A2A acknowledgement does not match its inbox entry");
+        }
+        records.push((record.acknowledged_at_ms, record.delivery_id, path));
+    }
+    records.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let removable_generation = records.len().saturating_sub(policy.retain_latest);
+    let mut removed = 0;
+    for (acknowledged_at_ms, _delivery_id, path) in records.into_iter().take(removable_generation) {
+        if acknowledged_at_ms >= policy.compact_before_ms {
+            continue;
+        }
+        remove_regular_file(&path, "local A2A acknowledgement")?;
+        removed += 1;
+    }
+    if removed > 0 {
+        sync_directory(acknowledged)
+            .context("local A2A acknowledgement inbox could not sync after compaction")?;
+    }
+    Ok(AcknowledgementCompaction {
+        examined,
+        removed,
+        retained: examined.saturating_sub(removed),
+    })
+}
+
 fn open_lock_file(path: &Path) -> Result<File> {
     let file = match OpenOptions::new()
         .read(true)
@@ -2497,6 +2639,107 @@ mod tests {
     }
 
     #[test]
+    fn acknowledgement_compaction_removes_old_tombstones_but_keeps_recent_retries_idempotent() {
+        let (_temporary, bus, _first, second, first_registration, second_registration) = setup();
+        let old = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &request("msg-old", "old"),
+            )
+            .expect("old enqueue");
+        bus.claim_pending(&second_registration, &old.delivery_id)
+            .expect("old claim");
+        bus.acknowledge(&second_registration, &old.delivery_id)
+            .expect("old acknowledgement");
+        let recent_request = request("msg-recent", "recent");
+        let recent = bus
+            .enqueue(&first_registration, &second.instance_id, &recent_request)
+            .expect("recent enqueue");
+        bus.claim_pending(&second_registration, &recent.delivery_id)
+            .expect("recent claim");
+        bus.acknowledge(&second_registration, &recent.delivery_id)
+            .expect("recent acknowledgement");
+
+        let (_pending, _processing, acknowledged) = bus
+            .queue_directories(second_registration.instance_id())
+            .expect("queue directories");
+        let old_path = acknowledged.join(delivery_filename(&old.delivery_id).expect("filename"));
+        let mut old_record: Acknowledgement =
+            read_required_json(&old_path, MAX_REGISTRY_BYTES, "acknowledgement").expect("old");
+        old_record.acknowledged_at_ms = 1;
+        atomic_replace_json(&acknowledged, &old_path, &old_record, MAX_REGISTRY_BYTES)
+            .expect("age old acknowledgement");
+        let recent_path =
+            acknowledged.join(delivery_filename(&recent.delivery_id).expect("filename"));
+        let recent_record: Acknowledgement =
+            read_required_json(&recent_path, MAX_REGISTRY_BYTES, "acknowledgement")
+                .expect("recent");
+
+        let report = bus
+            .compact_acknowledgements(
+                &second_registration,
+                AcknowledgementRetentionPolicy::new(recent_record.acknowledged_at_ms, 0)
+                    .expect("policy"),
+            )
+            .expect("compact");
+        assert_eq!(report.removed, 1);
+        assert!(!path_exists_without_following(&old_path).expect("old path"));
+        assert_eq!(
+            bus.enqueue(&first_registration, &second.instance_id, &recent_request)
+                .expect("recent duplicate"),
+            recent
+        );
+        assert_eq!(
+            bus.compact_acknowledgements(
+                &second_registration,
+                AcknowledgementRetentionPolicy::new(recent_record.acknowledged_at_ms, 0)
+                    .expect("policy"),
+            )
+            .expect("repeat")
+            .removed,
+            0
+        );
+    }
+
+    #[test]
+    fn full_acknowledgement_store_reclaims_only_old_generation() {
+        let (_temporary, bus, first, second, first_registration, second_registration) = setup();
+        let incoming = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &request("msg-at-capacity", "new delivery"),
+            )
+            .expect("enqueue");
+        bus.claim_pending(&second_registration, &incoming.delivery_id)
+            .expect("claim");
+        let (_pending, _processing, acknowledged) = bus
+            .queue_directories(second_registration.instance_id())
+            .expect("queue directories");
+        for index in 0..MAX_ACKNOWLEDGEMENTS {
+            let delivery_id = format!("delivery_{index:064x}");
+            let record = Acknowledgement {
+                schema_version: LOCAL_BUS_SCHEMA_VERSION,
+                delivery_id: delivery_id.clone(),
+                sender_instance_id: first.instance_id.clone(),
+                recipient_instance_id: second.instance_id.clone(),
+                acknowledged_at_ms: 1,
+                delivery_digest: None,
+            };
+            let path = acknowledged.join(delivery_filename(&delivery_id).expect("filename"));
+            fs::write(path, serde_json::to_vec(&record).expect("encode")).expect("write");
+        }
+
+        bus.acknowledge(&second_registration, &incoming.delivery_id)
+            .expect("acknowledge after automatic compaction");
+        assert_eq!(
+            count_visible_entries(&acknowledged).expect("acknowledgement count"),
+            AUTOMATIC_ACKNOWLEDGEMENT_RETAIN_LATEST + 1
+        );
+    }
+
+    #[test]
     fn release_returns_claimed_message_to_pending() {
         let (_temporary, bus, _first, second, first_registration, second_registration) = setup();
         bus.enqueue(
@@ -2785,6 +3028,57 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn retained_request_tombstone_preserves_response_before_ledger_reconciliation() {
+        let (_temporary, bus, first, second, first_registration, second_registration) = setup();
+        let request_receipt = bus
+            .enqueue(
+                &first_registration,
+                &second.instance_id,
+                &request("msg-reconcile", "please answer"),
+            )
+            .expect("request enqueue");
+        bus.claim_pending(&second_registration, &request_receipt.delivery_id)
+            .expect("request claim");
+        let response_receipt = bus
+            .complete_claimed_request(
+                &second_registration,
+                &request_receipt.delivery_id,
+                &response("msg-reconcile-answer", "durable answer"),
+            )
+            .expect("complete request");
+
+        let (_pending, _processing, acknowledged) = bus
+            .queue_directories(second_registration.instance_id())
+            .expect("queue directories");
+        let old_delivery_id = format!("delivery_{}", "f".repeat(64));
+        let old_path = acknowledged.join(delivery_filename(&old_delivery_id).expect("filename"));
+        let old = Acknowledgement {
+            schema_version: LOCAL_BUS_SCHEMA_VERSION,
+            delivery_id: old_delivery_id,
+            sender_instance_id: first.instance_id.clone(),
+            recipient_instance_id: second.instance_id.clone(),
+            acknowledged_at_ms: 1,
+            delivery_digest: None,
+        };
+        atomic_write_new_json(&acknowledged, &old_path, &old, MAX_REGISTRY_BYTES)
+            .expect("old tombstone");
+
+        let report = bus
+            .compact_acknowledgements(
+                &second_registration,
+                AcknowledgementRetentionPolicy::new(u64::MAX, 1).expect("policy"),
+            )
+            .expect("compact");
+        assert_eq!(report.removed, 1);
+        let proof = bus
+            .completed_response_receipt(&second_registration, &request_receipt.delivery_id)
+            .expect("reconciliation lookup")
+            .expect("durable response proof");
+        assert_eq!(proof.delivery_id, response_receipt.delivery_id);
+        assert_eq!(proof.recipient_instance_id, first.instance_id);
     }
 
     #[test]
