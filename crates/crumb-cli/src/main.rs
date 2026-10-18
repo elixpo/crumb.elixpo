@@ -6,7 +6,7 @@ use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1629,11 +1629,13 @@ fn read_repl_submission(
             }));
     };
     editor.workspace.set(cwd);
+    editor.composer_input_rows.store(1, Ordering::Relaxed);
     let signal = editor.editor.read_line(&CrumbPrompt::new(
         prompt.to_owned(),
         format!("{status}  "),
         fullscreen,
         Arc::clone(&editor.paste_artifacts),
+        Arc::clone(&editor.composer_input_rows),
     ))?;
     Ok(match signal {
         Signal::Success(command) => {
@@ -11060,6 +11062,7 @@ struct InteractiveLineEditor {
     editor: Reedline,
     workspace: CompletionWorkspace,
     paste_artifacts: Arc<Mutex<PendingComposerArtifacts>>,
+    composer_input_rows: Arc<AtomicU16>,
 }
 
 impl InteractiveLineEditor {
@@ -11422,6 +11425,61 @@ fn create_line_editor(
             interactive_history.save(HistoryItem::from_command_line(entry.command))?;
         }
     }
+    let keybindings = crumb_keybindings();
+    let menu_width = u16::try_from(suggestion_width(size()?.0)).unwrap_or(1);
+    let menu = IdeMenu::default()
+        .with_name("completion_menu")
+        .with_text_style(Style::new().fg(Color::Fixed(245)))
+        .with_selected_text_style(
+            Style::new()
+                .fg(Color::Fixed(252))
+                .on(Color::Fixed(238))
+                .bold(),
+        )
+        .with_description_text_style(Style::new().fg(Color::Fixed(243)))
+        .with_match_text_style(Style::new().fg(Color::Fixed(250)).underline())
+        .with_selected_match_text_style(
+            Style::new()
+                .fg(Color::Fixed(255))
+                .on(Color::Fixed(238))
+                .bold()
+                .underline(),
+        )
+        .with_min_completion_width(menu_width)
+        .with_max_completion_width(menu_width)
+        .with_max_completion_height(COMPLETION_PALETTE_ROWS)
+        .with_padding(0)
+        .with_cursor_offset(i16::try_from(FULLSCREEN_SIDE_GUTTER).unwrap_or(2))
+        .with_correct_cursor_pos(true);
+    let menu = CompletionOverlay::new(menu, renderer, header_rows, Arc::clone(&transcript));
+    let (paste_artifacts, composer_dock) =
+        composer_artifact_state(fullscreen, renderer, transcript, header_rows);
+    let composer_input_rows = Arc::new(AtomicU16::new(1));
+    let edit_mode = CrumbEditMode::new(
+        keybindings,
+        composer_dock.clone(),
+        Arc::clone(&paste_artifacts),
+    );
+    let editor = Reedline::create()
+        .with_history(Box::new(interactive_history))
+        .with_hinter(Box::new(CrumbHinter::new(
+            composer_dock,
+            Arc::clone(&paste_artifacts),
+            Arc::clone(&composer_input_rows),
+        )))
+        .with_completer(Box::new(CrumbCompleter::new(workspace.clone())))
+        .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
+        .with_persistent_menus(true)
+        .with_edit_mode(Box::new(edit_mode));
+    Ok(InteractiveLineEditor {
+        editor,
+        workspace,
+        paste_artifacts,
+        composer_input_rows,
+    })
+}
+
+fn crumb_keybindings() -> reedline::Keybindings {
     let mut keybindings = default_emacs_keybindings();
     for trigger in ['/', '@', '?'] {
         keybindings.add_binding(
@@ -11463,54 +11521,7 @@ fn create_line_editor(
         KeyCode::PageDown,
         ReedlineEvent::ExecuteHostCommand("crumb:transcript-down".to_owned()),
     );
-    let menu_width = u16::try_from(suggestion_width(size()?.0)).unwrap_or(1);
-    let menu = IdeMenu::default()
-        .with_name("completion_menu")
-        .with_text_style(Style::new().fg(Color::Fixed(245)))
-        .with_selected_text_style(
-            Style::new()
-                .fg(Color::Fixed(252))
-                .on(Color::Fixed(238))
-                .bold(),
-        )
-        .with_description_text_style(Style::new().fg(Color::Fixed(243)))
-        .with_match_text_style(Style::new().fg(Color::Fixed(250)).underline())
-        .with_selected_match_text_style(
-            Style::new()
-                .fg(Color::Fixed(255))
-                .on(Color::Fixed(238))
-                .bold()
-                .underline(),
-        )
-        .with_min_completion_width(menu_width)
-        .with_max_completion_width(menu_width)
-        .with_max_completion_height(COMPLETION_PALETTE_ROWS)
-        .with_padding(0)
-        .with_cursor_offset(i16::try_from(FULLSCREEN_SIDE_GUTTER).unwrap_or(2))
-        .with_correct_cursor_pos(true);
-    let menu = CompletionOverlay::new(menu, renderer, header_rows, Arc::clone(&transcript));
-    let (paste_artifacts, composer_dock) =
-        composer_artifact_state(fullscreen, renderer, transcript, header_rows);
-    let edit_mode = CrumbEditMode::new(
-        keybindings,
-        composer_dock.clone(),
-        Arc::clone(&paste_artifacts),
-    );
-    let editor = Reedline::create()
-        .with_history(Box::new(interactive_history))
-        .with_hinter(Box::new(CrumbHinter::new(
-            composer_dock,
-            Arc::clone(&paste_artifacts),
-        )))
-        .with_completer(Box::new(CrumbCompleter::new(workspace.clone())))
-        .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
-        .with_persistent_menus(true)
-        .with_edit_mode(Box::new(edit_mode));
-    Ok(InteractiveLineEditor {
-        editor,
-        workspace,
-        paste_artifacts,
-    })
+    keybindings
 }
 
 fn composer_artifact_state(
@@ -12043,6 +12054,7 @@ struct CrumbPrompt {
     right: String,
     anchor_to_composer: bool,
     paste_artifacts: Arc<Mutex<PendingComposerArtifacts>>,
+    composer_input_rows: Arc<AtomicU16>,
 }
 
 struct CrumbHinter {
@@ -12050,6 +12062,7 @@ struct CrumbHinter {
     placeholder_visible: bool,
     dock: Option<ComposerDock>,
     paste_artifacts: Arc<Mutex<PendingComposerArtifacts>>,
+    composer_input_rows: Arc<AtomicU16>,
 }
 
 #[derive(Clone)]
@@ -12063,16 +12076,18 @@ impl CrumbHinter {
     fn new(
         dock: Option<ComposerDock>,
         paste_artifacts: Arc<Mutex<PendingComposerArtifacts>>,
+        composer_input_rows: Arc<AtomicU16>,
     ) -> Self {
         Self {
             history: DefaultHinter::default().with_style(Style::new().fg(Color::DarkGray)),
             placeholder_visible: false,
             dock,
             paste_artifacts,
+            composer_input_rows,
         }
     }
 
-    fn with_dock(&self, hint: String, input_rows: u16) -> String {
+    fn with_dock(&self, hint: String) -> String {
         let Some(dock) = &self.dock else {
             return hint;
         };
@@ -12092,13 +12107,8 @@ impl CrumbHinter {
             "Ctrl+V attach clipboard · Enter send · PgUp/PgDn scroll · ? help"
         };
         let hotkeys = truncate_chars(hotkeys, usize::from(columns));
-        let input_capacity = FULLSCREEN_COMPOSER_ROWS.saturating_sub(5).max(1);
-        let footer_spacing = input_capacity
-            .saturating_sub(input_rows.min(input_capacity))
-            .saturating_add(1);
         format!(
-            "{hint}{}{}\n{}\n{}",
-            "\n".repeat(usize::from(footer_spacing)),
+            "{hint}\n{}\n{}\n{}",
             dock.renderer.composer_idle_status(),
             state.footer_context,
             hotkeys
@@ -12125,6 +12135,10 @@ impl Hinter for CrumbHinter {
         };
         let columns = size().map_or(80, |(columns, _)| columns);
         let input_rows = composer_visual_rows(line, artifact_width, columns);
+        self.composer_input_rows.store(
+            input_rows.min(FULLSCREEN_COMPOSER_ROWS.saturating_sub(5).max(1)),
+            Ordering::Relaxed,
+        );
         if self.placeholder_visible && !has_artifacts {
             let placeholder =
                 "Ask Crumb anything or type a command · @ context · / commands · Tab complete";
@@ -12137,16 +12151,16 @@ impl Hinter for CrumbHinter {
             } else {
                 placeholder.to_owned()
             };
-            return self.with_dock(hint, input_rows);
+            return self.with_dock(hint);
         }
         if self.placeholder_visible {
             let placeholder = "Ask Crumb anything…";
-            return self.with_dock(placeholder.to_owned(), input_rows);
+            return self.with_dock(placeholder.to_owned());
         }
         let hint = self
             .history
             .handle(line, pos, history, use_ansi_coloring, cwd);
-        self.with_dock(hint, input_rows)
+        self.with_dock(hint)
     }
 
     fn complete_hint(&self) -> String {
@@ -12172,12 +12186,14 @@ impl CrumbPrompt {
         right: String,
         anchor_to_composer: bool,
         paste_artifacts: Arc<Mutex<PendingComposerArtifacts>>,
+        composer_input_rows: Arc<AtomicU16>,
     ) -> Self {
         Self {
             rendered,
             right,
             anchor_to_composer,
             paste_artifacts,
+            composer_input_rows,
         }
     }
 }
@@ -12188,9 +12204,10 @@ impl Prompt for CrumbPrompt {
             return Cow::Borrowed(&self.rendered);
         }
         let rows = size().map_or(FULLSCREEN_COMPOSER_ROWS, |(_, rows)| rows);
+        let input_rows = self.composer_input_rows.load(Ordering::Relaxed);
         Cow::Owned(format!(
             "{}{}",
-            composer_anchor_sequence(rows),
+            composer_anchor_sequence(rows, input_rows),
             self.rendered
         ))
     }
@@ -12201,10 +12218,12 @@ impl Prompt for CrumbPrompt {
 
     fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
         let composer_input_row = self.anchor_to_composer.then(|| {
-            size()
-                .map_or(FULLSCREEN_COMPOSER_ROWS, |(_, rows)| rows)
-                .saturating_sub(FULLSCREEN_COMPOSER_ROWS)
-                .saturating_add(2)
+            let terminal_rows = size().map_or(FULLSCREEN_COMPOSER_ROWS, |(_, rows)| rows);
+            composer_anchor_row(
+                terminal_rows,
+                self.composer_input_rows.load(Ordering::Relaxed),
+            )
+            .saturating_add(2)
         });
         let mut prefix = self
             .paste_artifacts
@@ -12387,9 +12406,16 @@ fn position_composer(renderer: Renderer, header_rows: u16) -> io::Result<()> {
     writer.flush()
 }
 
-fn composer_anchor_sequence(terminal_rows: u16) -> String {
-    let composer_row = terminal_rows.saturating_sub(FULLSCREEN_COMPOSER_ROWS);
+fn composer_anchor_sequence(terminal_rows: u16, input_rows: u16) -> String {
+    let composer_row = composer_anchor_row(terminal_rows, input_rows);
     format!("\x1b[{};1H", composer_row.saturating_add(1))
+}
+
+fn composer_anchor_row(terminal_rows: u16, input_rows: u16) -> u16 {
+    let input_rows = input_rows
+        .max(1)
+        .min(FULLSCREEN_COMPOSER_ROWS.saturating_sub(5).max(1));
+    terminal_rows.saturating_sub(input_rows.saturating_add(5))
 }
 
 fn follow_up_cursor_sequence(terminal_rows: u16) -> String {
@@ -14485,8 +14511,9 @@ mod tests {
 
     #[test]
     fn fullscreen_prompt_is_anchored_above_the_fixed_footer() {
-        assert_eq!(composer_anchor_sequence(40), "\x1b[33;1H");
-        assert_eq!(composer_anchor_sequence(4), "\x1b[1;1H");
+        assert_eq!(composer_anchor_sequence(40, 1), "\x1b[35;1H");
+        assert_eq!(composer_anchor_sequence(40, 3), "\x1b[33;1H");
+        assert_eq!(composer_anchor_sequence(4, 1), "\x1b[1;1H");
         assert_eq!(transcript_activity_row(12, 40), 12);
         assert_eq!(transcript_activity_row(39, 40), 31);
     }
