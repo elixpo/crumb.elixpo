@@ -1,49 +1,70 @@
 <h1 align="center">
-  <img src="crumb.elixpo/public/favicon.png" width="30" height="30" alt="Crumb panda" />
+  <img src="crumb.elixpo/public/favicon.png" width="42" height="42" alt="Crumb panda" />
+  <br />
   Crumb
 </h1>
 
-<p>
-  <img src="crumb.elixpo/public/og-image.png" alt="Crumb — the autonomous agent harness and natural language terminal" width="100%" />
+<p align="center">
+  <strong>Your terminal, with an agent that actually gets the work done.</strong>
 </p>
 
-> Crumb is Elixpo's self-hosted autonomous agent harness and natural language terminal, powered by Pollinations.
+<p align="center">
+  Ask naturally. Keep using the commands you know. Stay in control.
+</p>
 
-Crumb runs locally as a Rust application around your real Bash, Zsh, or PowerShell session. Use the commands you already know, or give Crumb a goal and let its native harness plan, use approved tools, retain bounded context, supervise parallel work, and carry the task forward. Pollinations supplies the default model intelligence; Crumb owns the execution loop, permissions, memory, tools, and user-visible evidence.
+<p align="center">
+  <a href="https://crumb.elixpo.com">Website</a> ·
+  <a href="https://crumb.elixpo.com/docs">Docs</a> ·
+  <a href="https://github.com/elixpo/crumb.elixpo/issues">Ideas & feedback</a>
+</p>
 
-## A native autonomous harness
+<p align="center">
+  <img src="crumb.elixpo/public/og-image.png" alt="Crumb natural-language terminal" width="100%" />
+</p>
 
-- Run ordinary commands without changing how your shell works.
-- Give the Crumb agent a complete task and steer it while it works.
-- Run autonomous multi-step work inside explicit user-granted boundaries.
-- Keep the harness, sessions, memory, tools, and policy on your own machine.
-- Use Pollinations models without making the terminal depend on a network connection.
-- Add focused skills for the jobs you do often.
-- Connect outside services only when you choose.
-- Keep sessions, context, tool activity, checkpoints, and progress visible.
+## The goal
 
-## Calm by default
+Crumb turns the terminal into a capable teammate. Tell it what you want done, let it use the tools you approve, and get a clear report when the work is finished.
 
-Autonomous does not mean unaccountable. Crumb applies deterministic risk classes and user-owned permissions before a model-proposed action can reach a tool. It shows what is connected, asks before sensitive actions, supports cancellation and checkpoints, and keeps the terminal useful when Pollinations or any optional integration is unavailable.
+It is made for people who want the speed of an AI agent without giving up the control, familiarity, or power of their own terminal.
 
-Nothing should install itself, grant itself access, or get between you and the command line.
+## What you can do
 
-## Crumb and Elixpoo are different systems
+- Ask Crumb to investigate, build, fix, search, or explain.
+- Use normal Bash, Zsh, and PowerShell commands as usual.
+- Watch commands, file edits, progress, and results while Crumb works.
+- Steer, pause, cancel, or continue a task at any time.
+- Keep useful context across sessions without losing sight of what is stored.
+- Add skills and connect services when you need them.
+- Choose how much access Crumb has—and change it whenever you want.
 
-Crumb is a user-operated autonomous development agent and terminal harness. [Elixpoo](https://agent.elixpo.com) is Elixpo's bounded GitHub project-management agent and never implements product code. They share an emphasis on inspectable permissions, but they have separate runtimes, responsibilities, and trust boundaries.
+Try requests like:
 
-## A growing ecosystem
+> Find out why the tests are failing, fix the problem, and tell me what changed.
 
-The Crumb marketplace is being shaped as a home for community-built skills, connectors, and MCP tools. Add-ons will be easy to discover and connect while remaining inspectable, removable, and separate from Crumb itself.
+> Check whether I am signed in to GitHub and show me the current branch.
 
-Explore the ideas behind [skills](https://crumb.elixpo.com/skills), [plugins](https://crumb.elixpo.com/plugins), and [connectors](https://crumb.elixpo.com/profile/connectors).
+> Research this error, compare the likely fixes, and apply the safest one.
 
-## Current status
+## Clear while it works
 
-Crumb is an active pre-release project. Its native harness, Pollinations integration, persistent shell, permission system, sessions, memory, MCP boundary, background work, and agent supervision are being developed in public. Public installers and downloadable terminal builds are not available yet; Windows, Linux, and macOS releases will follow release-readiness and security checks.
+Crumb keeps the important parts visible: what it is doing, which tools it is using, how long commands take, what files changed, and how much context has been used. Detailed tool output stays out of the way until you choose to open it.
 
-Follow the [development roadmap](docs/development/TODO.md), read the [documentation](https://crumb.elixpo.com/docs), or share an idea through [GitHub Issues](https://github.com/elixpo/crumb.elixpo/issues).
+## You stay in charge
 
----
+Crumb asks before sensitive actions, keeps permissions in your hands, and shows the exact command it wants to run. You can work in planning mode, approve one action at a time, or allow broader access for a trusted workspace.
 
-Made with care for people who live in the terminal.
+If an AI service is unavailable, your terminal still works.
+
+## Make it yours
+
+Use model packs for different kinds of work, add focused [skills](https://crumb.elixpo.com/skills), install [plugins](https://crumb.elixpo.com/plugins), and connect outside services through [connectors](https://crumb.elixpo.com/profile/connectors).
+
+<p align="center">
+  <img src="crumb.elixpo/public/icon-192.png" width="96" height="96" alt="Crumb app icon" />
+</p>
+
+<p align="center">
+  <img src="crumb.elixpo/public/pollinations-favicon.png" width="18" height="18" alt="" />
+  Powered by <a href="https://pollinations.ai">Pollinations</a> · Built by <a href="https://elixpo.com">Elixpo</a> for people who live in the terminal.
+</p>
