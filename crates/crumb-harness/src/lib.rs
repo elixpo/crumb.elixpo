@@ -1163,10 +1163,16 @@ fn finish_turn(
         .usage
         .input_tokens
         .saturating_add(round.usage.output_tokens);
-    let final_text = repair_tool_identifier_drift(
+    let grounded = repair_tool_identifier_drift(
         &sanitize_agent_response(&round.text, &turn.user_message),
         &metrics.successful_tool_outputs,
     );
+    let final_text =
+        if !metrics.successful_tool_outputs.is_empty() && response_is_generic_idle(&grounded) {
+            render_successful_tool_fallback(&metrics.successful_tool_outputs)
+        } else {
+            grounded
+        };
     let chunks = if final_text == round.text {
         round.text_chunks
     } else {
@@ -1186,6 +1192,30 @@ fn finish_turn(
         context_tokens,
         model_rounds: metrics.model_rounds,
         tool_calls: metrics.tool_calls,
+    }
+}
+
+fn render_successful_tool_fallback(outputs: &[String]) -> String {
+    const MAX_EVIDENCE_BYTES: usize = 2_048;
+    let evidence = outputs
+        .iter()
+        .filter_map(|output| {
+            let output = output.trim();
+            (!output.is_empty()).then(|| compact_history_message(output, MAX_EVIDENCE_BYTES))
+        })
+        .collect::<Vec<_>>();
+    match evidence.as_slice() {
+        [] => "The tools completed, but returned no readable result.".to_owned(),
+        [only] => format!("Verified result:\n\n{only}"),
+        many => {
+            let body = many
+                .iter()
+                .enumerate()
+                .map(|(index, output)| format!("{}. {output}", index + 1))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            format!("Verified results:\n\n{body}")
+        }
     }
 }
 
@@ -1309,7 +1339,20 @@ fn response_needs_grounding_correction(response: &str, user_message: &str) -> bo
     let persona_only = strip_persona_boilerplate(&response, asks_about_identity(user_message))
         .trim()
         .is_empty();
-    contradicts_evidence || persona_only
+    contradicts_evidence || persona_only || response_is_generic_idle(&response)
+}
+
+fn response_is_generic_idle(response: &str) -> bool {
+    let response = response.trim().to_ascii_lowercase();
+    [
+        "ready when you are",
+        "give me something interesting",
+        "what would you like to do next",
+        "what can i do for you today",
+        "how can i help you today",
+    ]
+    .iter()
+    .any(|phrase| response.contains(phrase))
 }
 
 fn response_misquotes_tool_identifier(response: &str, tool_outputs: &[String]) -> bool {
@@ -1683,6 +1726,10 @@ fn prepare_grounding_retry(
 ) -> bool {
     if !successful_tool_evidence
         || *grounding_retry_used
+        // A generic idle reply contains nothing worth repairing. Finish the
+        // turn from bounded successful evidence instead of spending another
+        // inference round and risking the same empty answer.
+        || response_is_generic_idle(response)
         || !(response_needs_grounding_correction(response, user_message)
             || response_misquotes_tool_identifier(response, successful_tool_outputs))
     {
@@ -2002,7 +2049,7 @@ fn preserve_web_search_terms(call: &mut ToolCall, user_message: &str) {
     else {
         return;
     };
-    let query = compact_search_query(query);
+    let query = align_search_timeframe(&compact_search_query(query), user_message);
     let query_terms = search_terms(&query);
     let missing = search_terms(user_message)
         .into_iter()
@@ -2017,6 +2064,38 @@ fn preserve_web_search_terms(call: &mut ToolCall, user_message: &str) {
         format!("{query} {}", missing.join(" "))
     };
     call.arguments["query"] = serde_json::Value::String(optimized);
+}
+
+fn align_search_timeframe(query: &str, user_message: &str) -> String {
+    const TIMEFRAMES: &[&str] = &[
+        "now",
+        "current",
+        "currently",
+        "today",
+        "tonight",
+        "tomorrow",
+        "yesterday",
+    ];
+    let requested = search_terms(user_message);
+    let requested_timeframes = TIMEFRAMES
+        .iter()
+        .filter(|term| requested.contains(**term))
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if requested_timeframes.is_empty() {
+        return query.to_owned();
+    }
+    query
+        .split_whitespace()
+        .filter(|raw| {
+            let normalized = raw
+                .trim_matches(|character: char| !character.is_alphanumeric())
+                .to_ascii_lowercase();
+            !TIMEFRAMES.contains(&normalized.as_str())
+                || requested_timeframes.contains(normalized.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn compact_search_query(query: &str) -> String {
@@ -2058,9 +2137,9 @@ fn search_terms(input: &str) -> std::collections::BTreeSet<String> {
     const STOP_WORDS: &[&str] = &[
         "a", "about", "am", "an", "and", "are", "at", "be", "been", "being", "can", "could", "did",
         "do", "does", "find", "for", "from", "give", "had", "has", "have", "how", "i", "in", "is",
-        "it", "know", "look", "me", "might", "need", "of", "on", "please", "search", "should",
-        "short", "tell", "the", "thinking", "to", "up", "was", "web", "were", "what", "when",
-        "where", "which", "who", "why", "will", "would", "you",
+        "expect", "it", "know", "look", "me", "might", "need", "of", "on", "please", "search",
+        "should", "short", "tell", "the", "thinking", "to", "up", "was", "we", "web", "were",
+        "what", "when", "where", "which", "who", "why", "will", "would", "you",
     ];
     input
         .split(|character: char| {
@@ -3150,6 +3229,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_idle_reply_after_successful_tool_falls_back_to_verified_evidence() {
+        let idle_round = || {
+            vec![
+                ChatEvent::TextDelta(
+                    "Ready when you are—give me something interesting.".to_owned(),
+                ),
+                ChatEvent::Finished(FinishReason::Stop),
+            ]
+        };
+        let provider = Arc::new(ScriptedProvider::new(vec![tool_round(), idle_round()]));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let harness = NativeHarness::new(
+            provider.clone(),
+            tools(calls.clone()),
+            Arc::new(DenyAllApprovals),
+            HarnessLimits::default(),
+        );
+        let (_root, mut session) = session(AgentMode::Auto);
+        let mut conversation = harness.conversation();
+        let mut events = Vec::new();
+
+        let outcome = harness
+            .run_turn(
+                &mut session,
+                &mut conversation,
+                turn(),
+                &CancellationToken::default(),
+                &mut events,
+            )
+            .await
+            .expect("verified evidence is returned when the model stays idle");
+
+        assert_eq!(outcome.text, "Verified result:\n\n24 C");
+        assert_eq!(outcome.model_rounds, 2);
+        assert_eq!(outcome.tool_calls, 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.requests.lock().expect("request lock").len(), 2);
+        assert!(events.iter().any(|event| {
+            matches!(event, HarnessEvent::TextDelta(text) if text == "Verified result:\n\n24 C")
+        }));
+    }
+
+    #[tokio::test]
     async fn successful_tool_result_corrects_false_permission_refusal_without_rerunning() {
         let refusal_round = vec![
             ChatEvent::TextDelta(
@@ -3782,6 +3904,26 @@ mod tests {
             call.arguments["query"].as_str(),
             Some("weather forecast for Kolkata tomorrow")
         );
+    }
+
+    #[test]
+    fn web_search_cannot_replace_current_weather_with_tomorrow() {
+        let mut call = ToolCall {
+            id: "search_current_weather".to_owned(),
+            name: "web_search".to_owned(),
+            arguments: json!({"query": "weather forecast Kolkata tomorrow"}),
+        };
+
+        super::preserve_web_search_terms(
+            &mut call,
+            "what is the time now and weather in Kolkata; do we expect rain?",
+        );
+
+        let query = call.arguments["query"]
+            .as_str()
+            .expect("query remains text");
+        assert!(!query.contains("tomorrow"));
+        assert_eq!(query, "weather forecast Kolkata now rain time");
     }
 
     #[test]
