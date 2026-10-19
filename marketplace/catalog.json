@@ -26,7 +26,7 @@
       "source": "./packages/code-review",
       "compatibility": {
         "minimum_crumb_version": "0.1.0",
-        "maximum_crumb_version_exclusive": "0.2.0",
+        "maximum_crumb_version_exclusive": "2.0.0",
         "platforms": ["linux", "macos", "windows"]
       },
       "provenance": {
@@ -67,7 +67,7 @@
       "source": "./packages/rust-quality",
       "compatibility": {
         "minimum_crumb_version": "0.1.0",
-        "maximum_crumb_version_exclusive": "0.2.0",
+        "maximum_crumb_version_exclusive": "2.0.0",
         "platforms": ["linux", "macos", "windows"]
       },
       "provenance": {
@@ -108,7 +108,7 @@
       "source": "./packages/workspace-mcp",
       "compatibility": {
         "minimum_crumb_version": "0.1.0",
-        "maximum_crumb_version_exclusive": "0.2.0",
+        "maximum_crumb_version_exclusive": "2.0.0",
         "platforms": ["linux", "macos", "windows"]
       },
       "provenance": {

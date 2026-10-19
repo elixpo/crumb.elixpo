@@ -5,6 +5,8 @@ release, behavior and interfaces may change without compatibility guarantees.
 
 ## Unreleased
 
+## 1.0.2 - 2026-10-19
+
 - Added manually authorized cross-platform GitHub Releases with checksums,
   SPDX SBOMs, Sigstore signatures, and build-provenance attestations.
 - Added checksum-verifying one-line installers for Linux, macOS, and Windows.

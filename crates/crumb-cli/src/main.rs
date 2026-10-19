@@ -14162,7 +14162,7 @@ mod tests {
         let inspection = String::from_utf8_lossy(&output);
         assert!(inspection.contains("publisher Crumb · trust bundled"));
         assert!(inspection.contains("state available"));
-        assert!(inspection.contains("compatibility Crumb >= 0.1.0 and < 0.2.0"));
+        assert!(inspection.contains("compatibility Crumb >= 0.1.0 and < 2.0.0"));
         output.clear();
 
         show_marketplace(
