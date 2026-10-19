@@ -121,11 +121,11 @@ The `debian/` directory includes source and binary metadata, an offline Cargo
 build, a manual page, a smoke autopkgtest, machine-readable copyright data,
 and upstream watch and metadata files.
 
-The changelog remains `UNRELEASED` until an ITP number exists and all source
-package checks pass. Add `(Closes: #NNNNNN)` with the real ITP number and use
-`dch --release` only when preparing the upload candidate. The source package
-should then be maintained in a Debian packaging repository (normally Salsa),
-with its Vcs fields added to `debian/control`.
+The changelog remains `UNRELEASED` until all source-package checks pass. ITP
+bug [#1151280](https://bugs.debian.org/1151280) is recorded in the initial
+entry. Use `dch --release` only when preparing the upload candidate. The source
+package should then be maintained in a Debian packaging repository (normally
+Salsa), with its Vcs fields added to `debian/control`.
 
 ## Rust Team request
 
@@ -158,43 +158,22 @@ https://crumb.elixpo.com
 
 ## ITP status
 
-As of 19 October 2026, `wnpp-check crumb` returns no matching WNPP report and
-Debian's public list of packages being worked on contains no `crumb` entry.
-The file `docs/development/debian-itp.txt` is therefore a draft, not evidence
-that an ITP was submitted.
-
-Recheck immediately before filing:
-
-```bash
-wnpp-check crumb
-reportbug -B debian --email ayushman.elixpo@gmail.com wnpp
-```
-
-On systems without a configured mail transport, send the first line of
-`docs/development/debian-itp.txt` as the subject and its remaining contents as
-the body from that address to `submit@bugs.debian.org`. The ITP email does not
-require an OpenPGP signature.
-
-In `reportbug`, select `ITP`, enter `crumb`, use `self-hosted agent harness and
-natural-language terminal` as the short description, and use the exact body in
-`docs/development/debian-itp.txt`. Record the assigned bug number in the
-changelog only after the Debian BTS acknowledges the report.
+The ITP was accepted by the Debian BTS on 19 October 2026 as
+[#1151280](https://bugs.debian.org/1151280). The submitted message is retained
+in `docs/development/debian-itp.txt` for packaging history. Further ITP
+correspondence belongs at `1151280@bugs.debian.org`.
 
 ## Archive submission sequence
 
 1. Coordinate and land `rust-reedline` through the Debian Rust Team.
-2. Search WNPP and run `wnpp-check crumb` for an existing application effort.
-3. File `ITP: crumb -- self-hosted agent harness and natural-language terminal`
-   against `wnpp` using `reportbug`; the prepared body is in
-   `docs/development/debian-itp.txt`.
-4. Add `(Closes: #NNNNNN)` to the initial `debian/changelog` entry using the
-   real ITP bug number.
-5. Create a signed source package and build it in a clean, network-isolated
+2. After Salsa access is approved, create the packaging repositories and add
+   their Vcs fields without overwriting existing history.
+3. Create a signed source package and build it in a clean, network-isolated
    unstable environment.
-6. Run `lintian`, `autopkgtest`, `piuparts`, and `sbuild`.
-7. Upload the signed source package to `mentors.debian.net` and file an RFS
+4. Run `lintian`, `autopkgtest`, `piuparts`, and `sbuild`.
+5. Upload the signed source package to `mentors.debian.net` and file an RFS
    against `sponsorship-requests`.
-8. Respond to sponsor and FTP NEW review.
+6. Respond to sponsor and FTP NEW review.
 
 Do not announce Crumb as being in Debian until the package clears Debian's NEW
 queue and appears in the official archive.

@@ -25,7 +25,7 @@ The package uses Debian-provided Rust crates and the system SQLite library.
 The sole Rust dependency that had to be introduced first was reedline 0.52.1.
 The build and tests run without network access.
 
-The ITP is Debian bug #<ITP_BUG_NUMBER>.
+The ITP is Debian bug #1151280.
 
 Further information is available at:
 
@@ -37,12 +37,12 @@ The package can be downloaded with:
 
 Changes for the initial upload:
 
-  * Initial Debian release. (Closes: #<ITP_BUG_NUMBER>)
+  * Initial Debian release. (Closes: #1151280)
 
 Regards,
 --
   Ayushman Bhattacharya
 
-This is a prepared draft. Replace every angle-bracket placeholder with the
-actual ITP, Salsa, and mentors.debian.net values after the signed source
+This is a prepared draft. Replace the remaining angle-bracket placeholders
+with the actual Salsa and mentors.debian.net values after the signed source
 package has been uploaded. Do not submit this RFS before those URLs work.
