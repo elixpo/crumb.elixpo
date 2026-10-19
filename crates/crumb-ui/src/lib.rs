@@ -266,7 +266,7 @@ impl Renderer {
         let state = if context.agent_configured {
             format!("Ready{instance} · pack {pack} · {}", context.mode)
         } else {
-            format!("Native shell ready{instance} · run /auth login for AI")
+            format!("Native shell ready{instance} · run /auth login to connect")
         };
         let copy = format!(
             "{wordmark}\nCrumb CLI v{} · Native commands stay native.\n{} · effort {}\nTip: type naturally · : forces AI · / opens actions",
@@ -546,7 +546,7 @@ impl Renderer {
         let state = if context.agent_configured {
             "agent ready"
         } else {
-            "native shell ready · agent setup needed"
+            "native shell ready · AI disconnected · run /auth login to connect"
         };
         if self.settings.output == OutputMode::ScreenReader {
             return format!(
@@ -2593,6 +2593,21 @@ mod tests {
         assert!(!welcome.contains("Model context"));
         assert!(!welcome.contains("compact"));
         assert!(welcome.contains("╭▄█▄╮"));
+
+        let disconnected = renderer.startup_status(&StartupContext {
+            version: "1.0.2",
+            platform: Platform::Linux,
+            instance_name: Some("Oreo"),
+            model: Some("Balanced Crumb"),
+            mode: "auto",
+            effort: Some("medium"),
+            session_budget_tokens: 256_000,
+            context_tokens: 0,
+            auto_compaction: true,
+            agent_configured: false,
+        });
+        assert!(disconnected.contains("AI disconnected"));
+        assert!(disconnected.contains("run /auth login to connect"));
     }
 
     #[test]
