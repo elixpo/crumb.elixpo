@@ -34,8 +34,9 @@ to unverified remote installation or silently store credentials elsewhere.
 
 The initial full-feature graph had 14 absent and seven incompatible direct
 external dependencies in Debian unstable. Feature isolation reduced the
-Debian profile to 29 direct external crates. The audit on 19 October 2026 found
-28 represented by compatible packages in unstable and one missing crate:
+Debian profile to 29 external crates across the complete dependency graph. The
+audit on 19 October 2026 found 28 represented by compatible packages in
+unstable and one missing crate:
 
 ```text
 reedline 0.52.1
@@ -67,16 +68,34 @@ Once `librust-reedline-dev` is available in unstable, rerun the dependency
 check and change `EXPECTED_MISSING` to an empty set. Do not vendor the crate in
 the Crumb source package merely to bypass Debian review.
 
+The directly used external crates currently split as follows:
+
+- exact archive versions: `chrono`, `crossterm`, `ctrlc`, `directories`,
+  `image`, `nu-ansi-term`, `reqwest`, `serde`, `sha2`, and `url`;
+- compatible archive versions that do not require a Debian update: `anyhow`,
+  `arboard`, `rustix`, `serde_json`, and `tokio`; and
+- must be introduced first: `reedline 0.52.1`.
+
+No existing Debian Rust package needs to be updated for Crumb's current
+Debian feature profile. The generated `Build-Depends` also names feature
+packages from the compatible transitive graph.
+
+Debian unstable currently provides `rustc` and `cargo` 1.97.1, which satisfy
+Crumb's `rustc (>= 1.95)` build dependency. A dependency check on Ubuntu or
+another derivative is not an archive validation: use a clean Debian unstable
+`sbuild` chroot for the release evidence.
+
 ## Source-package files
 
 The `debian/` directory includes source and binary metadata, an offline Cargo
 build, a manual page, a smoke autopkgtest, machine-readable copyright data,
 and upstream watch and metadata files.
 
-The placeholder bug number in `debian/changelog` must be replaced with the ITP
-number before upload. The source package should then be maintained in a Debian
-packaging repository (normally Salsa), with its Vcs fields added to
-`debian/control`.
+The changelog remains `UNRELEASED` until an ITP number exists and all source
+package checks pass. Add `(Closes: #NNNNNN)` with the real ITP number and use
+`dch --release` only when preparing the upload candidate. The source package
+should then be maintained in a Debian packaging repository (normally Salsa),
+with its Vcs fields added to `debian/control`.
 
 ## Rust Team request
 
@@ -103,9 +122,28 @@ team? I am prepared to maintain the crate and test Crumb's fully offline source
 build once it enters unstable.
 
 Thank you,
-Ayushman Bhattacharya
+Ayushman Bhattacharya <elixpoo@gmail.com>
 https://crumb.elixpo.com
 ```
+
+## ITP status
+
+As of 19 October 2026, `wnpp-check crumb` returns no matching WNPP report and
+Debian's public list of packages being worked on contains no `crumb` entry.
+The file `docs/development/debian-itp.txt` is therefore a draft, not evidence
+that an ITP was submitted.
+
+Recheck immediately before filing:
+
+```bash
+wnpp-check crumb
+reportbug --email elixpoo@gmail.com wnpp
+```
+
+In `reportbug`, select `ITP`, enter `crumb`, use `self-hosted agent harness and
+natural-language terminal` as the short description, and use the exact body in
+`docs/development/debian-itp.txt`. Record the assigned bug number in the
+changelog only after the Debian BTS acknowledges the report.
 
 ## Archive submission sequence
 
@@ -114,7 +152,8 @@ https://crumb.elixpo.com
 3. File `ITP: crumb -- self-hosted agent harness and natural-language terminal`
    against `wnpp` using `reportbug`; the prepared body is in
    `docs/development/debian-itp.txt`.
-4. Replace `#nnnnnn` in `debian/changelog` with the ITP bug number.
+4. Add `(Closes: #NNNNNN)` to the initial `debian/changelog` entry using the
+   real ITP bug number.
 5. Create a signed source package and build it in a clean, network-isolated
    unstable environment.
 6. Run `lintian`, `autopkgtest`, `piuparts`, and `sbuild`.
