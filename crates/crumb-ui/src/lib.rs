@@ -250,10 +250,7 @@ impl Renderer {
                 "{}\n  {}\n  {}",
                 self.brand_art(terminal_width),
                 self.paint(punchline, "1"),
-                self.paint(
-                    "Try: explain this workspace · /help shows commands",
-                    "2",
-                )
+                self.paint("Try: explain this workspace · /help shows commands", "2",)
             ),
             BrandingMode::Compact => {
                 format!(
