@@ -53,10 +53,12 @@ binary.
 
 ## Publishing
 
-Publishing is manual. Dispatch `Publish Release` from `main`, provide a version
-matching the Cargo workspace version, type `RELEASE`, and approve the protected
-`production-release` environment. Ordinary pushes and tags cannot publish.
-The workflow creates the tag and GitHub Release only after all target builds,
+Publishing is manual. Dispatch `Publish Release` from `main` with `publish`
+disabled to exercise every build and retain the verified artifacts without
+creating a release. For publication, provide a version matching the Cargo
+workspace version, enable `publish`, type `RELEASE`, and approve the protected
+`production-release` environment. Ordinary pushes and tags cannot publish. The
+workflow creates the tag and GitHub Release only after all target builds,
 checksums, SBOMs, signatures, and attestations succeed.
 
 macOS architectures are distributed separately. The installer selects the
