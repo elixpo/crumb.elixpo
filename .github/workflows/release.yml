@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release tag matching the Cargo workspace version, for example v0.1.0
+        description: Release tag matching the Cargo workspace version, for example v1.0.2
         required: true
         type: string
       prerelease:
