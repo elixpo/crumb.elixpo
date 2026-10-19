@@ -67,7 +67,7 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Resolve selected `@file` and `@folder` references into bounded, redacted agent context.
 - [x] Implement `/attach`, `/detach`, and persistent session context.
 - [x] Implement live `/mode`, `/model`, `/effort`, and `/config` changes.
-- [ ] Add the installable terminal UI and binary packaging pass.
+- [x] Add the installable terminal UI and binary packaging pass.
 
 ## Active terminal UX pass
 
@@ -86,7 +86,12 @@ This is the local source of truth for implementation order. GitHub issues provid
 - [x] Add interactive approval, tool-call, patch, error, and completion components.
 - [x] Add live model, effort, and mode selection backed by atomic configuration writes.
 - [x] Add terminal-width snapshots, reduced-motion behavior, and accessibility checks.
-- [ ] Package signed standalone binaries for Linux, macOS, and Windows.
+- [x] Package standalone Linux, macOS, and Windows archives with checksums,
+  SPDX SBOMs, keyless Sigstore signatures, and provenance attestations.
+- [x] Add checksum-verifying repository installers for POSIX shells and Windows
+  PowerShell.
+- [ ] Configure Apple Developer ID/notarization and Windows Authenticode in the
+  protected release environment before advertising a stable native release.
 
 ### Competitive terminal roadmap
 
@@ -169,15 +174,18 @@ engines remain replaceable; none may bypass Crumb's permission, credential, or s
   - [x] Surface effort, session budget, estimated context use, and Harness auto-compaction.
   - [x] Keep the startup header fixed above a bounded scrolling transcript.
   - [x] Keep the composer and responsive hotkey guide pinned below the transcript.
-  - [ ] Add the final panda application icon and platform launcher metadata (distribution gate).
+  - [ ] Add the final panda application icon and platform launcher metadata (native distribution gate).
   - [x] Add responsive composer borders and a context/model status meter.
-  - [ ] Add installer, signed release binaries, and desktop launch entries (distribution gate).
+  - [x] Add checksum-verifying repository installers and signed release archives.
+  - [ ] Add platform-native installers and desktop launch entries (native distribution gate).
 - [x] Resume the `crumb.elixpo` production web UI after the CLI UI.
 - [x] Stream AI question-mode output and Harness activity.
 
-Signing, installers, launcher metadata, and non-Pollinations connectors remain intentionally deferred
-until the selective-prompt smoke tests are complete. Pollinations is the only production connector in
-the current release candidate.
+Platform-native signing, launchers, and non-Pollinations connectors remain
+intentionally deferred until the selective-prompt smoke tests are complete.
+Portable release archives, SBOMs, provenance, Sigstore signatures, and direct
+repository installers are implemented. Pollinations is the only production
+connector in the current release candidate.
 
 Later work packages remain defined in the [master plan](../product/master-plan.md). Only the current and immediately upcoming package should be expanded into implementation-level tasks.
 
