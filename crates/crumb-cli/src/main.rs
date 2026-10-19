@@ -1733,7 +1733,8 @@ fn render_startup(
             config.harness.as_ref(),
             Some(HarnessConfig::Native | HarnessConfig::Process { .. })
         ),
-        agent_configured: config.harness.is_some() && text_route.is_some(),
+        agent_configured: config.harness.is_some()
+            && selected_route_is_connected(&config, text_route),
     };
     let terminal_width = if interactive {
         size().map_or(100, |(columns, _)| columns)
@@ -1865,7 +1866,8 @@ fn context_footer_status(
             config.harness.as_ref(),
             Some(HarnessConfig::Native | HarnessConfig::Process { .. })
         ),
-        agent_configured: config.harness.is_some() && text_route.is_some(),
+        agent_configured: config.harness.is_some()
+            && selected_route_is_connected(&config, text_route),
     };
     renderer.context_footer(&startup, size().map_or(100, |(columns, _)| columns))
 }
@@ -2592,6 +2594,20 @@ fn handle_agent_boundary(
     )?;
     writer.flush()?;
     refresh_active_footer(renderer, terminal.fullscreen)?;
+    if route.is_some_and(|route| route.provider == "pollinations")
+        && !selected_route_is_connected(config, route)
+    {
+        writeln!(
+            writer,
+            "{}",
+            renderer.agent_error_for_width(
+                "Pollinations is not connected. Run `/auth login` to connect your crumb.elixpo account, then retry.",
+                false,
+                size().map_or(80, |(columns, _)| columns),
+            )
+        )?;
+        return Ok(());
+    }
     if runtime.is_none() {
         match AgentRuntime::new() {
             Ok(created) => *runtime = Some(created),
@@ -12502,6 +12518,12 @@ fn selected_text_route(config: &AgentConfig) -> Option<&ModelRoute> {
                 .get(&Modality::Text)
                 .and_then(|routes| routes.first())
         })
+}
+
+fn selected_route_is_connected(config: &AgentConfig, route: Option<&ModelRoute>) -> bool {
+    route.is_some_and(|route| {
+        route.provider != "pollinations" || configured_pollinations_runtime_key(config).is_some()
+    })
 }
 
 fn selected_profile_id(cwd: &Path) -> Option<String> {
