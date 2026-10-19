@@ -167,8 +167,13 @@ Recheck immediately before filing:
 
 ```bash
 wnpp-check crumb
-reportbug --email ayushman.elixpo@gmail.com wnpp
+reportbug -B debian --email ayushman.elixpo@gmail.com wnpp
 ```
+
+On systems without a configured mail transport, send the complete contents of
+`docs/development/debian-itp.txt` from that address to
+`submit@bugs.debian.org` instead. The ITP email does not require an OpenPGP
+signature.
 
 In `reportbug`, select `ITP`, enter `crumb`, use `self-hosted agent harness and
 natural-language terminal` as the short description, and use the exact body in
