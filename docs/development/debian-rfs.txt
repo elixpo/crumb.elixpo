@@ -1,4 +1,4 @@
-From: Ayushman Bhattacharya <ayushman@elixpo.com>
+From: Ayushman Bhattacharya <ayushman.elixpo@gmail.com>
 To: submit@bugs.debian.org
 Subject: RFS: crumb/1.0.3-1 [ITP] -- self-hosted agent harness and natural-language terminal
 
@@ -11,7 +11,7 @@ I am looking for a sponsor for my package "crumb":
 
  * Package name     : crumb
    Version          : 1.0.3-1
-   Upstream contact : Ayushman Bhattacharya <ayushman@elixpo.com>
+   Upstream contact : Ayushman Bhattacharya <ayushman.elixpo@gmail.com>
  * URL              : https://crumb.elixpo.com
  * License          : MIT and CC-BY-4.0
  * Vcs              : <SALSA_REPOSITORY_URL>

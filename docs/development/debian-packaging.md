@@ -74,7 +74,7 @@ cd debcargo-conf
 git switch -c reedline
 # Preserve kpcyrd and add the canonical identity to the existing uploaders
 # array in src/reedline/debian/debcargo.toml before regenerating.
-DEBFULLNAME="Ayushman Bhattacharya" DEBEMAIL="ayushman@elixpo.com" \
+DEBFULLNAME="Ayushman Bhattacharya" DEBEMAIL="ayushman.elixpo@gmail.com" \
   ./update.sh reedline
 dev/list-rdeps.sh reedline
 cd build
@@ -152,7 +152,7 @@ team? I am prepared to maintain the crate and test Crumb's fully offline source
 build once it enters unstable.
 
 Thank you,
-Ayushman Bhattacharya <ayushman@elixpo.com>
+Ayushman Bhattacharya <ayushman.elixpo@gmail.com>
 https://crumb.elixpo.com
 ```
 
@@ -167,7 +167,7 @@ Recheck immediately before filing:
 
 ```bash
 wnpp-check crumb
-reportbug --email ayushman@elixpo.com wnpp
+reportbug --email ayushman.elixpo@gmail.com wnpp
 ```
 
 In `reportbug`, select `ITP`, enter `crumb`, use `self-hosted agent harness and
