@@ -250,7 +250,10 @@ impl Renderer {
                 "{}\n  {}\n  {}",
                 self.brand_art(terminal_width),
                 self.paint(punchline, "1"),
-                self.paint("Type naturally · : forces AI · /help opens commands", "2")
+                self.paint(
+                    "Try: explain this workspace · /help shows commands",
+                    "2",
+                )
             ),
             BrandingMode::Compact => {
                 format!(
@@ -282,7 +285,7 @@ impl Renderer {
             format!("Native shell ready{instance} · run /auth login to connect")
         };
         let copy = format!(
-            "{wordmark}\nCrumb CLI v{} · Native commands stay native.\n{} · effort {}\nTip: type naturally · : forces AI · / opens actions",
+            "{wordmark}\nCrumb CLI v{} · Native commands stay native.\n{} · effort {}\nTry: explain this workspace · /help shows commands",
             context.version,
             state,
             context.effort.unwrap_or("default"),
