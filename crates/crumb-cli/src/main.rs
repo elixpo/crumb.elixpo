@@ -11168,7 +11168,7 @@ struct CompletionOverlay {
     header_rows: u16,
     transcript: Arc<Mutex<TranscriptState>>,
     paste_artifacts: Arc<Mutex<PendingComposerArtifacts>>,
-    composer_line: String,
+    composer_line: Mutex<String>,
 }
 
 struct CrumbHighlighter;
@@ -11204,13 +11204,17 @@ impl CompletionOverlay {
             header_rows,
             transcript,
             paste_artifacts,
-            composer_line: String::new(),
+            composer_line: Mutex::new(String::new()),
         }
     }
 
-    fn track_composer_line(&mut self, editor: &Editor) {
-        self.composer_line.clear();
-        self.composer_line.push_str(editor.get_buffer());
+    fn track_composer_line(&self, editor: &Editor) {
+        let mut composer_line = self
+            .composer_line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        composer_line.clear();
+        composer_line.push_str(editor.get_buffer());
     }
 
     fn paint_composer(&self, frame: &mut String, columns: u16, rows: u16) {
@@ -11220,7 +11224,11 @@ impl CompletionOverlay {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let artifact_width = artifacts.composer_prefix_width();
-        let input_rows = composer_visual_rows(&self.composer_line, artifact_width, columns);
+        let composer_line = self
+            .composer_line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let input_rows = composer_visual_rows(&composer_line, artifact_width, columns);
         let input_row = composer_anchor_row(rows, input_rows).saturating_add(2);
         let artifact_prefix = artifacts.composer_prefix(color, Some(input_row));
         frame.push_str(&completion_menu_composer_frame(
@@ -11229,7 +11237,7 @@ impl CompletionOverlay {
             columns,
             &artifact_prefix,
             artifact_width,
-            &self.composer_line,
+            &composer_line,
             color,
         ));
     }
@@ -11434,14 +11442,16 @@ impl Menu for CompletionOverlay {
         editor: &mut Editor,
         completer: &mut dyn Completer,
     ) -> bool {
+        let accepted_prefix = self
+            .menu
+            .can_partially_complete(values_updated, editor, completer);
         self.track_composer_line(editor);
-        self.menu
-            .can_partially_complete(values_updated, editor, completer)
+        accepted_prefix
     }
 
     fn update_values(&mut self, editor: &mut Editor, completer: &mut dyn Completer) {
-        self.track_composer_line(editor);
         self.menu.update_values(editor, completer);
+        self.track_composer_line(editor);
     }
 
     fn reset_position(&mut self) {
@@ -11454,12 +11464,13 @@ impl Menu for CompletionOverlay {
         completer: &mut dyn Completer,
         painter: &Painter,
     ) {
-        self.track_composer_line(editor);
         self.menu.update_working_details(editor, completer, painter);
+        self.track_composer_line(editor);
     }
 
     fn replace_in_buffer(&self, editor: &mut Editor) {
         self.menu.replace_in_buffer(editor);
+        self.track_composer_line(editor);
     }
 
     fn menu_required_lines(&self, _terminal_columns: u16) -> u16 {
