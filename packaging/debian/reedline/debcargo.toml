@@ -1,5 +1,5 @@
 overlay = "."
-uploaders = ["Ayushman Bhattacharya <elixpoo@gmail.com>"]
+uploaders = ["Ayushman Bhattacharya <ayushman@elixpo.com>"]
 
 # Crumb uses reedline with default-features = false. Keep the ordinary
 # no-feature library package enabled; debcargo may generate the optional

@@ -1,6 +1,6 @@
 Source: crumb
 Section: utils
-Maintainer: Ayushman Bhattacharya <elixpoo@gmail.com>
+Maintainer: Ayushman Bhattacharya <ayushman@elixpo.com>
 Build-Depends:
  cargo,
  debhelper-compat (= 13),
