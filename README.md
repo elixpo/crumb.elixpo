@@ -22,6 +22,26 @@
   <img src="crumb.elixpo/public/og-image.png" alt="Crumb natural-language terminal" width="100%" />
 </p>
 
+## Install
+
+Linux and macOS:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://raw.githubusercontent.com/elixpo/crumb.elixpo/main/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/elixpo/crumb.elixpo/main/install.ps1 | iex
+```
+
+The installer downloads the matching GitHub Release asset, verifies its
+SHA-256 checksum, and installs `crumb` into a user-owned directory. See the
+[release process](docs/development/release-process.md) for version pinning,
+signature verification, supported platforms, and uninstall instructions.
+
 ## The goal
 
 Crumb turns the terminal into a capable teammate. Tell it what you want done, let it use the tools you approve, and get a clear report when the work is finished.
