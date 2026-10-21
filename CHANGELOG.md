@@ -5,6 +5,9 @@ release, behavior and interfaces may change without compatibility guarantees.
 
 ## Unreleased
 
+- Moved the official Debian source packaging to Salsa; release tarballs no
+  longer ship a `debian/` directory.
+
 ## 1.0.3 - 2026-10-19
 
 - Added `amd64` and `arm64` Debian packages to protected releases.
