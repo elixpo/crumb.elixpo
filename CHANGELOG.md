@@ -5,6 +5,10 @@ release, behavior and interfaces may change without compatibility guarantees.
 
 ## Unreleased
 
+- Elixpo's `.deb` packages are now versioned `<version>-1~elixpo1`, so the
+  official Debian package of the same version takes precedence once
+  available.
+
 ## 1.0.4 - 2026-10-21
 
 - Added a `debian` build profile that uses the system SQLite library and
