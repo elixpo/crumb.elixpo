@@ -3300,23 +3300,15 @@ fn observe_agent_turn(
         input.redraw(writer)?;
     }
     while !task.is_finished() {
-        if let Ok(pending) = task.recv_approval_timeout(Duration::ZERO) {
-            input.clear_line(writer)?;
-            if let Some(indicator) = activity.take() {
-                indicator.finish();
-            }
-            resolve_tool_approval(
-                pending,
-                renderer,
-                writer,
-                terminal.interactive,
-                terminal.fullscreen,
-                context.workspace,
-            )?;
-            refresh_active_footer(renderer, terminal.fullscreen)?;
-            activity = Some(start_activity(renderer, "Thinking", terminal.fullscreen));
-            restore_steering_input(&mut input, &mut activity, writer)?;
-        }
+        handle_pending_prompts(
+            &task,
+            &mut input,
+            &mut activity,
+            renderer,
+            writer,
+            terminal,
+            context.workspace,
+        )?;
         if render_pending_activity(
             &task,
             &mut input,
@@ -3390,6 +3382,183 @@ fn observe_agent_turn(
 /// Renders agent events already queued, for up to one frame, then repaints
 /// once, so a fast stream never starves scrolling and typing. Returns whether
 /// the agent task has disconnected.
+/// Shows a pending tool approval or agent question, then resumes the turn's
+/// activity line and steering input.
+fn handle_pending_prompts(
+    task: &agent_runtime::AgentTurnTask,
+    input: &mut SteeringInput,
+    activity: &mut Option<crumb_ui::ActivityIndicator>,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    terminal: &AgentTerminal,
+    workspace: &Path,
+) -> Result<()> {
+    let approval = task.recv_approval_timeout(Duration::ZERO).ok();
+    let question = task.recv_question_timeout(Duration::ZERO).ok();
+    if approval.is_none() && question.is_none() {
+        return Ok(());
+    }
+    input.clear_line(writer)?;
+    if let Some(indicator) = activity.take() {
+        indicator.finish();
+    }
+    if let Some(pending) = approval {
+        resolve_tool_approval(
+            pending,
+            renderer,
+            writer,
+            terminal.interactive,
+            terminal.fullscreen,
+            workspace,
+        )?;
+    }
+    if let Some(pending) = question {
+        answer_agent_question(pending, renderer, writer, terminal)?;
+    }
+    refresh_active_footer(renderer, terminal.fullscreen)?;
+    *activity = Some(start_activity(renderer, "Thinking", terminal.fullscreen));
+    restore_steering_input(input, activity, writer)
+}
+
+/// Asks the user an agent's question with the choice dialog and sends the
+/// answer back. The question and answer are kept in the transcript.
+fn answer_agent_question(
+    pending: crumb_agent::PendingQuestion,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    terminal: &AgentTerminal,
+) -> Result<()> {
+    let question = pending.question.clone();
+    let asked = renderer.agent_activity(&format!("? {}", question.prompt));
+    record_turn_line(&asked, renderer, writer, terminal)?;
+    let answer = if terminal.interactive {
+        ask_question(&question, renderer, terminal.fullscreen)?
+    } else {
+        crumb_agent::QuestionAnswer::Dismissed
+    };
+    let summary = match &answer {
+        crumb_agent::QuestionAnswer::Selected(choices) => {
+            format!("You chose: {}", choices.join(", "))
+        }
+        crumb_agent::QuestionAnswer::Text(text) => format!("You answered: {text}"),
+        crumb_agent::QuestionAnswer::Dismissed => "You skipped this question".to_owned(),
+    };
+    let answered = renderer.agent_activity(&summary);
+    record_turn_line(&answered, renderer, writer, terminal)?;
+    pending.answer(answer);
+    Ok(())
+}
+
+fn ask_question(
+    question: &crumb_agent::UserQuestion,
+    renderer: Renderer,
+    fullscreen: bool,
+) -> Result<crumb_agent::QuestionAnswer> {
+    use crumb_agent::{QuestionAnswer, QuestionKind};
+    if question.kind == QuestionKind::Text {
+        return Ok(
+            choice_dialog::run_text_prompt(renderer, &question.prompt, "", fullscreen)?
+                .map_or(QuestionAnswer::Dismissed, QuestionAnswer::Text),
+        );
+    }
+    let multiple = question.kind == QuestionKind::Multiple;
+    let mut rows = question
+        .options
+        .iter()
+        .map(|option| choice_dialog::DialogRow {
+            label: option.label.clone(),
+            detail: option.description.clone().unwrap_or_default(),
+            checked: multiple.then_some(false),
+        })
+        .collect::<Vec<_>>();
+    if question.allow_other {
+        rows.push(choice_dialog::DialogRow {
+            label: "Other…".to_owned(),
+            detail: "type your own answer".to_owned(),
+            checked: multiple.then_some(false),
+        });
+    }
+    let dialog = choice_dialog::ChoiceDialog {
+        title: &question.prompt,
+        notes: &[],
+        hint: if multiple {
+            "↑/↓ move · Space toggle · Enter confirm · Esc skip"
+        } else {
+            "↑/↓ choose · Enter select · Esc skip"
+        },
+        actions: &[],
+    };
+    let choice_dialog::DialogOutcome::Chosen(highlighted) =
+        choice_dialog::run_choice_dialog(renderer, &dialog, &mut rows, fullscreen)?
+    else {
+        return Ok(QuestionAnswer::Dismissed);
+    };
+    let other = question.allow_other.then(|| rows.len() - 1);
+    let mut picked = if multiple {
+        let ticked = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.checked == Some(true))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if ticked.is_empty() {
+            vec![highlighted]
+        } else {
+            ticked
+        }
+    } else {
+        vec![highlighted]
+    };
+    let mut choices = Vec::new();
+    if other.is_some_and(|other| picked.contains(&other)) {
+        picked.retain(|index| Some(*index) != other);
+        if let Some(text) =
+            choice_dialog::run_text_prompt(renderer, &question.prompt, "", fullscreen)?
+        {
+            if picked.is_empty() {
+                return Ok(QuestionAnswer::Text(text));
+            }
+            choices.push(text);
+        }
+    }
+    let mut selected = picked
+        .into_iter()
+        .map(|index| rows[index].label.clone())
+        .collect::<Vec<_>>();
+    selected.extend(choices);
+    Ok(if selected.is_empty() {
+        QuestionAnswer::Dismissed
+    } else {
+        QuestionAnswer::Selected(selected)
+    })
+}
+
+/// Adds a line to the turn's output: the transcript in fullscreen (repainted,
+/// since dialogs draw over it), the writer inline.
+fn record_turn_line(
+    line: &str,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    terminal: &AgentTerminal,
+) -> Result<()> {
+    if terminal.fullscreen {
+        let mut state = terminal
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.close_live_block();
+        state.append(line);
+        render_transcript_view(&state, renderer, terminal.header_rows)?;
+        if state.scroll_offset == 0 {
+            position_after_transcript(&state, terminal.header_rows)?;
+        }
+    } else {
+        writeln!(writer, "{line}")?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
 fn render_pending_activity(
     task: &agent_runtime::AgentTurnTask,
     input: &mut SteeringInput,
