@@ -2712,7 +2712,11 @@ fn load_effective_agent_config(cwd: &Path, writer: &mut dyn Write) -> Result<Age
 
 fn read_agent_config(cwd: &Path) -> Result<AgentConfig> {
     let (path, config_root) = agent_config_location(cwd);
-    let mut config = LiveConfig::new(path).load_or_default()?;
+    let mut config = if path.exists() {
+        LiveConfig::new(path).load()?
+    } else {
+        builtin_agent_config()
+    };
     bundled_skills::apply_defaults(&mut config);
     apply_builtin_model_packs(&mut config);
     if let Some(HarnessConfig::Process {
@@ -7754,7 +7758,7 @@ fn configure_provider(command: &str, cwd: &Path, writer: &mut dyn Write) -> Resu
 }
 
 fn discover_provider_models(cwd: &Path, provider_id: &str, writer: &mut dyn Write) -> Result<()> {
-    let config = raw_agent_config(cwd).load_or_default()?;
+    let config = load_raw_agent_config(cwd)?;
     let provider = config
         .providers
         .get(provider_id)
@@ -7827,7 +7831,7 @@ fn configure_provider_model(arguments: &[&str], cwd: &Path, writer: &mut dyn Wri
 }
 
 fn show_providers(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
-    let config = raw_agent_config(cwd).load_or_default()?;
+    let config = load_raw_agent_config(cwd)?;
     writeln!(writer, "◆ Harness providers")?;
     if config.providers.is_empty() {
         writeln!(writer, "  No configurable providers")?;
@@ -7845,7 +7849,7 @@ fn show_providers(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
 }
 
 fn show_provider(cwd: &Path, id: &str, writer: &mut dyn Write) -> Result<()> {
-    let config = raw_agent_config(cwd).load_or_default()?;
+    let config = load_raw_agent_config(cwd)?;
     let provider = config
         .providers
         .get(id)
@@ -8612,11 +8616,35 @@ fn raw_agent_config(cwd: &Path) -> LiveConfig {
     LiveConfig::new(path)
 }
 
+/// Settings used where no `.crumb/agent.json` exists: Pollinations with the
+/// Balanced pack, so Crumb works in any folder without a setup step. The
+/// provider names no credential; the key comes from the environment or from
+/// `/auth login`.
+fn builtin_agent_config() -> AgentConfig {
+    serde_json::from_str(include_str!("../assets/default-agent.json"))
+        .expect("the bundled default agent config is valid")
+}
+
+/// The project's agent config, or the built-in default when there is none.
+fn load_raw_agent_config(cwd: &Path) -> Result<AgentConfig> {
+    let config = raw_agent_config(cwd);
+    if config.path().exists() {
+        config.load()
+    } else {
+        Ok(builtin_agent_config())
+    }
+}
+
 fn update_agent_config<F>(cwd: &Path, mutate: F) -> Result<AgentConfig>
 where
     F: FnOnce(&mut AgentConfig) -> Result<()>,
 {
-    raw_agent_config(cwd).update(|config| {
+    let live = raw_agent_config(cwd);
+    let seed = (!live.path().exists()).then(builtin_agent_config);
+    live.update(|config| {
+        if let Some(seed) = seed {
+            *config = seed;
+        }
         bundled_skills::apply_defaults(config);
         apply_builtin_model_packs(config);
         mutate(config)
@@ -14964,6 +14992,27 @@ mod tests {
         ] {
             assert!(!composition.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn folders_without_agent_config_use_the_balanced_pollinations_default() {
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        let config = read_agent_config(workspace.path()).expect("default config loads");
+
+        config.validate().expect("default config is valid");
+        assert!(matches!(config.harness, Some(HarnessConfig::Native)));
+        assert_eq!(config.active_model_pack.as_deref(), Some("balanced"));
+        assert!(config.model_packs.contains_key("balanced"));
+        let pollinations = &config.providers["pollinations"];
+        assert!(pollinations.credential.is_none());
+        assert!(
+            config
+                .models
+                .get(&Modality::Text)
+                .is_some_and(|routes| !routes.is_empty())
+        );
+        assert!(!workspace.path().join(".crumb/agent.json").exists());
     }
 
     #[test]
