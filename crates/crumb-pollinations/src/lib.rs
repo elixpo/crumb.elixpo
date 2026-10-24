@@ -80,6 +80,20 @@ impl PollinationsConfig {
         })
     }
 
+    /// Creates configuration for a keyless OpenAI-compatible server, such as
+    /// a local model runtime. Requests carry no `Authorization` header.
+    #[must_use]
+    pub fn without_key() -> Self {
+        Self {
+            base_url: DEFAULT_BASE_URL.to_owned(),
+            api_key: String::new(),
+            request_timeout: Duration::from_mins(1),
+            connect_timeout: Duration::from_secs(10),
+            stream_idle_timeout: Duration::from_mins(3),
+            retry: RetryPolicy::default(),
+        }
+    }
+
     /// Overrides the API origin, primarily for deterministic HTTP tests.
     ///
     /// # Errors
@@ -104,8 +118,13 @@ impl PollinationsConfig {
         format!("{}{path}", self.base_url)
     }
 
-    pub(crate) fn api_key(&self) -> &str {
-        &self.api_key
+    /// Adds bearer authentication when this configuration has a key.
+    pub(crate) fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
+        if self.api_key.is_empty() {
+            request
+        } else {
+            request.bearer_auth(&self.api_key)
+        }
     }
 }
 
@@ -176,9 +195,8 @@ impl PollinationsProvider {
         // Pollinations documents that resending an identical request is fine.
         let response = self
             .send_with_retry(|| {
-                self.client
-                    .post(&endpoint)
-                    .bearer_auth(self.config.api_key())
+                self.config
+                    .authorize(self.client.post(&endpoint))
                     .json(&body)
             })
             .await?;
@@ -195,9 +213,8 @@ impl PollinationsProvider {
         let body = WireEmbeddingRequest::from(request);
         let response = self
             .send_once(
-                self.client
-                    .post(endpoint)
-                    .bearer_auth(self.config.api_key())
+                self.config
+                    .authorize(self.client.post(endpoint))
                     .timeout(self.config.request_timeout)
                     .json(&body),
             )
