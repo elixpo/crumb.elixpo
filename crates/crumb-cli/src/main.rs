@@ -1569,7 +1569,7 @@ impl FullscreenTranscript {
             self.renderer,
             platform,
             cwd,
-            runtime_context_tokens(runtime),
+            FooterUsage::of(runtime),
             self.enabled,
             &self.state,
             self.header_rows,
@@ -2046,6 +2046,7 @@ fn render_startup(
         ),
         agent_configured: config.harness.is_some()
             && selected_route_is_connected(&config, text_route),
+        cached_percent: None,
     };
     let terminal_width = if interactive {
         size().map_or(100, |(columns, _)| columns)
@@ -2118,8 +2119,12 @@ fn initialize_transcript(
             None,
         )
     };
-    let (footer_context, footer_items) =
-        context_footer_status(renderer, platform, cwd, context_tokens);
+    let (footer_context, footer_items) = context_footer_status(
+        renderer,
+        platform,
+        cwd,
+        FooterUsage::context_only(context_tokens),
+    );
     let mut state = TranscriptState {
         footer_context,
         footer_items,
@@ -2136,7 +2141,7 @@ fn refresh_context_footer(
     renderer: Renderer,
     platform: Platform,
     cwd: &Path,
-    context_tokens: u64,
+    usage: FooterUsage,
     fullscreen: bool,
     transcript: &Arc<Mutex<TranscriptState>>,
     header_rows: u16,
@@ -2144,7 +2149,7 @@ fn refresh_context_footer(
     if !fullscreen {
         return Ok(());
     }
-    let (footer, items) = context_footer_status(renderer, platform, cwd, context_tokens);
+    let (footer, items) = context_footer_status(renderer, platform, cwd, usage);
     let mut state = transcript
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2158,7 +2163,7 @@ fn context_footer_status(
     renderer: Renderer,
     platform: Platform,
     cwd: &Path,
-    context_tokens: u64,
+    usage: FooterUsage,
 ) -> (String, Vec<(FooterItem, String)>) {
     let config = read_agent_config(cwd).unwrap_or_default();
     let instance = instance_store(cwd).load().ok();
@@ -2176,13 +2181,14 @@ fn context_footer_status(
                 .map_or("default", effort_display_name),
         ),
         session_budget_tokens: context_token_budget(&config, text_route),
-        context_tokens,
+        context_tokens: usage.context_tokens,
         auto_compaction: matches!(
             config.harness.as_ref(),
             Some(HarnessConfig::Native | HarnessConfig::Process { .. })
         ),
         agent_configured: config.harness.is_some()
             && selected_route_is_connected(&config, text_route),
+        cached_percent: usage.cached_percent,
     };
     let width = size().map_or(100, |(columns, _)| columns);
     let items = footer_items(&startup, GitSegment::discover(cwd).as_ref(), width);
@@ -2191,6 +2197,36 @@ fn context_footer_status(
 
 fn runtime_context_tokens(runtime: Option<&AgentRuntime>) -> u64 {
     runtime.map_or(0, |runtime| runtime.token_usage().0)
+}
+
+/// What the footer's context item shows.
+#[derive(Clone, Copy, Default)]
+struct FooterUsage {
+    context_tokens: u64,
+    /// Share of the session's prompt tokens served from the provider's cache.
+    cached_percent: Option<u8>,
+}
+
+impl FooterUsage {
+    const fn context_only(context_tokens: u64) -> Self {
+        Self {
+            context_tokens,
+            cached_percent: None,
+        }
+    }
+
+    fn of(runtime: Option<&AgentRuntime>) -> Self {
+        let Some(runtime) = runtime else {
+            return Self::default();
+        };
+        let (input, cached, _) = runtime.provider_token_usage();
+        Self {
+            context_tokens: runtime.token_usage().0,
+            cached_percent: (input > 0).then(|| {
+                u8::try_from(cached.min(input).saturating_mul(100) / input).unwrap_or(100)
+            }),
+        }
+    }
 }
 
 fn confirm_folder_trust(renderer: Renderer, workspace: &Path, fullscreen: bool) -> Result<bool> {
@@ -3799,7 +3835,7 @@ fn render_observed_activity(
             renderer,
             Platform::current(),
             workspace,
-            *live_context_tokens,
+            FooterUsage::context_only(*live_context_tokens),
             terminal.fullscreen,
             &terminal.transcript,
             terminal.header_rows,
