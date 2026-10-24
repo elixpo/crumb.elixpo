@@ -67,7 +67,10 @@ use crumb_native::session::{CommandOutcome, ShellSession};
 use crumb_native::shell_for;
 use crumb_optimize::{OptimizationPipeline, RtkOptimizer};
 use crumb_platform::Platform;
-use crumb_pollinations::{PollinationsSearchConfig, register_web_search_tool};
+use crumb_pollinations::{
+    JevDecisionConfig, PollinationsSearchConfig, register_jev_decision_tool,
+    register_web_search_tool,
+};
 use crumb_profile::{ProfileDocument, ProfileSelectionStore, ProfileStore};
 use crumb_pty::{PtyInput, PtyResizer, SystemPty, TerminalSize};
 use crumb_repl::{ReplOutcome, read_classified_line};
@@ -905,6 +908,11 @@ fn workspace_read_host(
         .and_then(|routes| routes.first())
         .filter(|route| route.provider == "pollinations");
     if let Some(api_key) = search_api_key.filter(|key| !key.trim().is_empty()) {
+        // Jev decisions are on by default whenever Pollinations is connected.
+        register_jev_decision_tool(
+            &mut host,
+            JevDecisionConfig::new(api_key.clone(), max_output_bytes)?,
+        )?;
         let search = PollinationsSearchConfig::new(api_key, max_output_bytes)?;
         let search = search_route.map_or(search.clone(), |route| search.with_model(&route.model));
         register_web_search_tool(&mut host, search)?;
@@ -5159,6 +5167,7 @@ fn visible_tool_activity(name: &str, detail: Option<&str>) -> String {
         ("run_shell", Some(command)) => format!("Running command · $ {command}"),
         ("write_file", Some(path)) => format!("Editing file · {path}"),
         ("web_search", Some(query)) => format!("Searching web · {query}"),
+        ("jev_decide", _) => "Asking Jev to weigh the options".to_owned(),
         ("web_fetch", Some(url)) => format!("Fetching page · {url}"),
         ("github_issue", Some(target)) => format!("Fetching GitHub item · {target}"),
         ("list_peer_agents", _) => "Finding peer agents".to_owned(),
@@ -5182,6 +5191,8 @@ fn finished_tool_activity(
         ("run_shell", false) => "Command failed",
         ("web_search", true) => "Searched the web",
         ("web_search", false) => "Web search failed",
+        ("jev_decide", true) => "Jev weighed the options",
+        ("jev_decide", false) => "Jev decision failed",
         ("web_fetch", true) => "Fetched page",
         ("web_fetch", false) => "Page fetch failed",
         ("github_issue", true) => "Fetched GitHub item",
@@ -7130,10 +7141,16 @@ fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
                 .get(&Modality::WebSearch)
                 .is_some_and(|routes| !routes.is_empty()),
         ),
+        (
+            "jev_decide",
+            "network decisions",
+            configured_pollinations_runtime_key(&config).is_some(),
+        ),
+        ("ask_user", "asks you", true),
     ] {
         let explicitly_granted = matches!(
             name,
-            "current_time" | "read_file" | "list_directory" | "detect_stack"
+            "current_time" | "read_file" | "list_directory" | "detect_stack" | "ask_user"
         ) || config.permissions.allow_network_tools.contains(name)
             || config.permissions.allow_workspace_tools.contains(name)
             || config.permissions.allow_execution_tools.contains(name);

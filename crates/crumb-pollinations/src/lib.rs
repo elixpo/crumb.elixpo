@@ -1,8 +1,10 @@
 //! Pollinations-specific configuration and wire protocol adapter.
 
+mod decisions;
 mod search;
 mod wire;
 
+pub use decisions::{JevDecisionConfig, register_jev_decision_tool};
 pub use search::{PollinationsSearchConfig, register_web_search_tool};
 
 use std::collections::VecDeque;
