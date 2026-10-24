@@ -13,6 +13,7 @@ pub mod questions;
 pub mod routing;
 pub mod session;
 pub mod steering;
+pub mod tasks;
 pub mod tools;
 
 pub use approvals::{ApprovalInbox, InteractiveApprovalBroker, PendingApproval, approval_channel};
@@ -42,6 +43,10 @@ pub use session::{
     set_session_archived, set_session_label, trash_session,
 };
 pub use steering::{SteeringAction, SteeringQueue};
+pub use tasks::{
+    Task, TaskBoard, TaskStatus, UPDATE_TASKS, register_update_tasks_tool, render_tasks,
+    task_summary,
+};
 pub use tools::{
     ApprovalBroker, ApprovalDecision, ApprovalRequest, ConfiguredApprovals, DenyAllApprovals,
     McpServer, McpTransport, OutputKind, RiskClass, TokenOptimizer, ToolCallError,

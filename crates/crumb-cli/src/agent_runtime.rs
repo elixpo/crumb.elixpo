@@ -1885,12 +1885,18 @@ impl AgentRuntime {
         let child_output_tokens = max_output_tokens.map(|tokens| {
             tokens.div_ceil(u32::try_from(team_limits.max_agents.get()).unwrap_or(u32::MAX))
         });
-        let workspace = self
+        let session = self
             .session
             .as_ref()
-            .context("agent session is unavailable")?
-            .workspace()
-            .to_path_buf();
+            .context("agent session is unavailable")?;
+        let workspace = session.workspace().to_path_buf();
+        // The task list lives with the session so a resumed session keeps it.
+        let tasks = crumb_agent::TaskBoard::persisted(
+            session_root(&workspace)
+                .join(session.id().as_str())
+                .join("tasks.json"),
+        );
+        crumb_agent::register_update_tasks_tool(&mut tools, tasks.clone())?;
         let harness_limits = native_harness_limits(config)?;
         register_parallel_agent_tool(
             &mut tools,
@@ -1904,7 +1910,8 @@ impl AgentRuntime {
                 team_limits,
             },
         )?;
-        let harness = NativeHarness::new(provider, tools, approvals, harness_limits);
+        let harness =
+            NativeHarness::new(provider, tools, approvals, harness_limits).with_task_board(tasks);
         let conversation = self
             .native_conversation
             .get_or_insert_with(|| harness.conversation());
