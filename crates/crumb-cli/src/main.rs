@@ -109,6 +109,7 @@ mod provider_projection;
 mod session_resume;
 mod sessions_view;
 mod shell_completion;
+mod terminal_setup;
 
 use agent_runtime::{
     AgentRuntime, PeerDeliveryInspection, PeerDiscardedFile, PeerImportedFile, PeerInspectionKind,
@@ -1159,6 +1160,10 @@ fn handle_repl_event(
             if command == "/skill run" || command.starts_with("/skill run ") =>
         {
             run_interactive_skill(&command, context)?;
+            Ok(None)
+        }
+        InputEvent::BuiltIn(BuiltInCommand::Reserved(command)) if command == "/terminal-setup" => {
+            terminal_setup::run(context.writer)?;
             Ok(None)
         }
         InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
