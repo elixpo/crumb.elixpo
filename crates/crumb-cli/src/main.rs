@@ -106,6 +106,7 @@ mod context;
 mod device_auth;
 mod provider_discovery;
 mod provider_projection;
+mod session_resume;
 mod sessions_view;
 mod shell_completion;
 
@@ -9141,12 +9142,15 @@ fn show_sessions(
                 ResumeContinuity::AlreadyActive => {
                     writeln!(writer, "◆ Session {id} is already active")?;
                 }
-                ResumeContinuity::Warm | ResumeContinuity::MetadataOnly => {
+                ResumeContinuity::Warm
+                | ResumeContinuity::Restored
+                | ResumeContinuity::MetadataOnly => {
                     writeln!(
                         writer,
                         "◆ Resumed session {id}{}",
                         resume_continuity_suffix(continuity)
                     )?;
+                    write_interrupted_note(runtime.as_ref(), cwd, writer)?;
                 }
             }
         }
@@ -9187,10 +9191,27 @@ fn show_sessions(
     Ok(())
 }
 
+/// After a resume, names the request that was cut off and how to continue it.
+fn write_interrupted_note(
+    runtime: Option<&AgentRuntime>,
+    cwd: &Path,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    if let Some(request) = runtime.and_then(|runtime| runtime.interrupted_request(cwd)) {
+        let request = request.lines().next().unwrap_or_default();
+        writeln!(
+            writer,
+            "  Interrupted while working on: {request}\n  Say \"continue\" to pick it up where it stopped."
+        )?;
+    }
+    Ok(())
+}
+
 const fn resume_continuity_suffix(continuity: ResumeContinuity) -> &'static str {
     match continuity {
         ResumeContinuity::AlreadyActive => " · already active",
         ResumeContinuity::Warm => " · warm conversation restored",
+        ResumeContinuity::Restored => " · conversation restored from disk",
         ResumeContinuity::MetadataOnly => " · metadata only; transcript was not persisted",
     }
 }

@@ -140,6 +140,24 @@ struct ConversationTurn {
     assistant: String,
 }
 
+/// A conversation saved for resume. Selected skills are left out: they are
+/// chosen again for the next turn.
+#[derive(Clone, Debug, Default, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+pub struct ConversationSnapshot {
+    pub turns: Vec<SavedTurn>,
+    #[serde(default)]
+    pub action_facts: Vec<String>,
+    #[serde(default)]
+    pub artifact_references: Vec<String>,
+}
+
+/// One completed exchange in a [`ConversationSnapshot`].
+#[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+pub struct SavedTurn {
+    pub user: String,
+    pub assistant: String,
+}
+
 const MAX_HISTORY_BYTES: usize = 24 * 1024;
 const COMPACTED_HISTORY_TURNS: usize = 3;
 const MAX_ACTION_FACT_BYTES: usize = 8 * 1024;
@@ -184,6 +202,52 @@ impl Conversation {
     #[must_use]
     pub fn len(&self) -> usize {
         self.turns.len()
+    }
+
+    /// The completed turns and continuity records, for saving.
+    #[must_use]
+    pub fn snapshot(&self) -> ConversationSnapshot {
+        ConversationSnapshot {
+            turns: self
+                .turns
+                .iter()
+                .map(|turn| SavedTurn {
+                    user: turn.user.clone(),
+                    assistant: turn.assistant.clone(),
+                })
+                .collect(),
+            action_facts: self.action_facts.iter().cloned().collect(),
+            artifact_references: self.artifact_references.iter().cloned().collect(),
+        }
+    }
+
+    /// Rebuilds a conversation from a snapshot, keeping the newest turns and
+    /// records within the usual limits.
+    #[must_use]
+    pub fn restore(max_turns: NonZeroUsize, snapshot: ConversationSnapshot) -> Self {
+        let mut conversation = Self::new(max_turns);
+        let skip = snapshot.turns.len().saturating_sub(max_turns.get());
+        conversation.turns = snapshot
+            .turns
+            .into_iter()
+            .skip(skip)
+            .map(|turn| ConversationTurn {
+                user: turn.user,
+                assistant: turn.assistant,
+            })
+            .collect();
+        let skip = snapshot.action_facts.len().saturating_sub(MAX_ACTION_FACTS);
+        conversation.action_facts = snapshot.action_facts.into_iter().skip(skip).collect();
+        let skip = snapshot
+            .artifact_references
+            .len()
+            .saturating_sub(MAX_ARTIFACT_REFERENCES);
+        conversation.artifact_references = snapshot
+            .artifact_references
+            .into_iter()
+            .skip(skip)
+            .collect();
+        conversation
     }
 
     #[must_use]

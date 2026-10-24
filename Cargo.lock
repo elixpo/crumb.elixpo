@@ -743,6 +743,7 @@ dependencies = [
  "anyhow",
  "crumb-agent",
  "crumb-llm",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

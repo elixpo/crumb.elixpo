@@ -475,6 +475,8 @@ pub struct AgentRuntime {
     peer: Option<PeerRuntimeState>,
     /// Background jobs of the active session, kept across its turns.
     background: Option<(SessionId, crumb_tools::BackgroundJobs)>,
+    /// Interrupted request, open tasks, and jobs for the first turn after a resume.
+    resume_brief: Option<String>,
 }
 
 struct PeerRuntimeState {
@@ -613,13 +615,16 @@ struct WarmSessionState {
 
 /// Describes how much live context was available when selecting a session.
 ///
-/// Session journals intentionally contain no raw transcript, so a session
-/// selected after a process restart can restore metadata but not conversation
-/// text. Warm state never leaves the current Crumb process.
+/// Journals contain no raw transcript. A session resumed after a restart gets
+/// its conversation back only from the redacted `conversation.json` saved
+/// beside the journal (see `session_resume`); warm state never leaves the
+/// current Crumb process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResumeContinuity {
     AlreadyActive,
     Warm,
+    /// The saved conversation was loaded from the session folder.
+    Restored,
     MetadataOnly,
 }
 
@@ -804,6 +809,7 @@ impl AgentRuntime {
             review_note_bytes: 0,
             peer: None,
             background: None,
+            resume_brief: None,
         })
     }
 
@@ -1318,12 +1324,31 @@ impl AgentRuntime {
             workspace,
             journal,
         ));
+        let folder = root.join(&target_key.session_id);
+        self.resume_brief = crate::session_resume::resume_brief(&folder);
         if self.restore_warm_session_state(&target_key) {
-            Ok(ResumeContinuity::Warm)
-        } else {
-            self.restore_active_state(SessionRuntimeState::default());
-            Ok(ResumeContinuity::MetadataOnly)
+            return Ok(ResumeContinuity::Warm);
         }
+        self.restore_active_state(SessionRuntimeState::default());
+        Ok(match crate::session_resume::load_conversation(&folder) {
+            Some(snapshot) => {
+                self.native_conversation = Some(Conversation::restore(
+                    HarnessLimits::default().max_history_turns,
+                    snapshot,
+                ));
+                ResumeContinuity::Restored
+            }
+            None => ResumeContinuity::MetadataOnly,
+        })
+    }
+
+    /// The request that was running when this session last stopped.
+    #[must_use]
+    pub fn interrupted_request(&self, workspace: &Path) -> Option<String> {
+        let session = self.active_session_id()?;
+        let workspace = std::fs::canonicalize(workspace).ok()?;
+        crate::session_resume::interrupted_turn(&session_root(&workspace).join(session))
+            .map(|turn| turn.request)
     }
 
     #[must_use]
@@ -1696,6 +1721,7 @@ impl AgentRuntime {
         );
         let mut trusted_context = trusted_context;
         trusted_context.extend(background.context_summary());
+        trusted_context.extend(self.resume_brief.take());
         let dispatched_request = if native {
             request
         } else {
@@ -1973,6 +1999,12 @@ impl AgentRuntime {
             .enable_all()
             .build()
             .context("failed to start native Harness runtime")?;
+        // Saved state lets an interrupted session resume where it stopped.
+        let save = config.sessions.save_conversation;
+        let folder = session_root(&workspace).join(session_id);
+        if save {
+            crate::session_resume::mark_turn_started(&folder, request)?;
+        }
         let outcome = runtime.block_on(
             harness.run_turn(
                 self.session
@@ -1984,6 +2016,10 @@ impl AgentRuntime {
                 &mut events,
             ),
         );
+        crate::session_resume::mark_turn_finished(&folder);
+        if save && outcome.is_ok() {
+            crate::session_resume::save_conversation(&folder, &conversation.snapshot())?;
+        }
         events.finish()?;
         let outcome = outcome.map_err(anyhow::Error::new)?;
         Ok(RunResult {
@@ -3524,6 +3560,7 @@ mod tests {
             review_note_bytes: 0,
             peer: None,
             background: None,
+            resume_brief: None,
         }
     }
 
@@ -4200,6 +4237,51 @@ mod tests {
 
         assert_eq!(runtime.token_usage().0, 5_700);
         assert_eq!(runtime.last_response(), Some("done"));
+    }
+
+    #[test]
+    fn resume_after_a_restart_restores_the_saved_conversation_and_interrupted_work() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let workspace = directory
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        drop(persisted_session(&workspace, "session-saved"));
+        let folder = super::session_root(&workspace).join("session-saved");
+        crate::session_resume::save_conversation(
+            &folder,
+            &crumb_harness::ConversationSnapshot {
+                turns: vec![crumb_harness::SavedTurn {
+                    user: "add a health endpoint".to_owned(),
+                    assistant: "Added /health and a test.".to_owned(),
+                }],
+                ..crumb_harness::ConversationSnapshot::default()
+            },
+        )
+        .expect("conversation saved");
+        crate::session_resume::mark_turn_started(&folder, "now deploy it").expect("marked");
+
+        // A fresh runtime, as after Crumb restarts.
+        let mut runtime = isolated_runtime();
+        assert_eq!(
+            runtime.resume(&workspace, "session-saved").expect("resume"),
+            ResumeContinuity::Restored
+        );
+        let conversation = runtime.native_conversation.as_ref().expect("restored");
+        assert_eq!(
+            conversation.snapshot().turns[0].assistant,
+            "Added /health and a test."
+        );
+        assert_eq!(
+            runtime.interrupted_request(&workspace).as_deref(),
+            Some("now deploy it")
+        );
+        assert!(
+            runtime
+                .resume_brief
+                .as_deref()
+                .is_some_and(|brief| brief.contains("now deploy it"))
+        );
     }
 
     #[test]
