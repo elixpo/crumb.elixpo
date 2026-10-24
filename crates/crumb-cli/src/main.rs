@@ -4598,10 +4598,11 @@ impl SteeringInput {
         if self.visible {
             if self.fullscreen {
                 let (columns, rows) = size()?;
-                let composer_row = follow_up_composer_row(rows);
-                let available_width = columns.saturating_sub(7);
+                let input_row = follow_up_input_row(rows);
+                let column = follow_up_input_column();
+                let available_width = columns.saturating_sub(column + 3);
                 let mut frame = Vec::new();
-                crossterm::execute!(frame, MoveTo(4, composer_row))?;
+                crossterm::execute!(frame, MoveTo(column, input_row))?;
                 write!(frame, "{}", " ".repeat(usize::from(available_width)))?;
                 write!(frame, "\x1b8")?;
                 let mut terminal = io::stderr();
@@ -4639,17 +4640,18 @@ impl SteeringInput {
 
     fn redraw_composer(&self, input: &str, writer: &mut dyn Write) -> Result<()> {
         let (columns, rows) = size()?;
-        let available_width = columns.saturating_sub(7);
+        let column = follow_up_input_column();
+        let available_width = columns.saturating_sub(column + 3);
         let rendered = self.renderer.composer_follow_up(input, available_width);
         if self.fullscreen {
-            let composer_row = follow_up_composer_row(rows);
+            let input_row = follow_up_input_row(rows);
             let mut frame = Vec::new();
             if !self.visible {
                 write!(frame, "\x1b7")?;
             }
-            crossterm::execute!(frame, MoveTo(4, composer_row))?;
+            crossterm::execute!(frame, MoveTo(column, input_row))?;
             write!(frame, "{}", " ".repeat(usize::from(available_width)))?;
-            crossterm::execute!(frame, MoveTo(4, composer_row))?;
+            crossterm::execute!(frame, MoveTo(column, input_row))?;
             write!(frame, "{rendered}")?;
             let mut terminal = io::stderr();
             terminal.write_all(&frame)?;
@@ -13608,8 +13610,23 @@ fn composer_anchor_row(terminal_rows: u16, input_rows: u16) -> u16 {
 }
 
 fn follow_up_cursor_sequence(terminal_rows: u16) -> String {
-    let composer_row = follow_up_composer_row(terminal_rows);
-    format!("\x1b[{};5H", composer_row.saturating_add(1))
+    format!(
+        "\x1b[{};{}H",
+        follow_up_input_row(terminal_rows).saturating_add(1),
+        follow_up_input_column().saturating_add(1)
+    )
+}
+
+/// The composer's input line during a turn: two rows below the anchor, past
+/// the context line and the border.
+fn follow_up_input_row(terminal_rows: u16) -> u16 {
+    follow_up_composer_row(terminal_rows).saturating_add(2)
+}
+
+/// Where typed follow-ups start: after the border and the folder prompt.
+fn follow_up_input_column() -> u16 {
+    let prompt = composer_prompt().chars().count();
+    u16::try_from(4 + prompt + usize::from(prompt > 0)).unwrap_or(4)
 }
 
 fn follow_up_composer_row(terminal_rows: u16) -> u16 {
@@ -15774,8 +15791,9 @@ mod tests {
 
     #[test]
     fn active_follow_up_cursor_is_placed_inside_the_composer() {
-        assert_eq!(follow_up_cursor_sequence(40), "\x1b[35;5H");
-        assert_eq!(follow_up_cursor_sequence(4), "\x1b[1;5H");
+        // The input line sits two rows below the anchor (context line, border).
+        assert_eq!(follow_up_cursor_sequence(40), "\x1b[37;5H");
+        assert_eq!(follow_up_cursor_sequence(4), "\x1b[3;5H");
         assert_eq!(follow_up_composer_row(40), composer_anchor_row(40, 1));
     }
 
