@@ -56,6 +56,8 @@ struct TurnResources {
 
 struct TurnInteraction {
     interactive: Option<InteractiveApprovalBroker>,
+    /// Present only when a user can answer `ask_user` questions.
+    questions: Option<crumb_agent::QuestionAsker>,
 }
 
 struct PreparedTurn<'a> {
@@ -328,6 +330,7 @@ fn project_notification(
 pub struct AgentTurnTask {
     activities: Receiver<HarnessActivity>,
     approvals: ApprovalInbox,
+    questions: crumb_agent::QuestionInbox,
     cancellation: CancellationToken,
     worker: JoinHandle<TurnThreadResult>,
 }
@@ -409,6 +412,14 @@ impl AgentTurnTask {
         timeout: Duration,
     ) -> std::result::Result<crumb_agent::PendingApproval, RecvTimeoutError> {
         self.approvals.recv_timeout(timeout)
+    }
+
+    /// Waits briefly for a question the agent is asking the user.
+    pub fn recv_question_timeout(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<crumb_agent::PendingQuestion, RecvTimeoutError> {
+        self.questions.recv_timeout(timeout)
     }
 
     #[must_use]
@@ -1466,6 +1477,7 @@ impl AgentRuntime {
         let request = self.attach_review_notes(request);
         let (activity_sender, activities) = sync_channel(activity_capacity);
         let (interactive, approval_inbox) = approval_channel(NonZeroUsize::MIN);
+        let (questions, question_inbox) = crumb_agent::question_channel();
         let cancellation = CancellationToken::default();
         let worker_cancellation = cancellation.clone();
         let worker = thread::Builder::new()
@@ -1478,6 +1490,7 @@ impl AgentRuntime {
                     &workspace,
                     TurnInteraction {
                         interactive: Some(interactive),
+                        questions: Some(questions),
                     },
                     &worker_cancellation,
                     |activity| {
@@ -1493,6 +1506,7 @@ impl AgentRuntime {
         Ok(AgentTurnTask {
             activities,
             approvals: approval_inbox,
+            questions: question_inbox,
             cancellation,
             worker,
         })
@@ -1527,7 +1541,10 @@ impl AgentRuntime {
             request,
             config,
             workspace,
-            TurnInteraction { interactive: None },
+            TurnInteraction {
+                interactive: None,
+                questions: None,
+            },
             cancellation,
             on_activity,
         )
@@ -1538,6 +1555,25 @@ impl AgentRuntime {
     /// # Errors
     ///
     /// Returns an error when the workspace or session journal is unavailable.
+    /// Tools for one turn; `ask_user` is added only when a user can answer.
+    fn turn_tool_host(
+        &self,
+        workspace: &Path,
+        config: &AgentConfig,
+        questions: Option<crumb_agent::QuestionAsker>,
+    ) -> Result<ToolHost> {
+        let mut tools = crate::workspace_read_host(
+            workspace,
+            config,
+            crate::configured_pollinations_runtime_key(config),
+            self.peer_runtime_for_workspace(workspace),
+        )?;
+        if let Some(asker) = questions {
+            crumb_agent::register_ask_user_tool(&mut tools, asker)?;
+        }
+        Ok(tools)
+    }
+
     pub fn prepare_local_job(&mut self, mode: AgentMode, workspace: &Path) -> Result<SessionId> {
         let workspace = std::fs::canonicalize(workspace)
             .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
@@ -1581,12 +1617,7 @@ impl AgentRuntime {
             .context("selected persona profile could not be applied")?;
         let config = &application.config;
         config.validate()?;
-        let tools = crate::workspace_read_host(
-            &workspace,
-            config,
-            crate::configured_pollinations_runtime_key(config),
-            self.peer_runtime_for_workspace(&workspace),
-        )?;
+        let tools = self.turn_tool_host(&workspace, config, interaction.questions)?;
         let approvals = turn_approvals(config, interaction.interactive);
         self.ensure_session(&workspace, config.mode)?;
         let route = select_request_route(config, request)
