@@ -20,7 +20,10 @@ use tokio::time::Instant;
 
 mod parallel;
 
-pub use parallel::{ParallelAgentConfig, ParallelAgentLimits, register_parallel_agent_tool};
+pub use parallel::{
+    ParallelAgentConfig, ParallelAgentLimits, parse_team_progress, register_parallel_agent_tool,
+    team_progress_label,
+};
 
 /// Hard limits applied to one user turn and its model/tool rounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

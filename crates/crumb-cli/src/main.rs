@@ -6,7 +6,7 @@ use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -296,8 +296,16 @@ fn run_agent_exec(cwd: &Path, request: &str, json: bool, writer: &mut dyn Write)
         let _ = runtime.initialize_peer_runtime(&workspace, &bus_root);
     }
     let cancellation = CancellationToken::default();
-    let result = runtime.run_local_job(request, &config, cwd, &cancellation)?;
+    let mut progress = ExecProgress::new(json);
+    let result =
+        runtime.run_local_job_with_events(request, &config, cwd, &cancellation, |event| {
+            progress.handle(&event, writer).map_err(Into::into)
+        })?;
     let response = crumb_ui::visible_agent_text(&result.final_response);
+    if progress.streamed {
+        progress.end_line(writer)?;
+        return Ok(());
+    }
     if json {
         serde_json::to_writer(
             &mut *writer,
@@ -318,6 +326,73 @@ fn run_agent_exec(cwd: &Path, request: &str, json: bool, writer: &mut dyn Write)
         writeln!(writer, "{response}")?;
     }
     Ok(())
+}
+
+/// Live progress for `crumb exec`. Model text streams to stdout only when it
+/// is a terminal, so piped stdout still receives just the final answer; tool
+/// steps go to stderr when it is a terminal. `--json` stays silent.
+struct ExecProgress {
+    targets: ExecTargets,
+    streamed: bool,
+    mid_line: bool,
+}
+
+/// Where `crumb exec` may show live output.
+struct ExecTargets {
+    stream_text: bool,
+    show_steps: bool,
+}
+
+impl ExecProgress {
+    fn new(json: bool) -> Self {
+        use std::io::IsTerminal as _;
+        Self {
+            targets: ExecTargets {
+                stream_text: !json && io::stdout().is_terminal(),
+                show_steps: !json && io::stderr().is_terminal(),
+            },
+            streamed: false,
+            mid_line: false,
+        }
+    }
+
+    fn handle(&mut self, event: &HarnessActivity, writer: &mut dyn Write) -> io::Result<()> {
+        match event {
+            HarnessActivity::ResponseDelta { text } if self.targets.stream_text => {
+                write!(writer, "{text}")?;
+                writer.flush()?;
+                self.streamed = true;
+                self.mid_line = !text.ends_with('\n');
+            }
+            HarnessActivity::ResponseCorrected { text } if self.targets.stream_text => {
+                self.end_line(writer)?;
+                writeln!(writer, "\nCorrected answer:\n{text}")?;
+            }
+            HarnessActivity::ToolStarted { name, detail } if self.targets.show_steps => {
+                self.end_line(writer)?;
+                eprintln!("  → {}", visible_tool_activity(name, detail.as_deref()));
+            }
+            HarnessActivity::ToolFinished { name, success } if self.targets.show_steps => {
+                eprintln!("  {} {name}", if *success { "✓" } else { "✗" });
+            }
+            HarnessActivity::ResponseRevised if self.targets.show_steps => {
+                self.end_line(writer)?;
+                eprintln!("  ↻ revising the draft against the tool results");
+            }
+            HarnessActivity::Progress { label } if self.targets.show_steps => {
+                eprintln!("  · {label}");
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn end_line(&mut self, writer: &mut dyn Write) -> io::Result<()> {
+        if std::mem::take(&mut self.mid_line) {
+            writeln!(writer)?;
+        }
+        writer.flush()
+    }
 }
 
 fn run_skill_job(cwd: &Path, selector: &str, request: &str, writer: &mut dyn Write) -> Result<()> {
@@ -3132,6 +3207,40 @@ fn promote_agent_turn(
 /// Longest batch of agent events rendered before the screen is repainted.
 const LIVE_FRAME: Duration = Duration::from_millis(16);
 
+/// Agents working in the current turn: Crumb itself plus running team
+/// members. Zero between turns. Read by the active footer.
+static ACTIVE_AGENTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts Crumb as working for the life of an observed turn, on every exit.
+struct ActiveAgentsGuard;
+
+impl ActiveAgentsGuard {
+    fn start() -> Self {
+        ACTIVE_AGENTS.store(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ActiveAgentsGuard {
+    fn drop(&mut self) {
+        ACTIVE_AGENTS.store(0, Ordering::Relaxed);
+    }
+}
+
+fn record_agent_activity(event: &HarnessActivity) {
+    match event {
+        HarnessActivity::Progress { label } => {
+            if let Some((active, _)) = crumb_harness::parse_team_progress(label) {
+                ACTIVE_AGENTS.store(1 + active, Ordering::Relaxed);
+            }
+        }
+        HarnessActivity::ToolFinished { name, .. } if name == "spawn_agents" => {
+            ACTIVE_AGENTS.store(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
 fn observe_agent_turn(
     task: agent_runtime::AgentTurnTask,
     steering: &mut SteeringQueue,
@@ -3142,6 +3251,7 @@ fn observe_agent_turn(
     context: &mut ActiveTurnContext<'_>,
 ) -> Result<TurnObservation> {
     let terminal = context.terminal;
+    let _agents = ActiveAgentsGuard::start();
     refresh_active_footer(renderer, terminal.fullscreen)?;
     let mut activity = Some(start_activity(
         renderer,
@@ -3340,6 +3450,7 @@ fn render_observed_activity(
     workspace: &Path,
     live_context_tokens: &mut u64,
 ) -> Result<()> {
+    record_agent_activity(event);
     // Streamed text only updates the transcript model; the observer repaints
     // once per batch so a fast stream cannot starve input handling.
     if terminal.fullscreen
@@ -3769,7 +3880,11 @@ fn refresh_active_footer(renderer: Renderer, fullscreen: bool) -> io::Result<()>
         return Ok(());
     }
     let (columns, rows) = size()?;
-    let frame = fixed_footer_frame(rows, &renderer.composer_active_hotkeys(columns));
+    let frame = fixed_footer_frame(
+        rows,
+        &renderer
+            .composer_active_hotkeys_with_agents(columns, ACTIVE_AGENTS.load(Ordering::Relaxed)),
+    );
     let _frame = crumb_ui::lock_terminal_output();
     let mut terminal = io::stderr();
     terminal.write_all(frame.as_bytes())?;

@@ -1481,13 +1481,25 @@ impl AgentRuntime {
         workspace: &Path,
         cancellation: &CancellationToken,
     ) -> Result<RunResult> {
+        self.run_local_job_with_events(request, config, workspace, cancellation, |_| Ok(()))
+    }
+
+    /// Runs a non-interactive turn and reports its activity as it happens.
+    pub fn run_local_job_with_events(
+        &mut self,
+        request: &str,
+        config: &AgentConfig,
+        workspace: &Path,
+        cancellation: &CancellationToken,
+        on_activity: impl FnMut(HarnessActivity) -> Result<()>,
+    ) -> Result<RunResult> {
         self.run_with_events_using(
             request,
             config,
             workspace,
             TurnInteraction { interactive: None },
             cancellation,
-            |_| Ok(()),
+            on_activity,
         )
     }
 
