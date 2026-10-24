@@ -3,6 +3,7 @@
 mod a2a;
 mod checkpoint;
 mod clock;
+mod code_search;
 mod disposable;
 mod github;
 mod shell;
@@ -19,6 +20,7 @@ pub use checkpoint::{
     CheckpointDecision, CheckpointFile, CheckpointStatus, CheckpointStore, WorkspaceCheckpoint,
 };
 pub use clock::register_current_time_tool;
+pub use code_search::{CodeSearchLimits, register_code_search_tool};
 pub use disposable::{DisposableToolConfig, register_disposable_tool};
 pub use github::{GitHubIssueLimits, register_github_issue_tool};
 pub use shell::{AgentShellConfig, register_shell_tool, register_shell_tool_with_optimizer};
