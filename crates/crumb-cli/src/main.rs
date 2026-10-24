@@ -11998,32 +11998,6 @@ impl CompletionOverlay {
         (columns, top, composer_row)
     }
 
-    fn paint_overlay(&self, body: &str) -> String {
-        let (columns, top, composer_row) = self.overlay_rows();
-        let terminal_rows = size().map_or(24, |(_, rows)| rows);
-        let transcript = self
-            .transcript
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut frame = String::new();
-        let mut lines = body.lines();
-        for row in top..composer_row {
-            let _ = write!(frame, "\x1b[{};1H\x1b[2K", row.saturating_add(1));
-            if let Some(line) = lines.next() {
-                frame.push_str(line);
-            }
-        }
-        frame.push_str(&completion_footer_frame(
-            &transcript,
-            self.renderer,
-            columns,
-            composer_row,
-            terminal_rows,
-        ));
-        self.paint_composer(&mut frame, columns, terminal_rows);
-        frame
-    }
-
     fn clear_overlay(&self) {
         let transcript = self
             .transcript
@@ -12032,30 +12006,16 @@ impl CompletionOverlay {
         let _ = render_transcript_view(&transcript, self.renderer, self.header_rows);
     }
 
-    fn restore_overlay_frame(&self) -> String {
+    /// Paints the menu (empty to restore the transcript) above the composer.
+    fn overlay_frame(&self, body: &str) -> String {
         let (columns, top, composer_row) = self.overlay_rows();
         let terminal_rows = size().map_or(24, |(_, rows)| rows);
         let transcript = self
             .transcript
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transcript_top = self.header_rows.min(composer_row.saturating_sub(1));
-        let viewport_height = composer_row.saturating_sub(transcript_top) as usize;
-        let end = transcript
-            .lines
-            .len()
-            .saturating_sub(transcript.scroll_offset);
-        let start = end.saturating_sub(viewport_height);
-        let mut frame = String::new();
-        for row in top..composer_row {
-            let _ = write!(frame, "\x1b[{};1H\x1b[2K", row.saturating_add(1));
-            let index = start.saturating_add(row.saturating_sub(transcript_top) as usize);
-            if index < end
-                && let Some(line) = transcript.lines.get(index)
-            {
-                frame.push_str(&line.text);
-            }
-        }
+        let mut frame =
+            completion_overlay_rows(&transcript, body, self.header_rows, top, composer_row);
         frame.push_str(&completion_footer_frame(
             &transcript,
             self.renderer,
@@ -12066,6 +12026,46 @@ impl CompletionOverlay {
         self.paint_composer(&mut frame, columns, terminal_rows);
         frame
     }
+}
+
+/// Rows `top..composer_row` with the menu sitting directly above the composer
+/// and the transcript still visible above a short menu, so a few suggestions
+/// never float in the middle of the screen.
+fn completion_overlay_rows(
+    transcript: &TranscriptState,
+    body: &str,
+    header_rows: u16,
+    top: u16,
+    composer_row: u16,
+) -> String {
+    let mut menu = body.lines().collect::<Vec<_>>();
+    while menu.last().is_some_and(|line| line.trim().is_empty()) {
+        menu.pop();
+    }
+    menu.truncate(usize::from(composer_row.saturating_sub(top)));
+    let menu_top = composer_row.saturating_sub(u16::try_from(menu.len()).unwrap_or(u16::MAX));
+    let transcript_top = header_rows.min(composer_row.saturating_sub(1));
+    let viewport_height = composer_row.saturating_sub(transcript_top) as usize;
+    let end = transcript
+        .lines
+        .len()
+        .saturating_sub(transcript.scroll_offset);
+    let start = end.saturating_sub(viewport_height);
+    let mut frame = String::new();
+    for row in top..composer_row {
+        let _ = write!(frame, "\x1b[{};1H\x1b[2K", row.saturating_add(1));
+        if row >= menu_top {
+            frame.push_str(menu[usize::from(row - menu_top)]);
+            continue;
+        }
+        let index = start.saturating_add(row.saturating_sub(transcript_top) as usize);
+        if index < end
+            && let Some(line) = transcript.lines.get(index)
+        {
+            frame.push_str(&line.text);
+        }
+    }
+    frame
 }
 
 fn completion_footer_frame(
@@ -12226,13 +12226,13 @@ impl Menu for CompletionOverlay {
 
     fn menu_string(&self, _available_lines: u16, use_ansi_coloring: bool) -> String {
         if self.menu.get_values().is_empty() {
-            return self.restore_overlay_frame();
+            return self.overlay_frame("");
         }
         let menu = self
             .menu
             .menu_string(COMPLETION_PALETTE_ROWS, use_ansi_coloring);
         let body = sanitize_completion_menu_body(&menu);
-        self.paint_overlay(&body)
+        self.overlay_frame(&body)
     }
 
     fn min_rows(&self) -> u16 {
@@ -13857,20 +13857,20 @@ mod tests {
         ComposerDock, CrumbEditMode, CrumbHighlighter, CrumbPrompt, DiscoverySource, ExitGesture,
         MarketplaceContent, PausedSubmission, PendingComposerArtifacts, Renderer,
         SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
-        TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
+        TranscriptLine, TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
         agent_config_location, aligned_composer_prompt, apply_builtin_model_packs,
         artifact_modal_action, bundled_catalog, completion_footer_frame,
-        completion_menu_composer_frame, composer_anchor_row, composer_anchor_sequence,
-        composer_placeholder_hint, composer_visual_rows, configure_permissions, configure_plugin,
-        crumb_keybindings, effort_display_name, effort_wire_name,
-        ensure_single_release_skill_install, exact_skill_manifest_url, exact_skill_run_config,
-        failed_command_recovery, finished_tool_activity, fixed_footer_frame,
-        follow_up_composer_row, follow_up_cursor_sequence, format_peer_discarded_file,
-        format_peer_imported_file, format_peer_inbox, format_peer_inspection,
-        format_peer_quarantined_file, format_peer_task, handle_skill_command,
-        initial_agent_activity, install_marketplace_package, load_exact_skill_manifest,
-        marketplace_update_blocker, normalize_bundled_skill_install, openrouter_preset,
-        parse_cli_skill_run, parse_credential_reference, parse_exec_request,
+        completion_menu_composer_frame, completion_overlay_rows, composer_anchor_row,
+        composer_anchor_sequence, composer_placeholder_hint, composer_visual_rows,
+        configure_permissions, configure_plugin, crumb_keybindings, effort_display_name,
+        effort_wire_name, ensure_single_release_skill_install, exact_skill_manifest_url,
+        exact_skill_run_config, failed_command_recovery, finished_tool_activity,
+        fixed_footer_frame, follow_up_composer_row, follow_up_cursor_sequence,
+        format_peer_discarded_file, format_peer_imported_file, format_peer_inbox,
+        format_peer_inspection, format_peer_quarantined_file, format_peer_task,
+        handle_skill_command, initial_agent_activity, install_marketplace_package,
+        load_exact_skill_manifest, marketplace_update_blocker, normalize_bundled_skill_install,
+        openrouter_preset, parse_cli_skill_run, parse_credential_reference, parse_exec_request,
         parse_interactive_skill_run, parse_paused_submission, parse_provider_header,
         parse_resume_session_argument, read_agent_config, read_bounded_response,
         register_local_skill, render_skill_discovery_search, resolve_memory_keep,
@@ -15648,6 +15648,25 @@ mod tests {
         let body = sanitize_completion_menu_body("\0? help\0\r\n\0? skills\0");
         assert_eq!(body, "? help\r\n? skills");
         assert!(!body.as_bytes().contains(&0));
+    }
+
+    #[test]
+    fn short_completion_menu_sits_directly_above_the_composer() {
+        let state = TranscriptState {
+            lines: (0..17)
+                .map(|index| TranscriptLine::plain(format!("line {index}")))
+                .collect(),
+            ..TranscriptState::default()
+        };
+
+        let frame = completion_overlay_rows(&state, "/auth login\n/auth status\n\n\n", 2, 10, 19);
+
+        // The last two rows hold the menu; the rows above it keep showing the
+        // transcript instead of an empty gap.
+        assert!(frame.contains("\x1b[18;1H\x1b[2K/auth login"));
+        assert!(frame.contains("\x1b[19;1H\x1b[2K/auth status"));
+        assert!(frame.contains("\x1b[17;1H\x1b[2Kline 14"));
+        assert!(frame.contains("\x1b[11;1H\x1b[2Kline 8"));
     }
 
     #[test]
