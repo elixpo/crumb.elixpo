@@ -175,7 +175,7 @@ jobs:
         with:
           subject-path: dist/crumb_*.deb
       - name: Upload verified release assets
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.label }}
           path: |
