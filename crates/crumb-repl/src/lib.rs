@@ -144,6 +144,14 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "set light, medium, high, extra high, or default",
     },
     SlashCommand {
+        usage: "/agents",
+        description: "show the agent map: helpers and background jobs",
+    },
+    SlashCommand {
+        usage: "/agents ",
+        description: "show one helper (/agents 2) or job (/agents job 1)",
+    },
+    SlashCommand {
         usage: "/sessions",
         description: "browse, resume, and rename sessions in this folder",
     },

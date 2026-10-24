@@ -333,6 +333,7 @@ pub struct AgentTurnTask {
     questions: crumb_agent::QuestionInbox,
     cancellation: CancellationToken,
     worker: JoinHandle<TurnThreadResult>,
+    map: Arc<AgentMapSource>,
 }
 
 /// Background, explicitly accepted inbound A2A turn.
@@ -395,6 +396,12 @@ impl PeerTurnTask {
 }
 
 impl AgentTurnTask {
+    /// The agent map's live state for this turn.
+    #[must_use]
+    pub fn agent_map(&self) -> &AgentMapSource {
+        &self.map
+    }
+
     /// Waits for one redacted activity state without blocking indefinitely.
     ///
     /// # Errors
@@ -477,6 +484,133 @@ pub struct AgentRuntime {
     background: Option<(SessionId, crumb_tools::BackgroundJobs)>,
     /// Interrupted request, open tasks, and jobs for the first turn after a resume.
     resume_brief: Option<String>,
+    /// Helper agents of this runtime, for the agent map.
+    team: crumb_harness::TeamRegistry,
+    /// The active session's background jobs, readable while a turn runs.
+    jobs_slot: Arc<Mutex<Option<crumb_tools::BackgroundJobs>>>,
+}
+
+/// Live state behind the agent map, safe to read from the terminal thread
+/// while a turn runs.
+#[derive(Clone)]
+pub struct AgentMapSource {
+    main: String,
+    team: crumb_harness::TeamRegistry,
+    jobs: Arc<Mutex<Option<crumb_tools::BackgroundJobs>>>,
+}
+
+impl AgentMapSource {
+    fn jobs(&self) -> Option<crumb_tools::BackgroundJobs> {
+        self.jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[must_use]
+    pub fn view(&self) -> crumb_ui::AgentMapView {
+        let helpers = self
+            .team
+            .snapshot()
+            .into_iter()
+            .map(|helper| crumb_ui::AgentMapHelper {
+                elapsed: helper.elapsed(),
+                name: format!("{} {}", helper.logo, helper.name),
+                task: helper.task,
+                write: helper.write,
+                state: match helper.state {
+                    crumb_harness::HelperState::Working => crumb_ui::AgentMapState::Working,
+                    crumb_harness::HelperState::Done => crumb_ui::AgentMapState::Done,
+                    crumb_harness::HelperState::Failed => crumb_ui::AgentMapState::Failed,
+                },
+                tokens: helper.tokens,
+                activity: helper.activity,
+            })
+            .collect();
+        let jobs = self
+            .jobs()
+            .map(|jobs| jobs.records())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| {
+                let finished = record.finished_unix.unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(record.started_unix, |now| now.as_secs())
+                });
+                crumb_ui::AgentMapJob {
+                    id: record.id,
+                    running: record.status == crumb_tools::JobStatus::Running,
+                    failed: matches!(
+                        record.status,
+                        crumb_tools::JobStatus::Exited { code: Some(code) } if code != 0
+                    ),
+                    status: match record.status {
+                        crumb_tools::JobStatus::Running => "running".to_owned(),
+                        crumb_tools::JobStatus::Exited { code: Some(0) } => "succeeded".to_owned(),
+                        crumb_tools::JobStatus::Exited { code: Some(code) } => {
+                            format!("failed ({code})")
+                        }
+                        crumb_tools::JobStatus::Exited { code: None } => "ended".to_owned(),
+                        crumb_tools::JobStatus::Stopped { reason } => format!("stopped: {reason}"),
+                        crumb_tools::JobStatus::Interrupted => "interrupted".to_owned(),
+                    },
+                    label: record.label,
+                    elapsed: Duration::from_secs(finished.saturating_sub(record.started_unix)),
+                }
+            })
+            .collect();
+        crumb_ui::AgentMapView {
+            main: self.main.clone(),
+            helpers,
+            jobs,
+        }
+    }
+
+    /// Details for `/agents N` (a helper) or `/agents job N` (a job's output).
+    #[must_use]
+    pub fn detail(&self, argument: &str) -> String {
+        let argument = argument.trim();
+        if let Some(id) = argument
+            .strip_prefix("job")
+            .and_then(|id| id.trim().parse::<u32>().ok())
+        {
+            return self
+                .jobs()
+                .and_then(|jobs| jobs.output_tail(id, 30))
+                .map_or_else(
+                    || format!("No background job {id} in this session."),
+                    |tail| {
+                        if tail.trim().is_empty() {
+                            format!("job {id} has no output yet.")
+                        } else {
+                            format!("job {id} · latest output:\n{tail}")
+                        }
+                    },
+                );
+        }
+        let Some(helper) = argument
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| self.team.snapshot().into_iter().nth(index))
+        else {
+            return "Use /agents N for a helper or /agents job N for a background job.".to_owned();
+        };
+        format!(
+            "{} {} · {}\ntask: {}\nlatest: {}\n{} tokens",
+            helper.logo,
+            helper.name,
+            match helper.state {
+                crumb_harness::HelperState::Working => "working",
+                crumb_harness::HelperState::Done => "done",
+                crumb_harness::HelperState::Failed => "failed",
+            },
+            helper.task,
+            helper.activity,
+            helper.tokens
+        )
+    }
 }
 
 struct PeerRuntimeState {
@@ -810,6 +944,8 @@ impl AgentRuntime {
             peer: None,
             background: None,
             resume_brief: None,
+            team: crumb_harness::TeamRegistry::default(),
+            jobs_slot: std::sync::Arc::default(),
         })
     }
 
@@ -1505,6 +1641,16 @@ impl AgentRuntime {
         )
     }
 
+    /// The agent map's live state; `main` describes the main agent.
+    #[must_use]
+    pub fn agent_map(&self, main: String) -> AgentMapSource {
+        AgentMapSource {
+            main,
+            team: self.team.clone(),
+            jobs: Arc::clone(&self.jobs_slot),
+        }
+    }
+
     /// Runs a turn off the terminal input thread and emits only bounded,
     /// redacted activity states.
     ///
@@ -1522,6 +1668,11 @@ impl AgentRuntime {
             bail!("agent activity channel capacity must be positive");
         }
         let request = self.attach_review_notes(request);
+        let map = self.agent_map(crate::agent_map_main_label(
+            &workspace,
+            &config,
+            self.token_usage().0,
+        ));
         let (activity_sender, activities) = sync_channel(activity_capacity);
         let (interactive, approval_inbox) = approval_channel(NonZeroUsize::MIN);
         let (questions, question_inbox) = crumb_agent::question_channel();
@@ -1556,6 +1707,7 @@ impl AgentRuntime {
             questions: question_inbox,
             cancellation,
             worker,
+            map: Arc::new(map),
         })
     }
 
@@ -1649,6 +1801,10 @@ impl AgentRuntime {
                 .join("jobs"),
         )?;
         self.background = Some((session_id, jobs.clone()));
+        *self
+            .jobs_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(jobs.clone());
         Ok(jobs)
     }
 
@@ -1992,6 +2148,7 @@ impl AgentRuntime {
                 harness_limits: parallel_harness_limits(harness_limits),
                 team_limits,
                 approvals: Some(Arc::clone(&approvals)),
+                registry: Some(self.team.clone()),
             },
         )?;
         let harness =
@@ -3580,6 +3737,8 @@ mod tests {
             peer: None,
             background: None,
             resume_brief: None,
+            team: crumb_harness::TeamRegistry::default(),
+            jobs_slot: std::sync::Arc::default(),
         }
     }
 

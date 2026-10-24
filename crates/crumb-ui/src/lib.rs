@@ -333,6 +333,103 @@ impl Renderer {
         .join("\n")
     }
 
+    /// Renders the agent map: the main agent, its helpers with time and
+    /// tokens, and the session's background jobs.
+    #[must_use]
+    pub fn agent_map(&self, view: &AgentMapView, terminal_width: u16) -> String {
+        let width = usize::from(terminal_width.saturating_sub(4)).max(20);
+        let working = view
+            .helpers
+            .iter()
+            .filter(|helper| helper.state == AgentMapState::Working)
+            .count();
+        let mut lines = vec![self.paint(
+            &fit_terminal_text(
+                &format!(
+                    "◆ Agent map · {} helper{} ({working} working) · {} background job{}",
+                    view.helpers.len(),
+                    if view.helpers.len() == 1 { "" } else { "s" },
+                    view.jobs.len(),
+                    if view.jobs.len() == 1 { "" } else { "s" },
+                ),
+                width,
+            ),
+            "1",
+        )];
+        lines.push(format!(
+            "  {} {}",
+            self.paint("●", "36;1"),
+            fit_terminal_text(&view.main, width.saturating_sub(4))
+        ));
+        for (index, helper) in view.helpers.iter().enumerate() {
+            let branch = if index + 1 == view.helpers.len() {
+                "└─"
+            } else {
+                "├─"
+            };
+            let (marker, color) = match helper.state {
+                AgentMapState::Working => ("●", "35;1"),
+                AgentMapState::Done => ("✓", "32"),
+                AgentMapState::Failed => ("✗", "31"),
+            };
+            let access = if helper.write { " · edits" } else { "" };
+            let head = format!(
+                "{} {} {}{access} · {} · {} tokens",
+                index + 1,
+                helper.name,
+                helper.task,
+                duration_text(helper.elapsed),
+                compact_tokens(helper.tokens)
+            );
+            lines.push(format!(
+                "  {branch} {} {}",
+                self.paint(marker, color),
+                fit_terminal_text(&head, width.saturating_sub(8))
+            ));
+            let rail = if index + 1 == view.helpers.len() {
+                " "
+            } else {
+                "│"
+            };
+            lines.push(self.paint(
+                &format!(
+                    "  {rail}     {}",
+                    fit_terminal_text(&helper.activity, width.saturating_sub(10))
+                ),
+                "2",
+            ));
+        }
+        if !view.jobs.is_empty() {
+            lines.push(self.paint("  Background jobs", "1"));
+            for job in &view.jobs {
+                let (marker, color) = if job.running {
+                    ("●", "32;1")
+                } else if job.failed {
+                    ("✗", "31")
+                } else {
+                    ("✓", "32")
+                };
+                let text = format!(
+                    "job {} · {} · {} · {}",
+                    job.id,
+                    job.label,
+                    job.status,
+                    duration_text(job.elapsed)
+                );
+                lines.push(format!(
+                    "  {} {}",
+                    self.paint(marker, color),
+                    fit_terminal_text(&text, width.saturating_sub(4))
+                ));
+            }
+        }
+        lines.push(self.paint(
+            "  /agents N for a helper's details · /agents job N for a job's output",
+            "2",
+        ));
+        lines.join("\n")
+    }
+
     /// Renders a boxed list the user moves through with the arrow keys.
     ///
     /// Rows are windowed around `selected` when there are more than
@@ -462,7 +559,7 @@ impl Renderer {
             return self.paint(&format!("  {}", fit_terminal_text(guide, available)), "2");
         }
         let count = format!(
-            "◆ {agents} agent{} working",
+            "◆ {agents} agent{} working · /agents",
             if agents == 1 { "" } else { "s" }
         );
         let guide = fit_terminal_text(guide, available.saturating_sub(count.chars().count() + 3));
@@ -1384,6 +1481,53 @@ fn paint_panda_line(renderer: Renderer, line: &str) -> String {
 
 fn trim_art(art: &str) -> &str {
     art.trim()
+}
+
+/// What the agent map shows; built by the CLI from live session state.
+#[derive(Clone, Debug, Default)]
+pub struct AgentMapView {
+    /// The main agent: folder, model pack, and context use.
+    pub main: String,
+    pub helpers: Vec<AgentMapHelper>,
+    pub jobs: Vec<AgentMapJob>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentMapState {
+    Working,
+    Done,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentMapHelper {
+    pub name: String,
+    pub task: String,
+    pub write: bool,
+    pub state: AgentMapState,
+    pub elapsed: Duration,
+    pub tokens: u64,
+    pub activity: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentMapJob {
+    pub id: u32,
+    pub label: String,
+    pub status: String,
+    pub running: bool,
+    pub failed: bool,
+    pub elapsed: Duration,
+}
+
+/// `41s`, `3m 50s`, `1h 02m`.
+fn duration_text(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3_599 => format!("{}m {:02}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {:02}m", seconds / 3_600, seconds % 3_600 / 60),
+    }
 }
 
 fn compact_tokens(tokens: u64) -> String {
@@ -2694,6 +2838,64 @@ mod tests {
             38,
         );
         assert!(narrow.contains("extra high"));
+    }
+
+    #[test]
+    fn agent_map_shows_the_main_agent_helpers_and_jobs() {
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Rich,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let view = super::AgentMapView {
+            main: "crumb.elipxo · Balanced Crumb · 18.6k context".to_owned(),
+            helpers: vec![
+                super::AgentMapHelper {
+                    name: "Koi".to_owned(),
+                    task: "Review PRs 530-534".to_owned(),
+                    write: false,
+                    state: super::AgentMapState::Working,
+                    elapsed: Duration::from_secs(230),
+                    tokens: 83_200,
+                    activity: "Searching · search_code".to_owned(),
+                },
+                super::AgentMapHelper {
+                    name: "Nyx".to_owned(),
+                    task: "Fix the parser".to_owned(),
+                    write: true,
+                    state: super::AgentMapState::Done,
+                    elapsed: Duration::from_secs(41),
+                    tokens: 12_000,
+                    activity: "Reported findings".to_owned(),
+                },
+            ],
+            jobs: vec![super::AgentMapJob {
+                id: 1,
+                label: "Merge remaining PRs".to_owned(),
+                status: "running".to_owned(),
+                running: true,
+                failed: false,
+                elapsed: Duration::from_secs(749),
+            }],
+        };
+        let map = renderer.agent_map(&view, 120);
+        assert!(
+            map.starts_with("◆ Agent map · 2 helpers (1 working) · 1 background job"),
+            "{map}"
+        );
+        assert!(map.contains("● crumb.elipxo · Balanced Crumb · 18.6k context"));
+        assert!(
+            map.contains("├─ ● 1 Koi Review PRs 530-534 · 3m 50s · 83.2k tokens"),
+            "{map}"
+        );
+        assert!(map.contains("│     Searching · search_code"));
+        assert!(
+            map.contains("└─ ✓ 2 Nyx Fix the parser · edits · 41s · 12.0k tokens"),
+            "{map}"
+        );
+        assert!(map.contains("● job 1 · Merge remaining PRs · running · 12m 29s"));
+        assert!(map.lines().all(|line| line.chars().count() <= 120));
     }
 
     #[test]
