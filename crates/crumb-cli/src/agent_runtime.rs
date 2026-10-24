@@ -244,6 +244,9 @@ impl EventSink for NativeEventBridge<'_> {
         let activity = match event {
             HarnessEvent::TurnStarted => Some(HarnessActivity::RequestAccepted),
             HarnessEvent::TextDelta(text) => Some(HarnessActivity::ResponseDelta { text }),
+            HarnessEvent::ReasoningDelta(text) => Some(HarnessActivity::ReasoningDelta { text }),
+            HarnessEvent::ResponseRevised => Some(HarnessActivity::ResponseRevised),
+            HarnessEvent::Correction(text) => Some(HarnessActivity::ResponseCorrected { text }),
             HarnessEvent::ToolRequested { name, detail, .. } => {
                 Some(HarnessActivity::ToolStarted { name, detail })
             }
@@ -2024,6 +2027,9 @@ impl EventSink for PeerEventBridge {
             // labels, paths, edits, usage, and completion bodies stay inside
             // the isolated worker.
             HarnessEvent::TextDelta(_)
+            | HarnessEvent::ReasoningDelta(_)
+            | HarnessEvent::ResponseRevised
+            | HarnessEvent::Correction(_)
             | HarnessEvent::ToolProgress { .. }
             | HarnessEvent::ToolOutput { .. }
             | HarnessEvent::FileChanged { .. }

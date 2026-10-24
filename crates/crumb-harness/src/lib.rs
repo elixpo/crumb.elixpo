@@ -81,7 +81,16 @@ pub struct SelectedSkill {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HarnessEvent {
     TurnStarted,
+    /// Model text, streamed as it arrives, including narration that
+    /// accompanies tool calls.
     TextDelta(String),
+    /// Model reasoning streamed separately from the answer.
+    ReasoningDelta(String),
+    /// The text streamed since the last tool round was a draft that failed a
+    /// check; another model round follows.
+    ResponseRevised,
+    /// The streamed final answer was corrected; this is the corrected text.
+    Correction(String),
     ToolRequested {
         id: String,
         name: String,
@@ -545,7 +554,6 @@ impl TurnMetrics {
 
 struct ModelRound {
     text: String,
-    text_chunks: Vec<String>,
     calls: Vec<ToolCall>,
     finish: Option<FinishReason>,
     usage: TokenUsage,
@@ -762,11 +770,9 @@ impl NativeHarness {
         let definitions = tool_definitions_for_turn(tools, &turn.user_message);
         let mut usage = TokenUsage::default();
         let mut output_bytes = 0_usize;
-        let mut retries = RequiredToolRetries::new(&definitions);
+        let mut checks = ResponseChecks::new(&definitions);
         let mut require_tool = initial_tool_requirement(&definitions, &turn.user_message);
-        let mut failed_tool_evidence = false;
-        let (mut grounding_retry_used, mut failure_retry_used) = (false, false);
-        let (mut completeness_retry_used, mut suppress_tools_once) = (false, false);
+        let (mut failed_tool_evidence, mut suppress_tools_once) = (false, false);
         let mut evidence_noted = false;
         // A reached limit ends tool use but grants one tool-free summary round.
         let mut wrap_up: Option<HarnessErrorKind> = None;
@@ -790,35 +796,32 @@ impl NativeHarness {
             record_usage(&mut usage, round.usage);
             if let Some(limit) = wrap_up {
                 round.calls.clear();
-                let mut outcome = finish_turn(round, turn, conversation, sink, usage, metrics);
+                let mut outcome = finish_turn(&round, turn, conversation, sink, usage, metrics);
                 outcome.limit = Some(limit);
                 return Ok(outcome);
             }
             if round.calls.is_empty() {
-                if !matches!(
-                    round.finish,
-                    Some(FinishReason::Stop | FinishReason::Other(_))
-                ) {
-                    return Err(incomplete_round_error(round.finish.as_ref()));
-                }
-                if let Some((next_required, next_suppressed)) = prepare_response_retry(
+                if let Some((next_required, next_suppressed)) = text_round_retry(
+                    &round,
                     &mut messages,
-                    &round.text,
                     &turn.user_message,
-                    !metrics.successful_tool_outputs.is_empty(),
                     &metrics.successful_tool_outputs,
-                    failed_tool_evidence,
-                    &mut grounding_retry_used,
-                    &mut failure_retry_used,
-                    &mut completeness_retry_used,
-                    &mut suppress_tools_once,
-                    &mut retries,
-                ) {
+                    (failed_tool_evidence, &mut suppress_tools_once),
+                    &mut checks,
+                    sink,
+                )? {
                     require_tool = next_required;
                     suppress_tools_once = next_suppressed;
                     continue;
                 }
-                return Ok(finish_turn(round, turn, conversation, sink, usage, metrics));
+                return Ok(finish_turn(
+                    &round,
+                    turn,
+                    conversation,
+                    sink,
+                    usage,
+                    metrics,
+                ));
             }
 
             for call in &mut round.calls {
@@ -848,7 +851,11 @@ impl NativeHarness {
                 record_successful_tool_evidence(&mut messages);
                 evidence_noted = true;
             }
-            if retries.prepare_failed_execution(&mut messages, &turn.user_message, &failed_tools) {
+            if checks.retries.prepare_failed_execution(
+                &mut messages,
+                &turn.user_message,
+                &failed_tools,
+            ) {
                 require_tool = true;
             }
         }
@@ -916,7 +923,6 @@ impl NativeHarness {
             .map_err(provider_error)?;
         let mut round = ModelRound {
             text: String::new(),
-            text_chunks: Vec::new(),
             calls: Vec::new(),
             finish: None,
             usage: TokenUsage::default(),
@@ -932,9 +938,11 @@ impl NativeHarness {
                         add_output_bytes(output_bytes, delta.len(), self.limits)?;
                     }
                     round.text.push_str(&delta);
-                    round.text_chunks.push(delta);
+                    sink.emit(HarnessEvent::TextDelta(delta));
                 }
-                ChatEvent::ReasoningDelta(_) => {}
+                ChatEvent::ReasoningDelta(reasoning) => {
+                    sink.emit(HarnessEvent::ReasoningDelta(reasoning));
+                }
                 ChatEvent::ToolCall(call) => round.calls.push(call),
                 ChatEvent::Usage(usage) => {
                     round.usage.input_tokens =
@@ -1101,6 +1109,39 @@ fn invalid_tool_call_message(tools: &ToolHost, name: &str, error: &str) -> Strin
     format!(
         "Tool call `{name}` was rejected: {error}. Available tools: {available}. Retry with one of these tools and arguments that match its schema."
     )
+}
+
+/// Decides what follows a round that ended in text without tool calls:
+/// `None` finishes the turn, `Some((require_tool, suppress_tools))` retries.
+/// A streamed draft that is retried is marked so the UI can show a revision.
+fn text_round_retry(
+    round: &ModelRound,
+    messages: &mut Vec<ChatMessage>,
+    user_message: &str,
+    successful_tool_outputs: &[String],
+    (failed_tool_evidence, suppress_tools_once): (bool, &mut bool),
+    checks: &mut ResponseChecks,
+    sink: &mut dyn EventSink,
+) -> Result<Option<(bool, bool)>, HarnessError> {
+    if !matches!(
+        round.finish,
+        Some(FinishReason::Stop | FinishReason::Other(_))
+    ) {
+        return Err(incomplete_round_error(round.finish.as_ref()));
+    }
+    let retry = prepare_response_retry(
+        messages,
+        &round.text,
+        user_message,
+        successful_tool_outputs,
+        failed_tool_evidence,
+        checks,
+        suppress_tools_once,
+    );
+    if retry.is_some() && !round.text.trim().is_empty() {
+        sink.emit(HarnessEvent::ResponseRevised);
+    }
+    Ok(retry)
 }
 
 /// Error for a round that ended with neither text completion nor tool calls.
@@ -1294,7 +1335,7 @@ fn retry_status(definitions: &[ToolDefinition], name: &str) -> RetryStatus {
 }
 
 fn finish_turn(
-    round: ModelRound,
+    round: &ModelRound,
     turn: HarnessTurn,
     conversation: &mut Conversation,
     sink: &mut dyn EventSink,
@@ -1318,13 +1359,15 @@ fn finish_turn(
     } else {
         grounded
     };
-    let chunks = if final_text == round.text {
-        round.text_chunks
-    } else {
-        vec![final_text.clone()]
-    };
-    for chunk in chunks {
-        sink.emit(HarnessEvent::TextDelta(chunk));
+    // The answer already streamed live. Show the final text only when nothing
+    // visible streamed, and append a correction when checks changed it.
+    let streamed = strip_private_reasoning(&round.text);
+    if streamed.trim().is_empty() {
+        if !final_text.is_empty() {
+            sink.emit(HarnessEvent::TextDelta(final_text.clone()));
+        }
+    } else if final_text.trim() != streamed.trim() {
+        sink.emit(HarnessEvent::Correction(final_text.clone()));
     }
     conversation.commit(
         turn.user_message,
@@ -1775,27 +1818,42 @@ fn initial_tool_requirement(definitions: &[crumb_llm::ToolDefinition], user_mess
         && user_requires_execution(user_message)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// One-shot answer checks; each retry may fire at most once per turn.
+struct ResponseChecks {
+    grounding_used: bool,
+    failure_used: bool,
+    completeness_used: bool,
+    retries: RequiredToolRetries,
+}
+
+impl ResponseChecks {
+    fn new(definitions: &[ToolDefinition]) -> Self {
+        Self {
+            grounding_used: false,
+            failure_used: false,
+            completeness_used: false,
+            retries: RequiredToolRetries::new(definitions),
+        }
+    }
+}
+
 fn prepare_response_retry(
     messages: &mut Vec<ChatMessage>,
     response: &str,
     user_message: &str,
-    successful_tool_evidence: bool,
     successful_tool_outputs: &[String],
     failed_tool_evidence: bool,
-    grounding_retry_used: &mut bool,
-    failure_retry_used: &mut bool,
-    completeness_retry_used: &mut bool,
+    checks: &mut ResponseChecks,
     suppress_tools_once: &mut bool,
-    retries: &mut RequiredToolRetries,
 ) -> Option<(bool, bool)> {
+    let successful_tool_evidence = !successful_tool_outputs.is_empty();
     if prepare_grounding_retry(
         messages,
         response,
         user_message,
         successful_tool_evidence,
         successful_tool_outputs,
-        grounding_retry_used,
+        &mut checks.grounding_used,
         suppress_tools_once,
     ) {
         return Some((false, *suppress_tools_once));
@@ -1805,7 +1863,7 @@ fn prepare_response_retry(
         response,
         successful_tool_evidence,
         failed_tool_evidence,
-        failure_retry_used,
+        &mut checks.failure_used,
         suppress_tools_once,
     ) {
         return Some((false, *suppress_tools_once));
@@ -1814,11 +1872,17 @@ fn prepare_response_retry(
         && !successful_tool_evidence
         && response_reports_execution_failure(response);
     if !terminal_tool_failure
-        && prepare_completeness_retry(messages, response, user_message, completeness_retry_used)
+        && prepare_completeness_retry(
+            messages,
+            response,
+            user_message,
+            &mut checks.completeness_used,
+        )
     {
         return Some((true, false));
     }
-    retries
+    checks
+        .retries
         .prepare(messages, user_message, response)
         .then_some((true, false))
 }
@@ -3243,6 +3307,27 @@ mod tests {
         );
     }
 
+    /// Text streamed after the last tool result or revision marker: the
+    /// answer the user is left reading once the turn ends.
+    fn final_segment(events: &[HarnessEvent]) -> String {
+        let start = events
+            .iter()
+            .rposition(|event| {
+                matches!(
+                    event,
+                    HarnessEvent::ResponseRevised | HarnessEvent::ToolFinished { .. }
+                )
+            })
+            .map_or(0, |index| index + 1);
+        events[start..]
+            .iter()
+            .filter_map(|event| match event {
+                HarnessEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     async fn run_weather_turn(
         rounds: Vec<Vec<ChatEvent>>,
         limits: HarnessLimits,
@@ -3434,15 +3519,16 @@ mod tests {
             HarnessEvent::ToolOutput { name, content, .. }
                 if name == "weather" && content == "24 C"
         )));
-        let streamed = events
-            .iter()
-            .filter_map(|event| match event {
+        // Narration beside the tool call streams live, before the tool runs;
+        // the answer streams after it.
+        assert_eq!(
+            events.iter().find_map(|event| match event {
                 HarnessEvent::TextDelta(delta) => Some(delta.as_str()),
                 _ => None,
-            })
-            .collect::<String>();
-        assert_eq!(streamed, "It is 24 C.");
-        assert!(!streamed.contains("placeholder"));
+            }),
+            Some("Unverified placeholder draft.")
+        );
+        assert_eq!(final_segment(&events), "It is 24 C.");
         let requests = provider.requests.lock().expect("request lock");
         assert_eq!(requests[0].messages[0].role, crumb_llm::ChatRole::System);
         assert!(
@@ -3516,7 +3602,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(provider.requests.lock().expect("request lock").len(), 2);
         assert!(events.iter().any(|event| {
-            matches!(event, HarnessEvent::TextDelta(text) if text == "Verified result:\n\n24 C")
+            matches!(event, HarnessEvent::Correction(text) if text == "Verified result:\n\n24 C")
         }));
     }
 
@@ -3665,14 +3751,8 @@ mod tests {
         assert_eq!(outcome.model_rounds, 3);
         assert_eq!(outcome.tool_calls, 1);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
-        let streamed = events
-            .iter()
-            .filter_map(|event| match event {
-                HarnessEvent::TextDelta(delta) => Some(delta.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
-        assert_eq!(streamed, outcome.text);
+        assert!(events.contains(&HarnessEvent::ResponseRevised));
+        assert_eq!(final_segment(&events), outcome.text);
         let requests = provider.requests.lock().expect("request lock");
         assert_eq!(requests[2].tool_choice, ToolChoice::None);
         assert!(requests[2].messages.iter().any(|message| {
@@ -3832,14 +3912,8 @@ mod tests {
 
         assert_eq!(outcome.text, "g++ is installed and available.");
         assert_eq!(calls.load(Ordering::Relaxed), 1);
-        let streamed = events
-            .iter()
-            .filter_map(|event| match event {
-                HarnessEvent::TextDelta(delta) => Some(delta.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
-        assert_eq!(streamed, "g++ is installed and available.");
+        assert!(events.contains(&HarnessEvent::ResponseRevised));
+        assert_eq!(final_segment(&events), "g++ is installed and available.");
         let requests = provider.requests.lock().expect("request lock");
         assert_eq!(requests[0].tool_choice, ToolChoice::Required);
         assert_eq!(

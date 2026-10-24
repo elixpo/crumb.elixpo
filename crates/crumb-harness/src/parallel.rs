@@ -497,14 +497,18 @@ impl EventSink for TeamEvents {
                 tool_activity_label(&name),
                 if success { "done" } else { "failed" }
             )),
-            HarnessEvent::ToolOutput { .. } | HarnessEvent::FileChanged { .. } => None,
             HarnessEvent::TextDelta(_) if !self.reporting => {
                 self.reporting = true;
                 Some("Reporting findings".to_owned())
             }
-            HarnessEvent::TextDelta(_) | HarnessEvent::Usage(_) | HarnessEvent::TurnFinished => {
-                None
-            }
+            HarnessEvent::ToolOutput { .. }
+            | HarnessEvent::FileChanged { .. }
+            | HarnessEvent::TextDelta(_)
+            | HarnessEvent::ReasoningDelta(_)
+            | HarnessEvent::ResponseRevised
+            | HarnessEvent::Correction(_)
+            | HarnessEvent::Usage(_)
+            | HarnessEvent::TurnFinished => None,
         };
         if let Some(label) = label {
             publish_activity(&self.activity, format!("{} · {label}", self.name));
