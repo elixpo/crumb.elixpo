@@ -473,6 +473,8 @@ pub struct AgentRuntime {
     review_notes: Vec<ReviewNote>,
     review_note_bytes: usize,
     peer: Option<PeerRuntimeState>,
+    /// Background jobs of the active session, kept across its turns.
+    background: Option<(SessionId, crumb_tools::BackgroundJobs)>,
 }
 
 struct PeerRuntimeState {
@@ -801,6 +803,7 @@ impl AgentRuntime {
             review_notes: Vec::new(),
             review_note_bytes: 0,
             peer: None,
+            background: None,
         })
     }
 
@@ -1574,6 +1577,37 @@ impl AgentRuntime {
         Ok(tools)
     }
 
+    /// The active session's background jobs, created on first use. Switching
+    /// sessions drops the previous registry, which stops its running jobs.
+    fn background_jobs(
+        &mut self,
+        workspace: &Path,
+        config: &AgentConfig,
+    ) -> Result<crumb_tools::BackgroundJobs> {
+        let session_id = self
+            .session
+            .as_ref()
+            .context("agent session is unavailable")?
+            .id()
+            .clone();
+        if let Some((id, jobs)) = &self.background
+            && *id == session_id
+        {
+            return Ok(jobs.clone());
+        }
+        let max_output_bytes =
+            usize::try_from(config.limits.max_output_bytes).unwrap_or(usize::MAX);
+        let jobs = crumb_tools::BackgroundJobs::new(
+            workspace,
+            crate::shell_tool_config(config, max_output_bytes),
+            session_root(workspace)
+                .join(session_id.as_str())
+                .join("jobs"),
+        )?;
+        self.background = Some((session_id, jobs.clone()));
+        Ok(jobs)
+    }
+
     pub fn prepare_local_job(&mut self, mode: AgentMode, workspace: &Path) -> Result<SessionId> {
         let workspace = std::fs::canonicalize(workspace)
             .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
@@ -1617,9 +1651,11 @@ impl AgentRuntime {
             .context("selected persona profile could not be applied")?;
         let config = &application.config;
         config.validate()?;
-        let tools = self.turn_tool_host(&workspace, config, interaction.questions)?;
+        let mut tools = self.turn_tool_host(&workspace, config, interaction.questions)?;
         let approvals = turn_approvals(config, interaction.interactive);
         self.ensure_session(&workspace, config.mode)?;
+        let background = self.background_jobs(&workspace, config)?;
+        crumb_tools::register_background_tools(&mut tools, background.clone())?;
         let route = select_request_route(config, request)
             .context("agent config has no text model route")?;
         let effort = config.reasoning_effort_for(route).map(str::to_owned);
@@ -1658,6 +1694,8 @@ impl AgentRuntime {
             context_token_budget(config, route),
             &workspace,
         );
+        let mut trusted_context = trusted_context;
+        trusted_context.extend(background.context_summary());
         let dispatched_request = if native {
             request
         } else {
@@ -3484,6 +3522,7 @@ mod tests {
             review_notes: Vec::new(),
             review_note_bytes: 0,
             peer: None,
+            background: None,
         }
     }
 

@@ -1,6 +1,7 @@
 //! Native tools whose permissions remain owned by Crumb.
 
 mod a2a;
+mod background;
 mod checkpoint;
 mod clock;
 mod code_search;
@@ -15,6 +16,10 @@ mod workspace;
 pub use a2a::{
     LIST_PEER_AGENTS_TOOL, ListPeerAgentsTool, SEND_PEER_MESSAGE_TOOL, SHARE_PEER_FILE_TOOL,
     SendPeerMessageTool, SharePeerFileTool, register_a2a_tools,
+};
+pub use background::{
+    BackgroundJobs, CHECK_BACKGROUND, JobRecord, JobStatus, START_BACKGROUND, STOP_BACKGROUND,
+    register_background_tools,
 };
 pub use checkpoint::{
     CheckpointDecision, CheckpointFile, CheckpointStatus, CheckpointStore, WorkspaceCheckpoint,

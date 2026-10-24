@@ -4280,7 +4280,7 @@ fn trusted_tool_detail(name: &str, arguments: &serde_json::Value) -> Option<Stri
         return Some(crumb_agent::task_summary(&tasks));
     }
     let field = match name {
-        "run_shell" => "command",
+        "run_shell" | "start_background" => "command",
         "web_search" => "query",
         "web_fetch" => "url",
         "search_code" => "pattern",
@@ -7159,6 +7159,8 @@ fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         ("write_file", "workspace write", true),
         ("run_disposable", "one-shot process", true),
         ("run_shell", "workspace process", true),
+        ("start_background", "background process", true),
+        ("stop_background", "background process", true),
         ("spawn_agents", "parallel analysis", true),
         ("web_fetch", "network", true),
         ("github_issue", "network", true),
@@ -7185,6 +7187,7 @@ fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
                 | "detect_stack"
                 | "search_code"
                 | "update_tasks"
+                | "check_background"
                 | "ask_user"
         ) || config.permissions.allow_network_tools.contains(name)
             || config.permissions.allow_workspace_tools.contains(name)
