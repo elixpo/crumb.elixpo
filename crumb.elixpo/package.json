@@ -15,7 +15,7 @@
     "dev:seed": "npm run db:migrate:local && npm run db:seed:local"
   },
   "dependencies": {
-    "@opennextjs/cloudflare": "1.20.9",
+    "@opennextjs/cloudflare": "1.20.13",
     "next": "16.4.3",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
