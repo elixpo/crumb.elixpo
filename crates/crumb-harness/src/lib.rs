@@ -934,6 +934,7 @@ impl NativeHarness {
                     round.text.push_str(&delta);
                     round.text_chunks.push(delta);
                 }
+                ChatEvent::ReasoningDelta(_) => {}
                 ChatEvent::ToolCall(call) => round.calls.push(call),
                 ChatEvent::Usage(usage) => {
                     round.usage.input_tokens =

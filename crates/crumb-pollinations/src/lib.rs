@@ -45,7 +45,13 @@ impl Default for RetryPolicy {
 pub struct PollinationsConfig {
     base_url: String,
     api_key: String,
+    /// Total time allowed for non-streaming requests such as model listing.
     pub request_timeout: Duration,
+    /// Time allowed to establish a connection.
+    pub connect_timeout: Duration,
+    /// Longest silence tolerated while waiting for response bytes. It resets
+    /// after every chunk, so long streamed answers are never cut off.
+    pub stream_idle_timeout: Duration,
     pub retry: RetryPolicy,
 }
 
@@ -68,6 +74,8 @@ impl PollinationsConfig {
             base_url: DEFAULT_BASE_URL.to_owned(),
             api_key,
             request_timeout: Duration::from_mins(1),
+            connect_timeout: Duration::from_secs(10),
+            stream_idle_timeout: Duration::from_mins(3),
             retry: RetryPolicy::default(),
         })
     }
@@ -108,6 +116,8 @@ impl fmt::Debug for PollinationsConfig {
             .field("base_url", &self.base_url)
             .field("api_key", &"[REDACTED]")
             .field("request_timeout", &self.request_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("stream_idle_timeout", &self.stream_idle_timeout)
             .field("retry", &self.retry)
             .finish()
     }
@@ -127,7 +137,8 @@ impl PollinationsProvider {
     /// Returns an invalid-request error if the HTTP client cannot be built.
     pub fn new(config: PollinationsConfig) -> ProviderResult<Self> {
         let client = Client::builder()
-            .timeout(config.request_timeout)
+            .connect_timeout(config.connect_timeout)
+            .read_timeout(config.stream_idle_timeout)
             .build()
             .map_err(|_| {
                 ProviderError::new(
@@ -141,7 +152,13 @@ impl PollinationsProvider {
 
     async fn list_models_inner(&self) -> ProviderResult<Vec<ModelInfo>> {
         let endpoint = self.config.endpoint("/text/models");
-        let response = self.send_with_retry(|| self.client.get(&endpoint)).await?;
+        let response = self
+            .send_with_retry(|| {
+                self.client
+                    .get(&endpoint)
+                    .timeout(self.config.request_timeout)
+            })
+            .await?;
         let payload = response
             .json::<TextModelsResponse>()
             .await
@@ -155,13 +172,15 @@ impl PollinationsProvider {
     ) -> ProviderResult<Box<dyn ChatStream>> {
         let endpoint = self.config.endpoint("/v1/chat/completions");
         let body = ChatCompletionRequest::from(request);
+        // Retrying is safe: it only happens before any response arrives, and
+        // Pollinations documents that resending an identical request is fine.
         let response = self
-            .send_once(
+            .send_with_retry(|| {
                 self.client
-                    .post(endpoint)
+                    .post(&endpoint)
                     .bearer_auth(self.config.api_key())
-                    .json(&body),
-            )
+                    .json(&body)
+            })
             .await?;
         Ok(Box::new(PollinationsChatStream::new(
             response.bytes_stream(),
@@ -179,6 +198,7 @@ impl PollinationsProvider {
                 self.client
                     .post(endpoint)
                     .bearer_auth(self.config.api_key())
+                    .timeout(self.config.request_timeout)
                     .json(&body),
             )
             .await?;
