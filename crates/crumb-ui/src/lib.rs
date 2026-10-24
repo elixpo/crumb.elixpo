@@ -344,6 +344,84 @@ impl Renderer {
         .join("\n")
     }
 
+    /// Renders a boxed list the user moves through with the arrow keys.
+    ///
+    /// Rows are windowed around `selected` when there are more than
+    /// `visible_rows`. A row with `checked: Some(_)` shows a checkbox.
+    #[must_use]
+    pub fn choice_dialog(&self, dialog: &ChoiceDialogView<'_>, terminal_width: u16) -> String {
+        let width = usize::from(terminal_width.clamp(56, 100));
+        let inner = width.saturating_sub(4);
+        let row = |text: &str| format!("│ {:<inner$} │", fit_terminal_text(text, inner));
+        let mut lines = vec![
+            self.paint(&format!("╭{}╮", "─".repeat(width - 2)), "2"),
+            self.paint(&row(dialog.title), "1"),
+        ];
+        for note in dialog.notes {
+            lines.push(self.paint(&row(note), "2"));
+        }
+        lines.push(self.paint(&row(""), "2"));
+        let visible = dialog.visible_rows.max(1);
+        let selected = dialog.selected.min(dialog.rows.len().saturating_sub(1));
+        let first = selected
+            .saturating_add(1)
+            .saturating_sub(visible)
+            .min(dialog.rows.len().saturating_sub(visible));
+        if first > 0 {
+            lines.push(self.paint(&row(&format!("  ↑ {first} more")), "2"));
+        }
+        for (index, choice) in dialog.rows.iter().enumerate().skip(first).take(visible) {
+            let cursor = if index == selected { "›" } else { " " };
+            let checkbox = match choice.checked {
+                Some(true) => "[x] ",
+                Some(false) => "[ ] ",
+                None => "",
+            };
+            let text = if choice.detail.is_empty() {
+                format!("{cursor} {checkbox}{}", choice.label)
+            } else {
+                format!("{cursor} {checkbox}{} · {}", choice.label, choice.detail)
+            };
+            lines.push(if index == selected {
+                self.paint(&row(&text), "30;44;1")
+            } else {
+                row(&text)
+            });
+        }
+        let below = dialog.rows.len().saturating_sub(first + visible);
+        if below > 0 {
+            lines.push(self.paint(&row(&format!("  ↓ {below} more")), "2"));
+        }
+        lines.push(self.paint(&row(""), "2"));
+        lines.push(self.paint(&row(dialog.hint), "2"));
+        lines.push(self.paint(&format!("╰{}╯", "─".repeat(width - 2)), "2"));
+        lines.join("\n")
+    }
+
+    /// Renders a boxed single-line text field.
+    #[must_use]
+    pub fn text_prompt_dialog(
+        &self,
+        title: &str,
+        value: &str,
+        hint: &str,
+        terminal_width: u16,
+    ) -> String {
+        let width = usize::from(terminal_width.clamp(56, 100));
+        let inner = width.saturating_sub(4);
+        let row = |text: &str| format!("│ {:<inner$} │", fit_terminal_text(text, inner));
+        [
+            self.paint(&format!("╭{}╮", "─".repeat(width - 2)), "2"),
+            self.paint(&row(title), "1"),
+            self.paint(&row(""), "2"),
+            self.paint(&row(&format!("› {value}▏")), "1"),
+            self.paint(&row(""), "2"),
+            self.paint(&row(hint), "2"),
+            self.paint(&format!("╰{}╯", "─".repeat(width - 2)), "2"),
+        ]
+        .join("\n")
+    }
+
     /// Renders the persistent keyboard guide below the full-screen composer.
     #[must_use]
     pub fn composer_hotkeys(&self, terminal_width: u16) -> String {
@@ -1449,6 +1527,24 @@ pub fn lock_terminal_output() -> std::sync::MutexGuard<'static, ()> {
     TERMINAL_OUTPUT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// One selectable row in a [`Renderer::choice_dialog`].
+pub struct ChoiceRow<'a> {
+    pub label: &'a str,
+    pub detail: &'a str,
+    /// `Some` renders a checkbox for multi-select lists.
+    pub checked: Option<bool>,
+}
+
+/// Everything a [`Renderer::choice_dialog`] draws.
+pub struct ChoiceDialogView<'a> {
+    pub title: &'a str,
+    pub notes: &'a [String],
+    pub rows: &'a [ChoiceRow<'a>],
+    pub selected: usize,
+    pub visible_rows: usize,
+    pub hint: &'a str,
 }
 
 /// A best-effort activity line that always clears itself before final output.

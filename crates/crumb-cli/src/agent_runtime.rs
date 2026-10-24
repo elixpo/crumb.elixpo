@@ -2021,6 +2021,7 @@ impl AgentRuntime {
                 workspace.to_path_buf(),
                 journal,
             )?);
+            crate::sessions_view::record_workspace(workspace);
         }
         Ok(())
     }
