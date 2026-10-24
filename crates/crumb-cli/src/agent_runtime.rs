@@ -1325,12 +1325,21 @@ impl AgentRuntime {
             journal,
         ));
         let folder = root.join(&target_key.session_id);
-        self.resume_brief = crate::session_resume::resume_brief(&folder);
+        let saved = crate::session_resume::load_conversation(&folder);
+        // The agent always starts a resumed session knowing what happened in it.
+        let brief = [
+            crate::session_resume::session_recap(&root, &target_key.session_id, saved.as_ref()),
+            crate::session_resume::resume_brief(&folder),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        self.resume_brief = (!brief.is_empty()).then(|| brief.join("\n\n"));
         if self.restore_warm_session_state(&target_key) {
             return Ok(ResumeContinuity::Warm);
         }
         self.restore_active_state(SessionRuntimeState::default());
-        Ok(match crate::session_resume::load_conversation(&folder) {
+        Ok(match saved {
             Some(snapshot) => {
                 self.native_conversation = Some(Conversation::restore(
                     HarnessLimits::default().max_history_turns,
@@ -1340,6 +1349,16 @@ impl AgentRuntime {
             }
             None => ResumeContinuity::MetadataOnly,
         })
+    }
+
+    /// A line for the user about the resumed session's latest exchange.
+    #[must_use]
+    pub fn resume_recap(&self, workspace: &Path) -> Option<String> {
+        let session = self.active_session_id()?;
+        let workspace = std::fs::canonicalize(workspace).ok()?;
+        let saved =
+            crate::session_resume::load_conversation(&session_root(&workspace).join(session));
+        crate::session_resume::user_recap(saved.as_ref())
     }
 
     /// The request that was running when this session last stopped.
@@ -4276,11 +4295,16 @@ mod tests {
             runtime.interrupted_request(&workspace).as_deref(),
             Some("now deploy it")
         );
+        let brief = runtime.resume_brief.as_deref().expect("brief");
+        assert!(brief.contains("now deploy it"), "{brief}");
+        assert!(brief.contains("Recap of this session so far"), "{brief}");
         assert!(
-            runtime
-                .resume_brief
-                .as_deref()
-                .is_some_and(|brief| brief.contains("now deploy it"))
+            brief.contains("- User: add a health endpoint\n  Crumb: Added /health and a test."),
+            "{brief}"
+        );
+        assert_eq!(
+            runtime.resume_recap(&workspace).as_deref(),
+            Some("Last: add a health endpoint → Added /health and a test.")
         );
     }
 
