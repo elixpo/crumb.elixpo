@@ -207,6 +207,9 @@ pub struct PromptContext<'a> {
     pub git: Option<&'a GitSegment>,
     pub last_exit_code: Option<i32>,
     pub terminal_width: u16,
+    /// Show the folder and git branch above the composer. Fullscreen keeps
+    /// them in the composer placeholder and the footer instead.
+    pub show_location: bool,
 }
 
 /// Non-secret state rendered once when the standalone terminal starts.
@@ -267,11 +270,6 @@ impl Renderer {
     #[must_use]
     pub fn welcome(&self, context: &StartupContext<'_>, terminal_width: u16) -> String {
         let panda = panda_art(panda_mood(Some(context.agent_configured)));
-        let wordmark = if terminal_width < 60 {
-            "CRUMB"
-        } else {
-            WORDMARK
-        };
         let pack = context.model.unwrap_or("not configured");
         let instance = context
             .instance_name
@@ -282,7 +280,7 @@ impl Renderer {
             format!("Native shell ready{instance} · run /auth login to connect")
         };
         let copy = format!(
-            "{wordmark}\nCrumb CLI v{} · Native commands stay native.\n{} · effort {}\nTry: explain this workspace · /help shows commands",
+            "C R U M B\nCrumb CLI v{} · Native commands stay native.\n{} · {}\nTry: explain this workspace · /help shows commands",
             context.version,
             state,
             context.effort.unwrap_or("default"),
@@ -493,28 +491,51 @@ impl Renderer {
     /// Renders compact, non-secret model and context state for the fixed footer.
     #[must_use]
     pub fn context_footer(&self, context: &StartupContext<'_>, terminal_width: u16) -> String {
-        let pack = context.model.unwrap_or("native");
-        let instance = context
-            .instance_name
-            .map_or(String::new(), |name| format!(" · {name}"));
-        let effort = context.effort.unwrap_or("default");
-        let text = if terminal_width < 60 {
-            format!(
-                "{}/{} · effort {effort} · {}",
-                compact_tokens(context.context_tokens),
-                compact_tokens(context.session_budget_tokens),
-                context.mode
-            )
-        } else {
-            format!(
-                "{}{} · effort {effort} · {pack} · {}",
-                context_meter(context),
-                instance,
-                context.mode
-            )
-        };
+        self.render_footer_items(&footer_items(context, None, terminal_width), terminal_width)
+    }
+
+    /// Renders footer items produced by [`footer_items`].
+    #[must_use]
+    pub fn render_footer_items(
+        &self,
+        items: &[(FooterItem, String)],
+        terminal_width: u16,
+    ) -> String {
+        let text = items
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join(FOOTER_SEPARATOR);
         let text = fit_terminal_text(&text, usize::from(terminal_width.saturating_sub(2)));
         self.paint(&format!("  {text}"), "2")
+    }
+
+    /// Renders the tip shown when a footer item is clicked: what it is and
+    /// how to change it.
+    #[must_use]
+    pub fn footer_tip(&self, item: FooterItem, value: &str, terminal_width: u16) -> String {
+        let (title, body) = item.help();
+        let value = value.strip_prefix(title).map_or(value, str::trim_start);
+        let width = usize::from(terminal_width.saturating_sub(4).clamp(24, 76));
+        let inner = width.saturating_sub(4);
+        let row = |text: &str| format!("│ {:<inner$} │", fit_terminal_text(text, inner));
+        let mut lines = vec![
+            self.paint(&format!("╭{}╮", "─".repeat(width - 2)), "35"),
+            self.paint(&row(&format!("{title} · {value}")), "1"),
+        ];
+        let mut pending = body.to_owned();
+        while !pending.is_empty() {
+            let (line, remainder) = split_terminal_words(&pending, inner);
+            lines.push(row(&line));
+            pending = remainder;
+        }
+        lines.push(self.paint(&row("Press any key to close"), "2"));
+        lines.push(self.paint(&format!("╰{}╯", "─".repeat(width - 2)), "35"));
+        lines
+            .into_iter()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Renders the bottom edge of the full-width composer.
@@ -538,9 +559,9 @@ impl Renderer {
 
     /// Renders the inactive prompt hint while a submitted turn is running.
     #[must_use]
-    pub fn composer_placeholder(&self, available_width: u16) -> String {
+    pub fn composer_placeholder(&self, folder: &str, available_width: u16) -> String {
         let placeholder = fit_terminal_text(
-            "Ask Crumb anything or type a command · @ context · / commands · Tab complete",
+            &format!("{folder} $ Ask Crumb anything or type a command · @ context · / commands"),
             usize::from(available_width),
         );
         self.paint(&placeholder, "2;1")
@@ -580,16 +601,16 @@ impl Renderer {
         let card_width = usize::from(terminal_width.saturating_sub(4));
         let content_width = card_width.saturating_sub(2);
         let timestamp = timestamp.unwrap_or_default();
-        let mut body = vec![String::new()];
+        let mut body = Vec::new();
         let mut pending = input.lines().map(str::to_owned).collect::<VecDeque<_>>();
         if pending.is_empty() {
             pending.push_back(String::new());
         }
-        while body.len() <= TRANSCRIPT_INPUT_MAX_ROWS
+        while body.len() < TRANSCRIPT_INPUT_MAX_ROWS
             && let Some(line) = pending.pop_front()
         {
-            let first = body.len() == 1;
-            let marker = if first { "◆ >" } else { "  │" };
+            let first = body.is_empty();
+            let marker = if first { "$" } else { " " };
             let timestamp_width = if first && !timestamp.is_empty() {
                 timestamp.chars().count().saturating_add(1)
             } else {
@@ -623,11 +644,13 @@ impl Renderer {
                 *last = fit_terminal_text(&format!("{last} …"), content_width);
             }
         }
-        body.push(String::new());
-        body.into_iter()
+        // One thin row per line, like a shell prompt, after a plain spacer.
+        let card = body
+            .into_iter()
             .map(|line| self.transcript_card_line(&line, card_width, "1"))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        format!("\n{card}")
     }
 
     fn transcript_card_line(self, line: &str, width: usize, style: &str) -> String {
@@ -1270,8 +1293,14 @@ impl Renderer {
             return format!("{}\n> ", segments.join(" | "));
         }
 
-        let mut context_line = self.paint(&format!("  {cwd}"), "34;1");
-        if let Some(git) = context.git {
+        let mut context_line = if context.show_location {
+            self.paint(&format!("  {cwd}"), "34;1")
+        } else {
+            String::from("  ")
+        };
+        if context.show_location
+            && let Some(git) = context.git
+        {
             let dirty = if git.dirty { " *" } else { "" };
             context_line.push_str(&self.paint(&format!("  git:{}{dirty}", git.branch), "2"));
         }
@@ -1374,6 +1403,117 @@ fn compact_tokens(tokens: u64) -> String {
     } else {
         tokens.to_string()
     }
+}
+
+const FOOTER_SEPARATOR: &str = " · ";
+
+/// A clickable item in the fullscreen footer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FooterItem {
+    Context,
+    Git,
+    Pack,
+    Mode,
+    Effort,
+}
+
+impl FooterItem {
+    /// The item's name and a short explanation of how to change it.
+    #[must_use]
+    pub const fn help(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Context => (
+                "Model context",
+                "How much of the model's context window this conversation uses. Older tool output is shortened automatically as it fills.",
+            ),
+            Self::Git => (
+                "Git branch",
+                "The branch of this folder's repository; * means uncommitted changes. Switch with git switch <branch>.",
+            ),
+            Self::Pack => (
+                "Model pack",
+                "The models Crumb uses for chat, images, and code. Change it with /pack use quick, balanced, or deep.",
+            ),
+            Self::Mode => (
+                "Agent mode",
+                "How the agent works: auto, negotiate, or plan. Change it with /mode use <mode>.",
+            ),
+            Self::Effort => (
+                "Reasoning effort",
+                "How hard the model thinks before answering. Change it with /effort use light, medium, high, extra high, or default.",
+            ),
+        }
+    }
+}
+
+/// The footer's items, left to right, sized for the terminal width.
+#[must_use]
+pub fn footer_items(
+    context: &StartupContext<'_>,
+    git: Option<&GitSegment>,
+    terminal_width: u16,
+) -> Vec<(FooterItem, String)> {
+    let effort = context.effort.unwrap_or("default").to_owned();
+    let mode = context.mode.to_owned();
+    if terminal_width < 60 {
+        return vec![
+            (
+                FooterItem::Context,
+                format!(
+                    "{}/{}",
+                    compact_tokens(context.context_tokens),
+                    compact_tokens(context.session_budget_tokens)
+                ),
+            ),
+            (FooterItem::Mode, mode),
+            (FooterItem::Effort, effort),
+        ];
+    }
+    let mut items = vec![(FooterItem::Context, context_meter(context))];
+    if let Some(git) = git {
+        let dirty = if git.dirty { " *" } else { "" };
+        items.push((FooterItem::Git, format!("git:{}{dirty}", git.branch)));
+    }
+    items.push((
+        FooterItem::Pack,
+        context.model.unwrap_or("native").to_owned(),
+    ));
+    items.push((FooterItem::Mode, mode));
+    items.push((FooterItem::Effort, effort));
+    items
+}
+
+/// The footer item under a zero-based terminal `column`, with its text.
+#[must_use]
+pub fn footer_item_at(items: &[(FooterItem, String)], column: u16) -> Option<(FooterItem, &str)> {
+    let column = usize::from(column);
+    // The rendered footer starts with a two-column gutter.
+    let mut start = 2;
+    for (item, text) in items {
+        let end = start + text.chars().count();
+        if (start..end).contains(&column) {
+            return Some((*item, text.as_str()));
+        }
+        start = end + FOOTER_SEPARATOR.chars().count();
+    }
+    None
+}
+
+/// Splits `text` at the last space that keeps the first part within `width`.
+fn split_terminal_words(text: &str, width: usize) -> (String, String) {
+    if text.chars().count() <= width {
+        return (text.to_owned(), String::new());
+    }
+    let head = text.chars().take(width + 1).collect::<String>();
+    let cut = head.rfind(' ').filter(|&cut| cut > 0).unwrap_or_else(|| {
+        head.char_indices()
+            .nth(width)
+            .map_or(head.len(), |(index, _)| index)
+    });
+    (
+        text[..cut].trim_end().to_owned(),
+        text[cut..].trim_start().to_owned(),
+    )
 }
 
 fn context_meter(context: &StartupContext<'_>) -> String {
@@ -1496,10 +1636,9 @@ fn paint_welcome_copy(renderer: Renderer, copy: &str, gutter: &str, width: usize
 
 const fn welcome_copy_style(row: usize) -> &'static str {
     match row {
-        0..=5 => "38;2;255;255;204;1",
-        6 => "97;1",
-        7 => "36;1",
-        9 => "35",
+        0 => "38;2;255;255;204;1",
+        1 => "97;1",
+        2 => "36;1",
         _ => "2",
     }
 }
@@ -2149,7 +2288,9 @@ fn append_optional_segments(segments: &mut Vec<String>, context: &PromptContext<
     }
 }
 
-fn display_path(path: &Path) -> String {
+/// `path` with the home directory shortened to `~`.
+#[must_use]
+pub fn display_path(path: &Path) -> String {
     let home = env::var_os(home_variable());
     if let Some(home) = home.map(PathBuf::from)
         && let Ok(relative) = path.strip_prefix(&home)
@@ -2194,8 +2335,9 @@ mod tests {
     use crumb_platform::Platform;
 
     use super::{
-        BrandingMode, COOKIE_SPINNER, GitSegment, MotionMode, OutputMode, PUNCHLINES, PeerActivity,
-        PeerActivityState, PromptContext, Renderer, StartupContext, StatusTone, UiSettings,
+        BrandingMode, COOKIE_SPINNER, FooterItem, GitSegment, MotionMode, OutputMode, PUNCHLINES,
+        PeerActivity, PeerActivityState, PromptContext, Renderer, StartupContext, StatusTone,
+        UiSettings, footer_item_at, footer_items,
     };
 
     #[test]
@@ -2217,6 +2359,7 @@ mod tests {
             git: Some(&git),
             last_exit_code: Some(2),
             terminal_width: 80,
+            show_location: true,
         });
 
         assert_eq!(
@@ -2240,6 +2383,7 @@ mod tests {
             git: None,
             last_exit_code: Some(0),
             terminal_width: 80,
+            show_location: true,
         });
 
         assert!(prompt.starts_with("  /workspace\n  ╭"));
@@ -2297,7 +2441,7 @@ mod tests {
         );
         assert_eq!(
             renderer.transcript_input("elixpo", "fix this"),
-            "  \n  ◆ > fix this\n  "
+            "\n  $ fix this"
         );
         assert_eq!(renderer.native_output_prefix(), "  ╰──▶ ");
         let handoff =
@@ -2514,8 +2658,9 @@ mod tests {
 
         assert!(footer.contains("Model context"));
         assert!(footer.contains("12.8k / 64.0k"));
-        assert!(footer.contains("effort high"));
-        assert!(footer.contains("· Oreo ·"));
+        assert!(footer.contains("· high"));
+        // The folder now shows in the composer, so the footer drops it.
+        assert!(!footer.contains("Oreo"));
         assert!(footer.contains("Quick Crumb"));
         assert!(footer.contains("auto"));
         assert!(footer.chars().count() <= 100);
@@ -2545,7 +2690,8 @@ mod tests {
             100,
         );
 
-        assert!(footer.contains("effort default"));
+        assert!(footer.ends_with("Quick Crumb · auto · default"));
+        assert!(!footer.contains("effort"));
         let narrow = renderer.context_footer(
             &StartupContext {
                 version: "0.1.0",
@@ -2561,7 +2707,60 @@ mod tests {
             },
             38,
         );
-        assert!(narrow.contains("effort extra high"));
+        assert!(narrow.contains("extra high"));
+    }
+
+    #[test]
+    fn footer_clicks_find_the_item_and_explain_it() {
+        let context = StartupContext {
+            version: "0.1.0",
+            platform: Platform::Linux,
+            instance_name: None,
+            model: Some("Balanced Crumb"),
+            mode: "auto",
+            effort: None,
+            session_budget_tokens: 64_000,
+            context_tokens: 0,
+            auto_compaction: false,
+            agent_configured: true,
+        };
+        let git = GitSegment {
+            branch: "main".to_owned(),
+            dirty: true,
+        };
+        let items = footer_items(&context, Some(&git), 120);
+        let renderer = Renderer::new(UiSettings {
+            color: false,
+            output: OutputMode::Rich,
+            motion: MotionMode::Reduced,
+            branding: BrandingMode::Disabled,
+        });
+        let footer = renderer.render_footer_items(&items, 120);
+        let column = |needle: &str| {
+            let byte = footer.find(needle).expect("item is shown");
+            u16::try_from(footer[..byte].chars().count()).expect("fits")
+        };
+
+        assert_eq!(
+            footer_item_at(&items, column("git:main *")),
+            Some((FooterItem::Git, "git:main *"))
+        );
+        assert_eq!(
+            footer_item_at(&items, column("Balanced")).map(|(item, _)| item),
+            Some(FooterItem::Pack)
+        );
+        assert_eq!(
+            footer_item_at(&items, column("default")).map(|(item, _)| item),
+            Some(FooterItem::Effort)
+        );
+        assert_eq!(footer_item_at(&items, 0), None);
+
+        let tip = renderer.footer_tip(FooterItem::Effort, "default", 60);
+        assert!(tip.contains("Reasoning effort · default"));
+        assert!(tip.contains("/effort use"));
+        assert!(tip.lines().all(|line| line.chars().count() <= 60));
+        let context_tip = renderer.footer_tip(FooterItem::Context, "Model context [──] 0%", 80);
+        assert!(context_tip.contains("Model context · [──] 0%"));
     }
 
     #[test]
@@ -2869,8 +3068,15 @@ mod tests {
                 "welcome exceeded {width} columns:\n{welcome}"
             );
         }
-        assert!(renderer.welcome(&context, 40).contains("CRUMB"));
-        assert!(renderer.welcome(&context, 60).contains("░█████╗░██████╗░"));
+        let wide = renderer.welcome(&context, 120);
+        assert!(wide.contains("C R U M B"));
+        assert!(wide.contains("╭▄█▄╮   ╭▄█▄╮"), "the panda logo stays");
+        assert!(!wide.contains("░█████╗░"), "the block wordmark is gone");
+        assert_eq!(
+            wide.lines().count(),
+            7,
+            "the header is as tall as the panda"
+        );
     }
 
     #[test]
