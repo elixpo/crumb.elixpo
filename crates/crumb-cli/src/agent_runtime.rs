@@ -127,26 +127,48 @@ fn turn_approvals(
     }
 }
 
-/// Builds the native Pollinations client, applying the provider's configured
-/// request timeout, stream idle timeout, and retry policy.
-fn native_pollinations_provider(
+/// Builds the native chat client for any `OpenAI` chat-completions provider,
+/// applying its configured request timeout, stream idle timeout, and retry
+/// policy. Pollinations falls back to the signed-in key; other providers need
+/// a configured credential unless they run on this machine.
+fn native_chat_provider(
+    name: &str,
     provider_config: &crumb_agent::ProviderConfig,
 ) -> Result<Arc<dyn crumb_llm::LlmProvider>> {
-    let credential = provider_config
+    if provider_config.protocol != crumb_agent::ProviderProtocol::OpenAiCompletions {
+        bail!(
+            "native Harness supports OpenAI chat-completions providers; `{name}` uses {:?}",
+            provider_config.protocol
+        );
+    }
+    let configured = provider_config
         .credential
         .as_ref()
         .map(crate::provider_projection::resolve_credential_secret)
         .transpose()?
-        .map_or_else(crate::pollinations_runtime_key, |secret| {
-            Some(secret.expose().to_owned())
-        })
-        .context("Pollinations credential is unavailable")?;
+        .map(|secret| secret.expose().to_owned());
+    let credential = if name == "pollinations" {
+        Some(
+            configured
+                .or_else(crate::pollinations_runtime_key)
+                .context("Pollinations credential is unavailable")?,
+        )
+    } else if configured.is_some() || is_loopback_endpoint(&provider_config.base_url) {
+        configured
+    } else {
+        bail!("provider `{name}` needs a credential unless it runs on localhost");
+    };
     let base_url = provider_config
         .base_url
         .trim_end_matches('/')
         .strip_suffix("/v1")
         .unwrap_or(provider_config.base_url.trim_end_matches('/'));
-    let mut client = PollinationsConfig::new(credential)?.with_base_url(base_url)?;
+    let mut client = credential
+        .map_or_else(
+            || Ok(PollinationsConfig::without_key()),
+            PollinationsConfig::new,
+        )?
+        .with_base_url(base_url)?;
     if let Some(timeout_ms) = provider_config.timeout_ms {
         client.request_timeout = Duration::from_millis(timeout_ms);
     }
@@ -163,6 +185,14 @@ fn native_pollinations_provider(
         client.retry.base_delay = Duration::from_millis(retry.base_delay_ms);
     }
     Ok(Arc::new(PollinationsProvider::new(client)?))
+}
+
+fn is_loopback_endpoint(base_url: &str) -> bool {
+    url::Url::parse(base_url).is_ok_and(|endpoint| {
+        endpoint
+            .host_str()
+            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1"))
+    })
 }
 
 fn native_harness_limits(config: &AgentConfig) -> Result<HarnessLimits> {
@@ -1814,17 +1844,11 @@ impl AgentRuntime {
         cancellation: &CancellationToken,
         on_activity: &mut dyn FnMut(HarnessActivity) -> Result<()>,
     ) -> Result<RunResult> {
-        if route.provider != "pollinations" {
-            bail!(
-                "native Harness currently supports the Pollinations provider; selected `{}`",
-                route.provider
-            );
-        }
         let provider_config = config
             .providers
             .get(&route.provider)
             .context("native Harness provider is not configured")?;
-        let provider = native_pollinations_provider(provider_config)?;
+        let provider = native_chat_provider(&route.provider, provider_config)?;
         let max_output_tokens = configured_max_output_tokens(config, route);
         let team_limits = ParallelAgentLimits::default();
         let child_output_tokens = max_output_tokens.map(|tokens| {
@@ -2112,14 +2136,11 @@ fn execute_isolated_peer_turn(
     let route = peer_router_route(config)
         .context("agent config has no peer router model")?
         .clone();
-    if route.provider != "pollinations" {
-        bail!("isolated peer turns require the Pollinations provider");
-    }
     let provider_config = config
         .providers
         .get(&route.provider)
         .context("native Harness provider is not configured")?;
-    let provider = native_pollinations_provider(provider_config)?;
+    let provider = native_chat_provider(&route.provider, provider_config)?;
 
     let mut tools = ToolHost::default();
     register_current_time_tool(&mut tools)?;
@@ -3831,6 +3852,55 @@ mod tests {
         assert_eq!(code_context.selected.len(), 1);
         assert!(code_context.instructions[0].contains("codebase-map"));
         assert!(!code_context.instructions[0].contains("web-research"));
+    }
+
+    #[test]
+    fn native_harness_accepts_local_openai_compatible_servers_without_a_key() {
+        use crumb_agent::{ProviderConfig, ProviderProtocol};
+
+        let local = ProviderConfig::new(
+            "Ollama",
+            ProviderProtocol::OpenAiCompletions,
+            "http://127.0.0.1:11434/v1",
+        );
+        assert!(super::native_chat_provider("ollama", &local).is_ok());
+
+        let remote = ProviderConfig::new(
+            "Remote",
+            ProviderProtocol::OpenAiCompletions,
+            "https://models.example.test/v1",
+        );
+        let error = super::native_chat_provider("remote", &remote)
+            .err()
+            .expect("a remote provider needs a credential");
+        assert!(error.to_string().contains("needs a credential"));
+
+        let responses = ProviderConfig::new(
+            "Responses",
+            ProviderProtocol::OpenAiResponses,
+            "http://localhost:8080/v1",
+        );
+        let error = super::native_chat_provider("responses", &responses)
+            .err()
+            .expect("only chat-completions providers run natively");
+        assert!(error.to_string().contains("chat-completions"));
+    }
+
+    #[test]
+    fn loopback_detection_covers_local_hosts_only() {
+        for local in [
+            "http://localhost:1976/v1",
+            "http://127.0.0.1:11434/v1",
+            "http://[::1]:1234/v1",
+        ] {
+            assert!(super::is_loopback_endpoint(local), "{local}");
+        }
+        for remote in [
+            "https://gen.pollinations.ai/v1",
+            "http://localhost.example.com/v1",
+        ] {
+            assert!(!super::is_loopback_endpoint(remote), "{remote}");
+        }
     }
 
     fn loaded_skill_ids(id: &str, request: &str) -> Vec<String> {
