@@ -4273,6 +4273,12 @@ fn persist_tool_permission(workspace: &Path, request: &crumb_agent::ApprovalRequ
 }
 
 fn trusted_tool_detail(name: &str, arguments: &serde_json::Value) -> Option<String> {
+    if name == crumb_agent::UPDATE_TASKS {
+        let tasks =
+            serde_json::from_value::<Vec<crumb_agent::Task>>(arguments.get("tasks")?.clone())
+                .ok()?;
+        return Some(crumb_agent::task_summary(&tasks));
+    }
     let field = match name {
         "run_shell" => "command",
         "web_search" => "query",
@@ -7149,6 +7155,7 @@ fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         ("list_directory", "workspace read", true),
         ("detect_stack", "workspace read", true),
         ("search_code", "workspace read", true),
+        ("update_tasks", "task list", true),
         ("write_file", "workspace write", true),
         ("run_disposable", "one-shot process", true),
         ("run_shell", "workspace process", true),
@@ -7177,6 +7184,7 @@ fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
                 | "list_directory"
                 | "detect_stack"
                 | "search_code"
+                | "update_tasks"
                 | "ask_user"
         ) || config.permissions.allow_network_tools.contains(name)
             || config.permissions.allow_workspace_tools.contains(name)

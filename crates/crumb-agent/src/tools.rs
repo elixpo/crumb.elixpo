@@ -110,7 +110,9 @@ impl ToolOutput {
 #[must_use]
 pub fn tool_activity_label(name: &str) -> String {
     let normalized = name.to_ascii_lowercase();
-    let action = if normalized.contains("write")
+    let action = if normalized.contains("task") {
+        "Planning"
+    } else if normalized.contains("write")
         || normalized.contains("edit")
         || normalized.contains("patch")
     {

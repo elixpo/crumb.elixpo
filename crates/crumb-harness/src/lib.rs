@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crumb_agent::{
     AgentSession, ApprovalBroker, ApprovalDecision, ApprovalRequest, CancellationToken, RiskClass,
-    ToolCallErrorKind, ToolHost, TurnStatus,
+    TaskBoard, ToolCallErrorKind, ToolHost, TurnStatus,
 };
 use crumb_llm::{
     ChatEvent, ChatMessage, ChatRequest, ChatRole, FinishReason, ImageInput, LlmProvider,
@@ -615,6 +615,7 @@ pub struct NativeHarness {
     tools: ToolHost,
     approvals: Arc<dyn ApprovalBroker>,
     limits: HarnessLimits,
+    tasks: Option<TaskBoard>,
 }
 
 #[derive(Clone, Copy)]
@@ -636,7 +637,16 @@ impl NativeHarness {
             tools,
             approvals,
             limits,
+            tasks: None,
         }
+    }
+
+    /// Checks `board` before a turn ends: open tasks send the model back to
+    /// finish them or mark them blocked with a reason.
+    #[must_use]
+    pub fn with_task_board(mut self, board: TaskBoard) -> Self {
+        self.tasks = Some(board);
+        self
     }
 
     #[must_use]
@@ -812,7 +822,7 @@ impl NativeHarness {
         let definitions = tool_definitions_for_turn(tools, &turn.user_message);
         let mut usage = TokenUsage::default();
         let mut output_bytes = 0_usize;
-        let mut checks = ResponseChecks::new(&definitions);
+        let mut checks = ResponseChecks::new(&definitions, self.tasks.clone());
         let mut require_tool = initial_tool_requirement(&definitions, &turn.user_message);
         let (mut failed_tool_evidence, mut suppress_tools_once) = (false, false);
         let mut evidence_noted = false;
@@ -2053,17 +2063,57 @@ struct ResponseChecks {
     failure_used: bool,
     completeness_used: bool,
     retries: RequiredToolRetries,
+    tasks: Option<TaskBoard>,
+    task_reminders: u8,
 }
 
+/// How many times one turn is sent back to finish open tasks.
+const MAX_TASK_REMINDERS: u8 = 2;
+
 impl ResponseChecks {
-    fn new(definitions: &[ToolDefinition]) -> Self {
+    fn new(definitions: &[ToolDefinition], tasks: Option<TaskBoard>) -> Self {
         Self {
             grounding_used: false,
             failure_used: false,
             completeness_used: false,
             retries: RequiredToolRetries::new(definitions),
+            tasks,
+            task_reminders: 0,
         }
     }
+}
+
+/// Sends the model back when its task list still has open items, so planned
+/// work is finished or reported as blocked instead of silently dropped.
+fn prepare_open_tasks_retry(
+    messages: &mut Vec<ChatMessage>,
+    response: &str,
+    checks: &mut ResponseChecks,
+) -> bool {
+    if checks.task_reminders >= MAX_TASK_REMINDERS {
+        return false;
+    }
+    let Some(board) = &checks.tasks else {
+        return false;
+    };
+    let open = board.open_tasks();
+    if open.is_empty() {
+        return false;
+    }
+    let list = open
+        .iter()
+        .map(|task| format!("- {}", task.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    messages.push(ChatMessage::text(ChatRole::Assistant, response));
+    messages.push(ChatMessage::text(
+        ChatRole::System,
+        format!(
+            "Your task list still has open items:\n{list}\nContinue them with tools now. If one truly cannot be finished, call update_tasks to mark it blocked with a note, then answer with what is done and what is blocked."
+        ),
+    ));
+    checks.task_reminders += 1;
+    true
 }
 
 fn prepare_response_retry(
@@ -2110,10 +2160,10 @@ fn prepare_response_retry(
     {
         return Some((true, false));
     }
-    checks
-        .retries
-        .prepare(messages, user_message, response)
-        .then_some((true, false))
+    if checks.retries.prepare(messages, user_message, response) {
+        return Some((true, false));
+    }
+    prepare_open_tasks_retry(messages, response, checks).then_some((false, false))
 }
 
 fn prepare_failure_grounding_retry(
@@ -3959,6 +4009,60 @@ mod tests {
         assert!(events.iter().any(|event| {
             matches!(event, HarnessEvent::Correction(text) if text == "Verified result:\n\n24 C")
         }));
+    }
+
+    #[tokio::test]
+    async fn open_tasks_send_the_model_back_before_the_turn_ends() {
+        let reply = |text: &str| {
+            vec![
+                ChatEvent::TextDelta(text.to_owned()),
+                ChatEvent::Finished(FinishReason::Stop),
+            ]
+        };
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            reply("Started."),
+            reply("Still going."),
+            reply("Here is where it stands."),
+        ]));
+        let board = crumb_agent::TaskBoard::default();
+        board
+            .replace(vec![crumb_agent::Task {
+                content: "Run the test suite".to_owned(),
+                status: crumb_agent::TaskStatus::Pending,
+                note: None,
+            }])
+            .expect("in-memory board");
+        let harness = NativeHarness::new(
+            provider.clone(),
+            tools(Arc::new(AtomicUsize::new(0))),
+            Arc::new(DenyAllApprovals),
+            HarnessLimits::default(),
+        )
+        .with_task_board(board);
+        let (_root, mut session) = session(AgentMode::Auto);
+        let mut conversation = harness.conversation();
+        let mut events = Vec::new();
+
+        let outcome = harness
+            .run_turn(
+                &mut session,
+                &mut conversation,
+                turn(),
+                &CancellationToken::default(),
+                &mut events,
+            )
+            .await
+            .expect("turn ends after the reminders");
+
+        let requests = provider.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 3, "two reminders, then the turn ends");
+        let reminder = requests[1].messages.iter().any(|message| {
+            message
+                .content
+                .contains("still has open items:\n- Run the test suite")
+        });
+        assert!(reminder);
+        assert_eq!(outcome.text, "Here is where it stands.");
     }
 
     #[tokio::test]
