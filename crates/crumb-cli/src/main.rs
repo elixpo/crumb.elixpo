@@ -3013,6 +3013,9 @@ struct ActiveTurnContext<'a> {
 #[derive(Default)]
 struct HarnessRenderState {
     streamed_response: bool,
+    /// An inline response block is being written; any other activity ends it
+    /// so narration, tool lines, and the answer each start on their own line.
+    response_open: bool,
     streamed_column: usize,
     active_tool: Option<(String, Option<String>)>,
     file_edits: BTreeMap<String, (u64, u64)>,
@@ -3262,12 +3265,15 @@ fn render_observed_activity(
             &terminal.transcript,
             terminal.header_rows,
         )?;
-        *activity = Some(start_activity_at(
-            renderer,
-            "Thinking",
-            terminal.fullscreen,
-            activity_row,
-        ));
+        // Inline, the spinner shares the line an open response is using.
+        if terminal.fullscreen || !render_state.response_open {
+            *activity = Some(start_activity_at(
+                renderer,
+                "Thinking",
+                terminal.fullscreen,
+                activity_row,
+            ));
+        }
     } else {
         render_harness_activity(
             event,
@@ -4293,6 +4299,9 @@ fn harness_activity_label(activity: &HarnessActivity) -> String {
     match activity {
         HarnessActivity::RequestAccepted => "request accepted".to_owned(),
         HarnessActivity::ResponseDelta { .. } => "responding".to_owned(),
+        HarnessActivity::ReasoningDelta { .. } => "reasoning".to_owned(),
+        HarnessActivity::ResponseRevised => "revising".to_owned(),
+        HarnessActivity::ResponseCorrected { .. } => "corrected answer".to_owned(),
         HarnessActivity::Usage { .. } => "updating context".to_owned(),
         HarnessActivity::Status { state } => format!("session {state}"),
         HarnessActivity::ToolStarted { name, .. } if name == "spawn_agents" => {
@@ -4333,22 +4342,10 @@ fn render_harness_activity(
     writer: &mut dyn Write,
     fullscreen: bool,
 ) -> Result<()> {
+    if render_response_activity(activity, indicator, state, renderer, writer, fullscreen)? {
+        return Ok(());
+    }
     match activity {
-        HarnessActivity::ResponseDelta { text } => {
-            if fullscreen {
-                state.streamed_response = true;
-                replace_activity(indicator, renderer, "Writing response", fullscreen);
-                return Ok(());
-            }
-            finish_activity_line(indicator, writer)?;
-            if !state.streamed_response {
-                write!(writer, "{} ", terminal_agent_response(renderer, ""))?;
-                state.streamed_response = true;
-                state.streamed_column = 8;
-            }
-            write_bounded_response_delta(writer, text, &mut state.streamed_column)?;
-            writer.flush()?;
-        }
         HarnessActivity::ToolStarted { name, detail } => render_tool_started(
             name,
             detail.as_deref(),
@@ -4422,9 +4419,79 @@ fn render_harness_activity(
         HarnessActivity::RequestAccepted => {
             replace_activity(indicator, renderer, "Request accepted", fullscreen);
         }
-        HarnessActivity::Usage { .. } => {}
+        HarnessActivity::Usage { .. }
+        | HarnessActivity::ResponseDelta { .. }
+        | HarnessActivity::ReasoningDelta { .. }
+        | HarnessActivity::ResponseRevised
+        | HarnessActivity::ResponseCorrected { .. } => {}
     }
     Ok(())
+}
+
+/// Renders model text activity. Returns whether `activity` was handled.
+fn render_response_activity(
+    activity: &HarnessActivity,
+    indicator: &mut Option<crumb_ui::ActivityIndicator>,
+    state: &mut HarnessRenderState,
+    renderer: Renderer,
+    writer: &mut dyn Write,
+    fullscreen: bool,
+) -> Result<bool> {
+    let continues_response = matches!(
+        activity,
+        HarnessActivity::ResponseDelta { .. } | HarnessActivity::Usage { .. }
+    );
+    if state.response_open && !continues_response {
+        writeln!(writer)?;
+        state.response_open = false;
+    }
+    match activity {
+        HarnessActivity::ResponseDelta { text } => {
+            if fullscreen {
+                state.streamed_response = true;
+                replace_activity(indicator, renderer, "Writing response", fullscreen);
+                return Ok(true);
+            }
+            // Clearing the line on every delta would erase the text streamed
+            // so far; only a new block takes over the activity line.
+            if !state.response_open {
+                finish_activity_line(indicator, writer)?;
+                write!(writer, "{} ", terminal_agent_response(renderer, ""))?;
+                state.streamed_response = true;
+                state.response_open = true;
+                state.streamed_column = 8;
+            }
+            write_bounded_response_delta(writer, text, &mut state.streamed_column)?;
+            writer.flush()?;
+        }
+        HarnessActivity::ReasoningDelta { .. } => {
+            replace_activity(indicator, renderer, "Reasoning", fullscreen);
+        }
+        HarnessActivity::ResponseRevised => {
+            if !fullscreen {
+                finish_activity_line(indicator, writer)?;
+                writeln!(
+                    writer,
+                    "{}",
+                    renderer.agent_activity("↻ revising the draft against the tool results")
+                )?;
+                writer.flush()?;
+            }
+            replace_activity(indicator, renderer, "Revising", fullscreen);
+        }
+        HarnessActivity::ResponseCorrected { text } => {
+            // Fullscreen renders the final, corrected answer when the turn
+            // settles; inline output already streamed and needs the fix shown.
+            if !fullscreen {
+                finish_activity_line(indicator, writer)?;
+                writeln!(writer, "{}", renderer.agent_activity("Corrected answer"))?;
+                writeln!(writer, "{}", terminal_agent_response(renderer, text))?;
+                writer.flush()?;
+            }
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 fn render_tool_started(
