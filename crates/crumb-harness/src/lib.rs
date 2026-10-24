@@ -809,7 +809,7 @@ impl NativeHarness {
         let mut messages = system_messages_for_profile(&turn, profile);
         messages.extend(conversation.messages());
         messages.push(turn.user_chat_message());
-        let definitions = tool_definitions_for_turn(tools, &turn.user_message);
+        let (mut definitions, mut deferred) = tool_definitions_for_turn(tools, &turn.user_message);
         let mut usage = TokenUsage::default();
         let mut output_bytes = 0_usize;
         let mut checks = ResponseChecks::new(&definitions);
@@ -866,20 +866,16 @@ impl NativeHarness {
                 ));
             }
 
-            for call in &mut round.calls {
-                preserve_web_search_terms(call, &turn.user_message);
+            record_tool_round(&mut messages, &mut round, &turn.user_message);
+            let calls =
+                answer_load_tools(round.calls, &mut definitions, &mut deferred, &mut messages);
+            if calls.is_empty() {
+                continue;
             }
-            messages.push(ChatMessage {
-                role: ChatRole::Assistant,
-                content: round.text,
-                images: Vec::new(),
-                tool_call_id: None,
-                tool_calls: round.calls.clone(),
-            });
             let (round_succeeded, failed_tools) = self.execute_round_calls(
                 session,
                 tools,
-                round.calls,
+                calls,
                 cancellation,
                 sink,
                 metrics,
@@ -1218,20 +1214,136 @@ fn wrap_up_instruction(limit: HarnessErrorKind) -> ChatMessage {
     )
 }
 
-fn tool_definitions_for_turn(tools: &ToolHost, user_message: &str) -> Vec<ToolDefinition> {
+/// `(offered, deferred)` for this turn: everything except situational tools
+/// the request does not mention, plus `load_tools` when any were held back.
+/// Adds the model's tool-calling message, keeping web search terms intact.
+fn record_tool_round(messages: &mut Vec<ChatMessage>, round: &mut ModelRound, user_message: &str) {
+    for call in &mut round.calls {
+        preserve_web_search_terms(call, user_message);
+    }
+    messages.push(ChatMessage {
+        role: ChatRole::Assistant,
+        content: std::mem::take(&mut round.text),
+        images: Vec::new(),
+        tool_call_id: None,
+        tool_calls: round.calls.clone(),
+    });
+}
+
+fn tool_definitions_for_turn(
+    tools: &ToolHost,
+    user_message: &str,
+) -> (Vec<ToolDefinition>, Vec<ToolDefinition>) {
+    let (mut offered, deferred) = split_turn_tools(tools, user_message);
+    if !deferred.is_empty() {
+        offered.push(load_tools_definition(&deferred));
+    }
+    (offered, deferred)
+}
+
+/// `(offered, deferred)`: deferred tools stay out of the prompt until the
+/// model asks for them with `load_tools`, so nothing is out of reach.
+fn split_turn_tools(
+    tools: &ToolHost,
+    user_message: &str,
+) -> (Vec<ToolDefinition>, Vec<ToolDefinition>) {
     if is_casual_conversation(user_message) {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let words = message_words(user_message);
     tools
         .tools()
-        .filter(|tool| situational_tool_relevant(&tool.name, &words))
         .map(|tool| ToolDefinition {
             name: tool.name.clone(),
             description: tool.description.clone(),
             input_schema: tool.input_schema.clone(),
         })
-        .collect()
+        .partition(|tool| situational_tool_relevant(&tool.name, &words))
+}
+
+const LOAD_TOOLS: &str = "load_tools";
+
+fn load_tools_definition(deferred: &[ToolDefinition]) -> ToolDefinition {
+    let catalog = deferred
+        .iter()
+        .map(|tool| {
+            let summary = tool
+                .description
+                .split_terminator(". ")
+                .next()
+                .unwrap_or(&tool.description);
+            format!("{}: {}", tool.name, compact_history_message(summary, 120))
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    ToolDefinition {
+        name: LOAD_TOOLS.to_owned(),
+        description: format!(
+            "Add more tools to this turn when the task needs them. Available: {catalog}."
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "names": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": deferred.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>()},
+                    "minItems": 1
+                }
+            },
+            "required": ["names"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// Answers `load_tools` calls in the harness: the named tools join this
+/// turn's definitions. Returns the calls that still need executing.
+fn answer_load_tools(
+    calls: Vec<ToolCall>,
+    definitions: &mut Vec<ToolDefinition>,
+    deferred: &mut Vec<ToolDefinition>,
+    messages: &mut Vec<ChatMessage>,
+) -> Vec<ToolCall> {
+    let (loads, rest): (Vec<_>, Vec<_>) =
+        calls.into_iter().partition(|call| call.name == LOAD_TOOLS);
+    for call in loads {
+        let requested = call
+            .arguments
+            .get("names")
+            .and_then(serde_json::Value::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut loaded = Vec::new();
+        deferred.retain(|tool| {
+            let wanted = requested.contains(&tool.name);
+            if wanted {
+                loaded.push(tool.clone());
+            }
+            !wanted
+        });
+        let names = loaded
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        definitions.retain(|tool| tool.name != LOAD_TOOLS);
+        definitions.extend(loaded);
+        if !deferred.is_empty() {
+            definitions.push(load_tools_definition(deferred));
+        }
+        let reply = if names.is_empty() {
+            "No matching tools to load; the available names are listed in load_tools.".to_owned()
+        } else {
+            format!("Loaded {}. Call them now.", names.join(", "))
+        };
+        messages.push(ChatMessage::tool_result(call.id, reply));
+    }
+    rest
 }
 
 /// Words that turn a greeting into a request for work.
@@ -3502,10 +3614,54 @@ mod tests {
             "ok",
         ] {
             assert!(
-                super::tool_definitions_for_turn(&tools, greeting).is_empty(),
+                super::tool_definitions_for_turn(&tools, greeting)
+                    .0
+                    .is_empty(),
                 "casual greeting should not spend tokens on tools: {greeting}"
             );
         }
+    }
+
+    #[test]
+    fn deferred_tools_can_be_loaded_mid_turn() {
+        let deferred = vec![crumb_llm::ToolDefinition {
+            name: "jev_decide".to_owned(),
+            description: "Get calibrated judgments. More detail here.".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let load = super::load_tools_definition(&deferred);
+        assert!(
+            load.description
+                .contains("jev_decide: Get calibrated judgments")
+        );
+        let mut definitions = vec![load];
+        let mut remaining = deferred;
+        let mut messages = Vec::new();
+        let rest = super::answer_load_tools(
+            vec![
+                crumb_llm::ToolCall {
+                    id: "load".to_owned(),
+                    name: "load_tools".to_owned(),
+                    arguments: serde_json::json!({"names": ["jev_decide"]}),
+                },
+                crumb_llm::ToolCall {
+                    id: "other".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: serde_json::json!({}),
+                },
+            ],
+            &mut definitions,
+            &mut remaining,
+            &mut messages,
+        );
+        assert_eq!(rest.len(), 1, "other calls still run");
+        assert_eq!(remaining, Vec::<crumb_llm::ToolDefinition>::new());
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(
+            definitions[0].name, "jev_decide",
+            "load_tools leaves once nothing is deferred"
+        );
+        assert!(messages[0].content.contains("Loaded jev_decide"));
     }
 
     #[test]
@@ -3562,7 +3718,7 @@ mod tests {
             "yo, search for today's news",
         ] {
             assert_eq!(
-                super::tool_definitions_for_turn(&tools, request).len(),
+                super::tool_definitions_for_turn(&tools, request).0.len(),
                 1,
                 "work request must retain available tools: {request}"
             );
