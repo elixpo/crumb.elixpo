@@ -144,6 +144,10 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "set light, medium, high, extra high, or default",
     },
     SlashCommand {
+        usage: "/terminal-setup",
+        description: "make Shift+Enter insert a new line in VS Code's terminal",
+    },
+    SlashCommand {
         usage: "/agents",
         description: "show the agent map: helpers and background jobs",
     },
