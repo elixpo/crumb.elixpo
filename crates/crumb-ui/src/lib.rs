@@ -1414,9 +1414,27 @@ fn startup_punchline() -> &'static str {
     PUNCHLINES[index]
 }
 
+/// Serializes whole terminal frames across threads.
+///
+/// The activity animation runs on its own thread and, like the transcript
+/// painter, saves and restores the cursor. Terminals keep a single saved
+/// position, so frames written concurrently would restore each other's
+/// cursor. Every frame writer holds this lock while it writes and flushes.
+static TERMINAL_OUTPUT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Holds the terminal frame lock; see [`TERMINAL_OUTPUT`].
+pub fn lock_terminal_output() -> std::sync::MutexGuard<'static, ()> {
+    TERMINAL_OUTPUT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A best-effort activity line that always clears itself before final output.
 pub struct ActivityIndicator {
     running: Arc<AtomicBool>,
+    /// Dropping the sender wakes the animation immediately instead of
+    /// waiting out its frame delay.
+    stop_signal: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<JoinHandle<()>>,
     started: Instant,
     label: String,
@@ -1428,13 +1446,15 @@ pub struct ActivityIndicator {
 impl ActivityIndicator {
     fn start(label: &str, animated: bool, color: bool, row: Option<u16>) -> Self {
         let running = Arc::new(AtomicBool::new(animated));
+        let (stop_signal, stopped) = std::sync::mpsc::channel();
         let thread = animated.then(|| {
             let running = Arc::clone(&running);
             let label = label.to_owned();
-            thread::spawn(move || animate_activity(&label, color, &running, row))
+            thread::spawn(move || animate_activity(&label, color, &running, &stopped, row))
         });
         Self {
             running,
+            stop_signal: Some(stop_signal),
             thread,
             started: Instant::now(),
             label: label.to_owned(),
@@ -1488,6 +1508,7 @@ impl ActivityIndicator {
 
     fn stop(&mut self) {
         self.running.store(false, Ordering::Release);
+        self.stop_signal.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
             clear_activity_line(self.row);
@@ -1501,7 +1522,13 @@ impl Drop for ActivityIndicator {
     }
 }
 
-fn animate_activity(label: &str, color: bool, running: &AtomicBool, row: Option<u16>) {
+fn animate_activity(
+    label: &str,
+    color: bool,
+    running: &AtomicBool,
+    stopped: &std::sync::mpsc::Receiver<()>,
+    row: Option<u16>,
+) {
     let mut frame = 0_usize;
     let started = Instant::now();
     while running.load(Ordering::Acquire) {
@@ -1513,9 +1540,12 @@ fn animate_activity(label: &str, color: bool, running: &AtomicBool, row: Option<
             format!("{cookie} {label} · {elapsed:.1}s")
         };
         write_activity_line(&line, row);
-        let _ = io::stderr().flush();
         frame = (frame + 1) % COOKIE_SPINNER.len();
-        thread::sleep(Duration::from_millis(140));
+        if stopped.recv_timeout(Duration::from_millis(140))
+            != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        {
+            break;
+        }
     }
 }
 
@@ -1525,12 +1555,14 @@ fn write_activity_line(line: &str, row: Option<u16>) {
     } else {
         format!("\r\x1b[2K{line}")
     };
-    let _ = io::stderr().write_all(rendered.as_bytes());
+    let _frame = lock_terminal_output();
+    let mut terminal = io::stderr();
+    let _ = terminal.write_all(rendered.as_bytes());
+    let _ = terminal.flush();
 }
 
 fn clear_activity_line(row: Option<u16>) {
     write_activity_line("", row);
-    let _ = io::stderr().flush();
 }
 
 /// Removes provider reasoning wrappers from text intended for the terminal.
