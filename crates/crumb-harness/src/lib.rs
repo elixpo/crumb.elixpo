@@ -149,6 +149,15 @@ const MAX_ARTIFACT_REFERENCES: usize = 20;
 const MAX_SELECTED_SKILL_BYTES: usize = 4 * 1024;
 const MAX_SELECTED_SKILLS: usize = 32;
 const TRUNCATION_MARKER: &str = "\n[... earlier turn content compacted ...]\n";
+/// Largest tool result sent to the model; larger output keeps its head and
+/// tail. Every later round resends it, so one huge result costs many times.
+const MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
+const TOOL_RESULT_MARKER: &str =
+    "\n[... tool output truncated; run a narrower command to see the omitted part ...]\n";
+/// Tool rounds whose results are resent in full; older results shrink.
+const FRESH_TOOL_ROUNDS: usize = 2;
+const STALE_TOOL_RESULT_BYTES: usize = 1024;
+const STALE_TOOL_RESULT_MARKER: &str = "\n[... earlier tool output shortened to save context; run the tool again if you need it ...]\n";
 
 /// In-memory bounded conversation state. It is never persisted by this crate.
 #[derive(Clone, Debug)]
@@ -450,23 +459,53 @@ fn render_selected_skill(skill: &SelectedSkill) -> String {
 }
 
 fn compact_history_message(message: &str, max_bytes: usize) -> String {
+    elide_middle(message, max_bytes, TRUNCATION_MARKER)
+}
+
+/// Keeps the head and tail of `message` within `max_bytes`, joined by `marker`.
+fn elide_middle(message: &str, max_bytes: usize, marker: &str) -> String {
     if message.len() <= max_bytes {
         return message.to_owned();
     }
-    if max_bytes <= TRUNCATION_MARKER.len() {
+    if max_bytes <= marker.len() {
         return String::new();
     }
-    let content_budget = max_bytes - TRUNCATION_MARKER.len();
+    let content_budget = max_bytes - marker.len();
     let head_budget = content_budget.div_ceil(2);
     let tail_budget = content_budget / 2;
     let head_end = floor_char_boundary(message, head_budget);
     let tail_start = ceil_char_boundary(message, message.len().saturating_sub(tail_budget));
-    format!(
-        "{}{}{}",
-        &message[..head_end],
-        TRUNCATION_MARKER,
-        &message[tail_start..]
-    )
+    format!("{}{marker}{}", &message[..head_end], &message[tail_start..])
+}
+
+/// The conversation as sent to the model: tool results from before the most
+/// recent [`FRESH_TOOL_ROUNDS`] tool rounds shrink to a short excerpt. The
+/// harness keeps the full text for its own checks.
+fn request_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let fresh_start = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, message)| {
+            message.role == ChatRole::Assistant && !message.tool_calls.is_empty()
+        })
+        .nth(FRESH_TOOL_ROUNDS - 1)
+        .map_or(0, |(index, _)| index);
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let mut message = message.clone();
+            if index < fresh_start && message.role == ChatRole::Tool {
+                message.content = elide_middle(
+                    &message.content,
+                    STALE_TOOL_RESULT_BYTES,
+                    STALE_TOOL_RESULT_MARKER,
+                );
+            }
+            message
+        })
+        .collect()
 }
 
 fn floor_char_boundary(value: &str, mut index: usize) -> usize {
@@ -908,7 +947,10 @@ impl NativeHarness {
             } else {
                 failed_tools.push(call.name.clone());
             }
-            messages.push(ChatMessage::tool_result(call.id, result.content));
+            messages.push(ChatMessage::tool_result(
+                call.id,
+                elide_middle(&result.content, MAX_TOOL_RESULT_BYTES, TOOL_RESULT_MARKER),
+            ));
         }
         Ok((round_succeeded, failed_tools))
     }
@@ -1765,7 +1807,7 @@ fn build_request(
     let (require_tool, suppress_tools) = tool_choice;
     ChatRequest {
         model: turn.model.clone(),
-        messages: messages.to_vec(),
+        messages: request_messages(messages),
         tools: definitions.to_vec(),
         tool_choice: if definitions.is_empty() || suppress_tools {
             ToolChoice::None
@@ -2704,9 +2746,9 @@ mod tests {
         export_session,
     };
     use crumb_llm::{
-        ChatEvent, ChatRequest, ChatRole, ChatStream, EmbeddingRequest, EmbeddingResponse,
-        FinishReason, ImageInput, LlmProvider, ProviderError, ProviderErrorKind, ProviderFuture,
-        TokenUsage, ToolCall, ToolChoice,
+        ChatEvent, ChatMessage, ChatRequest, ChatRole, ChatStream, EmbeddingRequest,
+        EmbeddingResponse, FinishReason, ImageInput, LlmProvider, ProviderError, ProviderErrorKind,
+        ProviderFuture, TokenUsage, ToolCall, ToolChoice,
     };
     use serde_json::json;
 
@@ -3308,6 +3350,84 @@ mod tests {
             error.to_string(),
             "model provider failed: Pollinations request failed with HTTP 400 Bad Request"
         );
+    }
+
+    fn tool_round_messages(round: usize, output: &str) -> [ChatMessage; 2] {
+        let id = format!("call_{round}");
+        [
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: String::new(),
+                images: Vec::new(),
+                tool_call_id: None,
+                tool_calls: vec![ToolCall {
+                    id: id.clone(),
+                    name: "read_file".to_owned(),
+                    arguments: json!({}),
+                }],
+            },
+            ChatMessage::tool_result(id, output),
+        ]
+    }
+
+    #[test]
+    fn stale_tool_results_shrink_while_recent_rounds_stay_whole() {
+        let output = "x".repeat(20 * 1024);
+        let mut messages = vec![ChatMessage::text(ChatRole::User, "refactor the module")];
+        for round in 0..4 {
+            messages.extend(tool_round_messages(round, &output));
+        }
+
+        let sent = super::request_messages(&messages);
+
+        let tool_sizes = sent
+            .iter()
+            .filter(|message| message.role == ChatRole::Tool)
+            .map(|message| message.content.len())
+            .collect::<Vec<_>>();
+        assert!(tool_sizes[0] <= super::STALE_TOOL_RESULT_BYTES);
+        assert!(tool_sizes[1] <= super::STALE_TOOL_RESULT_BYTES);
+        assert_eq!(&tool_sizes[2..], [output.len(), output.len()]);
+        assert!(sent[2].content.contains("run the tool again"));
+        // The harness's own copy is untouched.
+        assert_eq!(messages[2].content.len(), output.len());
+    }
+
+    #[test]
+    fn long_tool_loops_resend_far_fewer_bytes() {
+        // Twelve tool rounds of 20 KiB each: count every byte the model is sent
+        // across the session, with and without shrinking stale results.
+        let output = "y".repeat(20 * 1024);
+        let mut messages = vec![ChatMessage::text(ChatRole::User, "fix the build")];
+        let (mut full, mut trimmed) = (0_usize, 0_usize);
+        for round in 0..12 {
+            messages.extend(tool_round_messages(round, &output));
+            full += messages
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>();
+            trimmed += super::request_messages(&messages)
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>();
+        }
+        assert!(
+            trimmed * 10 < full * 4,
+            "expected more than a 60% saving, sent {trimmed} of {full} bytes"
+        );
+    }
+
+    #[test]
+    fn oversized_tool_results_keep_head_and_tail() {
+        let output = format!("HEAD{}TAIL", "z".repeat(100 * 1024));
+        let capped = super::elide_middle(
+            &output,
+            super::MAX_TOOL_RESULT_BYTES,
+            super::TOOL_RESULT_MARKER,
+        );
+        assert!(capped.len() <= super::MAX_TOOL_RESULT_BYTES);
+        assert!(capped.starts_with("HEAD") && capped.ends_with("TAIL"));
+        assert!(capped.contains("narrower command"));
     }
 
     /// Text streamed after the last tool result or revision marker: the
