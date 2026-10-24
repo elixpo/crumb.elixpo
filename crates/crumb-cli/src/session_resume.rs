@@ -9,6 +9,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use crumb_agent::{SessionEvent, TurnStatus, export_session};
 use crumb_core::redact_sensitive_text;
 use crumb_harness::{ConversationSnapshot, SavedTurn};
 use serde::{Deserialize, Serialize};
@@ -139,6 +140,107 @@ pub(crate) fn resume_brief(folder: &Path) -> Option<String> {
         "If the user asks to continue, pick up exactly where this left off: check what was already done before redoing it.",
     );
     Some(brief)
+}
+
+/// What happened in a session so far, from its journal and saved
+/// conversation: turn outcomes, tools used, recorded actions, and the latest
+/// exchanges. Lets a resumed agent start with the session's history instead
+/// of a blank slate, even for sessions saved before conversations were kept.
+pub(crate) fn session_recap(
+    root: &Path,
+    session_id: &str,
+    conversation: Option<&ConversationSnapshot>,
+) -> Option<String> {
+    let export = export_session(root, session_id).ok()?;
+    let mut turns = 0_u32;
+    let mut last_status = None;
+    let mut tools = std::collections::BTreeMap::<String, u32>::new();
+    for event in &export.events {
+        match event {
+            SessionEvent::TurnFinished { status, .. } => {
+                turns += 1;
+                last_status = Some(*status);
+            }
+            SessionEvent::ToolFinished {
+                name,
+                success: true,
+                ..
+            } => *tools.entry(name.clone()).or_default() += 1,
+            _ => {}
+        }
+    }
+    if turns == 0 && conversation.is_none_or(|saved| saved.turns.is_empty()) {
+        return None;
+    }
+    let mut recap = format!("Recap of this session so far: {turns} turns");
+    if let Some(status) = last_status {
+        let _ = write!(recap, " (the last one {})", status_label(status));
+    }
+    recap.push('.');
+    if !tools.is_empty() {
+        let mut used = tools.into_iter().collect::<Vec<_>>();
+        used.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        let used = used
+            .iter()
+            .take(8)
+            .map(|(name, count)| format!("{name} ×{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(recap, "\nTools that succeeded: {used}.");
+    }
+    if let Some(saved) = conversation {
+        if !saved.action_facts.is_empty() {
+            let _ = write!(recap, "\nRecorded actions:");
+            for fact in saved.action_facts.iter().rev().take(10).rev() {
+                let _ = write!(recap, "\n- {}", clip(fact, 200));
+            }
+        }
+        if !saved.turns.is_empty() {
+            let _ = write!(recap, "\nLatest exchanges:");
+            for turn in saved.turns.iter().rev().take(3).rev() {
+                let _ = write!(
+                    recap,
+                    "\n- User: {}\n  Crumb: {}",
+                    clip(&turn.user, 300),
+                    clip(&turn.assistant, 300)
+                );
+            }
+        }
+    } else {
+        recap.push_str("\nThe conversation text of this session was not saved; ask the user for any detail you need.");
+    }
+    Some(recap)
+}
+
+/// One line for the user: the latest request and how it ended.
+pub(crate) fn user_recap(conversation: Option<&ConversationSnapshot>) -> Option<String> {
+    let turn = conversation?.turns.last()?;
+    let answer = turn
+        .assistant
+        .lines()
+        .find(|line| !line.trim().is_empty())?;
+    Some(format!(
+        "Last: {} → {}",
+        clip(turn.user.lines().next().unwrap_or_default(), 80),
+        clip(answer, 100)
+    ))
+}
+
+const fn status_label(status: TurnStatus) -> &'static str {
+    match status {
+        TurnStatus::Complete => "completed",
+        TurnStatus::Cancelled => "was cancelled",
+        TurnStatus::Failed => "failed",
+        TurnStatus::LimitReached => "hit a limit",
+    }
+}
+
+fn clip(text: &str, limit: usize) -> String {
+    let text = text.trim().replace('\n', " ");
+    if text.chars().count() <= limit {
+        return text;
+    }
+    format!("{}…", text.chars().take(limit).collect::<String>())
 }
 
 fn read_json(path: &Path) -> Option<Value> {

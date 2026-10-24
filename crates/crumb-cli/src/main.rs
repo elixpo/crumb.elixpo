@@ -9197,6 +9197,9 @@ fn write_interrupted_note(
     cwd: &Path,
     writer: &mut dyn Write,
 ) -> Result<()> {
+    if let Some(recap) = runtime.and_then(|runtime| runtime.resume_recap(cwd)) {
+        writeln!(writer, "  {recap}")?;
+    }
     if let Some(request) = runtime.and_then(|runtime| runtime.interrupted_request(cwd)) {
         let request = request.lines().next().unwrap_or_default();
         writeln!(
