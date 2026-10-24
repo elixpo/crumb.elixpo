@@ -127,6 +127,44 @@ fn turn_approvals(
     }
 }
 
+/// Builds the native Pollinations client, applying the provider's configured
+/// request timeout, stream idle timeout, and retry policy.
+fn native_pollinations_provider(
+    provider_config: &crumb_agent::ProviderConfig,
+) -> Result<Arc<dyn crumb_llm::LlmProvider>> {
+    let credential = provider_config
+        .credential
+        .as_ref()
+        .map(crate::provider_projection::resolve_credential_secret)
+        .transpose()?
+        .map_or_else(crate::pollinations_runtime_key, |secret| {
+            Some(secret.expose().to_owned())
+        })
+        .context("Pollinations credential is unavailable")?;
+    let base_url = provider_config
+        .base_url
+        .trim_end_matches('/')
+        .strip_suffix("/v1")
+        .unwrap_or(provider_config.base_url.trim_end_matches('/'));
+    let mut client = PollinationsConfig::new(credential)?.with_base_url(base_url)?;
+    if let Some(timeout_ms) = provider_config.timeout_ms {
+        client.request_timeout = Duration::from_millis(timeout_ms);
+    }
+    if let Some(idle_ms) = provider_config.stream_idle_timeout_ms {
+        client.stream_idle_timeout = Duration::from_millis(idle_ms);
+    }
+    // An all-zero policy is the serde default and means "not configured".
+    let retry = provider_config.retry;
+    if retry.max_retries > 0 {
+        client.retry.max_attempts =
+            u8::try_from(retry.max_retries.saturating_add(1)).unwrap_or(u8::MAX);
+    }
+    if retry.base_delay_ms > 0 {
+        client.retry.base_delay = Duration::from_millis(retry.base_delay_ms);
+    }
+    Ok(Arc::new(PollinationsProvider::new(client)?))
+}
+
 fn native_harness_limits(config: &AgentConfig) -> Result<HarnessLimits> {
     Ok(HarnessLimits {
         max_model_rounds: NonZeroUsize::new(
@@ -1771,23 +1809,7 @@ impl AgentRuntime {
             .providers
             .get(&route.provider)
             .context("native Harness provider is not configured")?;
-        let credential = provider_config
-            .credential
-            .as_ref()
-            .map(crate::provider_projection::resolve_credential_secret)
-            .transpose()?
-            .map_or_else(crate::pollinations_runtime_key, |secret| {
-                Some(secret.expose().to_owned())
-            })
-            .context("Pollinations credential is unavailable")?;
-        let base_url = provider_config
-            .base_url
-            .trim_end_matches('/')
-            .strip_suffix("/v1")
-            .unwrap_or(provider_config.base_url.trim_end_matches('/'));
-        let provider: Arc<dyn crumb_llm::LlmProvider> = Arc::new(PollinationsProvider::new(
-            PollinationsConfig::new(credential)?.with_base_url(base_url)?,
-        )?);
+        let provider = native_pollinations_provider(provider_config)?;
         let max_output_tokens = configured_max_output_tokens(config, route);
         let team_limits = ParallelAgentLimits::default();
         let child_output_tokens = max_output_tokens.map(|tokens| {
@@ -2079,23 +2101,7 @@ fn execute_isolated_peer_turn(
         .providers
         .get(&route.provider)
         .context("native Harness provider is not configured")?;
-    let credential = provider_config
-        .credential
-        .as_ref()
-        .map(crate::provider_projection::resolve_credential_secret)
-        .transpose()?
-        .map_or_else(crate::pollinations_runtime_key, |secret| {
-            Some(secret.expose().to_owned())
-        })
-        .context("Pollinations credential is unavailable")?;
-    let base_url = provider_config
-        .base_url
-        .trim_end_matches('/')
-        .strip_suffix("/v1")
-        .unwrap_or(provider_config.base_url.trim_end_matches('/'));
-    let provider: Arc<dyn crumb_llm::LlmProvider> = Arc::new(PollinationsProvider::new(
-        PollinationsConfig::new(credential)?.with_base_url(base_url)?,
-    )?);
+    let provider = native_pollinations_provider(provider_config)?;
 
     let mut tools = ToolHost::default();
     register_current_time_tool(&mut tools)?;
