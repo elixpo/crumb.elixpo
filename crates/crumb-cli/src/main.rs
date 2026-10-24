@@ -1172,8 +1172,12 @@ fn handle_repl_event(
         InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
             if command == "/agents" || command.starts_with("/agents ") =>
         {
-            let text = agents_command_text(&command, context);
-            writeln!(context.writer, "{text}")?;
+            if command == "/agents" && context.interactive {
+                show_agent_map_panel(context)?;
+            } else {
+                let text = agents_command_text(&command, context);
+                writeln!(context.writer, "{text}")?;
+            }
             Ok(None)
         }
         InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
@@ -1236,6 +1240,119 @@ fn agents_command_text(command: &str, context: &InputContext<'_>) -> String {
         runtime.token_usage().0,
     ));
     agent_map_text(&map, command, context.renderer)
+}
+
+/// The agent map as a panel: helpers and jobs as rows; Enter or a click
+/// opens one entry's details, and Esc closes.
+fn show_agent_map_panel(context: &mut InputContext<'_>) -> Result<()> {
+    let Some(runtime) = context.agent_runtime.as_ref() else {
+        writeln!(context.writer, "◆ No agents have run in this session yet.")?;
+        return Ok(());
+    };
+    let config = read_agent_config(context.cwd).unwrap_or_default();
+    let map = runtime.agent_map(agent_map_main_label(
+        context.cwd,
+        &config,
+        runtime.token_usage().0,
+    ));
+    loop {
+        let view = map.view();
+        let mut entries = Vec::new();
+        let mut rows = Vec::new();
+        for (index, helper) in view.helpers.iter().enumerate() {
+            let state = match helper.state {
+                crumb_ui::AgentMapState::Working => "working",
+                crumb_ui::AgentMapState::Done => "done",
+                crumb_ui::AgentMapState::Failed => "failed",
+            };
+            rows.push(choice_dialog::DialogRow {
+                label: format!("{} · {state}", helper.name),
+                detail: format!(
+                    "{} · {} · {} tokens · {}",
+                    helper.task,
+                    elapsed_label(helper.elapsed),
+                    compact_token_count(helper.tokens),
+                    helper.activity
+                ),
+                checked: None,
+            });
+            entries.push((index + 1).to_string());
+        }
+        for job in &view.jobs {
+            rows.push(choice_dialog::DialogRow {
+                label: format!("job {} · {}", job.id, job.status),
+                detail: format!("{} · {}", job.label, elapsed_label(job.elapsed)),
+                checked: None,
+            });
+            entries.push(format!("job {}", job.id));
+        }
+        if rows.is_empty() {
+            writeln!(
+                context.writer,
+                "◆ Agent map · {} · no helpers or background jobs yet",
+                view.main
+            )?;
+            return Ok(());
+        }
+        let notes = vec![view.main.clone()];
+        let dialog = choice_dialog::ChoiceDialog {
+            title: "Agent map",
+            notes: &notes,
+            hint: "↑/↓ choose · Enter or click for details · Esc close",
+            actions: &[],
+        };
+        let outcome = choice_dialog::run_choice_dialog(
+            context.renderer,
+            &dialog,
+            &mut rows,
+            context.fullscreen,
+        )?;
+        let choice_dialog::DialogOutcome::Chosen(index) = outcome else {
+            break;
+        };
+        let detail = map.detail(&entries[index]);
+        let lines = detail
+            .lines()
+            .take(16)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut back = vec![choice_dialog::DialogRow {
+            label: "Back to the agent map".to_owned(),
+            detail: String::new(),
+            checked: None,
+        }];
+        let detail_dialog = choice_dialog::ChoiceDialog {
+            title: &rows[index].label,
+            notes: &lines,
+            hint: "Enter or Esc to go back",
+            actions: &[],
+        };
+        choice_dialog::run_choice_dialog(
+            context.renderer,
+            &detail_dialog,
+            &mut back,
+            context.fullscreen,
+        )?;
+    }
+    if context.fullscreen {
+        // The panel drew over the bottom of the screen.
+        let state = context
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        render_transcript_view(&state, context.renderer, context.header_rows)?;
+    }
+    Ok(())
+}
+
+/// `41s` or `3m 50s`.
+fn elapsed_label(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn agent_map_text(
