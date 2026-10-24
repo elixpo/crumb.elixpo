@@ -373,6 +373,16 @@ impl Renderer {
     /// Renders the fixed keyboard guide while an agent turn is active.
     #[must_use]
     pub fn composer_active_hotkeys(&self, terminal_width: u16) -> String {
+        self.composer_active_hotkeys_with_agents(terminal_width, 0)
+    }
+
+    /// Active-turn guide, led by how many agents are working when any are.
+    #[must_use]
+    pub fn composer_active_hotkeys_with_agents(
+        &self,
+        terminal_width: u16,
+        agents: usize,
+    ) -> String {
         let guide = if terminal_width < 52 {
             "↵ steer · ^↵ queue · ^C cancel"
         } else if terminal_width < 80 {
@@ -380,8 +390,20 @@ impl Renderer {
         } else {
             "Type a follow-up · Enter steer · Ctrl+Enter queue · PgUp/PgDn scroll · /pause · Ctrl+C cancel"
         };
-        let guide = fit_terminal_text(guide, usize::from(terminal_width.saturating_sub(2)));
-        self.paint(&format!("  {guide}"), "2")
+        let available = usize::from(terminal_width.saturating_sub(2));
+        if agents == 0 {
+            return self.paint(&format!("  {}", fit_terminal_text(guide, available)), "2");
+        }
+        let count = format!(
+            "◆ {agents} agent{} working",
+            if agents == 1 { "" } else { "s" }
+        );
+        let guide = fit_terminal_text(guide, available.saturating_sub(count.chars().count() + 3));
+        format!(
+            "  {} {}",
+            self.paint(&count, "35;1"),
+            self.paint(&format!("· {guide}"), "2")
+        )
     }
 
     /// Renders the persistent state row immediately below the composer.
@@ -2358,6 +2380,16 @@ mod tests {
         let narrow = renderer.composer_active_hotkeys(60);
         assert!(narrow.contains("Enter steer"));
         assert!(narrow.contains("Ctrl+C cancel"));
+
+        let team = renderer.composer_active_hotkeys_with_agents(120, 4);
+        assert!(team.contains("◆ 4 agents working"));
+        assert!(team.contains("Enter steer"));
+        assert!(
+            renderer
+                .composer_active_hotkeys_with_agents(120, 1)
+                .contains("◆ 1 agent working")
+        );
+        assert!(team.chars().count() <= 120);
     }
 
     #[test]
