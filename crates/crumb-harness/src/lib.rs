@@ -1222,8 +1222,10 @@ fn tool_definitions_for_turn(tools: &ToolHost, user_message: &str) -> Vec<ToolDe
     if is_casual_conversation(user_message) {
         return Vec::new();
     }
+    let words = message_words(user_message);
     tools
         .tools()
+        .filter(|tool| situational_tool_relevant(&tool.name, &words))
         .map(|tool| ToolDefinition {
             name: tool.name.clone(),
             description: tool.description.clone(),
@@ -1231,6 +1233,202 @@ fn tool_definitions_for_turn(tools: &ToolHost, user_message: &str) -> Vec<ToolDe
         })
         .collect()
 }
+
+/// Words that turn a greeting into a request for work.
+const WORK_TERMS: [&str; 49] = [
+    " search ",
+    " weather ",
+    " time ",
+    " date ",
+    " news ",
+    " price ",
+    " festival ",
+    " online ",
+    " website ",
+    " url ",
+    " latest ",
+    " current ",
+    " today ",
+    " explain ",
+    " write ",
+    " create ",
+    " change ",
+    " fix ",
+    " code ",
+    " file ",
+    " folder ",
+    " repo ",
+    " project ",
+    " command ",
+    " install ",
+    " run ",
+    " test ",
+    " tests ",
+    " build ",
+    " deploy ",
+    " merge ",
+    " commit ",
+    " push ",
+    " update ",
+    " delete ",
+    " remove ",
+    " add ",
+    " make ",
+    " show ",
+    " list ",
+    " open ",
+    " read ",
+    " debug ",
+    " review ",
+    " refactor ",
+    " generate ",
+    " help ",
+    " decide ",
+    " compare ",
+];
+
+/// Tools most turns never use, with the words that call for them. Their
+/// schemas are large, so they are offered only when the request mentions
+/// what they are for; every other tool is always offered.
+const SITUATIONAL_TOOLS: [(&str, &[&str]); 8] = [
+    (
+        "jev_decide",
+        &[
+            "decide",
+            "decision",
+            "choose",
+            "choice",
+            "compare",
+            "versus",
+            "vs",
+            "which",
+            "weigh",
+            "pick",
+            "tradeoff",
+            "trade",
+            "option",
+            "options",
+            "better",
+            "best",
+            "rank",
+            "score",
+            "probability",
+            "likely",
+            "should",
+        ],
+    ),
+    (
+        "spawn_agents",
+        &[
+            "parallel",
+            "agents",
+            "subagent",
+            "subagents",
+            "team",
+            "thorough",
+            "audit",
+            "review",
+            "across",
+            "entire",
+            "whole",
+            "investigate",
+            "everywhere",
+        ],
+    ),
+    (
+        "wait",
+        &[
+            "wait",
+            "until",
+            "poll",
+            "watch",
+            "ci",
+            "pipeline",
+            "deploy",
+            "deployment",
+            "finish",
+            "finished",
+            "minutes",
+            "seconds",
+            "sleep",
+            "background",
+            "monitor",
+        ],
+    ),
+    (
+        "run_disposable",
+        &[
+            "disposable",
+            "sandbox",
+            "container",
+            "docker",
+            "scratch",
+            "throwaway",
+            "isolated",
+            "experiment",
+        ],
+    ),
+    (
+        "github_issue",
+        &["issue", "issues", "bug", "report", "github"],
+    ),
+    ("send_peer_message", PEER_TERMS),
+    ("share_peer_file", PEER_TERMS),
+    ("list_peer_agents", PEER_TERMS),
+];
+
+const PEER_TERMS: &[&str] = &[
+    "peer", "peers", "agent", "agents", "session", "sessions", "send", "share", "message",
+    "teammate",
+];
+
+fn situational_tool_relevant(name: &str, words: &[String]) -> bool {
+    SITUATIONAL_TOOLS
+        .iter()
+        .find(|(tool, _)| *tool == name)
+        .is_none_or(|(_, terms)| words.iter().any(|word| terms.contains(&word.as_str())))
+}
+
+/// Lowercase words of `message`, without punctuation.
+fn message_words(message: &str) -> Vec<String> {
+    message
+        .to_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `yooo` → `yo`, `hiii` → `hi`, `heyyy` → `hey`: stretched greetings.
+fn collapse_stretched_word(word: &str) -> String {
+    let mut collapsed = word.to_owned();
+    while let Some(last) = collapsed.chars().last()
+        && collapsed.chars().rev().nth(1) == Some(last)
+    {
+        collapsed.pop();
+    }
+    collapsed
+}
+
+/// Whole-message acknowledgements that never need tools.
+const ACKNOWLEDGEMENTS: [&str; 16] = [
+    "thanks",
+    "thank you",
+    "thx",
+    "ty",
+    "ok",
+    "okay",
+    "cool",
+    "nice",
+    "great",
+    "awesome",
+    "lol",
+    "haha",
+    "bye",
+    "good night",
+    "gm",
+    "gn",
+];
 
 fn is_casual_conversation(user_message: &str) -> bool {
     let normalized = user_message
@@ -1246,6 +1444,16 @@ fn is_casual_conversation(user_message: &str) -> bool {
         })
         .collect::<String>();
     let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Stretched letters only matter for matching greetings; work checks see
+    // the words as typed (`install` must not become `instal`).
+    let casual = normalized
+        .split_whitespace()
+        .map(collapse_stretched_word)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if ACKNOWLEDGEMENTS.contains(&casual.as_str()) {
+        return true;
+    }
     if normalized.is_empty()
         || normalized.split_whitespace().count() > 16
         || user_requires_execution(&normalized)
@@ -1253,34 +1461,7 @@ fn is_casual_conversation(user_message: &str) -> bool {
         return false;
     }
     let padded = format!(" {normalized} ");
-    let has_work_request = [
-        " search ",
-        " weather ",
-        " time ",
-        " date ",
-        " news ",
-        " price ",
-        " festival ",
-        " online ",
-        " website ",
-        " url ",
-        " latest ",
-        " current ",
-        " today ",
-        " explain ",
-        " write ",
-        " create ",
-        " change ",
-        " fix ",
-        " code ",
-        " file ",
-        " folder ",
-        " repo ",
-        " project ",
-        " command ",
-    ]
-    .iter()
-    .any(|term| padded.contains(term));
+    let has_work_request = WORK_TERMS.iter().any(|term| padded.contains(term));
     if has_work_request || normalized.contains("http://") || normalized.contains("https://") {
         return false;
     }
@@ -1303,9 +1484,9 @@ fn is_casual_conversation(user_message: &str) -> bool {
     ]
     .iter()
     .any(|greeting| {
-        normalized == *greeting
-            || padded.contains(&format!(" {greeting} "))
-            || normalized.starts_with(&format!("{greeting} "))
+        casual == *greeting
+            || format!(" {casual} ").contains(&format!(" {greeting} "))
+            || casual.starts_with(&format!("{greeting} "))
     })
 }
 
@@ -3327,12 +3508,60 @@ mod tests {
             "hello",
             "Hey there!",
             "heck yah what's up buddy what's going on",
+            "yoo",
+            "hiii",
+            "heyyy!",
+            "thanks",
+            "ok",
         ] {
             assert!(
                 super::tool_definitions_for_turn(&tools, greeting).is_empty(),
                 "casual greeting should not spend tokens on tools: {greeting}"
             );
         }
+    }
+
+    #[test]
+    fn situational_tools_join_only_when_the_request_calls_for_them() {
+        let words = super::message_words;
+        assert!(!super::situational_tool_relevant(
+            "jev_decide",
+            &words("fix the failing test")
+        ));
+        assert!(super::situational_tool_relevant(
+            "jev_decide",
+            &words("Should we use SQLite or Postgres?")
+        ));
+        assert!(super::situational_tool_relevant(
+            "spawn_agents",
+            &words("review the whole repo in parallel")
+        ));
+        assert!(!super::situational_tool_relevant(
+            "wait",
+            &words("rename this function")
+        ));
+        assert!(super::situational_tool_relevant(
+            "wait",
+            &words("wait for CI to finish")
+        ));
+        assert!(!super::situational_tool_relevant(
+            "send_peer_message",
+            &words("list files")
+        ));
+        // Tools outside the situational list are always offered.
+        assert!(super::situational_tool_relevant(
+            "run_shell",
+            &words("rename this function")
+        ));
+    }
+
+    #[test]
+    fn acknowledgements_must_be_the_whole_message() {
+        assert!(super::is_casual_conversation("ok"));
+        assert!(super::is_casual_conversation("Thanks!"));
+        assert!(!super::is_casual_conversation("ok do it"));
+        assert!(!super::is_casual_conversation("thanks, now run the tests"));
+        assert!(!super::is_casual_conversation("heyyy install node please"));
     }
 
     #[test]
