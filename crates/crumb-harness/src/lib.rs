@@ -19,11 +19,13 @@ use crumb_llm::{
 use tokio::time::Instant;
 
 mod parallel;
+mod team;
 
 pub use parallel::{
     ParallelAgentConfig, ParallelAgentLimits, parse_team_progress, register_parallel_agent_tool,
     team_progress_label,
 };
+pub use team::{HelperState, HelperStatus, TeamRegistry};
 
 /// Hard limits applied to one user turn and its model/tool rounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

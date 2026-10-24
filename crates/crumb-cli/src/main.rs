@@ -1162,6 +1162,13 @@ fn handle_repl_event(
             Ok(None)
         }
         InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
+            if command == "/agents" || command.starts_with("/agents ") =>
+        {
+            let text = agents_command_text(&command, context);
+            writeln!(context.writer, "{text}")?;
+            Ok(None)
+        }
+        InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
             if command == "/sessions" || command == "/sessions all" =>
         {
             handle_sessions_command(&command, context)?;
@@ -1193,6 +1200,46 @@ fn handle_repl_event(
         }
         InputEvent::NativeInput(command) if command.trim().is_empty() => Ok(None),
         InputEvent::NativeInput(command) => handle_input(&command, context),
+    }
+}
+
+/// The main agent's line on the agent map: folder, model pack, context use.
+fn agent_map_main_label(workspace: &Path, config: &AgentConfig, context_tokens: u64) -> String {
+    let folder = workspace.file_name().map_or_else(
+        || workspace.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    format!(
+        "{folder} · {} · {} context",
+        active_pack_label(config),
+        compact_token_count(context_tokens)
+    )
+}
+
+/// `/agents` draws the agent map; `/agents N` and `/agents job N` show one entry.
+fn agents_command_text(command: &str, context: &InputContext<'_>) -> String {
+    let Some(runtime) = context.agent_runtime.as_ref() else {
+        return "◆ No agents have run in this session yet.".to_owned();
+    };
+    let config = read_agent_config(context.cwd).unwrap_or_default();
+    let map = runtime.agent_map(agent_map_main_label(
+        context.cwd,
+        &config,
+        runtime.token_usage().0,
+    ));
+    agent_map_text(&map, command, context.renderer)
+}
+
+fn agent_map_text(
+    map: &agent_runtime::AgentMapSource,
+    command: &str,
+    renderer: Renderer,
+) -> String {
+    let argument = command.strip_prefix("/agents").unwrap_or_default().trim();
+    if argument.is_empty() {
+        renderer.agent_map(&map.view(), size().map_or(100, |(columns, _)| columns))
+    } else {
+        map.detail(argument)
     }
 }
 
@@ -4526,6 +4573,17 @@ impl SteeringInput {
             self.buffer.clear();
             self.clear_line(writer)?;
             writeln!(writer, "◇ Cancelling active agent turn")?;
+            return Ok(SteeringInputAction::Continue);
+        }
+        if input == "/agents" || input.starts_with("/agents ") {
+            self.buffer.clear();
+            self.clear_line(writer)?;
+            writeln!(
+                writer,
+                "{}",
+                agent_map_text(task.agent_map(), &input, self.renderer)
+            )?;
+            writer.flush()?;
             return Ok(SteeringInputAction::Continue);
         }
         if input == "/background" {

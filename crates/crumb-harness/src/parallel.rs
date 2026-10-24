@@ -22,7 +22,7 @@ use crumb_agent::{
 use crumb_llm::LlmProvider;
 use serde_json::{Value, json};
 
-use crate::{EventSink, HarnessEvent, HarnessLimits, HarnessTurn, NativeHarness};
+use crate::{EventSink, HarnessEvent, HarnessLimits, HarnessTurn, NativeHarness, TeamRegistry};
 
 const SPAWN_AGENTS: &str = "spawn_agents";
 const NAMES: [&str; 8] = ["Koi", "Nyx", "Rune", "Echo", "Lux", "Mica", "Rook", "Zed"];
@@ -74,6 +74,8 @@ pub struct ParallelAgentConfig {
     pub team_limits: ParallelAgentLimits,
     /// The parent's approval broker. Without one, only read-only teams run.
     pub approvals: Option<Arc<dyn ApprovalBroker>>,
+    /// Live helper status for the agent map.
+    pub registry: Option<TeamRegistry>,
 }
 
 /// Adds a non-recursive `spawn_agents` tool backed by independent native Harness turns.
@@ -180,6 +182,15 @@ fn run_team(
             tool.child_tools.clone()
         };
         let config = tool.config.clone();
+        let helper = config.registry.clone().map(|registry| {
+            let id = registry.begin(
+                &assignment.name,
+                &assignment.logo,
+                &assignment.task,
+                request.write,
+            );
+            (registry, id)
+        });
         let worker = WorkerSpec {
             team: team.clone(),
             objective: request.objective.clone(),
@@ -192,6 +203,7 @@ fn run_team(
             tools: child_tools,
             approvals: Arc::clone(&approvals),
             write: request.write,
+            helper,
             config,
             cancellation: cancellation.clone(),
             activity: activity_tx.clone(),
@@ -312,6 +324,7 @@ struct WorkerSpec {
     tools: ToolHost,
     approvals: Arc<dyn ApprovalBroker>,
     write: bool,
+    helper: Option<(TeamRegistry, u64)>,
     config: ParallelAgentConfig,
     cancellation: CancellationToken,
     activity: SyncSender<String>,
@@ -330,6 +343,7 @@ fn run_worker(worker: WorkerSpec) -> Result<Finding> {
         tools,
         approvals,
         write,
+        helper,
         config,
         cancellation,
         activity,
@@ -349,6 +363,7 @@ fn run_worker(worker: WorkerSpec) -> Result<Finding> {
     let harness = NativeHarness::new(provider, tools, approvals, config.harness_limits);
     let mut conversation = harness.conversation();
     let mut events = TeamEvents::new(name.clone(), activity.clone());
+    events.helper.clone_from(&helper);
     let roster = assignments
         .iter()
         .map(|assignment| {
@@ -400,6 +415,9 @@ fn run_worker(worker: WorkerSpec) -> Result<Finding> {
             (format!("analysis failed: {error}"), true)
         }
     };
+    if let Some((registry, id)) = &helper {
+        registry.finish(*id, failed);
+    }
     Ok(Finding {
         name,
         logo,
@@ -551,6 +569,7 @@ struct TeamEvents {
     activity: SyncSender<String>,
     reporting: bool,
     changed_files: Vec<String>,
+    helper: Option<(TeamRegistry, u64)>,
 }
 
 impl TeamEvents {
@@ -560,12 +579,19 @@ impl TeamEvents {
             activity,
             reporting: false,
             changed_files: Vec::new(),
+            helper: None,
         }
     }
 }
 
 impl EventSink for TeamEvents {
     fn emit(&mut self, event: HarnessEvent) {
+        if let (HarnessEvent::Usage(usage), Some((registry, id))) = (&event, &self.helper) {
+            let tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+            registry.update(*id, |helper| {
+                helper.tokens = helper.tokens.saturating_add(tokens);
+            });
+        }
         let label = match event {
             HarnessEvent::TurnStarted => Some("Thinking".to_owned()),
             HarnessEvent::ToolRequested { name, detail, .. } => Some(detail.map_or_else(
@@ -597,6 +623,9 @@ impl EventSink for TeamEvents {
             | HarnessEvent::TurnFinished => None,
         };
         if let Some(label) = label {
+            if let Some((registry, id)) = &self.helper {
+                registry.update(*id, |helper| helper.activity.clone_from(&label));
+            }
             publish_activity(&self.activity, format!("{} · {label}", self.name));
         }
     }
@@ -818,6 +847,7 @@ mod tests {
                 },
                 team_limits: ParallelAgentLimits::default(),
                 approvals,
+                registry: None,
             },
         )
         .expect("parallel tool registers");
@@ -993,6 +1023,7 @@ mod tests {
                 },
                 team_limits: ParallelAgentLimits::default(),
                 approvals: None,
+                registry: None,
             },
         )
         .expect("parallel tool registers");

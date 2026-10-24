@@ -161,6 +161,13 @@ impl BackgroundJobs {
         jobs.iter().map(|job| job.record.clone()).collect()
     }
 
+    /// The last `lines` lines of job `id`'s output, secrets redacted.
+    #[must_use]
+    pub fn output_tail(&self, id: u32, lines: usize) -> Option<String> {
+        let record = self.records().into_iter().find(|record| record.id == id)?;
+        Some(log_tail(&record.log, lines))
+    }
+
     /// One line per job for the agent's runtime context; `None` when there
     /// are no jobs.
     #[must_use]
