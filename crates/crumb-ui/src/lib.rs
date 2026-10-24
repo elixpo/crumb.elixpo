@@ -270,32 +270,23 @@ impl Renderer {
     #[must_use]
     pub fn welcome(&self, context: &StartupContext<'_>, terminal_width: u16) -> String {
         let panda = panda_art(panda_mood(Some(context.agent_configured)));
-        let pack = context.model.unwrap_or("not configured");
-        let instance = context
-            .instance_name
-            .map_or(String::new(), |name| format!(" · {name}"));
-        let state = if context.agent_configured {
-            format!("Ready{instance} · pack {pack} · {}", context.mode)
+        // The header is the logo and the wordmark; live state is in the footer.
+        let copy = if terminal_width < 60 {
+            "CRUMB"
         } else {
-            format!("Native shell ready{instance} · run /auth login to connect")
+            WORDMARK
         };
-        let copy = format!(
-            "C R U M B\nCrumb CLI v{} · Native commands stay native.\n{} · {}\nTry: explain this workspace · /help shows commands",
-            context.version,
-            state,
-            context.effort.unwrap_or("default"),
-        );
         if terminal_width < 96 {
             let panda = format!("  {}", trim_art(panda).replace('\n', "\n  "));
             let copy = paint_welcome_copy(
                 *self,
-                &copy,
+                copy,
                 "  ",
                 usize::from(terminal_width.saturating_sub(2)),
             );
             return format!("{}\n\n{}", self.paint_panda(&panda), copy);
         }
-        compose_welcome(*self, trim_art(panda), &copy)
+        compose_welcome(*self, trim_art(panda), copy)
     }
 
     /// Renders the interactive workspace trust boundary.
@@ -428,7 +419,7 @@ impl Renderer {
         } else if terminal_width < 80 {
             "Enter send · Tab complete · PgUp/PgDn · / commands"
         } else {
-            "Enter send · Ctrl+Enter queue · PgUp/PgDn scroll · Tab · @ · / · ?"
+            "Enter send · Shift+Enter newline · Ctrl+Enter queue · PgUp/PgDn · Tab · @ · / · ?"
         };
         let guide = fit_terminal_text(guide, usize::from(terminal_width.saturating_sub(2)));
         self.paint(&format!("  {guide}"), "2")
@@ -1634,13 +1625,8 @@ fn paint_welcome_copy(renderer: Renderer, copy: &str, gutter: &str, width: usize
         .join("\n")
 }
 
-const fn welcome_copy_style(row: usize) -> &'static str {
-    match row {
-        0 => "38;2;255;255;204;1",
-        1 => "97;1",
-        2 => "36;1",
-        _ => "2",
-    }
+const fn welcome_copy_style(_row: usize) -> &'static str {
+    "38;2;255;255;204;1"
 }
 
 fn startup_punchline() -> &'static str {
@@ -3016,8 +3002,9 @@ mod tests {
             },
             120,
         );
-        assert!(welcome.contains("Crumb CLI v0.1.0 · Native commands stay native."));
-        assert!(welcome.contains("Ready · Oreo · pack Balanced Crumb · auto"));
+        // The header is only the logo and the wordmark.
+        assert!(!welcome.contains("Crumb CLI v0.1.0"));
+        assert!(!welcome.contains("Balanced Crumb"));
         assert!(!welcome.contains("Model context"));
         assert!(!welcome.contains("compact"));
         assert!(welcome.contains("╭▄█▄╮"));
@@ -3069,14 +3056,18 @@ mod tests {
             );
         }
         let wide = renderer.welcome(&context, 120);
-        assert!(wide.contains("C R U M B"));
         assert!(wide.contains("╭▄█▄╮   ╭▄█▄╮"), "the panda logo stays");
-        assert!(!wide.contains("░█████╗░"), "the block wordmark is gone");
+        assert!(wide.contains("░█████╗░██████╗░"), "the wordmark stays");
+        assert!(
+            !wide.contains("Crumb CLI v"),
+            "nothing else is in the header"
+        );
         assert_eq!(
             wide.lines().count(),
             7,
             "the header is as tall as the panda"
         );
+        assert!(renderer.welcome(&context, 40).contains("CRUMB"));
     }
 
     #[test]

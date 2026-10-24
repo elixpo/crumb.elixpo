@@ -12380,6 +12380,8 @@ fn create_line_editor(
         Arc::clone(&paste_artifacts),
     );
     let editor = Reedline::create()
+        // Lets supporting terminals report Shift+Enter apart from Enter.
+        .use_kitty_keyboard_enhancement(true)
         .with_history(Box::new(interactive_history))
         .with_highlighter(Box::new(CrumbHighlighter))
         .with_hinter(Box::new(CrumbHinter::new(
@@ -12426,6 +12428,13 @@ fn crumb_keybindings() -> reedline::Keybindings {
             ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
         );
     }
+    // Terminals without the enhanced keyboard protocol send Shift+Enter as a
+    // plain Enter; Ctrl+J is a line feed every terminal can still send.
+    keybindings.add_binding(
+        KeyModifiers::CONTROL,
+        KeyCode::Char('j'),
+        ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
+    );
     keybindings.add_binding(
         KeyModifiers::CONTROL,
         KeyCode::Char('o'),
@@ -13051,12 +13060,27 @@ fn composer_folder() -> String {
         .unwrap_or_default()
 }
 
-fn composer_placeholder_hint(line: &str, has_artifacts: bool, columns: u16) -> Option<String> {
-    // The input starts four columns in and must not wrap onto the status row.
-    let available = usize::from(columns.saturating_sub(6));
-    let folder = compact_folder(&composer_folder(), available / 2);
-    composer_placeholder_for(line, has_artifacts, &folder)
+fn composer_placeholder_hint(
+    line: &str,
+    has_artifacts: bool,
+    prefix_width: usize,
+    columns: u16,
+) -> Option<String> {
+    // The hint follows the prompt prefix and must not wrap onto the status row.
+    let available = usize::from(columns.saturating_sub(6))
+        .saturating_sub(prefix_width + usize::from(prefix_width > 0));
+    composer_placeholder_for(line, has_artifacts)
         .map(|placeholder| truncate_chars(&placeholder, available))
+}
+
+/// The shell-style prompt that opens the composer line: `~/project $`.
+fn composer_prompt() -> String {
+    let folder = composer_folder();
+    if folder.is_empty() {
+        return String::new();
+    }
+    let columns = size().map_or(80, |(columns, _)| columns);
+    format!("{} $", compact_folder(&folder, usize::from(columns / 3)))
 }
 
 /// Keeps the trailing folders of `folder` that fit in `width`: `…/e2e/ws`.
@@ -13079,13 +13103,9 @@ fn compact_folder(folder: &str, width: usize) -> String {
     format!("…/{kept}")
 }
 
-fn composer_placeholder_for(line: &str, has_artifacts: bool, folder: &str) -> Option<String> {
+fn composer_placeholder_for(line: &str, has_artifacts: bool) -> Option<String> {
     match (line, has_artifacts) {
-        ("", false) => Some(if folder.is_empty() {
-            COMPOSER_PLACEHOLDER.to_owned()
-        } else {
-            format!("{folder} $ {COMPOSER_PLACEHOLDER}")
-        }),
+        ("", false) => Some(COMPOSER_PLACEHOLDER.to_owned()),
         ("", true) => Some("Ask Crumb anything…".to_owned()),
         // `?` opens the help palette, but it is also inserted into Reedline's
         // buffer. Keep the composer guidance visible until the user narrows a
@@ -13121,8 +13141,8 @@ fn completion_menu_composer_frame(
     } else {
         line.clone()
     };
-    let placeholder =
-        composer_placeholder_hint(&line, artifact_width > 0, terminal_columns).unwrap_or_default();
+    let placeholder = composer_placeholder_hint(&line, false, artifact_width, terminal_columns)
+        .unwrap_or_default();
     let placeholder = truncate_chars(
         &placeholder,
         available_width.saturating_sub(line.chars().count()),
@@ -13220,7 +13240,9 @@ impl Hinter for CrumbHinter {
             input_rows.min(FULLSCREEN_COMPOSER_ROWS.saturating_sub(5).max(1)),
             Ordering::Relaxed,
         );
-        if let Some(placeholder) = composer_placeholder_hint(line, has_artifacts, columns) {
+        if let Some(placeholder) =
+            composer_placeholder_hint(line, has_artifacts, artifact_width, columns)
+        {
             self.placeholder_visible = true;
             let hint = if use_ansi_coloring {
                 Style::new()
@@ -13353,7 +13375,12 @@ impl Prompt for CrumbPrompt {
     }
 
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
-        Cow::Borrowed("::: ")
+        if self.anchor_to_composer {
+            // Continuation lines start at the composer's left edge, inside its border.
+            Cow::Borrowed("  │ ")
+        } else {
+            Cow::Borrowed("::: ")
+        }
     }
 
     fn render_prompt_history_search_indicator(
@@ -13607,7 +13634,7 @@ fn render_idle_composer(
         writer,
         "{prompt}{}",
         renderer.composer_placeholder(
-            &compact_folder(&composer_folder(), usize::from(columns / 2)),
+            &compact_folder(&composer_folder(), usize::from(columns / 3)),
             columns.saturating_sub(7)
         )
     )?;
@@ -15763,23 +15790,19 @@ mod tests {
     #[test]
     fn help_trigger_keeps_composer_guidance_visible() {
         assert_eq!(
-            composer_placeholder_for("", false, "~/crumb").as_deref(),
-            Some(format!("~/crumb $ {COMPOSER_PLACEHOLDER}").as_str())
-        );
-        assert_eq!(
-            composer_placeholder_for("", false, "").as_deref(),
+            composer_placeholder_for("", false).as_deref(),
             Some(COMPOSER_PLACEHOLDER)
         );
         assert_eq!(
-            composer_placeholder_for("", true, "~/crumb").as_deref(),
+            composer_placeholder_for("", true).as_deref(),
             Some("Ask Crumb anything…")
         );
         assert_eq!(
-            composer_placeholder_for("?", false, "~/crumb").as_deref(),
+            composer_placeholder_for("?", false).as_deref(),
             Some(" Ask Crumb anything or type a command · @ context · / commands · Tab complete")
         );
-        assert_eq!(composer_placeholder_for("? config", false, "~/crumb"), None);
-        assert_eq!(composer_placeholder_for("hello?", false, "~/crumb"), None);
+        assert_eq!(composer_placeholder_for("? config", false), None);
+        assert_eq!(composer_placeholder_for("hello?", false), None);
         assert_eq!(compact_folder("~/crumb", 20), "~/crumb");
         assert_eq!(compact_folder("/tmp/a/scratchpad/e2e/ws", 12), "…/e2e/ws");
         assert_eq!(
