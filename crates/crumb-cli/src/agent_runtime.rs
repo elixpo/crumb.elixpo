@@ -2802,8 +2802,71 @@ fn skill_is_relevant(skill: &SkillConfig, request: &str) -> bool {
             "skill.md",
         ]),
         "crumb-commands" => crumb_command_skill_relevant(&request),
+        "crumb-support" => crumb_support_skill_relevant(&request, &contains_any),
+        "polli" => polli_skill_relevant(&contains_any),
         _ => true,
     }
+}
+
+/// Requests that need the Pollinations `polli` CLI.
+fn polli_skill_relevant(contains_any: &dyn Fn(&[&str]) -> bool) -> bool {
+    contains_any(&[
+        "polli",
+        "pollinations",
+        "pollen",
+        "generate an image",
+        "generate image",
+        "make an image",
+        "create an image",
+        "image generation",
+        "generate a video",
+        "generate video",
+        "generate audio",
+        "text to speech",
+        "tts",
+        "transcribe",
+        "voice over",
+        "voiceover",
+    ])
+}
+
+/// Requests about Crumb itself, or about reporting a problem in it.
+fn crumb_support_skill_relevant(request: &str, contains_any: &dyn Fn(&[&str]) -> bool) -> bool {
+    let reporting = contains_any(&[
+        "report a bug",
+        "report this bug",
+        "report the bug",
+        "file an issue",
+        "open an issue",
+        "feature request",
+        "vulnerability",
+    ]);
+    let about_crumb = (request.contains("crumb") || request.contains("elixpo"))
+        && contains_any(&[
+            "bug",
+            "issue",
+            "report",
+            "crash",
+            "broken",
+            "feedback",
+            "who made",
+            "who built",
+            "who maintains",
+            "maintainer",
+            "source code",
+            "repo",
+            "repository",
+            "license",
+            "licence",
+            "security",
+            "support",
+            "contact",
+            "docs",
+            "documentation",
+            "version",
+            "what is",
+        ]);
+    reporting || about_crumb
 }
 
 fn crumb_command_skill_relevant(request: &str) -> bool {
@@ -3768,6 +3831,64 @@ mod tests {
         assert_eq!(code_context.selected.len(), 1);
         assert!(code_context.instructions[0].contains("codebase-map"));
         assert!(!code_context.instructions[0].contains("web-research"));
+    }
+
+    fn loaded_skill_ids(id: &str, request: &str) -> Vec<String> {
+        let skills = [SkillConfig {
+            id: id.to_owned(),
+            path: crate::bundled_skills::path(id),
+            enabled: true,
+        }];
+        load_enabled_skill_context(&skills, Path::new("."), request)
+            .expect("skill context loads")
+            .selected
+            .into_iter()
+            .map(|skill| skill.identity)
+            .collect()
+    }
+
+    #[test]
+    fn polli_skill_loads_only_for_pollinations_media_work() {
+        assert_eq!(
+            loaded_skill_ids("polli", "generate an image of a panda with polli"),
+            ["polli"]
+        );
+        assert_eq!(
+            loaded_skill_ids("polli", "check my pollen balance"),
+            ["polli"]
+        );
+        assert_eq!(
+            loaded_skill_ids("polli", "fix the failing Rust tests"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            loaded_skill_ids("polli", "show the http settings"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn crumb_support_skill_loads_for_questions_about_crumb_and_bug_reports() {
+        for request in [
+            "I found a bug in crumb, how do I report it?",
+            "who maintains crumb?",
+            "where is the crumb source code",
+            "I want to file an issue",
+        ] {
+            assert_eq!(
+                loaded_skill_ids("crumb-support", request),
+                ["crumb-support"],
+                "{request}"
+            );
+        }
+        assert_eq!(
+            loaded_skill_ids("crumb-support", "fix the bug in my parser"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            loaded_skill_ids("crumb-support", "list the files in this folder"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
