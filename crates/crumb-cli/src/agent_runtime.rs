@@ -1851,7 +1851,8 @@ impl AgentRuntime {
         Ok(RunResult {
             session_id: session_id.to_owned(),
             final_response: outcome.text,
-            finish_reason: Some("stop".to_owned()),
+            // A limit-stopped turn ends with a summary of partial work.
+            finish_reason: Some(outcome.limit.map_or("stop", |_| "limit").to_owned()),
             input_tokens: outcome.usage.input_tokens,
             cached_input_tokens: outcome.usage.cached_input_tokens,
             output_tokens: outcome.usage.output_tokens,
