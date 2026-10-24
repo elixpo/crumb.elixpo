@@ -12542,13 +12542,25 @@ impl Prompt for CrumbPrompt {
             )
             .saturating_add(2)
         });
-        let mut prefix = self
+        let mut artifacts = self
             .paste_artifacts
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .composer_prefix(std::env::var_os("NO_COLOR").is_none(), composer_input_row);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut prefix =
+            artifacts.composer_prefix(std::env::var_os("NO_COLOR").is_none(), composer_input_row);
         if !prefix.is_empty() {
             prefix.push(' ');
+        }
+        if self.anchor_to_composer {
+            // Reedline measures the prompt as if it were printed in one flow
+            // and parks the cursor in column 0 whenever that measurement ends
+            // on the right margin. The composer prompt is absolutely
+            // positioned, so reset the measurement with a carriage return and
+            // return to the input column; reedline then only counts the typed
+            // text and restores the real cursor position.
+            let width = artifacts.composer_prefix_width();
+            let column = 5 + width + usize::from(width > 0);
+            let _ = write!(prefix, "\r\x1b[{column}G");
         }
         Cow::Owned(prefix)
     }
@@ -14984,6 +14996,28 @@ mod tests {
         assert!(frame.contains("Enter send"));
         assert!(frame.contains("\x1b7"));
         assert!(frame.contains("\x1b8"));
+    }
+
+    #[test]
+    fn anchored_prompt_indicator_resets_reedline_column_measurement() {
+        let prompt = CrumbPrompt::new(
+            "workspace git:main\n╭─╮\n│ ".to_owned(),
+            "pack Balanced Crumb".to_owned(),
+            true,
+            None,
+            Arc::new(Mutex::new(PendingComposerArtifacts::default())),
+            Arc::new(std::sync::atomic::AtomicU16::new(1)),
+        );
+
+        let indicator = <CrumbPrompt as reedline::Prompt>::render_prompt_indicator(
+            &prompt,
+            reedline::PromptEditMode::Default,
+        );
+
+        // A carriage return restarts reedline's width count, so a long prompt
+        // can never be mistaken for one that ends on the right margin; the
+        // column move puts the cursor back at the input column.
+        assert!(indicator.ends_with("\r\x1b[5G"));
     }
 
     #[test]
