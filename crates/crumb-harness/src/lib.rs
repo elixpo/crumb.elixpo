@@ -1411,7 +1411,7 @@ fn finish_turn(
         if !final_text.is_empty() {
             sink.emit(HarnessEvent::TextDelta(final_text.clone()));
         }
-    } else if final_text.trim() != streamed.trim() {
+    } else if changes_streamed_meaning(&streamed, &final_text, &turn.user_message) {
         sink.emit(HarnessEvent::Correction(final_text.clone()));
     }
     conversation.commit(
@@ -1427,6 +1427,22 @@ fn finish_turn(
         tool_calls: metrics.tool_calls,
         limit: None,
     }
+}
+
+/// Whether the final answer says something different from what streamed.
+/// Trimming persona boilerplate is cosmetic: reprinting the whole answer as a
+/// correction for it would only duplicate text the user already read.
+fn changes_streamed_meaning(streamed: &str, final_text: &str, user_message: &str) -> bool {
+    let trimmed = strip_persona_boilerplate(streamed, asks_about_identity(user_message));
+    !trimmed.trim().is_empty() && squeeze_blank_lines(final_text) != squeeze_blank_lines(&trimmed)
+}
+
+fn squeeze_blank_lines(text: &str) -> String {
+    text.lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_successful_tool_fallback(outputs: &[String]) -> String {
@@ -3727,6 +3743,46 @@ mod tests {
         assert!(events.iter().any(|event| {
             matches!(event, HarnessEvent::Correction(text) if text == "Verified result:\n\n24 C")
         }));
+    }
+
+    #[tokio::test]
+    async fn trimmed_persona_boilerplate_does_not_reprint_a_streamed_answer() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            ChatEvent::TextDelta(
+                "Hey there! 👋\nI'm Crumb, your execution-oriented terminal sidekick, ready to help.\nJust let me know what you'd like to do."
+                    .to_owned(),
+            ),
+            ChatEvent::Finished(FinishReason::Stop),
+        ]]));
+        let harness = NativeHarness::new(
+            provider,
+            tools(Arc::new(AtomicUsize::new(0))),
+            Arc::new(DenyAllApprovals),
+            HarnessLimits::default(),
+        );
+        let (_root, mut session) = session(AgentMode::Auto);
+        let mut conversation = harness.conversation();
+        let mut events = Vec::new();
+        let mut greeting = turn();
+        greeting.user_message = "hello".to_owned();
+
+        let outcome = harness
+            .run_turn(
+                &mut session,
+                &mut conversation,
+                greeting,
+                &CancellationToken::default(),
+                &mut events,
+            )
+            .await
+            .expect("greeting completes");
+
+        assert!(!outcome.text.contains("sidekick"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::Correction(_)))
+        );
     }
 
     #[tokio::test]
