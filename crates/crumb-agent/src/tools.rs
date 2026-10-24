@@ -455,6 +455,26 @@ impl ToolHost {
         host
     }
 
+    /// Clones every tool except `names`.
+    #[must_use]
+    pub fn without(&self, names: &[&str]) -> Self {
+        let mut host = Self::default();
+        for descriptor in self
+            .registry
+            .iter()
+            .filter(|descriptor| !names.contains(&descriptor.name.as_str()))
+        {
+            if let Some(handler) = self.handlers.get(&descriptor.name) {
+                host.registry
+                    .tools
+                    .insert(descriptor.name.clone(), descriptor.clone());
+                host.handlers
+                    .insert(descriptor.name.clone(), Arc::clone(handler));
+            }
+        }
+        host
+    }
+
     /// Clones the minimal native read-only surface available to an isolated
     /// inbound peer turn.
     ///

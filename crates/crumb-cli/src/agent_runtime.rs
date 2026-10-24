@@ -1946,6 +1946,7 @@ impl AgentRuntime {
                 max_output_tokens: child_output_tokens,
                 harness_limits: parallel_harness_limits(harness_limits),
                 team_limits,
+                approvals: Some(Arc::clone(&approvals)),
             },
         )?;
         let harness =
