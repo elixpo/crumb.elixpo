@@ -96,12 +96,14 @@ use sha2::{Digest, Sha256};
 
 mod agent_runtime;
 mod bundled_skills;
+mod choice_dialog;
 mod completion;
 mod composer_artifacts;
 mod context;
 mod device_auth;
 mod provider_discovery;
 mod provider_projection;
+mod sessions_view;
 mod shell_completion;
 
 use agent_runtime::{
@@ -1147,6 +1149,12 @@ fn handle_repl_event(
             run_interactive_skill(&command, context)?;
             Ok(None)
         }
+        InputEvent::BuiltIn(BuiltInCommand::Reserved(command))
+            if command == "/sessions" || command == "/sessions all" =>
+        {
+            handle_sessions_command(&command, context)?;
+            Ok(None)
+        }
         InputEvent::BuiltIn(BuiltInCommand::Auth(action)) => {
             handle_auth_repl_event(action, context)
         }
@@ -1174,6 +1182,33 @@ fn handle_repl_event(
         InputEvent::NativeInput(command) if command.trim().is_empty() => Ok(None),
         InputEvent::NativeInput(command) => handle_input(&command, context),
     }
+}
+
+/// `/sessions` opens a picker for this folder's sessions; `/sessions all`
+/// lists every folder that has sessions.
+fn handle_sessions_command(command: &str, context: &mut InputContext<'_>) -> Result<()> {
+    if command == "/sessions all" {
+        return sessions_view::show_folder_groups(context.cwd, context.writer);
+    }
+    if !context.interactive {
+        return show_session_list(&sessions_view::session_root(context.cwd), context.writer);
+    }
+    sessions_view::browse_sessions(
+        context.cwd,
+        context.agent_runtime,
+        context.renderer,
+        context.fullscreen,
+        context.writer,
+    )?;
+    if context.fullscreen {
+        // The picker drew over the bottom of the screen.
+        let state = context
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        render_transcript_view(&state, context.renderer, context.header_rows)?;
+    }
+    Ok(())
 }
 
 fn handle_auth_repl_event(
