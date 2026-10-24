@@ -75,12 +75,12 @@ use crumb_profile::{ProfileDocument, ProfileSelectionStore, ProfileStore};
 use crumb_pty::{PtyInput, PtyResizer, SystemPty, TerminalSize};
 use crumb_repl::{ReplOutcome, read_classified_line};
 use crumb_tools::{
-    AgentShellConfig, CheckpointDecision, CheckpointStatus, CheckpointStore, DisposableToolConfig,
-    GitHubIssueLimits, StackDetectionLimits, WaitToolLimits, WebFetchLimits, WorkspaceToolLimits,
-    WorkspaceWriteLimits, register_a2a_tools, register_current_time_tool, register_disposable_tool,
-    register_github_issue_tool, register_shell_tool_with_optimizer, register_stack_detection_tool,
-    register_wait_tool, register_web_fetch_tool, register_workspace_read_tools,
-    register_workspace_write_tool,
+    AgentShellConfig, CheckpointDecision, CheckpointStatus, CheckpointStore, CodeSearchLimits,
+    DisposableToolConfig, GitHubIssueLimits, StackDetectionLimits, WaitToolLimits, WebFetchLimits,
+    WorkspaceToolLimits, WorkspaceWriteLimits, register_a2a_tools, register_code_search_tool,
+    register_current_time_tool, register_disposable_tool, register_github_issue_tool,
+    register_shell_tool_with_optimizer, register_stack_detection_tool, register_wait_tool,
+    register_web_fetch_tool, register_workspace_read_tools, register_workspace_write_tool,
 };
 use crumb_ui::{
     FooterItem, GitSegment, PeerActivity, PeerActivityState, PromptContext, Renderer,
@@ -877,6 +877,7 @@ fn workspace_read_host(
         workspace,
         StackDetectionLimits { max_output_bytes },
     )?;
+    register_code_search_tool(&mut host, workspace, CodeSearchLimits { max_output_bytes })?;
     register_disposable_tool(
         &mut host,
         workspace,
@@ -4276,6 +4277,7 @@ fn trusted_tool_detail(name: &str, arguments: &serde_json::Value) -> Option<Stri
         "run_shell" => "command",
         "web_search" => "query",
         "web_fetch" => "url",
+        "search_code" => "pattern",
         "github_issue" => "target",
         _ => return None,
     };
@@ -7146,6 +7148,7 @@ fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
         ("read_file", "workspace read", true),
         ("list_directory", "workspace read", true),
         ("detect_stack", "workspace read", true),
+        ("search_code", "workspace read", true),
         ("write_file", "workspace write", true),
         ("run_disposable", "one-shot process", true),
         ("run_shell", "workspace process", true),
@@ -7169,7 +7172,12 @@ fn show_agent_tools(cwd: &Path, writer: &mut dyn Write) -> Result<()> {
     ] {
         let explicitly_granted = matches!(
             name,
-            "current_time" | "read_file" | "list_directory" | "detect_stack" | "ask_user"
+            "current_time"
+                | "read_file"
+                | "list_directory"
+                | "detect_stack"
+                | "search_code"
+                | "ask_user"
         ) || config.permissions.allow_network_tools.contains(name)
             || config.permissions.allow_workspace_tools.contains(name)
             || config.permissions.allow_execution_tools.contains(name);
@@ -14832,6 +14840,7 @@ mod tests {
             ("read_file", RiskClass::ReadOnly),
             ("run_disposable", RiskClass::ProcessExecution),
             ("run_shell", RiskClass::ProcessExecution),
+            ("search_code", RiskClass::ReadOnly),
             ("wait", RiskClass::ReadOnly),
             ("web_fetch", RiskClass::NetworkAccess),
             ("write_file", RiskClass::WriteWorkspace),
