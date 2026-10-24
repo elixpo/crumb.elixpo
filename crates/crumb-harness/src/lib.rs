@@ -1290,7 +1290,7 @@ const WORK_TERMS: [&str; 49] = [
 /// Tools most turns never use, with the words that call for them. Their
 /// schemas are large, so they are offered only when the request mentions
 /// what they are for; every other tool is always offered.
-const SITUATIONAL_TOOLS: [(&str, &[&str]); 8] = [
+const SITUATIONAL_TOOLS: [(&str, &[&str]); 7] = [
     (
         "jev_decide",
         &[
@@ -1353,19 +1353,6 @@ const SITUATIONAL_TOOLS: [(&str, &[&str]); 8] = [
             "sleep",
             "background",
             "monitor",
-        ],
-    ),
-    (
-        "run_disposable",
-        &[
-            "disposable",
-            "sandbox",
-            "container",
-            "docker",
-            "scratch",
-            "throwaway",
-            "isolated",
-            "experiment",
         ],
     ),
     (
