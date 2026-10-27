@@ -26,6 +26,8 @@ release, behavior and interfaces may change without compatibility guarantees.
   runs, using existing `gh` or `GH_TOKEN` authentication.
 - `read_file` numbers every line it returns, so reported line numbers are
   exact.
+- HTTP clients are built on first use, so Crumb's tools register even on a
+  system without CA certificates; only calls that need the network fail.
 
 ### Packaging
 
