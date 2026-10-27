@@ -15,6 +15,10 @@ targets:
 - `aarch64-apple-darwin`; and
 - `x86_64-pc-windows-msvc`.
 
+Linux binaries are built in a Debian 11 container, so they need only glibc
+2.31 (Ubuntu 20.04, Debian 11, RHEL 9, or newer); a release step fails if a
+binary needs anything newer.
+
 Each GitHub Release contains a fixed-name archive, SHA-256 checksum, SPDX SBOM,
 keyless Sigstore bundle, and GitHub build-provenance attestation. Fixed asset
 names let the repository installer resolve the newest stable release without
