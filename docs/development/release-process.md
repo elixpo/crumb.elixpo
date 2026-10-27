@@ -73,6 +73,13 @@ workspace version, enable `publish`, type `RELEASE`, and approve the protected
 workflow creates the tag and GitHub Release only after all target builds,
 checksums, SBOMs, signatures, and attestations succeed.
 
+After a release is published, run
+`python3 packaging/package-managers/update.py <version>`. It reads the
+release's `.sha256` files and rewrites `Formula/crumb.rb` (the Homebrew tap
+this repository serves) and `packaging/winget/<version>/`; commit both. To
+publish to WinGet, submit that manifest directory to `microsoft/winget-pkgs`,
+for example with `wingetcreate submit packaging/winget/<version>`.
+
 macOS architectures are distributed separately. The installer selects the
 matching archive; neither archive is advertised as universal.
 
