@@ -44,6 +44,15 @@ brew tap elixpo/crumb https://github.com/elixpo/crumb.elixpo
 brew install elixpo/crumb/crumb
 ```
 
+Debian unstable:
+
+```bash
+sudo apt install crumb
+```
+
+The Debian package is built by Debian from source against Debian's own Rust
+crates, so it can trail the latest release.
+
 The installer downloads the matching GitHub Release asset, verifies its
 SHA-256 checksum, and installs `crumb` into a user-owned directory. See the
 [release process](docs/development/release-process.md) for version pinning,
