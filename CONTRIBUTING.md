@@ -19,11 +19,15 @@ as the default inference layer.
 
 ## Checks
 
-Run the checks that cover the area you changed:
+Use stable Rust 1.95 or newer: `rust-toolchain.toml` selects the stable
+channel and `Cargo.toml` sets `rust-version = "1.95"`.
+
+Run the checks that cover the area you changed. The first three match CI
+(`.github/workflows/ci.yml`):
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 cargo build --workspace --all-targets
 ```
