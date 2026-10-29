@@ -7,6 +7,8 @@ as the default inference layer.
 
 ## Before starting
 
+- New to the codebase? Start with the [newcomer guide](docs/NEWCOMERS.md) to
+  build, test, and find your way around without API keys.
 - Search existing issues and open an issue for substantial behavioral or
   architectural changes.
 - Keep a pull request focused on one reviewable outcome.
