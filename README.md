@@ -155,6 +155,10 @@ Elixpo is applying to be a mentoring organisation for Google Summer of Code 2027
 3. Read [Input namespaces and connectors](docs/product/input-namespaces-and-connectors.md) and the [MCP boundary](docs/development/mcp-boundary.md), plus the connector planning issues [#29](https://github.com/elixpo/crumb.elixpo/issues/29), [#30](https://github.com/elixpo/crumb.elixpo/issues/30) and [#31](https://github.com/elixpo/crumb.elixpo/issues/31).
 4. Pick a small issue from the [issue tracker](https://github.com/elixpo/crumb.elixpo/issues) to learn the codebase and review process.
 
+**Configuration and access**
+
+This repository keeps configuration encrypted with SOPS. Applicants do not need any keys: the warm-up tasks and the core of the idea run locally without decrypting configuration. Once accepted, contributors receive SOPS access scoped to their project (for example for integration tests or staging), which is revoked when the programme ends.
+
 Questions go to **gsoc@elixpo.com**. GitHub Discussions for GSoC open once Google announces the 2027 dates.
 
 _Google Summer of Code is a programme of Google LLC; Elixpo is applying as a mentoring organisation and is not affiliated with or endorsed by Google._
