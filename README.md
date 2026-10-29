@@ -140,6 +140,12 @@ work (for example integration tests or staging), revoked when the programme
 ends. Do not try to decrypt or commit configuration; if setup asks for a
 secret, open an issue.
 
+## License
+
+Crumb's code is licensed under the [MIT License](LICENSE). Visual assets under
+`crumb.elixpo/public/` are licensed under [CC-BY-4.0](LICENSES/preferred/CC-BY-4.0).
+The Elixpo and Oreo names and marks are covered by [`TRADEMARKS.md`](TRADEMARKS.md).
+
 <p align="center">
   <img src="crumb.elixpo/public/icon-192.png" width="96" height="96" alt="Crumb app icon" />
 </p>
