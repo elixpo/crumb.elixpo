@@ -151,13 +151,11 @@ Elixpo is applying to be a mentoring organisation for Google Summer of Code 2027
 **How to start**
 
 1. Read the idea page and the programme site at [gsoc.elixpo.com](https://gsoc.elixpo.com).
-2. Build Crumb from source and run the Rust checks listed in [CONTRIBUTING.md](CONTRIBUTING.md).
+2. Build Crumb from source and run the checks in [Build from source and warm-up](#build-from-source-and-warm-up-no-keys).
 3. Read [Input namespaces and connectors](docs/product/input-namespaces-and-connectors.md) and the [MCP boundary](docs/development/mcp-boundary.md), plus the connector planning issues [#29](https://github.com/elixpo/crumb.elixpo/issues/29), [#30](https://github.com/elixpo/crumb.elixpo/issues/30) and [#31](https://github.com/elixpo/crumb.elixpo/issues/31).
 4. Pick a small issue from the [issue tracker](https://github.com/elixpo/crumb.elixpo/issues) to learn the codebase and review process.
 
-**Configuration and access**
-
-This repository keeps configuration encrypted with SOPS. Applicants do not need any keys: the warm-up tasks and the core of the idea run locally without decrypting configuration. Once accepted, contributors receive SOPS access scoped to their project (for example for integration tests or staging), which is revoked when the programme ends.
+**Configuration and access:** no keys are needed to apply; see [Configuration and access](#configuration-and-access) above.
 
 Questions go to **gsoc@elixpo.com**. GitHub Discussions for GSoC open once Google announces the 2027 dates.
 
