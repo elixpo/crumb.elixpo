@@ -5,6 +5,13 @@ release, behavior and interfaces may change without compatibility guarantees.
 
 ## Unreleased
 
+### Run Crumb as a harness
+
+- `crumb exec --stream-json` prints one JSON event per line while a turn runs
+  (text, reasoning, tool steps, file changes, approvals, usage) and ends with
+  a `result` event, so harness runners can follow and cancel Crumb like other
+  coding agents. Tool output is reported by size only, never by contents.
+
 ## 1.2.0 - 2026-10-27
 
 ### Use Crumb from other agents
