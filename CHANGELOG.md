@@ -3,6 +3,14 @@
 This file records notable public changes to Crumb. Until the first stable
 release, behavior and interfaces may change without compatibility guarantees.
 
+## Unreleased
+
+### Use Crumb in your editor
+
+- `crumb acp` offers `crumb auth login` as a terminal sign-in to editors
+  that can run one (`auth.terminal`, or the earlier `terminal-auth`), so an
+  editor can connect the crumb.elixpo account without leaving it.
+
 ## 1.4.0 - 2026-11-04
 
 ### Use Crumb in your editor

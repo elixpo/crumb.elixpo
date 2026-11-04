@@ -187,9 +187,14 @@ fn parse_approval_flag(value: &str) -> Option<ApprovalMode> {
 
 const ACP_USAGE: &str = "usage: crumb acp [--approvals always-ask|sensitive-only|full-access]";
 
-/// Parses `crumb acp [--approvals <mode>]`: `None` when the command is not
-/// `acp`, otherwise the approval override, if any.
-fn parse_acp_command(arguments: &[std::ffi::OsString]) -> Result<Option<Option<ApprovalMode>>> {
+/// `crumb acp [--approvals <mode>]`.
+#[derive(Debug, PartialEq, Eq)]
+struct AcpCommand {
+    approvals: Option<ApprovalMode>,
+}
+
+/// Parses `crumb acp`; `None` when the command is something else.
+fn parse_acp_command(arguments: &[std::ffi::OsString]) -> Result<Option<AcpCommand>> {
     let Some((command, rest)) = arguments.split_first() else {
         return Ok(None);
     };
@@ -197,11 +202,15 @@ fn parse_acp_command(arguments: &[std::ffi::OsString]) -> Result<Option<Option<A
         return Ok(None);
     }
     match rest {
-        [] => Ok(Some(None)),
+        [] => Ok(Some(AcpCommand { approvals: None })),
         [flag, value] if flag == "--approvals" => value
             .to_str()
             .and_then(parse_approval_flag)
-            .map(|mode| Some(Some(mode)))
+            .map(|mode| {
+                Some(AcpCommand {
+                    approvals: Some(mode),
+                })
+            })
             .with_context(|| format!("unknown approval mode; {ACP_USAGE}")),
         _ => bail!("{ACP_USAGE}"),
     }
@@ -213,8 +222,8 @@ fn run_command_line_action() -> Result<bool> {
         run_agent_exec(&current_process_dir()?, &exec, &mut io::stdout().lock())?;
         return Ok(true);
     }
-    if let Some(approvals) = parse_acp_command(&arguments)? {
-        acp::serve(approvals)?;
+    if let Some(command) = parse_acp_command(&arguments)? {
+        acp::serve(command.approvals)?;
         return Ok(true);
     }
     if matches!(arguments.as_slice(), [group, action] if group == "mcp" && action == "serve") {
@@ -14591,7 +14600,7 @@ mod tests {
     use crumb_profile::{ProfileSelectionStore, ProfileStore};
 
     use super::{
-        ArtifactModalAction, ArtifactModalBounds, COMPOSER_PLACEHOLDER, CaptureOutcome,
+        AcpCommand, ArtifactModalAction, ArtifactModalBounds, COMPOSER_PLACEHOLDER, CaptureOutcome,
         ComposerDock, CrumbEditMode, CrumbHighlighter, CrumbPrompt, DiscoverySource, ExecOutput,
         ExecRequest, ExitGesture, MarketplaceContent, PausedSubmission, PendingComposerArtifacts,
         Renderer, SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
@@ -14668,13 +14677,18 @@ mod tests {
 
     #[test]
     fn acp_arguments_take_only_an_approval_override() {
-        fn parse(arguments: &[&str]) -> anyhow::Result<Option<Option<ApprovalMode>>> {
+        fn parse(arguments: &[&str]) -> anyhow::Result<Option<AcpCommand>> {
             parse_acp_command(&arguments.iter().map(OsString::from).collect::<Vec<_>>())
         }
-        assert_eq!(parse(&["acp"]).unwrap(), Some(None));
+        assert_eq!(
+            parse(&["acp"]).unwrap(),
+            Some(AcpCommand { approvals: None })
+        );
         assert_eq!(
             parse(&["acp", "--approvals", "sensitive-only"]).unwrap(),
-            Some(Some(ApprovalMode::SensitiveOnly))
+            Some(AcpCommand {
+                approvals: Some(ApprovalMode::SensitiveOnly)
+            })
         );
         assert!(parse(&["acp", "--approvals", "yolo"]).is_err());
         assert!(parse(&["acp", "--approvals"]).is_err());
