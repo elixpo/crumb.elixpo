@@ -206,12 +206,15 @@ impl<B: AcpBackend, W: Write> AcpServer<B, W> {
 
     fn request(&mut self, method: &str, params: &Value) -> Result<Value, (i64, String)> {
         match method {
-            "initialize" => Ok(initialize_result()),
+            "initialize" => Ok(initialize_result(params)),
             "authenticate" => Ok(json!({})),
             "session/new" => {
                 let cwd = cwd_param(params)?;
                 warn_unused_mcp_servers(params);
-                let session = self.backend.new_session(&cwd).map_err(internal)?;
+                let session = self
+                    .backend
+                    .new_session(&cwd)
+                    .map_err(|error| internal(&error))?;
                 Ok(json!({"sessionId": session}))
             }
             "session/resume" => {
@@ -220,12 +223,14 @@ impl<B: AcpBackend, W: Write> AcpServer<B, W> {
                 warn_unused_mcp_servers(params);
                 self.backend
                     .resume_session(&session, &cwd)
-                    .map_err(internal)?;
+                    .map_err(|error| internal(&error))?;
                 Ok(json!({}))
             }
             "session/close" => {
                 let session = session_param(params)?;
-                self.backend.close_session(&session).map_err(internal)?;
+                self.backend
+                    .close_session(&session)
+                    .map_err(|error| internal(&error))?;
                 Ok(json!({}))
             }
             "session/list" => {
@@ -233,7 +238,7 @@ impl<B: AcpBackend, W: Write> AcpServer<B, W> {
                 let sessions = self
                     .backend
                     .list_sessions(cwd.as_deref())
-                    .map_err(internal)?;
+                    .map_err(|error| internal(&error))?;
                 Ok(json!({"sessions": sessions.iter().map(|session| {
                     let mut info = json!({
                         "sessionId": session.id,
@@ -315,7 +320,7 @@ impl<B: AcpBackend, W: Write> AcpServer<B, W> {
             match turn.poll(TURN_POLL) {
                 TurnSignal::Activity(activity) => {
                     for update in tools.updates(&activity) {
-                        self.update(&session, update)?;
+                        self.update(&session, &update)?;
                     }
                 }
                 TurnSignal::Approval(prompt) => {
@@ -353,7 +358,7 @@ impl<B: AcpBackend, W: Write> AcpServer<B, W> {
         self.reply(id, reply)
     }
 
-    fn update(&mut self, session: &str, update: Value) -> Result<()> {
+    fn update(&mut self, session: &str, update: &Value) -> Result<()> {
         self.send(&json!({
             "jsonrpc": "2.0",
             "method": "session/update",
@@ -376,7 +381,7 @@ impl<B: AcpBackend, W: Write> AcpServer<B, W> {
     }
 }
 
-fn internal(error: anyhow::Error) -> (i64, String) {
+fn internal(error: &anyhow::Error) -> (i64, String) {
     (INTERNAL_ERROR, format!("{error:#}"))
 }
 
@@ -424,7 +429,38 @@ fn permission_allowed(result: Option<&Value>) -> bool {
         })
 }
 
-pub(crate) fn initialize_result() -> Value {
+/// Whether the editor can run an agent's sign-in in a terminal: the stable
+/// `auth.terminal` capability, or the earlier `_meta["terminal-auth"]`.
+fn supports_terminal_auth(params: &Value) -> bool {
+    let capabilities = params.get("clientCapabilities").unwrap_or(&Value::Null);
+    capabilities.pointer("/auth/terminal") == Some(&Value::Bool(true))
+        || capabilities.pointer("/_meta/terminal-auth") == Some(&Value::Bool(true))
+}
+
+/// `crumb auth login`, run by the editor in a terminal. It exits 0 once the
+/// crumb.elixpo account is connected.
+fn terminal_login_method() -> Value {
+    let args = ["auth", "login"];
+    let command = std::env::current_exe()
+        .ok()
+        .map_or_else(|| "crumb".to_owned(), |path| path.display().to_string());
+    json!({
+        "id": "crumb-login",
+        "name": "Sign in to crumb.elixpo",
+        "description": "Connect your crumb.elixpo account in a terminal to use Pollinations models",
+        "type": "terminal",
+        "args": args,
+        "env": {},
+        "_meta": {"terminal-auth": {"command": command, "args": args, "label": "crumb auth login"}},
+    })
+}
+
+pub(crate) fn initialize_result(params: &Value) -> Value {
+    let auth_methods = if supports_terminal_auth(params) {
+        vec![terminal_login_method()]
+    } else {
+        Vec::new()
+    };
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "agentCapabilities": {
@@ -434,7 +470,7 @@ pub(crate) fn initialize_result() -> Value {
             "sessionCapabilities": {"resume": {}, "list": {}, "close": {}},
         },
         "agentInfo": {"name": "crumb", "title": "Crumb", "version": env!("CARGO_PKG_VERSION")},
-        "authMethods": [],
+        "authMethods": auth_methods,
     })
 }
 
@@ -534,13 +570,12 @@ impl ToolCalls {
 
     /// The `toolCall` of a permission request.
     pub(crate) fn permission_call(&mut self, name: &str, arguments: &Value) -> Value {
-        let id = match self.open_id(name) {
-            Some(id) => id.to_owned(),
-            None => {
-                let id = self.new_id();
-                self.announced.push_back((name.to_owned(), id.clone()));
-                id
-            }
+        let id = if let Some(id) = self.open_id(name) {
+            id.to_owned()
+        } else {
+            let id = self.new_id();
+            self.announced.push_back((name.to_owned(), id.clone()));
+            id
         };
         json!({
             "toolCallId": id,
@@ -1076,6 +1111,27 @@ mod tests {
             json!({"resume": {}, "list": {}, "close": {}})
         );
         assert_eq!(result["agentCapabilities"]["loadSession"], false);
+        assert_eq!(result["authMethods"], json!([]));
+    }
+
+    #[test]
+    fn terminal_sign_in_is_offered_only_to_editors_that_can_run_it() {
+        for capabilities in [
+            json!({"auth": {"terminal": true}}),
+            json!({"_meta": {"terminal-auth": true}}),
+        ] {
+            let result = initialize_result(&json!({"clientCapabilities": capabilities}));
+            let method = &result["authMethods"][0];
+            assert_eq!(method["type"], "terminal");
+            assert_eq!(method["args"], json!(["auth", "login"]));
+            assert_eq!(
+                method["_meta"]["terminal-auth"]["args"],
+                json!(["auth", "login"])
+            );
+        }
+        let result =
+            initialize_result(&json!({"clientCapabilities": {"auth": {"terminal": false}}}));
+        assert_eq!(result["authMethods"], json!([]));
     }
 
     #[test]
