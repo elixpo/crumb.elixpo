@@ -3,7 +3,7 @@
 This file records notable public changes to Crumb. Until the first stable
 release, behavior and interfaces may change without compatibility guarantees.
 
-## Unreleased
+## 1.3.0 - 2026-11-04
 
 ### Run Crumb as a harness
 
