@@ -125,6 +125,14 @@ Continue a session with `--resume <session_id>` (the id from the `result`
 event or `--json` output), and pick a configured model for one turn with
 `--model <provider>/<model>`; neither changes `.crumb/agent.json`.
 
+To run a turn against any OpenAI-compatible endpoint, such as a harness
+runner's local relay, set `CRUMB_EXEC_BASE_URL` (and `CRUMB_EXEC_API_KEY` if
+it needs a key; `CRUMB_EXEC_PROTOCOL=openai_responses` for the Responses API)
+and pass `--model exec/<model-id>`. The key is read from the environment when
+the request is sent and is never written to config, sessions or logs.
+Whoever launches Crumb can set the turn's approval policy with
+`--approvals always-ask|sensitive-only|full-access`; the model cannot change it.
+
 ## Build from source and warm-up (no keys)
 
 <!-- Commands match .github/workflows/ci.yml (jobs "quality" and "test"). -->
