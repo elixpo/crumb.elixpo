@@ -3223,7 +3223,7 @@ fn context_token_budget(config: &AgentConfig, route: &crumb_agent::ModelRoute) -
     })
 }
 
-fn session_root(workspace: &Path) -> PathBuf {
+pub(crate) fn session_root(workspace: &Path) -> PathBuf {
     workspace.join(".crumb").join("sessions").join("crumb")
 }
 

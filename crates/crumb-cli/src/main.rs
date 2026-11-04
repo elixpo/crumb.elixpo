@@ -98,6 +98,7 @@ use reedline::{
 };
 use sha2::{Digest, Sha256};
 
+mod acp;
 mod agent_runtime;
 mod agent_tool;
 mod bundled_skills;
@@ -174,10 +175,46 @@ fn parse_resume_session_argument(arguments: &[String]) -> Result<Option<String>>
     }
 }
 
+/// `--approvals` values accepted by `crumb exec` and `crumb acp`.
+fn parse_approval_flag(value: &str) -> Option<ApprovalMode> {
+    match value {
+        "always-ask" => Some(ApprovalMode::AlwaysAsk),
+        "sensitive-only" => Some(ApprovalMode::SensitiveOnly),
+        "full-access" => Some(ApprovalMode::FullAccess),
+        _ => None,
+    }
+}
+
+const ACP_USAGE: &str = "usage: crumb acp [--approvals always-ask|sensitive-only|full-access]";
+
+/// Parses `crumb acp [--approvals <mode>]`: `None` when the command is not
+/// `acp`, otherwise the approval override, if any.
+fn parse_acp_command(arguments: &[std::ffi::OsString]) -> Result<Option<Option<ApprovalMode>>> {
+    let Some((command, rest)) = arguments.split_first() else {
+        return Ok(None);
+    };
+    if command != "acp" {
+        return Ok(None);
+    }
+    match rest {
+        [] => Ok(Some(None)),
+        [flag, value] if flag == "--approvals" => value
+            .to_str()
+            .and_then(parse_approval_flag)
+            .map(|mode| Some(Some(mode)))
+            .with_context(|| format!("unknown approval mode; {ACP_USAGE}")),
+        _ => bail!("{ACP_USAGE}"),
+    }
+}
+
 fn run_command_line_action() -> Result<bool> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if let Some(exec) = parse_exec_request(&arguments)? {
         run_agent_exec(&current_process_dir()?, &exec, &mut io::stdout().lock())?;
+        return Ok(true);
+    }
+    if let Some(approvals) = parse_acp_command(&arguments)? {
+        acp::serve(approvals)?;
         return Ok(true);
     }
     if matches!(arguments.as_slice(), [group, action] if group == "mcp" && action == "serve") {
@@ -254,7 +291,7 @@ fn run_command_line_action() -> Result<bool> {
         [group, action] if group == "auth" && action == "logout" => AuthAction::Logout,
         _ => {
             return Err(anyhow!(
-                "usage: crumb [exec [options] <request> | skill <operation> | auth <login|status|logout> | mcp serve | review export <id|all> | completions <shell> | jobs <list|run <id>|tick>]"
+                "usage: crumb [exec [options] <request> | skill <operation> | auth <login|status|logout> | acp | mcp serve | review export <id|all> | completions <shell> | jobs <list|run <id>|tick>]"
             ));
         }
     };
@@ -330,12 +367,9 @@ fn parse_exec_request(arguments: &[OsString]) -> Result<Option<ExecRequest>> {
                 if argument == "--resume" {
                     resume = Some(value.to_owned());
                 } else if argument == "--approvals" {
-                    approvals = Some(match value {
-                        "always-ask" => ApprovalMode::AlwaysAsk,
-                        "sensitive-only" => ApprovalMode::SensitiveOnly,
-                        "full-access" => ApprovalMode::FullAccess,
-                        _ => bail!("unknown approval mode `{value}`; {EXEC_USAGE}"),
-                    });
+                    approvals = Some(parse_approval_flag(value).with_context(|| {
+                        format!("unknown approval mode `{value}`; {EXEC_USAGE}")
+                    })?);
                 } else {
                     let (provider, name) = value
                         .split_once('/')
@@ -14575,7 +14609,7 @@ mod tests {
         format_peer_quarantined_file, format_peer_task, handle_skill_command,
         initial_agent_activity, install_marketplace_package, load_exact_skill_manifest,
         marketplace_update_blocker, normalize_bundled_skill_install, openrouter_preset,
-        parse_cli_skill_run, parse_credential_reference, parse_exec_request,
+        parse_acp_command, parse_cli_skill_run, parse_credential_reference, parse_exec_request,
         parse_interactive_skill_run, parse_paused_submission, parse_provider_header,
         parse_resume_session_argument, read_agent_config, read_bounded_response,
         register_local_skill, render_skill_discovery_search, resolve_memory_keep,
@@ -14630,6 +14664,23 @@ mod tests {
         write_stream_event(&mut buffer, &stream_event(&HarnessActivity::Cancelled))
             .expect("event is written");
         assert_eq!(buffer, b"{\"type\":\"cancelled\"}\n");
+    }
+
+    #[test]
+    fn acp_arguments_take_only_an_approval_override() {
+        fn parse(arguments: &[&str]) -> anyhow::Result<Option<Option<ApprovalMode>>> {
+            parse_acp_command(&arguments.iter().map(OsString::from).collect::<Vec<_>>())
+        }
+        assert_eq!(parse(&["acp"]).unwrap(), Some(None));
+        assert_eq!(
+            parse(&["acp", "--approvals", "sensitive-only"]).unwrap(),
+            Some(Some(ApprovalMode::SensitiveOnly))
+        );
+        assert!(parse(&["acp", "--approvals", "yolo"]).is_err());
+        assert!(parse(&["acp", "--approvals"]).is_err());
+        assert!(parse(&["acp", "extra"]).is_err());
+        assert_eq!(parse(&["exec", "acp"]).unwrap(), None);
+        assert_eq!(parse(&[]).unwrap(), None);
     }
 
     #[test]
