@@ -275,7 +275,17 @@ enum ExecOutput {
 }
 
 const EXEC_USAGE: &str = "usage: crumb exec [--json | --stream-json] [--resume <session-id>] \
-                          [--model <provider>/<model>] [--] <request>";
+                          [--model <provider>/<model>] \
+                          [--approvals always-ask|sensitive-only|full-access] [--] <request>";
+
+/// Environment variables that point `crumb exec` at an OpenAI-compatible
+/// endpoint for one turn, as harness runners do with a local relay. The key
+/// is referenced by name, so it is never copied into config, sessions or logs.
+const EXEC_BASE_URL_ENV: &str = "CRUMB_EXEC_BASE_URL";
+const EXEC_API_KEY_ENV: &str = "CRUMB_EXEC_API_KEY";
+const EXEC_PROTOCOL_ENV: &str = "CRUMB_EXEC_PROTOCOL";
+/// The provider id `--model` names to use that endpoint.
+const EXEC_PROVIDER_ID: &str = "exec";
 
 /// A parsed `crumb exec` command line.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -285,6 +295,8 @@ struct ExecRequest {
     resume: Option<String>,
     /// Use this `<provider>/<model>` for the turn, without changing the config.
     model: Option<(String, String)>,
+    /// The approval mode for this turn, set by whoever launches Crumb.
+    approvals: Option<ApprovalMode>,
     request: String,
 }
 
@@ -298,6 +310,7 @@ fn parse_exec_request(arguments: &[OsString]) -> Result<Option<ExecRequest>> {
     let mut output = ExecOutput::Text;
     let mut resume = None;
     let mut model = None;
+    let mut approvals = None;
     let mut rest = arguments[1..].iter();
     let mut request = Vec::new();
     while let Some(argument) = rest.next() {
@@ -307,7 +320,7 @@ fn parse_exec_request(arguments: &[OsString]) -> Result<Option<ExecRequest>> {
         match argument {
             "--json" => output = ExecOutput::Json,
             "--stream-json" => output = ExecOutput::StreamJson,
-            "--resume" | "--model" => {
+            "--resume" | "--model" | "--approvals" => {
                 let value = rest
                     .next()
                     .and_then(|value| value.to_str())
@@ -316,6 +329,13 @@ fn parse_exec_request(arguments: &[OsString]) -> Result<Option<ExecRequest>> {
                     .with_context(|| format!("{argument} requires a value; {EXEC_USAGE}"))?;
                 if argument == "--resume" {
                     resume = Some(value.to_owned());
+                } else if argument == "--approvals" {
+                    approvals = Some(match value {
+                        "always-ask" => ApprovalMode::AlwaysAsk,
+                        "sensitive-only" => ApprovalMode::SensitiveOnly,
+                        "full-access" => ApprovalMode::FullAccess,
+                        _ => bail!("unknown approval mode `{value}`; {EXEC_USAGE}"),
+                    });
                 } else {
                     let (provider, name) = value
                         .split_once('/')
@@ -350,6 +370,7 @@ fn parse_exec_request(arguments: &[OsString]) -> Result<Option<ExecRequest>> {
         output,
         resume,
         model,
+        approvals,
         request,
     }))
 }
@@ -371,9 +392,7 @@ fn run_agent_exec(cwd: &Path, exec: &ExecRequest, writer: &mut dyn Write) -> Res
     let output = exec.output;
     let request = exec.request.as_str();
     let mut config = read_agent_config(cwd)?;
-    if let Some((provider, model)) = &exec.model {
-        select_text_model(&mut config, provider, model)?;
-    }
+    apply_exec_overrides(&mut config, exec, &|name| std::env::var(name).ok())?;
     let mut runtime = exec_runtime(cwd)?;
     if let Some(session) = &exec.resume {
         runtime
@@ -412,6 +431,60 @@ fn run_agent_exec(cwd: &Path, exec: &ExecRequest, writer: &mut dyn Write) -> Res
             summary["type"] = serde_json::Value::from("result");
             write_stream_event(writer, &summary)?;
         }
+    }
+    Ok(())
+}
+
+/// Applies a `crumb exec` turn's overrides to an in-memory copy of the
+/// config: the environment endpoint, the model, and the approval mode.
+fn apply_exec_overrides(
+    config: &mut AgentConfig,
+    exec: &ExecRequest,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<()> {
+    let base_url = env(EXEC_BASE_URL_ENV).filter(|url| !url.trim().is_empty());
+    let exec_model = exec
+        .model
+        .as_ref()
+        .filter(|(provider, _)| provider == EXEC_PROVIDER_ID)
+        .map(|(_, model)| model.as_str());
+    match (base_url, exec_model) {
+        (Some(base_url), Some(model)) => {
+            let protocol = match env(EXEC_PROTOCOL_ENV).as_deref() {
+                None | Some("" | "openai_completions") => ProviderProtocol::OpenAiCompletions,
+                Some("openai_responses") => ProviderProtocol::OpenAiResponses,
+                Some(other) => bail!(
+                    "{EXEC_PROTOCOL_ENV} must be openai_completions or openai_responses, not `{other}`"
+                ),
+            };
+            let mut provider = ProviderConfig::new("Exec endpoint", protocol, base_url.trim());
+            provider.credential =
+                env(EXEC_API_KEY_ENV)
+                    .is_some()
+                    .then(|| CredentialReference::Environment {
+                        name: EXEC_API_KEY_ENV.to_owned(),
+                    });
+            let mut entry = ProviderModel::new(model);
+            entry.input.insert(Modality::Text);
+            entry.tool_calling = true;
+            provider.models.push(entry);
+            config
+                .providers
+                .insert(EXEC_PROVIDER_ID.to_owned(), provider);
+        }
+        (Some(_), None) => bail!(
+            "{EXEC_BASE_URL_ENV} is set; choose its model with --model {EXEC_PROVIDER_ID}/<model>"
+        ),
+        (None, Some(_)) => bail!(
+            "--model {EXEC_PROVIDER_ID}/<model> needs {EXEC_BASE_URL_ENV} to point at an endpoint"
+        ),
+        (None, None) => {}
+    }
+    if let Some((provider, model)) = &exec.model {
+        select_text_model(config, provider, model)?;
+    }
+    if let Some(mode) = exec.approvals {
+        config.permissions.mode = mode;
     }
     Ok(())
 }
@@ -14490,18 +14563,19 @@ mod tests {
         Renderer, SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
         TranscriptLine, TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
         agent_config_location, aligned_composer_prompt, apply_builtin_model_packs,
-        artifact_modal_action, builtin_agent_config, bundled_catalog, compact_folder,
-        completion_footer_frame, completion_menu_composer_frame, completion_overlay_rows,
-        composer_anchor_row, composer_anchor_sequence, composer_placeholder_for,
-        composer_visual_rows, configure_permissions, configure_plugin, crumb_keybindings,
-        effort_display_name, effort_wire_name, ensure_single_release_skill_install,
-        exact_skill_manifest_url, exact_skill_run_config, failed_command_recovery,
-        finished_tool_activity, fixed_footer_frame, follow_up_composer_row,
-        follow_up_cursor_sequence, format_peer_discarded_file, format_peer_imported_file,
-        format_peer_inbox, format_peer_inspection, format_peer_quarantined_file, format_peer_task,
-        handle_skill_command, initial_agent_activity, install_marketplace_package,
-        load_exact_skill_manifest, marketplace_update_blocker, normalize_bundled_skill_install,
-        openrouter_preset, parse_cli_skill_run, parse_credential_reference, parse_exec_request,
+        apply_exec_overrides, artifact_modal_action, builtin_agent_config, bundled_catalog,
+        compact_folder, completion_footer_frame, completion_menu_composer_frame,
+        completion_overlay_rows, composer_anchor_row, composer_anchor_sequence,
+        composer_placeholder_for, composer_visual_rows, configure_permissions, configure_plugin,
+        crumb_keybindings, effort_display_name, effort_wire_name,
+        ensure_single_release_skill_install, exact_skill_manifest_url, exact_skill_run_config,
+        failed_command_recovery, finished_tool_activity, fixed_footer_frame,
+        follow_up_composer_row, follow_up_cursor_sequence, format_peer_discarded_file,
+        format_peer_imported_file, format_peer_inbox, format_peer_inspection,
+        format_peer_quarantined_file, format_peer_task, handle_skill_command,
+        initial_agent_activity, install_marketplace_package, load_exact_skill_manifest,
+        marketplace_update_blocker, normalize_bundled_skill_install, openrouter_preset,
+        parse_cli_skill_run, parse_credential_reference, parse_exec_request,
         parse_interactive_skill_run, parse_paused_submission, parse_provider_header,
         parse_resume_session_argument, read_agent_config, read_bounded_response,
         register_local_skill, render_skill_discovery_search, resolve_memory_keep,
@@ -14568,6 +14642,7 @@ mod tests {
                 output,
                 resume: resume.map(str::to_owned),
                 model: model.map(|(provider, name)| (provider.to_owned(), name.to_owned())),
+                approvals: None,
                 request: text.to_owned(),
             })
         };
@@ -14617,12 +14692,81 @@ mod tests {
             request(ExecOutput::Text, None, None, "explain --resume flag")
         );
 
+        let full = parse(&["exec", "--approvals", "full-access", "task"])
+            .unwrap()
+            .expect("exec action");
+        assert_eq!(full.approvals, Some(ApprovalMode::FullAccess));
+        assert!(parse(&["exec", "--approvals", "yolo", "task"]).is_err());
+
         assert!(parse(&["exec"]).is_err());
         assert!(parse(&["exec", "--json"]).is_err());
         assert!(parse(&["exec", "--resume"]).is_err());
         assert!(parse(&["exec", "--model", "no-slash", "task"]).is_err());
         assert!(parse(&["exec", "--model", "/model", "task"]).is_err());
         assert!(parse(&["auth", "status"]).unwrap().is_none());
+    }
+
+    #[test]
+    fn exec_endpoint_comes_from_the_environment_and_never_stores_the_key() {
+        let exec = |model: Option<(&str, &str)>, approvals| ExecRequest {
+            output: ExecOutput::Json,
+            resume: None,
+            model: model.map(|(provider, name)| (provider.to_owned(), name.to_owned())),
+            approvals,
+            request: "task".to_owned(),
+        };
+        let env = |name: &str| match name {
+            "CRUMB_EXEC_BASE_URL" => Some("http://127.0.0.1:9/v1".to_owned()),
+            "CRUMB_EXEC_API_KEY" => Some("relay-placeholder-secret".to_owned()),
+            _ => None,
+        };
+        let mut config = builtin_agent_config();
+        apply_exec_overrides(
+            &mut config,
+            &exec(
+                Some(("exec", "any/model-id")),
+                Some(ApprovalMode::FullAccess),
+            ),
+            &env,
+        )
+        .expect("endpoint and model apply");
+        let provider = &config.providers["exec"];
+        assert_eq!(provider.base_url, "http://127.0.0.1:9/v1");
+        assert_eq!(
+            provider.credential,
+            Some(CredentialReference::Environment {
+                name: "CRUMB_EXEC_API_KEY".to_owned()
+            })
+        );
+        let first = &config.models[&Modality::Text][0];
+        assert_eq!(
+            (first.provider.as_str(), first.model.as_str()),
+            ("exec", "any/model-id")
+        );
+        assert_eq!(config.permissions.mode, ApprovalMode::FullAccess);
+        let stored = serde_json::to_string(&config).expect("config serializes");
+        assert!(!stored.contains("relay-placeholder-secret"));
+
+        let no_env = |_: &str| None;
+        let mut config = builtin_agent_config();
+        assert!(
+            apply_exec_overrides(&mut config, &exec(Some(("exec", "m")), None), &no_env).is_err()
+        );
+        let mut config = builtin_agent_config();
+        assert!(apply_exec_overrides(&mut config, &exec(None, None), &env).is_err());
+        let bad_protocol = |name: &str| match name {
+            "CRUMB_EXEC_PROTOCOL" => Some("grpc".to_owned()),
+            other => env(other),
+        };
+        let mut config = builtin_agent_config();
+        assert!(
+            apply_exec_overrides(&mut config, &exec(Some(("exec", "m")), None), &bad_protocol)
+                .is_err()
+        );
+        let mut config = builtin_agent_config();
+        let before = config.permissions.mode;
+        apply_exec_overrides(&mut config, &exec(None, None), &no_env).expect("no overrides");
+        assert_eq!(config.permissions.mode, before);
     }
 
     #[test]

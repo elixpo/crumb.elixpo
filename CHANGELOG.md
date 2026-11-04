@@ -14,6 +14,11 @@ release, behavior and interfaces may change without compatibility guarantees.
 - `crumb exec --resume <session_id>` continues a saved session, and
   `crumb exec --model <provider>/<model>` picks a configured model for one
   turn without changing `.crumb/agent.json`.
+- `CRUMB_EXEC_BASE_URL`, `CRUMB_EXEC_API_KEY` and `CRUMB_EXEC_PROTOCOL` point
+  `crumb exec --model exec/<model-id>` at any OpenAI-compatible endpoint for
+  one turn; the key is referenced by name and never stored.
+- `crumb exec --approvals always-ask|sensitive-only|full-access` sets the
+  turn's approval policy from the command line, which the model cannot change.
 
 ## 1.2.0 - 2026-10-27
 
