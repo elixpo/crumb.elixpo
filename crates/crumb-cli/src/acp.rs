@@ -1062,6 +1062,12 @@ mod tests {
         }
     }
 
+    /// An absolute workspace path on this platform (`/work` has no drive
+    /// letter on Windows, so it is not absolute there).
+    fn work_dir() -> String {
+        std::env::temp_dir().join("work").display().to_string()
+    }
+
     fn text_prompt(session: &str, text: &str) -> Value {
         json!({"sessionId": session, "prompt": [{"type": "text", "text": text}]})
     }
@@ -1162,7 +1168,11 @@ mod tests {
         );
         let prompts = Arc::clone(&backend.prompts);
         let editor = Editor::start(backend);
-        editor.request(0, "session/new", json!({"cwd": "/work", "mcpServers": []}));
+        editor.request(
+            0,
+            "session/new",
+            json!({"cwd": work_dir(), "mcpServers": []}),
+        );
         assert_eq!(editor.next()["result"]["sessionId"], "s1");
         editor.request(1, "session/prompt", text_prompt("s1", "read lib.rs"));
         let out = editor.until_response(1);
@@ -1304,10 +1314,13 @@ mod tests {
     fn sessions_resume_list_and_reject_bad_parameters() {
         let editor = Editor::start(FakeBackend::default());
         let calls = [
-            ("session/resume", json!({"sessionId": "s9", "cwd": "/work"})),
             (
                 "session/resume",
-                json!({"sessionId": "missing", "cwd": "/work"}),
+                json!({"sessionId": "s9", "cwd": work_dir()}),
+            ),
+            (
+                "session/resume",
+                json!({"sessionId": "missing", "cwd": work_dir()}),
             ),
             ("session/list", json!({})),
             ("session/new", json!({"cwd": "relative"})),
