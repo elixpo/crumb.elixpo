@@ -11,6 +11,9 @@ release, behavior and interfaces may change without compatibility guarantees.
   (text, reasoning, tool steps, file changes, approvals, usage) and ends with
   a `result` event, so harness runners can follow and cancel Crumb like other
   coding agents. Tool output is reported by size only, never by contents.
+- `crumb exec --resume <session_id>` continues a saved session, and
+  `crumb exec --model <provider>/<model>` picks a configured model for one
+  turn without changing `.crumb/agent.json`.
 
 ## 1.2.0 - 2026-10-27
 
