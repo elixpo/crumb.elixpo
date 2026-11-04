@@ -121,6 +121,10 @@ contents), `file_changed`, `approval_required`, `usage`, `status`,
 Errors go to stderr with a non-zero exit status, and killing the process
 cancels the turn.
 
+Continue a session with `--resume <session_id>` (the id from the `result`
+event or `--json` output), and pick a configured model for one turn with
+`--model <provider>/<model>`; neither changes `.crumb/agent.json`.
+
 ## Build from source and warm-up (no keys)
 
 <!-- Commands match .github/workflows/ci.yml (jobs "quality" and "test"). -->

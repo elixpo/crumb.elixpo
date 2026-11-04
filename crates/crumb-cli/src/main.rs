@@ -176,13 +176,8 @@ fn parse_resume_session_argument(arguments: &[String]) -> Result<Option<String>>
 
 fn run_command_line_action() -> Result<bool> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if let Some((output, request)) = parse_exec_request(&arguments)? {
-        run_agent_exec(
-            &current_process_dir()?,
-            &request,
-            output,
-            &mut io::stdout().lock(),
-        )?;
+    if let Some(exec) = parse_exec_request(&arguments)? {
+        run_agent_exec(&current_process_dir()?, &exec, &mut io::stdout().lock())?;
         return Ok(true);
     }
     if matches!(arguments.as_slice(), [group, action] if group == "mcp" && action == "serve") {
@@ -259,7 +254,7 @@ fn run_command_line_action() -> Result<bool> {
         [group, action] if group == "auth" && action == "logout" => AuthAction::Logout,
         _ => {
             return Err(anyhow!(
-                "usage: crumb [exec [--json | --stream-json] <request> | skill <operation> | auth <login|status|logout> | mcp serve | review export <id|all> | completions <shell> | jobs <list|run <id>|tick>]"
+                "usage: crumb [exec [options] <request> | skill <operation> | auth <login|status|logout> | mcp serve | review export <id|all> | completions <shell> | jobs <list|run <id>|tick>]"
             ));
         }
     };
@@ -279,39 +274,84 @@ enum ExecOutput {
     StreamJson,
 }
 
-fn parse_exec_request(arguments: &[OsString]) -> Result<Option<(ExecOutput, String)>> {
+const EXEC_USAGE: &str = "usage: crumb exec [--json | --stream-json] [--resume <session-id>] \
+                          [--model <provider>/<model>] [--] <request>";
+
+/// A parsed `crumb exec` command line.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExecRequest {
+    output: ExecOutput,
+    /// Continue this saved session instead of starting a new one.
+    resume: Option<String>,
+    /// Use this `<provider>/<model>` for the turn, without changing the config.
+    model: Option<(String, String)>,
+    request: String,
+}
+
+fn parse_exec_request(arguments: &[OsString]) -> Result<Option<ExecRequest>> {
     let Some(command) = arguments.first() else {
         return Ok(None);
     };
     if command != "exec" {
         return Ok(None);
     }
-    let mut request = &arguments[1..];
-    let output = match request.first().and_then(|argument| argument.to_str()) {
-        Some("--json") => ExecOutput::Json,
-        Some("--stream-json") => ExecOutput::StreamJson,
-        _ => ExecOutput::Text,
-    };
-    if output != ExecOutput::Text {
-        request = &request[1..];
-    }
-    // `--` ends the options, after an output flag too, and is not part of the request.
-    if request.first().is_some_and(|argument| argument == "--") {
-        request = &request[1..];
-    }
-    if request.is_empty() {
-        bail!("usage: crumb exec [--json | --stream-json] <request>");
+    let mut output = ExecOutput::Text;
+    let mut resume = None;
+    let mut model = None;
+    let mut rest = arguments[1..].iter();
+    let mut request = Vec::new();
+    while let Some(argument) = rest.next() {
+        let argument = argument
+            .to_str()
+            .context("exec request arguments must be UTF-8")?;
+        match argument {
+            "--json" => output = ExecOutput::Json,
+            "--stream-json" => output = ExecOutput::StreamJson,
+            "--resume" | "--model" => {
+                let value = rest
+                    .next()
+                    .and_then(|value| value.to_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .with_context(|| format!("{argument} requires a value; {EXEC_USAGE}"))?;
+                if argument == "--resume" {
+                    resume = Some(value.to_owned());
+                } else {
+                    let (provider, name) = value
+                        .split_once('/')
+                        .filter(|(provider, name)| !provider.is_empty() && !name.is_empty())
+                        .with_context(|| {
+                            format!("--model expects <provider>/<model>; {EXEC_USAGE}")
+                        })?;
+                    model = Some((provider.to_owned(), name.to_owned()));
+                }
+            }
+            // `--` ends the options and is not part of the request.
+            "--" => {
+                request.extend(rest.by_ref().map(|argument| argument.to_str()));
+                break;
+            }
+            _ => {
+                request.push(Some(argument));
+                request.extend(rest.by_ref().map(|argument| argument.to_str()));
+                break;
+            }
+        }
     }
     let request = request
-        .iter()
-        .map(|argument| {
-            argument
-                .to_str()
-                .context("exec request arguments must be UTF-8")
-        })
-        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .context("exec request arguments must be UTF-8")?
         .join(" ");
-    Ok(Some((output, request)))
+    if request.trim().is_empty() {
+        bail!(EXEC_USAGE);
+    }
+    Ok(Some(ExecRequest {
+        output,
+        resume,
+        model,
+        request,
+    }))
 }
 
 /// A runtime for one non-interactive turn, as `crumb exec` and the
@@ -327,14 +367,19 @@ fn exec_runtime(cwd: &Path) -> Result<AgentRuntime> {
     Ok(runtime)
 }
 
-fn run_agent_exec(
-    cwd: &Path,
-    request: &str,
-    output: ExecOutput,
-    writer: &mut dyn Write,
-) -> Result<()> {
-    let config = read_agent_config(cwd)?;
+fn run_agent_exec(cwd: &Path, exec: &ExecRequest, writer: &mut dyn Write) -> Result<()> {
+    let output = exec.output;
+    let request = exec.request.as_str();
+    let mut config = read_agent_config(cwd)?;
+    if let Some((provider, model)) = &exec.model {
+        select_text_model(&mut config, provider, model)?;
+    }
     let mut runtime = exec_runtime(cwd)?;
+    if let Some(session) = &exec.resume {
+        runtime
+            .resume(cwd, session)
+            .with_context(|| format!("session `{session}` could not be resumed"))?;
+    }
     let cancellation = CancellationToken::default();
     let mut progress = ExecProgress::new(output);
     let result =
@@ -7907,31 +7952,36 @@ fn set_text_model(command: &str, cwd: &Path, writer: &mut dyn Write) -> Result<(
         .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
         .context("usage: /model use <provider>/<model>")?;
     update_agent_config(cwd, |config| {
-        let provider = config
-            .providers
-            .get(provider_id)
-            .with_context(|| format!("provider `{provider_id}` is not configured"))?;
-        provider
-            .models
-            .iter()
-            .find(|model| model.id == model_id)
-            .with_context(|| {
-                format!("model `{model_id}` is not configured for provider `{provider_id}`")
-            })?;
-        let routes = config.models.entry(Modality::Text).or_default();
-        routes.retain(|route| route.provider != provider_id || route.model != model_id);
-        routes.insert(
-            0,
-            ModelRoute {
-                provider: provider_id.to_owned(),
-                model: model_id.to_owned(),
-                reasoning_effort: None,
-            },
-        );
-        config.active_model_pack = None;
-        Ok(())
+        select_text_model(config, provider_id, model_id)
     })?;
     writeln!(writer, "◆ Text model · {provider_id}/{model_id}")?;
+    Ok(())
+}
+
+/// Makes `provider_id/model_id` the first text route, as `/model use` and
+/// `crumb exec --model` do. The provider and model must be configured.
+fn select_text_model(config: &mut AgentConfig, provider_id: &str, model_id: &str) -> Result<()> {
+    let provider = config
+        .providers
+        .get(provider_id)
+        .with_context(|| format!("provider `{provider_id}` is not configured"))?;
+    provider
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .with_context(|| {
+            format!("model `{model_id}` is not configured for provider `{provider_id}`")
+        })?;
+    promote_model_route(
+        &mut config.models,
+        Modality::Text,
+        ModelRoute {
+            provider: provider_id.to_owned(),
+            model: model_id.to_owned(),
+            reasoning_effort: None,
+        },
+    );
+    config.active_model_pack = None;
     Ok(())
 }
 
@@ -14436,19 +14486,19 @@ mod tests {
     use super::{
         ArtifactModalAction, ArtifactModalBounds, COMPOSER_PLACEHOLDER, CaptureOutcome,
         ComposerDock, CrumbEditMode, CrumbHighlighter, CrumbPrompt, DiscoverySource, ExecOutput,
-        ExitGesture, MarketplaceContent, PausedSubmission, PendingComposerArtifacts, Renderer,
-        SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
+        ExecRequest, ExitGesture, MarketplaceContent, PausedSubmission, PendingComposerArtifacts,
+        Renderer, SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
         TranscriptLine, TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
         agent_config_location, aligned_composer_prompt, apply_builtin_model_packs,
-        artifact_modal_action, bundled_catalog, compact_folder, completion_footer_frame,
-        completion_menu_composer_frame, completion_overlay_rows, composer_anchor_row,
-        composer_anchor_sequence, composer_placeholder_for, composer_visual_rows,
-        configure_permissions, configure_plugin, crumb_keybindings, effort_display_name,
-        effort_wire_name, ensure_single_release_skill_install, exact_skill_manifest_url,
-        exact_skill_run_config, failed_command_recovery, finished_tool_activity,
-        fixed_footer_frame, follow_up_composer_row, follow_up_cursor_sequence,
-        format_peer_discarded_file, format_peer_imported_file, format_peer_inbox,
-        format_peer_inspection, format_peer_quarantined_file, format_peer_task,
+        artifact_modal_action, builtin_agent_config, bundled_catalog, compact_folder,
+        completion_footer_frame, completion_menu_composer_frame, completion_overlay_rows,
+        composer_anchor_row, composer_anchor_sequence, composer_placeholder_for,
+        composer_visual_rows, configure_permissions, configure_plugin, crumb_keybindings,
+        effort_display_name, effort_wire_name, ensure_single_release_skill_install,
+        exact_skill_manifest_url, exact_skill_run_config, failed_command_recovery,
+        finished_tool_activity, fixed_footer_frame, follow_up_composer_row,
+        follow_up_cursor_sequence, format_peer_discarded_file, format_peer_imported_file,
+        format_peer_inbox, format_peer_inspection, format_peer_quarantined_file, format_peer_task,
         handle_skill_command, initial_agent_activity, install_marketplace_package,
         load_exact_skill_manifest, marketplace_update_blocker, normalize_bundled_skill_install,
         openrouter_preset, parse_cli_skill_run, parse_credential_reference, parse_exec_request,
@@ -14456,12 +14506,12 @@ mod tests {
         parse_resume_session_argument, read_agent_config, read_bounded_response,
         register_local_skill, render_skill_discovery_search, resolve_memory_keep,
         sanitize_completion_menu_body, sanitize_transcript_output, select_discovery_skill,
-        set_skill_enabled, shell_blast_radius, shell_tool_config, should_auto_enable_rtk,
-        show_graph, show_instance, show_marketplace, show_memory, show_profile_with_stores,
-        status_tone_for_output, stream_event, suggestion_width, transcript_activity_row,
-        unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
-        visible_tool_activity, workspace_read_host, write_bounded_response_delta_for_width,
-        write_stream_event,
+        select_text_model, set_skill_enabled, shell_blast_radius, shell_tool_config,
+        should_auto_enable_rtk, show_graph, show_instance, show_marketplace, show_memory,
+        show_profile_with_stores, status_tone_for_output, stream_event, suggestion_width,
+        transcript_activity_row, unregister_local_skill, validate_marketplace_path,
+        validate_marketplace_response, visible_tool_activity, workspace_read_host,
+        write_bounded_response_delta_for_width, write_stream_event,
     };
     use crate::agent_runtime::{
         PeerDeliveryInspection, PeerDiscardedFile, PeerImportedFile, PeerInboxSummary,
@@ -14510,64 +14560,93 @@ mod tests {
 
     #[test]
     fn exec_arguments_support_plain_json_and_flag_like_requests() {
-        let parsed = parse_exec_request(&[
-            OsString::from("exec"),
-            OsString::from("--json"),
-            OsString::from("inspect"),
-            OsString::from("this workspace"),
-        ])
-        .expect("valid exec request")
-        .expect("exec action");
+        fn parse(arguments: &[&str]) -> anyhow::Result<Option<ExecRequest>> {
+            parse_exec_request(&arguments.iter().map(OsString::from).collect::<Vec<_>>())
+        }
+        let request = |output, resume: Option<&str>, model: Option<(&str, &str)>, text: &str| {
+            Some(ExecRequest {
+                output,
+                resume: resume.map(str::to_owned),
+                model: model.map(|(provider, name)| (provider.to_owned(), name.to_owned())),
+                request: text.to_owned(),
+            })
+        };
         assert_eq!(
-            parsed,
-            (ExecOutput::Json, "inspect this workspace".to_owned())
+            parse(&["exec", "--json", "inspect", "this workspace"]).unwrap(),
+            request(ExecOutput::Json, None, None, "inspect this workspace")
         );
-
-        let escaped = parse_exec_request(&[
-            OsString::from("exec"),
-            OsString::from("--"),
-            OsString::from("--json is part of this request"),
-        ])
-        .expect("escaped exec request")
-        .expect("exec action");
         assert_eq!(
-            escaped,
-            (
+            parse(&["exec", "--", "--json is part of this request"]).unwrap(),
+            request(
                 ExecOutput::Text,
-                "--json is part of this request".to_owned()
+                None,
+                None,
+                "--json is part of this request"
             )
         );
-        let json_then_separator = parse_exec_request(&[
-            OsString::from("exec"),
-            OsString::from("--json"),
-            OsString::from("--"),
-            OsString::from("count the lines"),
-        ])
-        .expect("json then separator")
-        .expect("exec action");
         assert_eq!(
-            json_then_separator,
-            (ExecOutput::Json, "count the lines".to_owned())
+            parse(&["exec", "--json", "--", "count the lines"]).unwrap(),
+            request(ExecOutput::Json, None, None, "count the lines")
         );
-        let streamed = parse_exec_request(&[
-            OsString::from("exec"),
-            OsString::from("--stream-json"),
-            OsString::from("fix"),
-            OsString::from("the test"),
-        ])
-        .expect("stream-json exec request")
-        .expect("exec action");
         assert_eq!(
-            streamed,
-            (ExecOutput::StreamJson, "fix the test".to_owned())
+            parse(&["exec", "--stream-json", "fix", "the test"]).unwrap(),
+            request(ExecOutput::StreamJson, None, None, "fix the test")
+        );
+        assert_eq!(
+            parse(&[
+                "exec",
+                "--resume",
+                "crumb-1",
+                "--stream-json",
+                "--model",
+                "pollinations/openai",
+                "--",
+                "and now the docs",
+            ])
+            .unwrap(),
+            request(
+                ExecOutput::StreamJson,
+                Some("crumb-1"),
+                Some(("pollinations", "openai")),
+                "and now the docs"
+            )
+        );
+        // Options only count before the request; later words are the request.
+        assert_eq!(
+            parse(&["exec", "explain", "--resume", "flag"]).unwrap(),
+            request(ExecOutput::Text, None, None, "explain --resume flag")
         );
 
-        assert!(parse_exec_request(&[OsString::from("exec")]).is_err());
-        assert!(
-            parse_exec_request(&[OsString::from("auth"), OsString::from("status")])
-                .expect("non-exec arguments")
-                .is_none()
+        assert!(parse(&["exec"]).is_err());
+        assert!(parse(&["exec", "--json"]).is_err());
+        assert!(parse(&["exec", "--resume"]).is_err());
+        assert!(parse(&["exec", "--model", "no-slash", "task"]).is_err());
+        assert!(parse(&["exec", "--model", "/model", "task"]).is_err());
+        assert!(parse(&["auth", "status"]).unwrap().is_none());
+    }
+
+    #[test]
+    fn exec_model_override_needs_a_configured_provider_and_model() {
+        let mut config = builtin_agent_config();
+        assert!(select_text_model(&mut config, "nobody", "model").is_err());
+        let (provider, model) = config
+            .providers
+            .iter()
+            .find_map(|(id, provider)| {
+                provider
+                    .models
+                    .last()
+                    .map(|model| (id.clone(), model.id.clone()))
+            })
+            .expect("the built-in config has a provider with models");
+        assert!(select_text_model(&mut config, &provider, "no-such-model").is_err());
+        select_text_model(&mut config, &provider, &model).expect("configured model is accepted");
+        let first = &config.models[&Modality::Text][0];
+        assert_eq!(
+            (first.provider.as_str(), first.model.as_str()),
+            (provider.as_str(), model.as_str())
         );
+        assert_eq!(config.active_model_pack, None);
     }
 
     #[test]
