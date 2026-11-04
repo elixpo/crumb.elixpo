@@ -3,6 +3,17 @@
 This file records notable public changes to Crumb. Until the first stable
 release, behavior and interfaces may change without compatibility guarantees.
 
+## Unreleased
+
+### Use Crumb in your editor
+
+- `crumb acp` runs Crumb as an Agent Client Protocol (v1) agent, so editors
+  such as Zed can use it: answers, reasoning and tool calls with their output
+  stream into the editor, tool approvals become the editor's permission
+  prompts, a cancel stops the turn, and sessions can be listed, resumed and
+  closed. `--approvals` overrides the approval policy. Image and audio
+  prompts and editor-provided MCP servers are not supported yet.
+
 ## 1.3.0 - 2026-11-04
 
 ### Run Crumb as a harness

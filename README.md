@@ -125,6 +125,32 @@ Continue a session with `--resume <session_id>` (the id from the `result`
 event or `--json` output), and pick a configured model for one turn with
 `--model <provider>/<model>`; neither changes `.crumb/agent.json`.
 
+### In your editor (Agent Client Protocol)
+
+`crumb acp` runs Crumb as an [Agent Client Protocol](https://agentclientprotocol.com)
+agent, so editors such as Zed can use it as their coding agent. In Zed, add it
+to `settings.json`:
+
+```json
+{
+  "agent_servers": {
+    "Crumb": {
+      "type": "custom",
+      "command": "crumb",
+      "args": ["acp"],
+      "env": {}
+    }
+  }
+}
+```
+
+Crumb's text, reasoning and tool calls (with their output) stream into the
+editor, approvals appear there as permission prompts, and sessions can be
+listed and resumed. Add `--approvals always-ask|sensitive-only|full-access`
+to `args` to override the workspace's approval policy. Crumb speaks ACP v1;
+image and audio prompts, and MCP servers offered by the editor, are not
+supported yet.
+
 To run a turn against any OpenAI-compatible endpoint, such as a harness
 runner's local relay, set `CRUMB_EXEC_BASE_URL` (and `CRUMB_EXEC_API_KEY` if
 it needs a key; `CRUMB_EXEC_PROTOCOL=openai_responses` for the Responses API)
