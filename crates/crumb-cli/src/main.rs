@@ -176,11 +176,11 @@ fn parse_resume_session_argument(arguments: &[String]) -> Result<Option<String>>
 
 fn run_command_line_action() -> Result<bool> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if let Some((json, request)) = parse_exec_request(&arguments)? {
+    if let Some((output, request)) = parse_exec_request(&arguments)? {
         run_agent_exec(
             &current_process_dir()?,
             &request,
-            json,
+            output,
             &mut io::stdout().lock(),
         )?;
         return Ok(true);
@@ -259,7 +259,7 @@ fn run_command_line_action() -> Result<bool> {
         [group, action] if group == "auth" && action == "logout" => AuthAction::Logout,
         _ => {
             return Err(anyhow!(
-                "usage: crumb [exec [--json] <request> | skill <operation> | auth <login|status|logout> | mcp serve | review export <id|all> | completions <shell> | jobs <list|run <id>|tick>]"
+                "usage: crumb [exec [--json | --stream-json] <request> | skill <operation> | auth <login|status|logout> | mcp serve | review export <id|all> | completions <shell> | jobs <list|run <id>|tick>]"
             ));
         }
     };
@@ -267,7 +267,19 @@ fn run_command_line_action() -> Result<bool> {
     Ok(true)
 }
 
-fn parse_exec_request(arguments: &[OsString]) -> Result<Option<(bool, String)>> {
+/// How `crumb exec` reports its turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecOutput {
+    /// The final answer as plain text.
+    Text,
+    /// One JSON object with the answer, session, finish reason and usage.
+    Json,
+    /// Newline-delimited JSON events while the turn runs, ending with the
+    /// same object `Json` prints, tagged `"type": "result"`.
+    StreamJson,
+}
+
+fn parse_exec_request(arguments: &[OsString]) -> Result<Option<(ExecOutput, String)>> {
     let Some(command) = arguments.first() else {
         return Ok(None);
     };
@@ -275,16 +287,20 @@ fn parse_exec_request(arguments: &[OsString]) -> Result<Option<(bool, String)>> 
         return Ok(None);
     }
     let mut request = &arguments[1..];
-    let json = request.first().is_some_and(|argument| argument == "--json");
-    if json {
+    let output = match request.first().and_then(|argument| argument.to_str()) {
+        Some("--json") => ExecOutput::Json,
+        Some("--stream-json") => ExecOutput::StreamJson,
+        _ => ExecOutput::Text,
+    };
+    if output != ExecOutput::Text {
         request = &request[1..];
     }
-    // `--` ends the options, after `--json` too, and is not part of the request.
+    // `--` ends the options, after an output flag too, and is not part of the request.
     if request.first().is_some_and(|argument| argument == "--") {
         request = &request[1..];
     }
     if request.is_empty() {
-        bail!("usage: crumb exec [--json] <request>");
+        bail!("usage: crumb exec [--json | --stream-json] <request>");
     }
     let request = request
         .iter()
@@ -295,7 +311,7 @@ fn parse_exec_request(arguments: &[OsString]) -> Result<Option<(bool, String)>> 
         })
         .collect::<Result<Vec<_>>>()?
         .join(" ");
-    Ok(Some((json, request)))
+    Ok(Some((output, request)))
 }
 
 /// A runtime for one non-interactive turn, as `crumb exec` and the
@@ -311,11 +327,16 @@ fn exec_runtime(cwd: &Path) -> Result<AgentRuntime> {
     Ok(runtime)
 }
 
-fn run_agent_exec(cwd: &Path, request: &str, json: bool, writer: &mut dyn Write) -> Result<()> {
+fn run_agent_exec(
+    cwd: &Path,
+    request: &str,
+    output: ExecOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
     let config = read_agent_config(cwd)?;
     let mut runtime = exec_runtime(cwd)?;
     let cancellation = CancellationToken::default();
-    let mut progress = ExecProgress::new(json);
+    let mut progress = ExecProgress::new(output);
     let result =
         runtime.run_local_job_with_events(request, &config, cwd, &cancellation, |event| {
             progress.handle(&event, writer).map_err(Into::into)
@@ -325,32 +346,95 @@ fn run_agent_exec(cwd: &Path, request: &str, json: bool, writer: &mut dyn Write)
         progress.end_line(writer)?;
         return Ok(());
     }
-    if json {
-        serde_json::to_writer(
-            &mut *writer,
-            &serde_json::json!({
-                "session_id": result.session_id,
-                "response": response,
-                "finish_reason": result.finish_reason,
-                "usage": {
-                    "input_tokens": result.input_tokens,
-                    "cached_input_tokens": result.cached_input_tokens,
-                    "output_tokens": result.output_tokens,
-                    "context_tokens": result.context_tokens,
-                }
-            }),
-        )?;
-        writeln!(writer)?;
-    } else {
-        writeln!(writer, "{response}")?;
+    let mut summary = serde_json::json!({
+        "session_id": result.session_id,
+        "response": response,
+        "finish_reason": result.finish_reason,
+        "usage": {
+            "input_tokens": result.input_tokens,
+            "cached_input_tokens": result.cached_input_tokens,
+            "output_tokens": result.output_tokens,
+            "context_tokens": result.context_tokens,
+        }
+    });
+    match output {
+        ExecOutput::Text => writeln!(writer, "{response}")?,
+        ExecOutput::Json => {
+            serde_json::to_writer(&mut *writer, &summary)?;
+            writeln!(writer)?;
+        }
+        ExecOutput::StreamJson => {
+            summary["type"] = serde_json::Value::from("result");
+            write_stream_event(writer, &summary)?;
+        }
     }
     Ok(())
 }
 
+/// One line of `crumb exec --stream-json`.
+fn write_stream_event(writer: &mut dyn Write, event: &serde_json::Value) -> io::Result<()> {
+    serde_json::to_writer(&mut *writer, event)?;
+    writeln!(writer)?;
+    writer.flush()
+}
+
+/// The `--stream-json` form of a harness event. Tool output is reported by
+/// size only: like the terminal activity channel, the stream never carries
+/// tool output contents.
+fn stream_event(event: &HarnessActivity) -> serde_json::Value {
+    use serde_json::json;
+    match event {
+        HarnessActivity::RequestAccepted => json!({"type": "started"}),
+        HarnessActivity::ResponseDelta { text } => json!({"type": "text", "text": text}),
+        HarnessActivity::ReasoningDelta { text } => json!({"type": "reasoning", "text": text}),
+        HarnessActivity::ResponseRevised => json!({"type": "text_revised"}),
+        HarnessActivity::ResponseCorrected { text } => {
+            json!({"type": "text_corrected", "text": text})
+        }
+        HarnessActivity::Usage {
+            input_tokens,
+            output_tokens,
+        } => json!({
+            "type": "usage",
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }),
+        HarnessActivity::Status { state } => json!({"type": "status", "state": state}),
+        HarnessActivity::ToolStarted { name, detail } => {
+            json!({"type": "tool_started", "name": name, "detail": detail})
+        }
+        HarnessActivity::ApprovalRequired { name } => {
+            json!({"type": "approval_required", "name": name})
+        }
+        HarnessActivity::ToolOutput { name, bytes, .. } => {
+            json!({"type": "tool_output", "name": name, "bytes": bytes})
+        }
+        HarnessActivity::ToolFinished { name, success } => {
+            json!({"type": "tool_finished", "name": name, "success": success})
+        }
+        HarnessActivity::FileChanged {
+            path,
+            additions,
+            deletions,
+        } => json!({
+            "type": "file_changed",
+            "path": path,
+            "additions": additions,
+            "deletions": deletions,
+        }),
+        HarnessActivity::Completed { reason } => json!({"type": "completed", "reason": reason}),
+        HarnessActivity::Failed { reason } => json!({"type": "failed", "reason": reason}),
+        HarnessActivity::Cancelled => json!({"type": "cancelled"}),
+        HarnessActivity::Progress { label } => json!({"type": "progress", "label": label}),
+    }
+}
+
 /// Live progress for `crumb exec`. Model text streams to stdout only when it
 /// is a terminal, so piped stdout still receives just the final answer; tool
-/// steps go to stderr when it is a terminal. `--json` stays silent.
+/// steps go to stderr when it is a terminal. `--json` stays silent, and
+/// `--stream-json` writes every event to stdout as one JSON line.
 struct ExecProgress {
+    stream_json: bool,
     targets: ExecTargets,
     streamed: bool,
     mid_line: bool,
@@ -363,12 +447,14 @@ struct ExecTargets {
 }
 
 impl ExecProgress {
-    fn new(json: bool) -> Self {
+    fn new(output: ExecOutput) -> Self {
         use std::io::IsTerminal as _;
+        let text = output == ExecOutput::Text;
         Self {
+            stream_json: output == ExecOutput::StreamJson,
             targets: ExecTargets {
-                stream_text: !json && io::stdout().is_terminal(),
-                show_steps: !json && io::stderr().is_terminal(),
+                stream_text: text && io::stdout().is_terminal(),
+                show_steps: text && io::stderr().is_terminal(),
             },
             streamed: false,
             mid_line: false,
@@ -376,6 +462,9 @@ impl ExecProgress {
     }
 
     fn handle(&mut self, event: &HarnessActivity, writer: &mut dyn Write) -> io::Result<()> {
+        if self.stream_json {
+            return write_stream_event(writer, &stream_event(event));
+        }
         match event {
             HarnessActivity::ResponseDelta { text } if self.targets.stream_text => {
                 write!(writer, "{text}")?;
@@ -14339,14 +14428,15 @@ mod tests {
         OptimizerConfig, ProviderConfig, ProviderHeader, ProviderModel, ProviderProtocol,
         RiskClass, SkillConfig,
     };
+    use crumb_harness_dsh::HarnessActivity;
     use crumb_marketplace::UpdateStatus;
     use crumb_memory::{MemoryScope, MemorySet, MemoryStore};
     use crumb_profile::{ProfileSelectionStore, ProfileStore};
 
     use super::{
         ArtifactModalAction, ArtifactModalBounds, COMPOSER_PLACEHOLDER, CaptureOutcome,
-        ComposerDock, CrumbEditMode, CrumbHighlighter, CrumbPrompt, DiscoverySource, ExitGesture,
-        MarketplaceContent, PausedSubmission, PendingComposerArtifacts, Renderer,
+        ComposerDock, CrumbEditMode, CrumbHighlighter, CrumbPrompt, DiscoverySource, ExecOutput,
+        ExitGesture, MarketplaceContent, PausedSubmission, PendingComposerArtifacts, Renderer,
         SessionCommandContext, SteeringAction, TerminalModeTracker, TranscriptCapture,
         TranscriptLine, TranscriptScroll, TranscriptState, UiSettings, active_scroll_direction,
         agent_config_location, aligned_composer_prompt, apply_builtin_model_packs,
@@ -14368,9 +14458,10 @@ mod tests {
         sanitize_completion_menu_body, sanitize_transcript_output, select_discovery_skill,
         set_skill_enabled, shell_blast_radius, shell_tool_config, should_auto_enable_rtk,
         show_graph, show_instance, show_marketplace, show_memory, show_profile_with_stores,
-        status_tone_for_output, suggestion_width, transcript_activity_row, unregister_local_skill,
-        validate_marketplace_path, validate_marketplace_response, visible_tool_activity,
-        workspace_read_host, write_bounded_response_delta_for_width,
+        status_tone_for_output, stream_event, suggestion_width, transcript_activity_row,
+        unregister_local_skill, validate_marketplace_path, validate_marketplace_response,
+        visible_tool_activity, workspace_read_host, write_bounded_response_delta_for_width,
+        write_stream_event,
     };
     use crate::agent_runtime::{
         PeerDeliveryInspection, PeerDiscardedFile, PeerImportedFile, PeerInboxSummary,
@@ -14389,6 +14480,35 @@ mod tests {
     }
 
     #[test]
+    fn stream_json_events_are_typed_and_never_carry_tool_output() {
+        assert_eq!(
+            stream_event(&HarnessActivity::RequestAccepted),
+            serde_json::json!({"type": "started"})
+        );
+        assert_eq!(
+            stream_event(&HarnessActivity::ResponseDelta {
+                text: "hi".to_owned()
+            }),
+            serde_json::json!({"type": "text", "text": "hi"})
+        );
+        let output = stream_event(&HarnessActivity::ToolOutput {
+            name: "run_command".to_owned(),
+            bytes: Some(42),
+            content: Some("TOKEN=secret".to_owned()),
+        });
+        assert_eq!(
+            output,
+            serde_json::json!({"type": "tool_output", "name": "run_command", "bytes": 42})
+        );
+        assert!(!output.to_string().contains("secret"));
+
+        let mut buffer = Vec::new();
+        write_stream_event(&mut buffer, &stream_event(&HarnessActivity::Cancelled))
+            .expect("event is written");
+        assert_eq!(buffer, b"{\"type\":\"cancelled\"}\n");
+    }
+
+    #[test]
     fn exec_arguments_support_plain_json_and_flag_like_requests() {
         let parsed = parse_exec_request(&[
             OsString::from("exec"),
@@ -14398,7 +14518,10 @@ mod tests {
         ])
         .expect("valid exec request")
         .expect("exec action");
-        assert_eq!(parsed, (true, "inspect this workspace".to_owned()));
+        assert_eq!(
+            parsed,
+            (ExecOutput::Json, "inspect this workspace".to_owned())
+        );
 
         let escaped = parse_exec_request(&[
             OsString::from("exec"),
@@ -14409,7 +14532,10 @@ mod tests {
         .expect("exec action");
         assert_eq!(
             escaped,
-            (false, "--json is part of this request".to_owned())
+            (
+                ExecOutput::Text,
+                "--json is part of this request".to_owned()
+            )
         );
         let json_then_separator = parse_exec_request(&[
             OsString::from("exec"),
@@ -14419,7 +14545,22 @@ mod tests {
         ])
         .expect("json then separator")
         .expect("exec action");
-        assert_eq!(json_then_separator, (true, "count the lines".to_owned()));
+        assert_eq!(
+            json_then_separator,
+            (ExecOutput::Json, "count the lines".to_owned())
+        );
+        let streamed = parse_exec_request(&[
+            OsString::from("exec"),
+            OsString::from("--stream-json"),
+            OsString::from("fix"),
+            OsString::from("the test"),
+        ])
+        .expect("stream-json exec request")
+        .expect("exec action");
+        assert_eq!(
+            streamed,
+            (ExecOutput::StreamJson, "fix the test".to_owned())
+        );
 
         assert!(parse_exec_request(&[OsString::from("exec")]).is_err());
         assert!(

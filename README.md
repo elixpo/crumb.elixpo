@@ -107,6 +107,20 @@ Claude Code, Codex, and other agents can hand Crumb a whole task. In Claude Code
 
 Other agents can use the [Crumb skill and MCP server](integrations/claude-code/README.md) directly.
 
+Programs that run Crumb as a harness can follow a turn live:
+
+```bash
+crumb exec --stream-json -- "fix the failing test in crates/api"
+```
+
+Each line on stdout is one JSON event: `started`, `text`, `reasoning`,
+`tool_started`, `tool_finished`, `tool_output` (size only, never the
+contents), `file_changed`, `approval_required`, `usage`, `status`,
+`progress`, and finally `result`, which carries `session_id`, `response`,
+`finish_reason`, and `usage`, the same fields `crumb exec --json` prints.
+Errors go to stderr with a non-zero exit status, and killing the process
+cancels the turn.
+
 ## Build from source and warm-up (no keys)
 
 <!-- Commands match .github/workflows/ci.yml (jobs "quality" and "test"). -->
