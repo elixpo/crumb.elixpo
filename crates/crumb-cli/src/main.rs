@@ -363,13 +363,19 @@ fn parse_exec_request(arguments: &[OsString]) -> Result<Option<ExecRequest>> {
         let argument = argument
             .to_str()
             .context("exec request arguments must be UTF-8")?;
+        // `--option=value` is the same as `--option value`.
+        let (argument, inline_value) = match argument.split_once('=') {
+            Some((option @ ("--resume" | "--model" | "--approvals"), value)) => {
+                (option, Some(value))
+            }
+            _ => (argument, None),
+        };
         match argument {
             "--json" => output = ExecOutput::Json,
             "--stream-json" => output = ExecOutput::StreamJson,
             "--resume" | "--model" | "--approvals" => {
-                let value = rest
-                    .next()
-                    .and_then(|value| value.to_str())
+                let value = inline_value
+                    .or_else(|| rest.next().and_then(|value| value.to_str()))
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .with_context(|| format!("{argument} requires a value; {EXEC_USAGE}"))?;
@@ -14762,6 +14768,30 @@ mod tests {
             .expect("exec action");
         assert_eq!(full.approvals, Some(ApprovalMode::FullAccess));
         assert!(parse(&["exec", "--approvals", "yolo", "task"]).is_err());
+
+        // `--option=value` sets the option instead of starting the request.
+        let inline = parse(&[
+            "exec",
+            "--approvals=always-ask",
+            "--resume=crumb-1",
+            "--model=pollinations/openai",
+            "task",
+        ])
+        .unwrap()
+        .expect("exec action");
+        assert_eq!(inline.approvals, Some(ApprovalMode::AlwaysAsk));
+        assert_eq!(inline.resume.as_deref(), Some("crumb-1"));
+        assert_eq!(
+            inline.model,
+            Some(("pollinations".to_owned(), "openai".to_owned()))
+        );
+        assert_eq!(inline.request, "task");
+        assert!(parse(&["exec", "--approvals=yolo", "task"]).is_err());
+        assert!(parse(&["exec", "--resume=", "task"]).is_err());
+        assert_eq!(
+            parse(&["exec", "explain", "--resume=x"]).unwrap(),
+            request(ExecOutput::Text, None, None, "explain --resume=x")
+        );
 
         assert!(parse(&["exec"]).is_err());
         assert!(parse(&["exec", "--json"]).is_err());
