@@ -44,6 +44,15 @@ impl fmt::Display for AuthError {
 impl Error for AuthError {}
 
 /// Secret text that is redacted in diagnostics and zeroed when dropped.
+///
+/// # Examples
+///
+/// ```
+/// use crumb_auth::SecretString;
+///
+/// let key = SecretString::new("example-api-key");
+/// assert_eq!(format!("{key:?}"), "SecretString([REDACTED])");
+/// ```
 pub struct SecretString {
     inner: Zeroizing<String>,
 }
@@ -57,6 +66,10 @@ impl SecretString {
         }
     }
 
+    /// Borrows the unredacted secret text.
+    ///
+    /// Use only when passing the secret to a provider or credential store. The
+    /// returned string is not redacted; never include it in logs or diagnostics.
     #[must_use]
     pub fn expose(&self) -> &str {
         self.inner.as_str()
