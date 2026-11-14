@@ -353,14 +353,10 @@ fn looks_like_agent_imperative(first: &str, words: &[&str]) -> bool {
                 | "currently"
         )
     });
-    if words.len() >= 3
+    words.len() >= 3
         && ambiguous_lead
         && conversational_glue
         && !looks_like_shell_arguments(&words[1..])
-    {
-        return true;
-    }
-    false
 }
 
 fn first_word_is_http_url(input: &str) -> bool {
