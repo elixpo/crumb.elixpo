@@ -204,7 +204,7 @@ secret, open an issue.
 
 Crumb's code is licensed under the [MIT License](LICENSE). Visual assets under
 `crumb.elixpo/public/` are licensed under [CC-BY-4.0](LICENSES/preferred/CC-BY-4.0).
-The Elixpo and Oreo names and marks are covered by [`TRADEMARKS.md`](TRADEMARKS.md).
+The Elixpo and Lumi names and marks are covered by [`TRADEMARKS.md`](TRADEMARKS.md).
 ## Google Summer of Code 2027
 
 Elixpo is applying to be a mentoring organisation for Google Summer of Code 2027. Google has not announced the 2027 programme yet, and Elixpo has not been accepted. Crumb hosts one proposed project idea:
