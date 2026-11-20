@@ -40,9 +40,18 @@ pub(crate) fn load(workspace: &Path) -> Vec<String> {
         let shown = path
             .strip_prefix(&base)
             .map_or_else(|_| path.clone(), Path::to_path_buf);
-        rendered.push(format!("### {}\n{}", shown.display(), text.trim_end()));
+        rendered.push(format!("### {}\n{}", slash_path(&shown), text.trim_end()));
     }
     rendered
+}
+
+/// Renders a path with `/` on every platform, so the model sees the same
+/// text on Windows as elsewhere.
+fn slash_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Directories to consult, outermost first: the repository root down to the
