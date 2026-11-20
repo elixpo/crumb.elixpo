@@ -86,6 +86,8 @@ Try requests like:
 
 Crumb keeps the important parts visible: what it is doing, which tools it is using, how long commands take, what files changed, and how much context has been used. Detailed tool output stays out of the way until you choose to open it.
 
+When a task runs for more than a few seconds, Crumb asks your terminal for a desktop notification once it finishes or needs your approval, so you can switch away while it works. Kitty, iTerm2, WezTerm, Ghostty and foot show a notification; other terminals get the bell. Set `CRUMB_NOTIFICATIONS=off` to turn this off.
+
 ## You stay in charge
 
 Crumb asks before sensitive actions, keeps permissions in your hands, and shows the exact command it wants to run. You can work in planning mode, approve one action at a time, or allow broader access for a trusted workspace.

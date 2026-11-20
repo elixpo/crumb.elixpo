@@ -107,6 +107,7 @@ mod completion;
 mod composer_artifacts;
 mod context;
 mod device_auth;
+mod notify;
 mod project_instructions;
 mod provider_discovery;
 mod provider_projection;
@@ -3482,6 +3483,18 @@ fn write_bounded_response_delta_for_width(
     Ok(())
 }
 
+/// Activity capacity, steering message count and steering bytes as `usize`.
+fn agent_sequence_limits(config: &AgentConfig) -> Result<(usize, usize, usize)> {
+    Ok((
+        usize::try_from(config.limits.max_activity_events)
+            .context("max_activity_events exceeds this platform's address space")?,
+        usize::try_from(config.limits.max_steering_messages)
+            .context("max_steering_messages exceeds this platform's address space")?,
+        usize::try_from(config.limits.max_steering_bytes)
+            .context("max_steering_bytes exceeds this platform's address space")?,
+    ))
+}
+
 fn execute_agent_sequence(
     initial_request: String,
     config: &AgentConfig,
@@ -3491,12 +3504,7 @@ fn execute_agent_sequence(
     writer: &mut dyn Write,
     terminal: &AgentTerminal,
 ) -> Result<()> {
-    let activity_capacity = usize::try_from(config.limits.max_activity_events)
-        .context("max_activity_events exceeds this platform's address space")?;
-    let steering_messages = usize::try_from(config.limits.max_steering_messages)
-        .context("max_steering_messages exceeds this platform's address space")?;
-    let steering_bytes = usize::try_from(config.limits.max_steering_bytes)
-        .context("max_steering_bytes exceeds this platform's address space")?;
+    let (activity_capacity, steering_messages, steering_bytes) = agent_sequence_limits(config)?;
     let mut steering = SteeringQueue::new(steering_messages, steering_bytes)?;
     let mut request = initial_request;
     let mut active_runtime = runtime.take().context("agent runtime is unavailable")?;
@@ -3505,6 +3513,7 @@ fn execute_agent_sequence(
         let session_id = active_runtime.prepare_local_job(config.mode, workspace)?;
         let persisted_request = request.clone();
         let initial_activity = initial_agent_activity(&persisted_request, config);
+        let turn_started = std::time::Instant::now();
         let mut task = active_runtime.spawn_turn(
             request,
             config.clone(),
@@ -3555,6 +3564,7 @@ fn execute_agent_sequence(
         };
         active_runtime = returned_runtime;
         live_context_tokens = active_runtime.token_usage().0;
+        notify::turn_finished(turn_started, result.is_ok());
         match finish_agent_turn(
             &result,
             interruption,
