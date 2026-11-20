@@ -444,6 +444,48 @@ pub struct AgentConfig {
     pub permissions: ToolPermissions,
     pub sessions: SessionSettings,
     pub checks: CheckSettings,
+    pub hooks: HookSettings,
+}
+
+/// Commands run around agent tool calls and at the end of each turn.
+///
+/// Hooks receive a JSON description of the event on stdin. A `pre_tool` hook
+/// that exits with status 2 blocks the call (stderr is the reason given to
+/// the model); a `post_tool` hook that exits with status 2 adds its stderr
+/// to the result. Hooks never approve anything.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HookSettings {
+    pub pre_tool: Vec<HookCommand>,
+    pub post_tool: Vec<HookCommand>,
+    pub on_stop: Vec<HookCommand>,
+}
+
+impl HookSettings {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pre_tool.is_empty() && self.post_tool.is_empty() && self.on_stop.is_empty()
+    }
+}
+
+/// One hook command.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookCommand {
+    /// Shell command (`sh -c` on Unix, `cmd /C` on Windows), run in the
+    /// workspace.
+    pub command: String,
+    /// Tool names this hook applies to; empty means every tool. Ignored for
+    /// `on_stop`.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Seconds before the hook is stopped and treated as passing.
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_secs: u64,
+}
+
+const fn default_hook_timeout() -> u64 {
+    30
 }
 
 /// Automatic verification after the agent edits the workspace.

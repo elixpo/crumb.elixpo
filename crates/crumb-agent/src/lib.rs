@@ -20,10 +20,10 @@ pub use approvals::{ApprovalInbox, InteractiveApprovalBroker, PendingApproval, a
 pub use backend::{BackendDiscovery, CodingBackend};
 pub use config::{
     AgentConfig, AgentLimits, AgentMode, ApprovalMode, CacheRetention, CheckSettings,
-    CompatibilityFlag, CredentialReference, HarnessConfig, LiveConfig, MistakePolicy, Modality,
-    ModelPack, ModelRoute, OptimizerConfig, ProviderCompatibility, ProviderConfig, ProviderHeader,
-    ProviderModel, ProviderProtocol, ProviderRetryPolicy, ProviderTransport, SessionSettings,
-    SkillConfig, StructuredEncoding, ToolPermissions,
+    CompatibilityFlag, CredentialReference, HarnessConfig, HookCommand, HookSettings, LiveConfig,
+    MistakePolicy, Modality, ModelPack, ModelRoute, OptimizerConfig, ProviderCompatibility,
+    ProviderConfig, ProviderHeader, ProviderModel, ProviderProtocol, ProviderRetryPolicy,
+    ProviderTransport, SessionSettings, SkillConfig, StructuredEncoding, ToolPermissions,
 };
 pub use harness::{HarnessTurnRequest, ModelCapabilities};
 pub use jobs::{

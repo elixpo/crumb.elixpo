@@ -107,6 +107,7 @@ mod completion;
 mod composer_artifacts;
 mod context;
 mod device_auth;
+mod hooks;
 mod notify;
 mod post_edit_check;
 mod project_instructions;
