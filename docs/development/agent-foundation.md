@@ -70,6 +70,23 @@ interrupted, and gives the next turn a brief of the interrupted request, open
 tasks, and earlier jobs. Project memory and the code graph are read again each
 turn.
 
+## Checks after edits
+
+When a native turn edited files (a successful `WriteWorkspace` or
+`Destructive` tool call) and the model gives its final answer, the harness
+runs the project's fast check before finishing: `cargo check` for a
+`Cargo.toml`, the local `tsc --noEmit` for a `tsconfig.json`, `go vet ./...`
+for a `go.mod`, or `ruff check` for Python projects with ruff installed.
+Failures go back to the model to fix, at most twice per turn. A check that
+cannot give a verdict (missing tool, timeout, Ctrl+C) never fails the turn.
+Configure it in `.crumb/agent.json`:
+
+```json
+"checks": {"after_edit": true, "command": "make lint", "timeout_secs": 120}
+```
+
+`command` replaces the detected check; `"after_edit": false` turns it off.
+
 Ctrl+C sets the shared cancellation token. Native tools must stop their child
 processes. The current DeepSeek Harness JSON-RPC SDK has no turn-cancellation
 method, so its adapter must terminate and restart the harness subprocess.

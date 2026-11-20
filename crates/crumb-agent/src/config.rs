@@ -443,6 +443,32 @@ pub struct AgentConfig {
     pub optimizers: Vec<OptimizerConfig>,
     pub permissions: ToolPermissions,
     pub sessions: SessionSettings,
+    pub checks: CheckSettings,
+}
+
+/// Automatic verification after the agent edits the workspace.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CheckSettings {
+    /// Run the project's fast check (for example `cargo check`) when a turn
+    /// that changed the workspace is about to finish, and send failures back
+    /// to the model.
+    pub after_edit: bool,
+    /// Shell command to run instead of the detected check.
+    pub command: Option<String>,
+    /// Seconds before the check is abandoned; an abandoned check never fails
+    /// the turn.
+    pub timeout_secs: u64,
+}
+
+impl Default for CheckSettings {
+    fn default() -> Self {
+        Self {
+            after_edit: true,
+            command: None,
+            timeout_secs: 120,
+        }
+    }
 }
 
 /// How sessions are kept between Crumb runs.

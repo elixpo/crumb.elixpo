@@ -650,6 +650,9 @@ struct TurnMetrics {
     tool_calls: usize,
     action_facts: Vec<String>,
     successful_tool_outputs: Vec<String>,
+    /// A tool that can change files succeeded during this turn.
+    workspace_changed: bool,
+    verification_rounds: usize,
 }
 
 impl TurnMetrics {
@@ -685,6 +688,42 @@ pub struct NativeHarness {
     approvals: Arc<dyn ApprovalBroker>,
     limits: HarnessLimits,
     tasks: Option<TaskBoard>,
+    verifier: Option<Arc<dyn TurnVerifier>>,
+}
+
+/// Checks the workspace after a turn changed it, before the turn finishes.
+///
+/// The harness calls [`TurnVerifier::verify`] when the model gives its final
+/// answer and a write-capable tool succeeded during the turn. A failure is
+/// sent back to the model so it can fix the problem first.
+pub trait TurnVerifier: Send + Sync {
+    /// Short description of the check shown while it runs, such as
+    /// `cargo check`.
+    fn label(&self) -> String;
+
+    /// Runs the check. Returns the diagnostics when it fails, and `None` when
+    /// it passes or could not give a verdict (timeout, cancellation, missing
+    /// tool), so an unusable check never blocks a turn.
+    fn verify(&self, cancellation: &CancellationToken) -> Option<String>;
+}
+
+/// Maximum checks per turn; afterwards the turn finishes regardless.
+const MAX_VERIFICATION_ROUNDS: usize = 2;
+/// Activity name used for the automatic check in tool events.
+pub const VERIFY_TOOL_NAME: &str = "verify_changes";
+
+/// Whether a successful call of a tool with this risk edited files. Shell
+/// commands are left out so read-only commands such as `git status` do not
+/// trigger a check; file edits go through the workspace write tools.
+fn can_change_workspace(risk: RiskClass) -> bool {
+    matches!(risk, RiskClass::WriteWorkspace | RiskClass::Destructive)
+}
+
+fn verification_message(label: &str, output: &str) -> String {
+    format!(
+        "Automatic check `{label}` failed after your changes. Fix these problems, then give your final answer. If a problem is unrelated to your changes, say so instead of changing unrelated code.\n```\n{}\n```",
+        output.trim_end()
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -707,7 +746,15 @@ impl NativeHarness {
             approvals,
             limits,
             tasks: None,
+            verifier: None,
         }
+    }
+
+    /// Runs `verifier` before a turn that changed the workspace finishes.
+    #[must_use]
+    pub fn with_verifier(mut self, verifier: Arc<dyn TurnVerifier>) -> Self {
+        self.verifier = Some(verifier);
+        self
     }
 
     /// Checks `board` before a turn ends: open tasks send the model back to
@@ -935,6 +982,12 @@ impl NativeHarness {
                     suppress_tools_once = next_suppressed;
                     continue;
                 }
+                if let Some(failure) = self.verify_changes(metrics, cancellation, sink).await {
+                    messages.push(ChatMessage::text(ChatRole::Assistant, round.text.clone()));
+                    messages.push(ChatMessage::text(ChatRole::User, failure));
+                    sink.emit(HarnessEvent::ResponseRevised);
+                    continue;
+                }
                 return Ok(finish_turn(
                     &round,
                     turn,
@@ -978,6 +1031,39 @@ impl NativeHarness {
         }
     }
 
+    /// Runs the verifier when this turn changed the workspace. Returns the
+    /// message for the model when the check failed.
+    async fn verify_changes(
+        &self,
+        metrics: &mut TurnMetrics,
+        cancellation: &CancellationToken,
+        sink: &mut dyn EventSink,
+    ) -> Option<String> {
+        let verifier = self.verifier.clone()?;
+        if !metrics.workspace_changed || metrics.verification_rounds >= MAX_VERIFICATION_ROUNDS {
+            return None;
+        }
+        metrics.verification_rounds += 1;
+        let label = verifier.label();
+        let id = format!("verify-{}", metrics.verification_rounds);
+        sink.emit(HarnessEvent::ToolRequested {
+            id: id.clone(),
+            name: VERIFY_TOOL_NAME.to_owned(),
+            detail: Some(label.clone()),
+        });
+        let token = cancellation.clone();
+        let failure = tokio::task::spawn_blocking(move || verifier.verify(&token))
+            .await
+            .ok()
+            .flatten();
+        sink.emit(HarnessEvent::ToolFinished {
+            id,
+            name: VERIFY_TOOL_NAME.to_owned(),
+            success: failure.is_none(),
+        });
+        failure.map(|output| verification_message(&label, &output))
+    }
+
     /// Executes one round's tool calls and appends a result for every call.
     /// Returns whether any call succeeded and the names of failed calls.
     #[allow(clippy::too_many_arguments)]
@@ -1018,6 +1104,9 @@ impl NativeHarness {
             emit_tool_output(sink, &call, &result);
             if result.success {
                 round_succeeded = true;
+                metrics.workspace_changed |= tools
+                    .descriptor(&call.name)
+                    .is_some_and(|tool| can_change_workspace(tool.risk));
                 metrics.record_successful_tool(&call, &result.content);
             } else {
                 failed_tools.push(call.name.clone());
@@ -3386,7 +3475,7 @@ mod tests {
 
     use super::{
         Conversation, HarnessErrorKind, HarnessEvent, HarnessLimits, HarnessTurn, NativeHarness,
-        SelectedSkill,
+        SelectedSkill, TurnVerifier,
     };
 
     #[derive(Default)]
@@ -4296,6 +4385,173 @@ mod tests {
             .await
             .expect("turn succeeds");
         (outcome, provider, calls.load(Ordering::Relaxed))
+    }
+
+    struct AllowAll;
+
+    impl crumb_agent::ApprovalBroker for AllowAll {
+        fn decide(
+            &self,
+            _request: &crumb_agent::ApprovalRequest,
+            _arguments: &serde_json::Value,
+            _cancellation: &CancellationToken,
+        ) -> crumb_agent::ApprovalDecision {
+            crumb_agent::ApprovalDecision::AllowOnce
+        }
+    }
+
+    /// Returns scripted verdicts; once exhausted, every check fails.
+    struct ScriptedVerifier {
+        verdicts: Mutex<VecDeque<Option<String>>>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedVerifier {
+        fn new(verdicts: Vec<Option<&str>>) -> Arc<Self> {
+            Arc::new(Self {
+                verdicts: Mutex::new(verdicts.into_iter().map(|v| v.map(str::to_owned)).collect()),
+                calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl TurnVerifier for ScriptedVerifier {
+        fn label(&self) -> String {
+            "cargo check".to_owned()
+        }
+
+        fn verify(&self, _cancellation: &CancellationToken) -> Option<String> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.verdicts
+                .lock()
+                .expect("verdict lock")
+                .pop_front()
+                .unwrap_or_else(|| Some("error: still broken".to_owned()))
+        }
+    }
+
+    fn write_tools(calls: Arc<AtomicUsize>) -> ToolHost {
+        let mut tools = ToolHost::default();
+        tools
+            .register(
+                ToolDescriptor {
+                    name: "write_file".to_owned(),
+                    description: "Write a file".to_owned(),
+                    input_schema: json!({"type":"object"}),
+                    risk: RiskClass::WriteWorkspace,
+                    transport: ToolTransport::Native,
+                },
+                Arc::new(CountingTool(calls)),
+            )
+            .expect("tool registers");
+        tools
+    }
+
+    fn write_round() -> Vec<ChatEvent> {
+        vec![
+            ChatEvent::ToolCall(ToolCall {
+                id: "call_w".to_owned(),
+                name: "write_file".to_owned(),
+                arguments: json!({"path":"src/lib.rs"}),
+            }),
+            ChatEvent::Finished(FinishReason::ToolCall),
+        ]
+    }
+
+    async fn run_verified_turn(
+        rounds: Vec<Vec<ChatEvent>>,
+        tools: ToolHost,
+        verifier: Arc<ScriptedVerifier>,
+    ) -> (
+        super::HarnessOutcome,
+        Arc<ScriptedProvider>,
+        Vec<HarnessEvent>,
+    ) {
+        let provider = Arc::new(ScriptedProvider::new(rounds));
+        let harness = NativeHarness::new(
+            provider.clone(),
+            tools,
+            Arc::new(AllowAll),
+            HarnessLimits::default(),
+        )
+        .with_verifier(verifier);
+        let (_root, mut session) = session(AgentMode::Auto);
+        let mut conversation = harness.conversation();
+        let mut events = Vec::new();
+        let outcome = harness
+            .run_turn(
+                &mut session,
+                &mut conversation,
+                turn(),
+                &CancellationToken::default(),
+                &mut events,
+            )
+            .await
+            .expect("turn succeeds");
+        (outcome, provider, events)
+    }
+
+    #[tokio::test]
+    async fn failed_check_after_edits_goes_back_to_the_model() {
+        let verifier = ScriptedVerifier::new(vec![Some("error[E0308]: mismatched types"), None]);
+        let (outcome, provider, events) = run_verified_turn(
+            vec![write_round(), answer_round(), answer_round()],
+            write_tools(Arc::new(AtomicUsize::new(0))),
+            verifier.clone(),
+        )
+        .await;
+
+        assert_eq!(outcome.text, "It is 24 C.");
+        assert_eq!(verifier.calls.load(Ordering::Relaxed), 2);
+        let requests = provider.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 3);
+        let feedback = requests[2]
+            .messages
+            .iter()
+            .find(|message| {
+                message
+                    .content
+                    .contains("Automatic check `cargo check` failed")
+            })
+            .expect("check failure sent to the model");
+        assert!(feedback.content.contains("E0308"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HarnessEvent::ToolFinished { name, success: false, .. } if name == super::VERIFY_TOOL_NAME
+        )));
+    }
+
+    #[tokio::test]
+    async fn read_only_turns_are_not_checked() {
+        let verifier = ScriptedVerifier::new(vec![Some("error")]);
+        let (outcome, _provider, _events) = run_verified_turn(
+            vec![tool_round(), answer_round()],
+            tools(Arc::new(AtomicUsize::new(0))),
+            verifier.clone(),
+        )
+        .await;
+
+        assert_eq!(outcome.text, "It is 24 C.");
+        assert_eq!(verifier.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn checks_stop_after_two_failures() {
+        let verifier = ScriptedVerifier::new(Vec::new());
+        let (_outcome, provider, _events) = run_verified_turn(
+            vec![
+                write_round(),
+                answer_round(),
+                answer_round(),
+                answer_round(),
+            ],
+            write_tools(Arc::new(AtomicUsize::new(0))),
+            verifier.clone(),
+        )
+        .await;
+
+        assert_eq!(verifier.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(provider.requests.lock().expect("request lock").len(), 4);
     }
 
     #[tokio::test]

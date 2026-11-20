@@ -2159,8 +2159,11 @@ impl AgentRuntime {
                 project_instructions: project_instructions.clone(),
             },
         )?;
-        let harness =
+        let mut harness =
             NativeHarness::new(provider, tools, approvals, harness_limits).with_task_board(tasks);
+        if let Some(verifier) = crate::post_edit_check::verifier_for(&workspace, &config.checks) {
+            harness = harness.with_verifier(verifier);
+        }
         let conversation = self
             .native_conversation
             .get_or_insert_with(|| harness.conversation());
