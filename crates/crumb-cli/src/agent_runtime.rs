@@ -2137,6 +2137,7 @@ impl AgentRuntime {
         );
         crumb_agent::register_update_tasks_tool(&mut tools, tasks.clone())?;
         let harness_limits = native_harness_limits(config)?;
+        let project_instructions = crate::project_instructions::load(&workspace);
         register_parallel_agent_tool(
             &mut tools,
             Arc::clone(&provider),
@@ -2149,6 +2150,7 @@ impl AgentRuntime {
                 team_limits,
                 approvals: Some(Arc::clone(&approvals)),
                 registry: Some(self.team.clone()),
+                project_instructions: project_instructions.clone(),
             },
         )?;
         let harness =
@@ -2165,6 +2167,7 @@ impl AgentRuntime {
                 provider_config.max_request_image_bytes,
             )?,
             persona: persona.map(str::to_owned),
+            project_instructions,
             static_context: static_context.to_vec(),
             selected_skills: selected_skills.to_vec(),
             trusted_context: trusted_context.to_vec(),
@@ -2458,6 +2461,7 @@ fn execute_isolated_peer_turn(
         user_message: claimed.projection().as_str().to_owned(),
         images: Vec::new(),
         persona: None,
+        project_instructions: Vec::new(),
         static_context: Vec::new(),
         selected_skills: Vec::new(),
         trusted_context: Vec::new(),

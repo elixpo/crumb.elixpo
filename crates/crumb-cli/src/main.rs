@@ -107,6 +107,7 @@ mod completion;
 mod composer_artifacts;
 mod context;
 mod device_auth;
+mod project_instructions;
 mod provider_discovery;
 mod provider_projection;
 mod session_resume;
