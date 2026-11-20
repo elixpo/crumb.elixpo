@@ -96,6 +96,8 @@ If an AI service is unavailable, your terminal still works.
 
 Use model packs for different kinds of work, add focused [skills](https://crumb.elixpo.com/skills), install [plugins](https://crumb.elixpo.com/plugins), and connect outside services through [connectors](https://crumb.elixpo.com/profile/connectors).
 
+Crumb follows your project's `AGENTS.md`, the instruction file other coding agents read too, and falls back to `CLAUDE.md`. It reads them from the repository root down to the folder you are working in, so a nested file can refine the project-wide one. These files guide how Crumb works; they never grant it permissions.
+
 ## Use it from other agents
 
 Claude Code, Codex, and other agents can hand Crumb a whole task. In Claude Code:

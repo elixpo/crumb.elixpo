@@ -76,6 +76,8 @@ pub struct ParallelAgentConfig {
     pub approvals: Option<Arc<dyn ApprovalBroker>>,
     /// Live helper status for the agent map.
     pub registry: Option<TeamRegistry>,
+    /// The parent's project instruction files, shared with every helper.
+    pub project_instructions: Vec<String>,
 }
 
 /// Adds a non-recursive `spawn_agents` tool backed by independent native Harness turns.
@@ -386,6 +388,7 @@ fn run_worker(worker: WorkerSpec) -> Result<Finding> {
         ),
         images: Vec::new(),
         persona: None,
+        project_instructions: config.project_instructions,
         static_context: Vec::new(),
         selected_skills: Vec::new(),
         trusted_context: Vec::new(),
@@ -848,6 +851,7 @@ mod tests {
                 team_limits: ParallelAgentLimits::default(),
                 approvals,
                 registry: None,
+                project_instructions: Vec::new(),
             },
         )
         .expect("parallel tool registers");
@@ -1024,6 +1028,7 @@ mod tests {
                 team_limits: ParallelAgentLimits::default(),
                 approvals: None,
                 registry: None,
+                project_instructions: Vec::new(),
             },
         )
         .expect("parallel tool registers");
