@@ -34,6 +34,10 @@ pub struct AgentShellConfig {
     /// full-access sessions. Safer permission modes keep the isolated
     /// PATH-only environment.
     pub inherit_environment: bool,
+    /// Crumb executable used to confine commands with the OS sandbox
+    /// (`crumb __sandbox-exec`): writes are limited to the workspace,
+    /// temporary directories and toolchain caches. `None` runs unconfined.
+    pub sandbox: Option<PathBuf>,
     pub max_output_bytes: usize,
     pub timeout: Duration,
 }
@@ -282,10 +286,8 @@ fn run_shell(
     }
     let timeout = requested_timeout(arguments, config.timeout)?;
     let started_at = SystemTime::now();
-    let mut process = Command::new(&config.program);
+    let mut process = shell_command(config, workspace, command);
     process
-        .args(&config.arguments)
-        .arg(command)
         .current_dir(workspace)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -297,6 +299,7 @@ fn run_shell(
         process.env("PATH", path);
     }
     configure_process_group(&mut process);
+    let sandboxed = config.sandbox.is_some();
     let mut child = process
         .spawn()
         .context("failed to start isolated agent shell")?;
@@ -341,7 +344,7 @@ fn run_shell(
     let stdout_text = String::from_utf8_lossy(&stdout.bytes).into_owned();
     let stderr_text = String::from_utf8_lossy(&stderr.bytes).into_owned();
 
-    let (exit_status, output) = finish_shell_output(
+    let (exit_status, mut output) = finish_shell_output(
         &outcome,
         command,
         &stdout,
@@ -349,6 +352,10 @@ fn run_shell(
         optimizer,
         config.max_output_bytes,
     )?;
+    if sandboxed && output.is_error && looks_blocked(&stderr_text) {
+        output.text.push('\n');
+        output.text.push_str(crate::sandbox::SANDBOX_HINT);
+    }
 
     Ok(ShellRunResult {
         output,
@@ -357,6 +364,40 @@ fn run_shell(
         stderr_text,
         started_at,
     })
+}
+
+/// Builds the command for `command`, started through the sandbox launcher
+/// when one is configured.
+pub(crate) fn shell_command(config: &AgentShellConfig, workspace: &Path, command: &str) -> Command {
+    let arguments = config
+        .arguments
+        .iter()
+        .cloned()
+        .chain(std::iter::once(OsString::from(command)));
+    if let Some(launcher) = &config.sandbox {
+        let mut process = Command::new(launcher);
+        process.args(crate::sandbox::wrapped_arguments(
+            &crate::sandbox::writable_paths(workspace),
+            &config.program,
+            arguments,
+        ));
+        process
+    } else {
+        let mut process = Command::new(&config.program);
+        process.args(arguments);
+        process
+    }
+}
+
+/// Whether a failure looks like a write the sandbox refused.
+fn looks_blocked(stderr: &str) -> bool {
+    [
+        "Permission denied",
+        "Read-only file system",
+        "Operation not permitted",
+    ]
+    .iter()
+    .any(|message| stderr.contains(message))
 }
 
 fn finish_shell_output(
@@ -789,6 +830,7 @@ mod tests {
             path,
             command_rewriter: None,
             inherit_environment: false,
+            sandbox: None,
             max_output_bytes: 256,
             timeout,
         }

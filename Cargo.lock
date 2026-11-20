@@ -917,6 +917,7 @@ dependencies = [
  "crumb-instance",
  "crumb-optimize",
  "getrandom 0.4.3",
+ "landlock",
  "regex",
  "reqwest",
  "rustix",
@@ -1982,6 +1983,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fb1e621458ca9c51aa110bd0339d4751a056b9576bf1253aee1aa560dda0fc9d"
 dependencies = [
  "log",
+]
+
+[[package]]
+name = "landlock"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

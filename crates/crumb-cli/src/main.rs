@@ -148,6 +148,14 @@ const MARKETPLACE_CATALOG_SIGNER: &str =
 const SIGSTORE_GITHUB_ACTIONS_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
 fn main() -> Result<()> {
+    // Agent commands are started through this hidden subcommand to confine
+    // them; it must run before anything else starts a thread.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == crumb_tools::SANDBOX_EXEC_ARG)
+    {
+        return sandbox_exec(std::env::args_os().skip(2).collect());
+    }
     let resume_session = resume_session_argument()?;
     if resume_session.is_none() && run_command_line_action()? {
         return Ok(());
@@ -157,6 +165,30 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Applies the agent command sandbox to this process, then becomes the
+/// requested program.
+fn sandbox_exec(arguments: Vec<std::ffi::OsString>) -> Result<()> {
+    let exec = crumb_tools::parse_sandbox_exec(arguments).map_err(anyhow::Error::msg)?;
+    crumb_tools::restrict_current_thread(&exec.writable)
+        .map_err(|error| anyhow::anyhow!("could not apply the agent command sandbox: {error}"))?;
+    let mut command = std::process::Command::new(&exec.program);
+    command.args(&exec.arguments);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec only returns on failure.
+        let error = command.exec();
+        Err(error).context("failed to start the sandboxed command")
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command
+            .status()
+            .context("failed to start the sandboxed command")?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 fn resume_session_argument() -> Result<Option<String>> {
@@ -1229,9 +1261,20 @@ fn shell_tool_config(config: &AgentConfig, max_output_bytes: usize) -> AgentShel
         path: disposable.path,
         command_rewriter: Some(PathBuf::from("rtk")),
         inherit_environment: config.permissions.mode == ApprovalMode::FullAccess,
+        sandbox: sandbox_launcher(config),
         max_output_bytes: disposable.max_output_bytes,
         timeout: Duration::from_secs(config.limits.max_shell_command_seconds),
     }
+}
+
+/// Crumb's own executable, used to start sandboxed agent commands. Only Linux
+/// has an OS sandbox today; full access and `permissions.sandbox = false` run
+/// commands unconfined.
+fn sandbox_launcher(config: &AgentConfig) -> Option<PathBuf> {
+    let wanted = cfg!(target_os = "linux")
+        && config.permissions.sandbox
+        && config.permissions.mode != ApprovalMode::FullAccess;
+    wanted.then(std::env::current_exe).and_then(Result::ok)
 }
 
 fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
