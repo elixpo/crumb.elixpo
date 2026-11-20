@@ -400,6 +400,14 @@ pub struct ToolPermissions {
     /// Supervised MCP tools explicitly allowed by the user.
     #[serde(alias = "allow_process_tools")]
     pub allow_mcp_tools: BTreeSet<String>,
+    /// Confine agent shell commands with the operating system's sandbox
+    /// (Landlock on Linux) unless the mode is full access.
+    #[serde(default = "default_true")]
+    pub sandbox: bool,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl Default for ToolPermissions {
@@ -411,6 +419,7 @@ impl Default for ToolPermissions {
             allow_execution_tools: BTreeSet::new(),
             allow_peer_tools: BTreeSet::new(),
             allow_mcp_tools: BTreeSet::new(),
+            sandbox: true,
         }
     }
 }

@@ -113,6 +113,23 @@ to some tools (empty or `"*"` means all), and `timeout_secs` defaults to 30.
 Any other exit status, a timeout or a hook that cannot start lets the call
 proceed. Hooks can only block or annotate: they never approve a call or widen
 permissions.
+## Command sandbox
+
+On Linux, agent shell commands and background jobs start through
+`crumb __sandbox-exec --write <dir>… -- <shell> <args>…`. The helper applies a
+Landlock ruleset to itself while still single-threaded, then `exec`s the
+shell, so the restriction needs no `unsafe` code and covers every process the
+command starts. Reading and executing stay allowed everywhere; writing is
+limited to the workspace, the temporary directories, `/dev`, and toolchain
+caches (`~/.cargo`, `~/.rustup`, `~/.cache`, `~/.npm`, `~/go`, plus
+`CARGO_HOME`, `RUSTUP_HOME`, `GOPATH`, `GOCACHE` and `XDG_CACHE_HOME`). A
+failed command whose error looks like a refused write gets a note telling the
+model to ask the user instead of retrying.
+
+The sandbox is skipped in full-access mode, with
+`"permissions": {"sandbox": false}`, on kernels without Landlock, and on other
+platforms (macOS Seatbelt is a follow-up). Network access is not restricted
+yet. The interactive shell is never sandboxed.
 
 Ctrl+C sets the shared cancellation token. Native tools must stop their child
 processes. The current DeepSeek Harness JSON-RPC SDK has no turn-cancellation
