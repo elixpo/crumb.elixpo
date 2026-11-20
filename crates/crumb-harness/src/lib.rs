@@ -20,10 +20,11 @@ use tokio::time::Instant;
 
 mod parallel;
 mod team;
+mod worktree;
 
 pub use parallel::{
-    ParallelAgentConfig, ParallelAgentLimits, parse_team_progress, register_parallel_agent_tool,
-    team_progress_label,
+    ParallelAgentConfig, ParallelAgentLimits, WriteToolFactory, parse_team_progress,
+    register_parallel_agent_tool, team_progress_label,
 };
 pub use team::{HelperState, HelperStatus, TeamRegistry};
 

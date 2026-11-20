@@ -130,6 +130,21 @@ The sandbox is skipped in full-access mode, with
 `"permissions": {"sandbox": false}`, on kernels without Landlock, and on other
 platforms (macOS Seatbelt is a follow-up). Network access is not restricted
 yet. The interactive shell is never sandboxed.
+## Write helpers in worktrees
+
+`spawn_agents` with `access: "write"` runs each helper in its own git
+worktree when the workspace is inside a git repository (Unix for now). The
+worktree starts from what the user sees: the current commit plus uncommitted
+and untracked changes (`.crumb/` excluded), committed in the worktree as the
+helper's starting point. As soon as a helper finishes, its diff against that
+starting point is applied to the workspace with `git apply` (files only, never
+the user's index), and the progress line says so. A diff that no longer
+applies, for example because a sibling changed the same lines, is not forced:
+it is saved as `<team>-agent-<n>.patch` next to the helper journals and
+reported to the parent model and the user. Worktrees live under the system
+temp directory and are removed after merging, on cancellation and on errors;
+stale records are pruned at the next team start. Outside git repositories,
+helpers share the workspace as before.
 
 Ctrl+C sets the shared cancellation token. Native tools must stop their child
 processes. The current DeepSeek Harness JSON-RPC SDK has no turn-cancellation
