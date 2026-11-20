@@ -110,6 +110,24 @@ impl ApprovalBroker for TurnApprovals {
     }
 }
 
+/// Adds the post-edit check and user hooks configured for this workspace.
+fn with_turn_checks(
+    mut harness: NativeHarness,
+    config: &AgentConfig,
+    workspace: &Path,
+) -> NativeHarness {
+    if let Some(verifier) = crate::post_edit_check::verifier_for(workspace, &config.checks) {
+        harness = harness.with_verifier(verifier);
+    }
+    if !config.hooks.is_empty() {
+        harness = harness.with_hooks(Arc::new(crate::hooks::CommandHooks::new(
+            config.hooks.clone(),
+            workspace.to_path_buf(),
+        )));
+    }
+    harness
+}
+
 fn configured_approvals(config: &AgentConfig) -> ConfiguredApprovals {
     ConfiguredApprovals::new(config.permissions.allow_network_tools.clone())
         .with_mode(config.permissions.mode)
@@ -2159,11 +2177,11 @@ impl AgentRuntime {
                 project_instructions: project_instructions.clone(),
             },
         )?;
-        let mut harness =
-            NativeHarness::new(provider, tools, approvals, harness_limits).with_task_board(tasks);
-        if let Some(verifier) = crate::post_edit_check::verifier_for(&workspace, &config.checks) {
-            harness = harness.with_verifier(verifier);
-        }
+        let harness = with_turn_checks(
+            NativeHarness::new(provider, tools, approvals, harness_limits).with_task_board(tasks),
+            config,
+            &workspace,
+        );
         let conversation = self
             .native_conversation
             .get_or_insert_with(|| harness.conversation());

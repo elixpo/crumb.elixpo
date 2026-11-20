@@ -689,6 +689,34 @@ pub struct NativeHarness {
     limits: HarnessLimits,
     tasks: Option<TaskBoard>,
     verifier: Option<Arc<dyn TurnVerifier>>,
+    hooks: Option<Arc<dyn ToolHooks>>,
+}
+
+/// User-configured hooks around tool calls and turn ends.
+///
+/// Hooks can block a call or annotate its result, but never approve
+/// anything: approvals stay with the [`ApprovalBroker`].
+pub trait ToolHooks: Send + Sync {
+    /// Runs before approval and execution. `Some(reason)` blocks the call;
+    /// the reason is reported to the model.
+    fn before_tool(
+        &self,
+        tool: &str,
+        arguments: &serde_json::Value,
+        cancellation: &CancellationToken,
+    ) -> Option<String>;
+
+    /// Runs after a successful call. `Some(note)` is appended to the result
+    /// the model sees.
+    fn after_tool(
+        &self,
+        tool: &str,
+        arguments: &serde_json::Value,
+        cancellation: &CancellationToken,
+    ) -> Option<String>;
+
+    /// Runs once a turn has ended, whatever its status.
+    fn turn_finished(&self, status: TurnStatus);
 }
 
 /// Checks the workspace after a turn changed it, before the turn finishes.
@@ -747,7 +775,15 @@ impl NativeHarness {
             limits,
             tasks: None,
             verifier: None,
+            hooks: None,
         }
+    }
+
+    /// Runs `hooks` around tool calls and at the end of each turn.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: Arc<dyn ToolHooks>) -> Self {
+        self.hooks = Some(hooks);
+        self
     }
 
     /// Runs `verifier` before a turn that changed the workspace finishes.
@@ -912,6 +948,9 @@ impl NativeHarness {
                 u32::try_from(metrics.tool_calls).unwrap_or(u32::MAX),
             )
             .map_err(persistence_error)?;
+        if let Some(hooks) = &self.hooks {
+            hooks.turn_finished(status);
+        }
         if result.is_ok() {
             sink.emit(HarnessEvent::TurnFinished);
         }
@@ -1228,6 +1267,11 @@ impl NativeHarness {
             name: call.name.clone(),
             detail: tool_request_detail(&call.name, &arguments),
         });
+        if let Some(blocked) =
+            self.blocked_by_hook(session, call, &arguments, cancellation, sink)?
+        {
+            return Ok(blocked);
+        }
         let mut report_progress = |label: &str| {
             sink.emit(HarnessEvent::ToolProgress {
                 id: call.id.clone(),
@@ -1247,7 +1291,7 @@ impl NativeHarness {
         // Time spent waiting for the user's approval is not agent work.
         let approval_wait = approvals.waited();
         ensure_active(cancellation, deadline + approval_wait)?;
-        let (content, structured, success) = match result {
+        let (mut content, structured, success) = match result {
             Ok(output) => (output.text, output.structured, !output.is_error),
             Err(error) if error.kind == ToolCallErrorKind::Cancelled => {
                 return Err(HarnessError::new(
@@ -1257,6 +1301,9 @@ impl NativeHarness {
             }
             Err(error) => (error.to_string(), None, false),
         };
+        if success {
+            self.append_hook_note(&mut content, call, &arguments, cancellation);
+        }
         session
             .record_tool_finish(call.name.clone(), success, content.len())
             .map_err(persistence_error)?;
@@ -1271,6 +1318,60 @@ impl NativeHarness {
             success,
             approval_wait,
         })
+    }
+}
+
+impl NativeHarness {
+    /// Asks the `pre_tool` hooks; a block is recorded and returned as the
+    /// call's failed result.
+    fn blocked_by_hook(
+        &self,
+        session: &mut AgentSession,
+        call: &ToolCall,
+        arguments: &serde_json::Value,
+        cancellation: &CancellationToken,
+        sink: &mut dyn EventSink,
+    ) -> Result<Option<ExecutedTool>, HarnessError> {
+        let Some(reason) = self
+            .hooks
+            .as_ref()
+            .and_then(|hooks| hooks.before_tool(&call.name, arguments, cancellation))
+        else {
+            return Ok(None);
+        };
+        let content = format!("Blocked by a user hook before running: {reason}");
+        session
+            .record_tool_finish(call.name.clone(), false, content.len())
+            .map_err(persistence_error)?;
+        sink.emit(HarnessEvent::ToolFinished {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            success: false,
+        });
+        Ok(Some(ExecutedTool {
+            content,
+            structured: None,
+            success: false,
+            approval_wait: Duration::ZERO,
+        }))
+    }
+
+    /// Appends a `post_tool` hook's note to a successful result.
+    fn append_hook_note(
+        &self,
+        content: &mut String,
+        call: &ToolCall,
+        arguments: &serde_json::Value,
+        cancellation: &CancellationToken,
+    ) {
+        if let Some(note) = self
+            .hooks
+            .as_ref()
+            .and_then(|hooks| hooks.after_tool(&call.name, arguments, cancellation))
+        {
+            content.push_str("\n\nUser hook: ");
+            content.push_str(&note);
+        }
     }
 }
 
@@ -3475,7 +3576,7 @@ mod tests {
 
     use super::{
         Conversation, HarnessErrorKind, HarnessEvent, HarnessLimits, HarnessTurn, NativeHarness,
-        SelectedSkill, TurnVerifier,
+        SelectedSkill, ToolHooks, TurnVerifier,
     };
 
     #[derive(Default)]
@@ -4552,6 +4653,108 @@ mod tests {
 
         assert_eq!(verifier.calls.load(Ordering::Relaxed), 2);
         assert_eq!(provider.requests.lock().expect("request lock").len(), 4);
+    }
+
+    #[derive(Default)]
+    struct RecordingHooks {
+        block: Option<&'static str>,
+        note: Option<&'static str>,
+        finished: Mutex<Vec<crumb_agent::TurnStatus>>,
+    }
+
+    impl ToolHooks for RecordingHooks {
+        fn before_tool(
+            &self,
+            _tool: &str,
+            _arguments: &serde_json::Value,
+            _cancellation: &CancellationToken,
+        ) -> Option<String> {
+            self.block.map(str::to_owned)
+        }
+
+        fn after_tool(
+            &self,
+            _tool: &str,
+            _arguments: &serde_json::Value,
+            _cancellation: &CancellationToken,
+        ) -> Option<String> {
+            self.note.map(str::to_owned)
+        }
+
+        fn turn_finished(&self, status: crumb_agent::TurnStatus) {
+            self.finished.lock().expect("hook lock").push(status);
+        }
+    }
+
+    async fn run_hooked_turn(
+        hooks: Arc<RecordingHooks>,
+        rounds: Vec<Vec<ChatEvent>>,
+    ) -> (super::HarnessOutcome, Arc<ScriptedProvider>, usize) {
+        let provider = Arc::new(ScriptedProvider::new(rounds));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let harness = NativeHarness::new(
+            provider.clone(),
+            tools(calls.clone()),
+            Arc::new(DenyAllApprovals),
+            HarnessLimits::default(),
+        )
+        .with_hooks(hooks);
+        let (_root, mut session) = session(AgentMode::Auto);
+        let mut conversation = harness.conversation();
+        let outcome = harness
+            .run_turn(
+                &mut session,
+                &mut conversation,
+                turn(),
+                &CancellationToken::default(),
+                &mut Vec::new(),
+            )
+            .await
+            .expect("turn succeeds");
+        (outcome, provider, calls.load(Ordering::Relaxed))
+    }
+
+    fn tool_result_text(provider: &ScriptedProvider) -> String {
+        provider.requests.lock().expect("request lock")[1]
+            .messages
+            .iter()
+            .find(|message| message.role == ChatRole::Tool)
+            .map(|message| message.content.clone())
+            .expect("tool result")
+    }
+
+    #[tokio::test]
+    async fn a_pre_tool_hook_blocks_the_call_before_it_runs() {
+        let hooks = Arc::new(RecordingHooks {
+            block: Some("weather lookups are disabled here"),
+            ..RecordingHooks::default()
+        });
+        // A blocked call is a failed call, so the model gets recovery rounds.
+        let rounds = vec![tool_round(), answer_round(), answer_round(), answer_round()];
+        let (_outcome, provider, executed) = run_hooked_turn(hooks.clone(), rounds).await;
+
+        assert_eq!(executed, 0, "a blocked tool never runs");
+        let result = tool_result_text(&provider);
+        assert!(result.contains("Blocked by a user hook"));
+        assert!(result.contains("weather lookups are disabled here"));
+    }
+
+    #[tokio::test]
+    async fn a_post_tool_note_reaches_the_model_and_turn_end_runs_once() {
+        let hooks = Arc::new(RecordingHooks {
+            note: Some("formatted 1 file"),
+            ..RecordingHooks::default()
+        });
+        let (outcome, provider, executed) =
+            run_hooked_turn(hooks.clone(), vec![tool_round(), answer_round()]).await;
+
+        assert_eq!(executed, 1);
+        assert!(tool_result_text(&provider).ends_with("User hook: formatted 1 file"));
+        assert_eq!(outcome.text, "It is 24 C.");
+        assert_eq!(
+            *hooks.finished.lock().expect("hook lock"),
+            vec![crumb_agent::TurnStatus::Complete]
+        );
     }
 
     #[tokio::test]

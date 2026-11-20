@@ -86,6 +86,33 @@ Configure it in `.crumb/agent.json`:
 ```
 
 `command` replaces the detected check; `"after_edit": false` turns it off.
+## Hooks
+
+Hooks run user commands around native agent tool calls, configured in
+`.crumb/agent.json` (project hooks only run in a folder you trusted):
+
+```json
+"hooks": {
+  "pre_tool": [{"command": "./scripts/guard.sh", "tools": ["run_shell"]}],
+  "post_tool": [{"command": "cargo fmt --all", "tools": ["edit_file", "write_file"]}],
+  "on_stop": [{"command": "notify-send 'Crumb is done'"}]
+}
+```
+
+Each hook runs in the workspace with `sh -c` (`cmd /C` on Windows) and gets a
+JSON event on stdin (`event`, `tool`, `arguments`, `workspace`; `status` for
+`on_stop`) plus `CRUMB_HOOK_EVENT` and `CRUMB_WORKSPACE`. `tools` limits a hook
+to some tools (empty or `"*"` means all), and `timeout_secs` defaults to 30.
+
+- `pre_tool` runs before approval. Exit status 2 blocks the call; stderr is
+  the reason reported to the model.
+- `post_tool` runs after a successful call. Exit status 2 appends stderr to
+  the result the model sees.
+- `on_stop` runs when a turn ends; its outcome is ignored.
+
+Any other exit status, a timeout or a hook that cannot start lets the call
+proceed. Hooks can only block or annotate: they never approve a call or widen
+permissions.
 
 Ctrl+C sets the shared cancellation token. Native tools must stop their child
 processes. The current DeepSeek Harness JSON-RPC SDK has no turn-cancellation
