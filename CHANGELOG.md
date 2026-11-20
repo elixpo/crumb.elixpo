@@ -3,6 +3,62 @@
 This file records notable public changes to Crumb. Until the first stable
 release, behavior and interfaces may change without compatibility guarantees.
 
+## 1.5.0 - 2026-11-20
+
+### Follows your project's instructions
+
+- Crumb reads the project's `AGENTS.md`, the instruction file other coding
+  agents use, and falls back to `CLAUDE.md`. Files are read from the
+  repository root down to the working folder, so a nested file refines the
+  project-wide one; outside a repository only the working folder is read.
+  They guide how Crumb works and never grant permissions. Helper agents get
+  the same instructions.
+
+### Safer by default
+
+- On Linux, commands Crumb runs for you are confined by the kernel
+  (Landlock): they can read the system but can only write inside the
+  project, temporary folders and toolchain caches, so files such as
+  `~/.ssh` stay out of reach. Your own shell commands are never sandboxed.
+  Full-access mode or `"permissions": {"sandbox": false}` turns it off.
+  Commands that used to write elsewhere now fail with "Permission denied",
+  and Crumb tells the model to ask you instead of retrying.
+
+### Checks its own work
+
+- After editing files, Crumb runs the project's fast check (`cargo check`,
+  `tsc --noEmit`, `go vet` or `ruff check`) before finishing and fixes what
+  it reports, at most twice per turn. Configure or disable it with
+  `"checks"` in `.crumb/agent.json`.
+
+### Hooks
+
+- `"hooks"` in `.crumb/agent.json` runs your own commands before and after
+  agent tool calls and when a turn ends. A `pre_tool` hook can block a call,
+  a `post_tool` hook can add a note for the model; hooks never approve
+  anything.
+
+### Helper agents in worktrees
+
+- Helpers that edit files (`spawn_agents` with write access) now work in
+  their own git worktree, starting from what you see, and their changes are
+  applied to your workspace as soon as each one finishes. Changes that no
+  longer apply are saved as a patch and reported, never forced. Outside git
+  repositories, and on Windows for now, helpers share the workspace as
+  before.
+
+### Notifications
+
+- When a task runs for more than ten seconds, Crumb asks the terminal for a
+  desktop notification when it finishes or needs your approval (kitty,
+  iTerm2, WezTerm, Ghostty and foot; other terminals get the bell). Set
+  `CRUMB_NOTIFICATIONS=off` to turn it off.
+
+### Other
+
+- The eval suite grows from 11 to 24 outcome-graded scenarios.
+- The website uses Next.js 16.4.6.
+
 ## 1.4.1 - 2026-11-04
 
 ### Use Crumb in your editor
