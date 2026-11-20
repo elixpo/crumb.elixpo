@@ -128,6 +128,20 @@ fn with_turn_checks(
     harness
 }
 
+/// Builds a write helper's tools rooted at its own worktree. Helpers get the
+/// workspace tools but no peer (A2A) runtime.
+fn helper_tool_factory(config: &AgentConfig) -> crumb_harness::WriteToolFactory {
+    let config = config.clone();
+    Arc::new(move |root: &Path| {
+        crate::workspace_read_host(
+            root,
+            &config,
+            crate::configured_pollinations_runtime_key(&config),
+            None,
+        )
+    })
+}
+
 fn configured_approvals(config: &AgentConfig) -> ConfiguredApprovals {
     ConfiguredApprovals::new(config.permissions.allow_network_tools.clone())
         .with_mode(config.permissions.mode)
@@ -2175,6 +2189,7 @@ impl AgentRuntime {
                 approvals: Some(Arc::clone(&approvals)),
                 registry: Some(self.team.clone()),
                 project_instructions: project_instructions.clone(),
+                write_tools_for: Some(helper_tool_factory(config)),
             },
         )?;
         let harness = with_turn_checks(
