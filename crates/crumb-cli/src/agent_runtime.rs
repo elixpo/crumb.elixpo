@@ -47,6 +47,8 @@ struct TurnApprovals {
     configured: ConfiguredApprovals,
     interactive: InteractiveApprovalBroker,
     approved: Mutex<BTreeSet<(String, String)>>,
+    /// When the turn started; long turns notify before asking.
+    started: std::time::Instant,
 }
 
 struct TurnResources {
@@ -94,6 +96,9 @@ impl ApprovalBroker for TurnApprovals {
         {
             return ApprovalDecision::AllowOnce;
         }
+        if self.started.elapsed() >= crate::notify::NOTIFY_AFTER {
+            crate::notify::notify("Crumb needs your approval");
+        }
         let decision = self.interactive.decide(request, arguments, cancellation);
         if decision == ApprovalDecision::AllowOnce {
             self.approved
@@ -124,6 +129,7 @@ fn turn_approvals(
             configured,
             interactive,
             approved: Mutex::new(BTreeSet::new()),
+            started: std::time::Instant::now(),
         }),
         None => Arc::new(configured),
     }
