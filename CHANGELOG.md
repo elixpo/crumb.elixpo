@@ -3,12 +3,13 @@
 This file records notable public changes to Crumb. Until the first stable
 release, behavior and interfaces may change without compatibility guarantees.
 
-## Unreleased
+## 1.5.1 - 2026-11-21
 
 - `crumb --version` (or `-V`) prints the installed version, for example
-  `crumb 1.5.0`.
+  `crumb 1.5.1`.
 - `crumb --help` (or `-h`, `crumb help`) lists every command and the `exec`
   options instead of failing with a usage error.
+- The MCP HTTP tests no longer fail intermittently on Windows.
 
 ## 1.5.0 - 2026-11-20
 
