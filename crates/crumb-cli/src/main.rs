@@ -4899,7 +4899,7 @@ fn trusted_tool_detail(name: &str, arguments: &serde_json::Value) -> Option<Stri
         return Some(crumb_agent::task_summary(&tasks));
     }
     let field = match name {
-        "run_shell" | "start_background" => "command",
+        "run_shell" | "run_shell_outside_sandbox" | "start_background" => "command",
         "web_search" => "query",
         "web_fetch" => "url",
         "search_code" => "pattern",
@@ -4925,6 +4925,7 @@ fn trusted_tool_detail(name: &str, arguments: &serde_json::Value) -> Option<Stri
     }
     Some(match name {
         "run_shell" => format!("$ {detail}"),
+        "run_shell_outside_sandbox" => format!("outside the sandbox: $ {detail}"),
         "web_search" => format!("search: {detail}"),
         "web_fetch" => format!("fetch: {detail}"),
         "github_issue" | "github" => format!("GitHub: {detail}"),
@@ -5821,6 +5822,9 @@ fn visible_tool_activity(name: &str, detail: Option<&str>) -> String {
         ("wait", Some(detail)) => format!("Waiting · {detail}"),
         ("wait", None) => "Waiting".to_owned(),
         ("run_shell", Some(command)) => format!("Running command · $ {command}"),
+        ("run_shell_outside_sandbox", Some(command)) => {
+            format!("Running outside the sandbox · $ {command}")
+        }
         ("write_file", Some(path)) => format!("Editing file · {path}"),
         ("web_search", Some(query)) => format!("Searching web · {query}"),
         ("jev_decide", _) => "Asking Jev to weigh the options".to_owned(),
@@ -5847,6 +5851,8 @@ fn finished_tool_activity(
     let verb = match (name, success) {
         ("run_shell", true) => "Ran command",
         ("run_shell", false) => "Command failed",
+        ("run_shell_outside_sandbox", true) => "Ran outside the sandbox",
+        ("run_shell_outside_sandbox", false) => "Command outside the sandbox failed",
         ("web_search", true) => "Searched the web",
         ("web_search", false) => "Web search failed",
         ("jev_decide", true) => "Jev weighed the options",
@@ -5870,7 +5876,9 @@ fn finished_tool_activity(
     };
     let elapsed = format_activity_elapsed(elapsed);
     match (name, detail) {
-        ("run_shell", Some(command)) => format!("{verb} · {elapsed} · $ {command}"),
+        ("run_shell" | "run_shell_outside_sandbox", Some(command)) => {
+            format!("{verb} · {elapsed} · $ {command}")
+        }
         (_, Some(detail)) => format!("{verb} · {elapsed} · {detail}"),
         (_, None) => format!("{verb} · {elapsed} · {name}"),
     }

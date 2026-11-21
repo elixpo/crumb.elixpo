@@ -24,7 +24,7 @@ pub const SANDBOX_EXEC_ARG: &str = "__sandbox-exec";
 
 /// Appended to failed command output when the sandbox was active, so the
 /// model asks for approval instead of retrying blocked writes.
-pub(crate) const SANDBOX_HINT: &str = "Note: agent commands run in a sandbox that only allows writing inside the workspace, temporary directories and toolchain caches. If the command needs to write elsewhere, ask the user instead of retrying.";
+pub(crate) const SANDBOX_HINT: &str = "Note: agent commands run in a sandbox that only allows writing inside the workspace, temporary directories and toolchain caches. If the user really wants this command to write elsewhere, run it with run_shell_outside_sandbox, which asks the user to approve it; do not retry it with run_shell.";
 
 /// Directories an agent command may write to.
 #[must_use]

@@ -9,6 +9,9 @@ release, behavior and interfaces may change without compatibility guarantees.
   for you to approve the sign-in, instead of a static line.
 - Messages the browser prints when Crumb opens it (for example GTK
   warnings) no longer appear in Crumb's screen.
+- When the sandbox blocks a command you asked for, Crumb can ask you to
+  approve running just that command outside the sandbox
+  (`run_shell_outside_sandbox`); the model cannot approve it itself.
 
 ## 1.5.1 - 2026-11-21
 

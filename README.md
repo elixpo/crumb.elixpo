@@ -92,7 +92,7 @@ When a task runs for more than a few seconds, Crumb asks your terminal for a des
 
 Crumb asks before sensitive actions, keeps permissions in your hands, and shows the exact command it wants to run. You can work in planning mode, approve one action at a time, or allow broader access for a trusted workspace.
 
-On Linux, commands Crumb runs for you are also confined by the kernel (Landlock): they can read your system, but can only write inside the project, temporary folders and toolchain caches, so your other files, such as `~/.ssh`, stay out of reach. Your own shell commands are never sandboxed. Full-access mode, or `"permissions": {"sandbox": false}`, turns this off.
+On Linux, commands Crumb runs for you are also confined by the kernel (Landlock): they can read your system, but can only write inside the project, temporary folders and toolchain caches, so your other files, such as `~/.ssh`, stay out of reach. When a command you asked for really needs to write elsewhere, Crumb asks you to approve running just that command outside the sandbox. Your own shell commands are never sandboxed. Full-access mode, or `"permissions": {"sandbox": false}`, turns this off.
 
 If an AI service is unavailable, your terminal still works.
 
