@@ -216,6 +216,46 @@ fn is_version_request(arguments: &[std::ffi::OsString]) -> bool {
     matches!(arguments, [flag] if flag == "--version" || flag == "-V")
 }
 
+/// `crumb --help`, `crumb -h` or `crumb help`.
+fn is_help_request(arguments: &[std::ffi::OsString]) -> bool {
+    matches!(arguments, [flag] if flag == "--help" || flag == "-h" || flag == "help")
+}
+
+/// What `crumb --help` prints.
+fn help_text() -> String {
+    format!(
+        "{version}
+Your terminal, with an AI agent built in.
+
+Usage:
+  crumb                         Start the interactive terminal
+  crumb --resume <session-id>   Resume a saved session
+  crumb exec [options] <request>
+                                Run one agent request and exit
+  crumb skill <operation>       List, install and run skills
+  crumb auth login|status|logout
+                                Sign in to your crumb.elixpo account
+  crumb acp                     Run as an Agent Client Protocol agent (for editors)
+  crumb mcp serve               Run Crumb as an MCP server (stdio)
+  crumb review export <id|all>  Export edit checkpoints for review
+  crumb completions <shell>     Print a completion script (bash, zsh, fish, powershell)
+  crumb jobs list|tick|run <id> Manage scheduled jobs
+  crumb --version, -V           Print the version
+  crumb --help, -h              Print this help
+
+exec options:
+  --json | --stream-json        Machine-readable output
+  --resume <session-id>         Continue a saved session
+  --model <provider>/<model>    Use a configured model for this turn
+  --approvals always-ask|sensitive-only|full-access
+
+Project settings live in .crumb/agent.json; Crumb also follows AGENTS.md.
+Docs and issues: https://github.com/elixpo/crumb.elixpo
+",
+        version = version_line()
+    )
+}
+
 /// The line `crumb --version` prints, for example `crumb 1.5.0`.
 fn version_line() -> String {
     format!("crumb {}", env!("CARGO_PKG_VERSION"))
@@ -266,6 +306,10 @@ fn run_command_line_action() -> Result<bool> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if is_version_request(&arguments) {
         writeln!(io::stdout().lock(), "{}", version_line())?;
+        return Ok(true);
+    }
+    if is_help_request(&arguments) {
+        write!(io::stdout().lock(), "{}", help_text())?;
         return Ok(true);
     }
     if let Some(exec) = parse_exec_request(&arguments)? {
@@ -350,7 +394,7 @@ fn run_command_line_action() -> Result<bool> {
         [group, action] if group == "auth" && action == "logout" => AuthAction::Logout,
         _ => {
             return Err(anyhow!(
-                "usage: crumb [--version | exec [options] <request> | skill <operation> | auth <login|status|logout> | acp | mcp serve | review export <id|all> | completions <shell> | jobs <list|run <id>|tick>]"
+                "usage: crumb [--help | --version | exec [options] <request> | skill <operation> | auth <login|status|logout> | acp | mcp serve | review export <id|all> | completions <shell> | jobs <list|run <id>|tick>]"
             ));
         }
     };
@@ -14720,6 +14764,30 @@ mod tests {
             Some("crumb-session-1")
         );
         assert!(parse_resume_session_argument(&["--resume".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn help_flag_lists_every_command() {
+        for flag in ["--help", "-h", "help"] {
+            assert!(super::is_help_request(&[OsString::from(flag)]));
+        }
+        assert!(!super::is_help_request(&[OsString::from("exec")]));
+        let help = super::help_text();
+        assert!(help.starts_with(&super::version_line()));
+        for command in [
+            "crumb exec",
+            "crumb skill",
+            "crumb auth",
+            "crumb acp",
+            "crumb mcp serve",
+            "crumb review export",
+            "crumb completions",
+            "crumb jobs",
+            "--version",
+            "--resume",
+        ] {
+            assert!(help.contains(command), "help lacks {command}");
+        }
     }
 
     #[test]
