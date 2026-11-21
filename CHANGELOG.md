@@ -3,6 +3,13 @@
 This file records notable public changes to Crumb. Until the first stable
 release, behavior and interfaces may change without compatibility guarantees.
 
+## Unreleased
+
+- `crumb --version` (or `-V`) prints the installed version, for example
+  `crumb 1.5.0`.
+- `crumb --help` (or `-h`, `crumb help`) lists every command and the `exec`
+  options instead of failing with a usage error.
+
 ## 1.5.0 - 2026-11-20
 
 ### Follows your project's instructions
