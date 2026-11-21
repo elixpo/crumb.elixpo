@@ -5,6 +5,9 @@
 //! desktop notification when the turn finishes or needs an approval. The
 //! escape sequence depends on the terminal; anything unknown gets the
 //! terminal bell, which most terminals turn into a tab or taskbar alert.
+//! On Linux desktops the bell is paired with a real desktop notification
+//! through `notify-send`, because many terminals (VS Code, GNOME Terminal,
+//! Konsole) only play a sound for it.
 //! Set `CRUMB_NOTIFICATIONS=off` to disable.
 
 use std::io::{IsTerminal, Write};
@@ -37,6 +40,33 @@ pub(crate) fn notify(message: &str) {
     // Best effort: a notification must never break the turn.
     let _ = stdout.write_all(sequence.as_bytes());
     let _ = stdout.flush();
+    if sequence == BELL && desktop_session(&|name| std::env::var_os(name).is_some()) {
+        send_desktop_notification(&sanitize(message));
+    }
+}
+
+/// Whether a Linux graphical session can show desktop notifications.
+fn desktop_session(is_set: &dyn Fn(&str) -> bool) -> bool {
+    cfg!(target_os = "linux")
+        && (is_set("WAYLAND_DISPLAY") || is_set("DISPLAY"))
+        && is_set("DBUS_SESSION_BUS_ADDRESS")
+}
+
+/// Shows `message` with `notify-send`, ignoring failures and output.
+fn send_desktop_notification(message: &str) {
+    use std::process::{Command, Stdio};
+
+    if let Ok(mut child) = Command::new("notify-send")
+        .args(["--app-name=Crumb", "Crumb", message])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 /// Returns the escape sequence for the current terminal, or `None` when
@@ -134,6 +164,25 @@ mod tests {
         assert_eq!(
             seq(&[("TERM", "xterm-kitty"), ("TMUX", "/tmp/tmux")], "done").as_deref(),
             Some(BELL)
+        );
+    }
+
+    #[test]
+    fn desktop_notifications_need_a_graphical_session_bus() {
+        let only = |vars: &'static [&'static str]| move |name: &str| vars.contains(&name);
+        let expected = cfg!(target_os = "linux");
+        assert_eq!(
+            desktop_session(&only(&["WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS"])),
+            expected
+        );
+        assert_eq!(
+            desktop_session(&only(&["DISPLAY", "DBUS_SESSION_BUS_ADDRESS"])),
+            expected
+        );
+        assert!(!desktop_session(&only(&["DISPLAY"])), "no session bus");
+        assert!(
+            !desktop_session(&only(&["DBUS_SESSION_BUS_ADDRESS"])),
+            "no display"
         );
     }
 
