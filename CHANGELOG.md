@@ -12,6 +12,11 @@ release, behavior and interfaces may change without compatibility guarantees.
 - When the sandbox blocks a command you asked for, Crumb can ask you to
   approve running just that command outside the sandbox
   (`run_shell_outside_sandbox`); the model cannot approve it itself.
+- Crumb now runs inline by default, in your terminal's normal scrollback, so
+  scrolling, search and selection are the terminal's own and stay smooth.
+  `CRUMB_FULLSCREEN=1` brings back the full-screen view.
+- `/agents` opens the agent map as a dialog while helpers are working too,
+  instead of printing over the live view.
 
 ## 1.5.1 - 2026-11-21
 
