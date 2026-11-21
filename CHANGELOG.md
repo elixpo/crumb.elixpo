@@ -3,20 +3,37 @@
 This file records notable public changes to Crumb. Until the first stable
 release, behavior and interfaces may change without compatibility guarantees.
 
-## Unreleased
+## 1.5.2 - 2026-11-21
 
-- `/auth login` shows a moving spinner with the elapsed time while it waits
-  for you to approve the sign-in, instead of a static line.
-- Messages the browser prints when Crumb opens it (for example GTK
-  warnings) no longer appear in Crumb's screen.
-- When the sandbox blocks a command you asked for, Crumb can ask you to
-  approve running just that command outside the sandbox
-  (`run_shell_outside_sandbox`); the model cannot approve it itself.
+### Terminal
+
 - Crumb now runs inline by default, in your terminal's normal scrollback, so
   scrolling, search and selection are the terminal's own and stay smooth.
   `CRUMB_FULLSCREEN=1` brings back the full-screen view.
 - `/agents` opens the agent map as a dialog while helpers are working too,
   instead of printing over the live view.
+- Requests that quote code, such as "add a function fn f() -> String", go
+  to the agent instead of failing in the shell because of `>` or `()`.
+  Real commands like `ls | grep x` still run in your shell.
+
+### Agent
+
+- Helper agents (`spawn_agents`) no longer hang at "Thinking · 0 tokens":
+  they shared the turn's network connections, which could not make progress
+  while the turn waited for them.
+- When the sandbox blocks a command you asked for, Crumb can ask you to
+  approve running just that command outside the sandbox
+  (`run_shell_outside_sandbox`); the model cannot approve it itself.
+- The temporary folder used by write helpers is removed when they finish.
+
+### Sign-in and notifications
+
+- `/auth login` shows a moving spinner with the elapsed time while it waits
+  for you to approve the sign-in.
+- Messages the browser prints when Crumb opens it (for example GTK
+  warnings) no longer appear in Crumb's screen.
+- On Linux desktops where the terminal can only ring the bell, long tasks
+  also show a desktop notification (`notify-send`).
 
 ## 1.5.1 - 2026-11-21
 
