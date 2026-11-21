@@ -171,6 +171,22 @@ fn turn_approvals(
 /// applying its configured request timeout, stream idle timeout, and retry
 /// policy. Pollinations falls back to the signed-in key; other providers need
 /// a configured credential unless they run on this machine.
+/// Runtime for one native turn.
+///
+/// Helper agents (`spawn_agents`) share the turn's provider and its pooled
+/// HTTP connections, and the turn blocks while they run. A pooled connection
+/// is driven by the runtime that opened it, so on a single-threaded runtime a
+/// helper reusing the turn's connection waits forever. Two worker threads
+/// keep connection I/O moving while the turn itself is blocked.
+fn native_turn_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("crumb-turn")
+        .enable_all()
+        .build()
+        .context("failed to start native Harness runtime")
+}
+
 fn native_chat_provider(
     name: &str,
     provider_config: &crumb_agent::ProviderConfig,
@@ -2216,10 +2232,7 @@ impl AgentRuntime {
             max_output_tokens,
         };
         let mut events = NativeEventBridge::new(on_activity);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to start native Harness runtime")?;
+        let runtime = native_turn_runtime()?;
         // Saved state lets an interrupted session resume where it stopped.
         let save = config.sessions.save_conversation;
         let folder = session_root(&workspace).join(session_id);
@@ -3402,6 +3415,71 @@ fn new_session_id() -> Result<SessionId> {
 
 #[cfg(test)]
 mod tests {
+    /// Serves keep-alive HTTP/1.1 responses until the test ends.
+    fn keep_alive_server() -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                    let mut stream = stream;
+                    loop {
+                        let mut line = String::new();
+                        // Read one request head, then answer and keep the connection.
+                        loop {
+                            line.clear();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                        }
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+                        );
+                    }
+                });
+            }
+        });
+        format!("http://{address}/")
+    }
+
+    #[test]
+    fn helpers_can_reuse_the_turns_connections_while_the_turn_blocks() {
+        let url = keep_alive_server();
+        let client = reqwest::Client::new();
+        let runtime = super::native_turn_runtime().expect("runtime");
+        let helper_result = runtime.block_on(async {
+            // The turn opens a pooled connection...
+            let first = client.get(&url).send().await.expect("turn request");
+            assert!(first.status().is_success());
+            let _ = first.text().await;
+            // ...then blocks while a helper on its own runtime reuses it.
+            let (client, url) = (client.clone(), url.clone());
+            std::thread::spawn(move || {
+                let helper = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("helper runtime");
+                helper.block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        client.get(&url).send().await?.text().await
+                    })
+                    .await
+                })
+            })
+            .join()
+            .expect("helper thread")
+        });
+        let body = helper_result
+            .expect("the helper's request must not hang")
+            .expect("helper request");
+        assert_eq!(body, "ok");
+    }
+
     use std::collections::BTreeMap;
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
