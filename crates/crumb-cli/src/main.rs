@@ -2266,6 +2266,8 @@ struct FullscreenStatusWriter {
     transcript: Arc<Mutex<TranscriptState>>,
     header_rows: u16,
     pending: Vec<u8>,
+    /// A `\r`-prefixed progress line is shown and updated in place.
+    live: bool,
 }
 
 impl FullscreenStatusWriter {
@@ -2275,7 +2277,27 @@ impl FullscreenStatusWriter {
             transcript,
             header_rows,
             pending: Vec::new(),
+            live: false,
         }
+    }
+
+    /// Shows `line` as the live progress line, replacing the previous one.
+    fn render_live(&mut self, line: &str) -> io::Result<()> {
+        let line = line.trim_start_matches('\r').replace("\x1b[K", "");
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(());
+        }
+        let rendered = self
+            .renderer
+            .status_line(status_tone_for_output(line), line);
+        let mut state = self
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.set_live_block(&rendered);
+        self.live = true;
+        render_transcript_view(&state, self.renderer, self.header_rows)
     }
 
     fn render_pending(&mut self) -> io::Result<()> {
@@ -2300,6 +2322,10 @@ impl FullscreenStatusWriter {
             .transcript
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if std::mem::take(&mut self.live) {
+            // Keep the last progress line and continue below it.
+            state.close_live_block();
+        }
         state.append(&rendered);
         render_transcript_view(&state, self.renderer, self.header_rows)
     }
@@ -2307,7 +2333,12 @@ impl FullscreenStatusWriter {
 
 impl Write for FullscreenStatusWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.pending.extend_from_slice(buffer);
+        if buffer.first() == Some(&b'\r') {
+            self.render_pending()?;
+            self.render_live(&String::from_utf8_lossy(buffer))?;
+        } else {
+            self.pending.extend_from_slice(buffer);
+        }
         Ok(buffer.len())
     }
 

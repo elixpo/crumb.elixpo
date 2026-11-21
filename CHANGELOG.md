@@ -3,6 +3,13 @@
 This file records notable public changes to Crumb. Until the first stable
 release, behavior and interfaces may change without compatibility guarantees.
 
+## Unreleased
+
+- `/auth login` shows a moving spinner with the elapsed time while it waits
+  for you to approve the sign-in, instead of a static line.
+- Messages the browser prints when Crumb opens it (for example GTK
+  warnings) no longer appear in Crumb's screen.
+
 ## 1.5.1 - 2026-11-21
 
 - `crumb --version` (or `-V`) prints the installed version, for example
