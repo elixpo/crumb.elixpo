@@ -19,6 +19,9 @@ use serde_json::{Value, json};
 use crate::bounded_text;
 
 const RUN_SHELL: &str = "run_shell";
+/// The same shell without the OS sandbox; every call needs the user's
+/// approval, so the model cannot widen its own access.
+pub const RUN_SHELL_OUTSIDE_SANDBOX: &str = "run_shell_outside_sandbox";
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Launch and runtime limits for the isolated agent shell.
@@ -108,6 +111,23 @@ fn register_shell_tool_inner(
     }
     let capacity = std::num::NonZeroUsize::new(UNDO_LEDGER_CAPACITY)
         .expect("UNDO_LEDGER_CAPACITY is a nonzero constant");
+    // While the sandbox is on, offer an approval-gated way out of it for
+    // commands that genuinely need to write elsewhere.
+    if config.sandbox.is_some() {
+        host.register(
+            outside_sandbox_descriptor(),
+            Arc::new(ShellTool {
+                workspace: workspace.clone(),
+                config: AgentShellConfig {
+                    sandbox: None,
+                    ..config.clone()
+                },
+                optimizer: optimizer.clone(),
+                ledger: Mutex::new(UndoLedger::new(capacity)),
+                last_failure: Mutex::new(None),
+            }),
+        )?;
+    }
     let shell_tool = Arc::new(ShellTool {
         workspace,
         config,
@@ -696,6 +716,25 @@ fn descriptor() -> ToolDescriptor {
         transport: ToolTransport::Native,
     }
 }
+fn outside_sandbox_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: RUN_SHELL_OUTSIDE_SANDBOX.to_owned(),
+        description: "Run one Bash command WITHOUT the sandbox, so it can write outside the workspace. Use it only after run_shell failed because the sandbox refused a write the user asked for. The user must approve every call; explain why the command needs it."
+            .to_owned(),
+        input_schema: json!({
+            "type":"object",
+            "properties":{
+                "command":{"type":"string","minLength":1},
+                "timeout_seconds":{"type":"integer","minimum":1}
+            },
+            "required":["command"],
+            "additionalProperties":false
+        }),
+        risk: RiskClass::SystemMutation,
+        transport: ToolTransport::Native,
+    }
+}
+
 struct DiagnoseLastFailureTool {
     shell: Arc<ShellTool>,
 }
@@ -857,6 +896,39 @@ mod tests {
         )
         .expect("optimized shell tool is registered");
         host
+    }
+
+    #[test]
+    fn the_unsandboxed_shell_exists_only_with_the_sandbox_and_always_needs_approval() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut plain = ToolHost::default();
+        super::register_shell_tool(&mut plain, workspace.path(), config(Duration::from_secs(5)))
+            .expect("shell registers");
+        assert!(plain.descriptor(super::RUN_SHELL_OUTSIDE_SANDBOX).is_none());
+
+        let mut sandboxed = ToolHost::default();
+        let mut with_sandbox = config(Duration::from_secs(5));
+        with_sandbox.sandbox = Some(PathBuf::from("/usr/bin/crumb"));
+        super::register_shell_tool(&mut sandboxed, workspace.path(), with_sandbox)
+            .expect("shell registers");
+        let escape = sandboxed
+            .descriptor(super::RUN_SHELL_OUTSIDE_SANDBOX)
+            .expect("registered while sandboxed");
+        assert_eq!(escape.risk, RiskClass::SystemMutation);
+
+        // The default policy never allows it on its own: the user decides.
+        let policy = crumb_agent::ConfiguredApprovals::new(std::collections::BTreeSet::new());
+        let decision = crumb_agent::ApprovalBroker::decide(
+            &policy,
+            &crumb_agent::ApprovalRequest {
+                tool: super::RUN_SHELL_OUTSIDE_SANDBOX.to_owned(),
+                risk: escape.risk,
+                arguments_digest: String::new(),
+            },
+            &serde_json::json!({"command": "echo hi > ~/x"}),
+            &CancellationToken::default(),
+        );
+        assert_eq!(decision, crumb_agent::ApprovalDecision::Deny);
     }
 
     #[test]

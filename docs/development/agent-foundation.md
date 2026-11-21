@@ -123,8 +123,12 @@ command starts. Reading and executing stay allowed everywhere; writing is
 limited to the workspace, the temporary directories, `/dev`, and toolchain
 caches (`~/.cargo`, `~/.rustup`, `~/.cache`, `~/.npm`, `~/go`, plus
 `CARGO_HOME`, `RUSTUP_HOME`, `GOPATH`, `GOCACHE` and `XDG_CACHE_HOME`). A
-failed command whose error looks like a refused write gets a note telling the
-model to ask the user instead of retrying.
+failed command whose error looks like a refused write gets a note pointing the
+model at `run_shell_outside_sandbox`: the same shell without the sandbox,
+registered only while the sandbox is on, with the `SystemMutation` risk class.
+No policy allows it on its own, so every call shows the user an approval prompt
+("Running outside the sandbox · $ …"); without an interactive user, as in
+`crumb exec`, it is denied.
 
 The sandbox is skipped in full-access mode, with
 `"permissions": {"sandbox": false}`, on kernels without Landlock, and on other

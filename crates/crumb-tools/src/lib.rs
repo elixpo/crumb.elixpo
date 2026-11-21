@@ -34,7 +34,10 @@ pub use github_read::{GITHUB, register_github_read_tool};
 pub use sandbox::{
     SANDBOX_EXEC_ARG, SandboxExec, parse_sandbox_exec, restrict_current_thread, writable_paths,
 };
-pub use shell::{AgentShellConfig, register_shell_tool, register_shell_tool_with_optimizer};
+pub use shell::{
+    AgentShellConfig, RUN_SHELL_OUTSIDE_SANDBOX, register_shell_tool,
+    register_shell_tool_with_optimizer,
+};
 pub use stack_detection::{
     DetectedStack, LanguageDetection, StackConfidence, StackDetectionLimits,
     register_stack_detection_tool,
