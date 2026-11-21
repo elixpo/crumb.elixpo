@@ -35,6 +35,11 @@ release, behavior and interfaces may change without compatibility guarantees.
 - On Linux desktops where the terminal can only ring the bell, long tasks
   also show a desktop notification (`notify-send`).
 
+### Security
+
+- Updates rustls to 0.23.46, fixing a moderate advisory (TLS secrets could
+  appear in debug output) and three low ones.
+
 ## 1.5.1 - 2026-11-21
 
 - `crumb --version` (or `-V`) prints the installed version, for example
