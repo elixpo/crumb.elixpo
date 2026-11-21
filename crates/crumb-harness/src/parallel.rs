@@ -404,8 +404,8 @@ impl HelperIsolation {
         crate::worktree::prune(&top);
         let parent = std::env::temp_dir().join("crumb-helpers").join(team);
         let mut isolation = Self {
+            worktrees: Vec::new(),
             folder: Some(parent.clone()),
-            ..Self::default()
         };
         for index in 0..count {
             match HelperWorktree::create(
@@ -1080,6 +1080,17 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
+    /// Helper team folders this test process left under the temp directory.
+    fn team_folders_left() -> usize {
+        let prefix = format!("{}-", std::process::id());
+        std::fs::read_dir(std::env::temp_dir().join("crumb-helpers")).map_or(0, |entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+                .count()
+        })
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_helpers_in_a_repository_get_worktrees_merged_as_they_finish() {
@@ -1177,16 +1188,7 @@ mod tests {
             1,
             "helper worktrees are removed"
         );
-        let prefix = format!("{}-", std::process::id());
-        let leftovers = std::fs::read_dir(std::env::temp_dir().join("crumb-helpers"))
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
-                    .count()
-            })
-            .unwrap_or(0);
-        assert_eq!(leftovers, 0, "the team's temp folder is removed");
+        assert_eq!(team_folders_left(), 0, "the team's temp folder is removed");
     }
 
     #[test]
