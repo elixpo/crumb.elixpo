@@ -1335,11 +1335,26 @@ fn sandbox_launcher(config: &AgentConfig) -> Option<PathBuf> {
     wanted.then(std::env::current_exe).and_then(Result::ok)
 }
 
+/// Crumb runs inline by default, in the terminal's normal scrollback, so the
+/// terminal's own scrolling, search and selection work. `CRUMB_FULLSCREEN=1`
+/// opts into the alternate-screen view; `CRUMB_INLINE` always wins.
+fn fullscreen_requested(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    let on = |value: Option<String>| {
+        value.is_some_and(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "off" | "false" | "no"
+            )
+        })
+    };
+    env("CRUMB_INLINE").is_none() && on(env("CRUMB_FULLSCREEN"))
+}
+
 fn run_managed_repl(resume_session: Option<&str>) -> Result<ReplOutcome> {
     let (started_at, stdin, stdout) = (Instant::now(), io::stdin(), io::stdout());
     let interactive = stdin.is_terminal() && stdout.is_terminal();
     let renderer = Renderer::new(UiSettings::from_environment(interactive));
-    let fullscreen = interactive && std::env::var_os("CRUMB_INLINE").is_none();
+    let fullscreen = interactive && fullscreen_requested(&|name| std::env::var(name).ok());
     let screen = AlternateScreenGuard::enter(fullscreen)?;
     let (platform, initial_cwd) = (Platform::current(), current_process_dir()?);
     if interactive && !confirm_folder_trust(renderer, &initial_cwd, fullscreen)? {
@@ -1625,6 +1640,32 @@ fn show_agent_map_panel(context: &mut InputContext<'_>) -> Result<()> {
         &config,
         runtime.token_usage().0,
     ));
+    if !run_agent_map_dialog(&map, context.renderer, context.fullscreen)? {
+        writeln!(
+            context.writer,
+            "◆ Agent map · {} · no helpers or background jobs yet",
+            map.view().main
+        )?;
+    }
+    if context.fullscreen {
+        // The panel drew over the bottom of the screen.
+        let state = context
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        render_transcript_view(&state, context.renderer, context.header_rows)?;
+    }
+    Ok(())
+}
+
+/// The agent map as a modal dialog: helpers and background jobs to pick
+/// from, Enter for one's details, Esc to close. Each opening shows a fresh
+/// snapshot. Returns `false` when there is nothing to show.
+fn run_agent_map_dialog(
+    map: &agent_runtime::AgentMapSource,
+    renderer: Renderer,
+    fullscreen: bool,
+) -> Result<bool> {
     loop {
         let view = map.view();
         let mut entries = Vec::new();
@@ -1657,12 +1698,7 @@ fn show_agent_map_panel(context: &mut InputContext<'_>) -> Result<()> {
             entries.push(format!("job {}", job.id));
         }
         if rows.is_empty() {
-            writeln!(
-                context.writer,
-                "◆ Agent map · {} · no helpers or background jobs yet",
-                view.main
-            )?;
-            return Ok(());
+            return Ok(false);
         }
         let notes = vec![view.main.clone()];
         let dialog = choice_dialog::ChoiceDialog {
@@ -1671,14 +1707,9 @@ fn show_agent_map_panel(context: &mut InputContext<'_>) -> Result<()> {
             hint: "↑/↓ choose · Enter or click for details · Esc close",
             actions: &[],
         };
-        let outcome = choice_dialog::run_choice_dialog(
-            context.renderer,
-            &dialog,
-            &mut rows,
-            context.fullscreen,
-        )?;
+        let outcome = choice_dialog::run_choice_dialog(renderer, &dialog, &mut rows, fullscreen)?;
         let choice_dialog::DialogOutcome::Chosen(index) = outcome else {
-            break;
+            return Ok(true);
         };
         let detail = map.detail(&entries[index]);
         let lines = detail
@@ -1697,22 +1728,8 @@ fn show_agent_map_panel(context: &mut InputContext<'_>) -> Result<()> {
             hint: "Enter or Esc to go back",
             actions: &[],
         };
-        choice_dialog::run_choice_dialog(
-            context.renderer,
-            &detail_dialog,
-            &mut back,
-            context.fullscreen,
-        )?;
+        choice_dialog::run_choice_dialog(renderer, &detail_dialog, &mut back, fullscreen)?;
     }
-    if context.fullscreen {
-        // The panel drew over the bottom of the screen.
-        let state = context
-            .transcript
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        render_transcript_view(&state, context.renderer, context.header_rows)?;
-    }
-    Ok(())
 }
 
 /// `41s` or `3m 50s`.
@@ -5151,12 +5168,20 @@ impl SteeringInput {
         if input == "/agents" || input.starts_with("/agents ") {
             self.buffer.clear();
             self.clear_line(writer)?;
-            writeln!(
-                writer,
-                "{}",
-                agent_map_text(task.agent_map(), &input, self.renderer)
-            )?;
+            // The map opens as a modal; `/agents N` still prints one entry.
+            if input == "/agents" {
+                if !run_agent_map_dialog(task.agent_map(), self.renderer, self.fullscreen)? {
+                    writeln!(writer, "◆ No helpers or background jobs yet")?;
+                }
+            } else {
+                writeln!(
+                    writer,
+                    "{}",
+                    agent_map_text(task.agent_map(), &input, self.renderer)
+                )?;
+            }
             writer.flush()?;
+            self.redraw(writer)?;
             return Ok(SteeringInputAction::Continue);
         }
         if input == "/background" {
@@ -14649,7 +14674,9 @@ fn relay_output(reader: &mut dyn Read, writer: &mut dyn Write) -> io::Result<()>
     Ok(())
 }
 
-struct RawModeGuard;
+struct RawModeGuard {
+    restore: bool,
+}
 
 struct KeyboardEnhancementGuard;
 
@@ -14705,9 +14732,12 @@ impl Drop for AlternateScreenGuard {
 }
 
 impl RawModeGuard {
+    /// Enables raw mode, and on drop restores the previous state, so a
+    /// dialog opened while raw mode is already on (mid-turn) leaves it on.
     fn enable() -> io::Result<Self> {
+        let restore = !crossterm::terminal::is_raw_mode_enabled()?;
         enable_raw_mode()?;
-        Ok(Self)
+        Ok(Self { restore })
     }
 }
 
@@ -14732,7 +14762,9 @@ impl Drop for KeyboardEnhancementGuard {
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
+        if self.restore {
+            let _ = disable_raw_mode();
+        }
     }
 }
 
@@ -14793,6 +14825,34 @@ mod tests {
         PeerDeliveryInspection, PeerDiscardedFile, PeerImportedFile, PeerInboxSummary,
         PeerInspectionKind, PeerInspectionPart, PeerQuarantinedFile, PeerTaskSummary,
     };
+
+    #[test]
+    fn crumb_runs_inline_unless_fullscreen_is_requested() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        assert!(!super::fullscreen_requested(&env(&[])));
+        assert!(super::fullscreen_requested(&env(&[(
+            "CRUMB_FULLSCREEN",
+            "1"
+        )])));
+        assert!(!super::fullscreen_requested(&env(&[(
+            "CRUMB_FULLSCREEN",
+            "0"
+        )])));
+        assert!(!super::fullscreen_requested(&env(&[(
+            "CRUMB_FULLSCREEN",
+            "off"
+        )])));
+        assert!(!super::fullscreen_requested(&env(&[
+            ("CRUMB_FULLSCREEN", "1"),
+            ("CRUMB_INLINE", "1")
+        ])));
+    }
 
     #[test]
     fn resume_argument_accepts_the_handoff_command() {
