@@ -380,6 +380,8 @@ struct Finding {
 #[derive(Default)]
 struct HelperIsolation {
     worktrees: Vec<Option<HelperWorktree>>,
+    /// The team's folder under the temp directory, removed at the end.
+    folder: Option<PathBuf>,
 }
 
 impl HelperIsolation {
@@ -401,7 +403,10 @@ impl HelperIsolation {
         };
         crate::worktree::prune(&top);
         let parent = std::env::temp_dir().join("crumb-helpers").join(team);
-        let mut isolation = Self::default();
+        let mut isolation = Self {
+            folder: Some(parent.clone()),
+            ..Self::default()
+        };
         for index in 0..count {
             match HelperWorktree::create(
                 &config.workspace,
@@ -457,6 +462,10 @@ impl Drop for HelperIsolation {
     fn drop(&mut self) {
         for worktree in self.worktrees.iter_mut().filter_map(Option::take) {
             worktree.remove();
+        }
+        // Only removes the folder once it is empty, never helper work.
+        if let Some(folder) = self.folder.take() {
+            let _ = std::fs::remove_dir(folder);
         }
     }
 }
@@ -1168,6 +1177,16 @@ mod tests {
             1,
             "helper worktrees are removed"
         );
+        let prefix = format!("{}-", std::process::id());
+        let leftovers = std::fs::read_dir(std::env::temp_dir().join("crumb-helpers"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(leftovers, 0, "the team's temp folder is removed");
     }
 
     #[test]
