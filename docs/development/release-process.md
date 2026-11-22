@@ -76,9 +76,11 @@ checksums, SBOMs, signatures, and attestations succeed.
 After a release is published, run
 `python3 packaging/package-managers/update.py <version>`. It reads the
 release's `.sha256` files and rewrites `Formula/crumb.rb` (the Homebrew tap
-this repository serves) and `packaging/winget/<version>/`; commit both. To
-publish to WinGet, submit that manifest directory to `microsoft/winget-pkgs`,
-for example with `wingetcreate submit packaging/winget/<version>`.
+this repository serves), `bucket/crumb.json` (the Scoop bucket this repository
+serves) and `packaging/winget/<version>/`; commit them all. Homebrew and Scoop
+users get the release as soon as that commit is on `main`. To publish to
+WinGet, submit the manifest directory to `microsoft/winget-pkgs`, for example
+with `wingetcreate submit packaging/winget/<version>`; that queue is slow.
 The ACP registry picks up new releases by itself; see
 `packaging/acp-registry/README.md` for its entry.
 
