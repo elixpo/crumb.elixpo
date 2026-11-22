@@ -37,6 +37,13 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/elixpo/crumb.elixpo/main/install.ps1 | iex
 ```
 
+Scoop (Windows):
+
+```powershell
+scoop bucket add elixpo https://github.com/elixpo/crumb.elixpo
+scoop install elixpo/crumb
+```
+
 Homebrew (macOS and Linux):
 
 ```bash
