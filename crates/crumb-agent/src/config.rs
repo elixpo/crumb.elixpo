@@ -49,6 +49,26 @@ pub enum MistakePolicy {
     Disabled,
 }
 
+/// Default capability policy with minimal permissions
+pub const DEFAULT_CAPABILITY_POLICY: CapabilityPolicy = CapabilityPolicy {
+    allow_read: false,
+    allow_write: false,
+    allow_network: false,
+    allow_spawn: false,
+    allowed_hosts: Vec::new(),
+    allowed_paths: Vec::new(),
+};
+
+/// Capability policy for development with broader permissions
+pub const DEVELOPMENT_CAPABILITY_POLICY: CapabilityPolicy = CapabilityPolicy {
+    allow_read: true,
+    allow_write: true,
+    allow_network: true,
+    allow_spawn: true,
+    allowed_hosts: Vec::new(),
+    allowed_paths: Vec::new(),
+};
+
 /// Encoding used when structured context is sent to a model.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +97,24 @@ pub enum HarnessConfig {
         command: PathBuf,
         capabilities: Vec<ModelCapabilities>,
     },
+}
+
+/// Capability policy for spawned processes
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct CapabilityPolicy {
+    /// Allow filesystem read operations
+    pub allow_read: bool,
+    /// Allow filesystem write operations
+    pub allow_write: bool,
+    /// Allow network operations
+    pub allow_network: bool,
+    /// Allow process spawning
+    pub allow_spawn: bool,
+    /// Allowed network hosts (if allow_network is true)
+    pub allowed_hosts: Vec<String>,
+    /// Allowed filesystem paths (if allow_read/write is true)
+    pub allowed_paths: Vec<PathBuf>,
 }
 
 /// Provider-neutral generation modality.

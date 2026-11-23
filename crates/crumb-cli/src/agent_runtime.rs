@@ -142,6 +142,21 @@ fn helper_tool_factory(config: &AgentConfig) -> crumb_harness::WriteToolFactory 
     })
 }
 
+/// Create a capability policy for a helper agent based on the main agent's config
+fn helper_capability_policy(config: &AgentConfig) -> crumb_agent::CapabilityPolicy {
+    // Helper agents get more restrictive policies by default
+    let mut policy = crumb_agent::DEFAULT_CAPABILITY_POLICY.clone();
+    
+    // Allow read access to the workspace
+    policy.allow_read = true;
+    policy.allowed_paths.push(config.workspace.clone());
+    
+    // Allow network access only if the main agent allows it
+    policy.allow_network = config.permissions.allow_network_tools;
+    
+    policy
+}
+
 fn configured_approvals(config: &AgentConfig) -> ConfiguredApprovals {
     ConfiguredApprovals::new(config.permissions.allow_network_tools.clone())
         .with_mode(config.permissions.mode)
@@ -178,6 +193,8 @@ fn turn_approvals(
 /// is driven by the runtime that opened it, so on a single-threaded runtime a
 /// helper reusing the turn's connection waits forever. Two worker threads
 /// keep connection I/O moving while the turn itself is blocked.
+///
+/// Helper agents are spawned with restricted capabilities based on the main agent's config
 fn native_turn_runtime() -> Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

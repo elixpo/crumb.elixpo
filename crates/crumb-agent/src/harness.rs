@@ -27,6 +27,8 @@ pub struct HarnessTurnRequest {
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_policy: Option<crate::config::CapabilityPolicy>,
 }
 
 impl HarnessTurnRequest {
@@ -45,7 +47,18 @@ impl HarnessTurnRequest {
             provider: route.provider.clone(),
             model: route.model.clone(),
             reasoning_effort: reasoning_effort.map(str::to_owned),
+            capability_policy: None,
         }
+    }
+    
+    /// Create a new request with a capability policy
+    #[must_use]
+    pub fn with_capability_policy(
+        mut self,
+        policy: crate::config::CapabilityPolicy,
+    ) -> Self {
+        self.capability_policy = Some(policy);
+        self
     }
 
     /// Checks the exact model and effort before an adapter performs network I/O.
