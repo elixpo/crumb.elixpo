@@ -825,6 +825,7 @@ dependencies = [
  "crumb-auth",
  "reqwest",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
