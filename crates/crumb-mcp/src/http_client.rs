@@ -476,24 +476,42 @@ mod tests {
     struct Fixture {
         url: String,
         calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<String>>>,
         stopped: Arc<AtomicBool>,
         worker: Option<thread::JoinHandle<()>>,
     }
 
     impl Fixture {
         fn start(delay: Duration, malformed_list: bool) -> Self {
+            Self::start_with_redirect(delay, malformed_list, None)
+        }
+
+        fn start_with_redirect(
+            delay: Duration,
+            malformed_list: bool,
+            redirect: Option<(String, String)>,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener");
             listener.set_nonblocking(true).expect("fixture nonblocking");
             let address = listener.local_addr().expect("fixture address");
             let calls = Arc::new(AtomicUsize::new(0));
+            let requests = Arc::new(Mutex::new(Vec::new()));
             let stopped = Arc::new(AtomicBool::new(false));
             let worker_calls = Arc::clone(&calls);
+            let worker_requests = Arc::clone(&requests);
             let worker_stopped = Arc::clone(&stopped);
             let worker = thread::spawn(move || {
                 while !worker_stopped.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            handle_request(&mut stream, &worker_calls, delay, malformed_list);
+                            handle_request(
+                                &mut stream,
+                                &worker_calls,
+                                &worker_requests,
+                                delay,
+                                malformed_list,
+                                redirect.as_ref(),
+                            );
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(2));
@@ -505,6 +523,7 @@ mod tests {
             Self {
                 url: format!("http://{address}/mcp"),
                 calls,
+                requests,
                 stopped,
                 worker: Some(worker),
             }
@@ -540,21 +559,37 @@ mod tests {
     fn handle_request(
         stream: &mut TcpStream,
         calls: &AtomicUsize,
+        requests: &Mutex<Vec<String>>,
         delay: Duration,
         malformed_list: bool,
+        redirect: Option<&(String, String)>,
     ) {
         // Windows inherits the listener's nonblocking mode on accept; block so the 1s
         // read timeout bounds the request instead of rejecting bytes that have not arrived.
         stream
             .set_nonblocking(false)
             .expect("fixture stream blocking");
-        let Some(body) = read_http_body(stream) else {
+        let Some((headers, body)) = read_http_request(stream) else {
             return;
         };
+        requests
+            .lock()
+            .expect("fixture request headers")
+            .push(headers);
         let Ok(message) = serde_json::from_slice::<Value>(&body) else {
             return;
         };
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+        if let Some((redirect_method, location)) = redirect
+            && method == redirect_method
+        {
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            return;
+        }
         if method == "notifications/initialized" {
             let _ = stream.write_all(
                 b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -593,7 +628,7 @@ mod tests {
         let _ = stream.write_all(&encoded);
     }
 
-    fn read_http_body(stream: &mut TcpStream) -> Option<Vec<u8>> {
+    fn read_http_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
         stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
         let mut request = Vec::new();
         let mut byte = [0_u8; 1];
@@ -605,15 +640,26 @@ mod tests {
             }
         }
         let headers = std::str::from_utf8(&request).ok()?;
-        let length = headers.lines().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
-        })?;
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
         let mut body = vec![0; length];
         stream.read_exact(&mut body).ok()?;
-        Some(body)
+        Some((headers.to_owned(), body))
+    }
+
+    fn header_value<'a>(headers: &'a str, expected_name: &str) -> Option<&'a str> {
+        headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case(expected_name)
+                .then(|| value.trim())
+        })
     }
 
     #[test]
@@ -673,6 +719,120 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("malformed"));
         assert!(host.descriptor("mcp__remote__echo").is_none());
+    }
+
+    #[test]
+    fn bearer_authorization_and_protocol_headers_reach_the_configured_endpoint() {
+        let fixture = Fixture::start(Duration::ZERO, false);
+        let token = "synthetic-mcp-test-token";
+        let client = StreamableHttpClient::connect(
+            &fixture.url,
+            Some(SecretString::new(token)),
+            StreamableHttpLimits::default(),
+        )
+        .expect("client initializes");
+        client.discover().expect("tools are discovered");
+        assert_eq!(
+            client
+                .call("echo", &json!({}), &CancellationToken::default())
+                .expect("tool call succeeds")
+                .text,
+            "called"
+        );
+
+        let requests = fixture
+            .requests
+            .lock()
+            .expect("fixture request headers")
+            .clone();
+        assert_eq!(requests.len(), 4, "initialize, notification, list, call");
+        for headers in &requests {
+            assert!(
+                header_value(headers, "authorization")
+                    .and_then(|value| value.strip_prefix("Bearer "))
+                    .is_some_and(|value| value == token),
+                "configured endpoint receives the synthetic bearer credential"
+            );
+            assert!(
+                header_value(headers, "accept")
+                    .is_some_and(|value| value == "application/json, text/event-stream"),
+                "MCP Accept header is retained"
+            );
+            assert!(
+                header_value(headers, "content-type")
+                    .is_some_and(|value| value == "application/json"),
+                "MCP Content-Type header is retained"
+            );
+            assert!(
+                header_value(headers, "mcp-protocol-version")
+                    .is_some_and(|value| value == PROTOCOL_VERSION),
+                "MCP protocol version header is retained"
+            );
+            assert!(
+                headers.starts_with("POST /mcp HTTP/1.1\r\n"),
+                "MCP requests remain POST requests to the configured path"
+            );
+        }
+        assert!(
+            header_value(&requests[2], SESSION_HEADER).is_some(),
+            "discovery request carries the negotiated session"
+        );
+        assert!(
+            header_value(&requests[3], SESSION_HEADER).is_some(),
+            "tool call carries the negotiated session"
+        );
+    }
+
+    #[test]
+    fn bearer_credentials_are_not_forwarded_to_a_redirect_destination() {
+        let destination = Fixture::start(Duration::ZERO, false);
+        let token = "synthetic-mcp-redirect-test-token";
+        let configured = Fixture::start_with_redirect(
+            Duration::ZERO,
+            false,
+            Some(("tools/call".to_owned(), destination.url.clone())),
+        );
+        let client = StreamableHttpClient::connect(
+            &configured.url,
+            Some(SecretString::new(token)),
+            StreamableHttpLimits::default(),
+        )
+        .expect("client initializes");
+        client.discover().expect("tools are discovered");
+        let error = client
+            .call("echo", &json!({}), &CancellationToken::default())
+            .expect_err("redirect response must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("external MCP HTTP request failed"),
+            "redirect produces a controlled HTTP error"
+        );
+        let configured_requests = configured
+            .requests
+            .lock()
+            .expect("configured fixture request headers")
+            .clone();
+        assert_eq!(
+            configured_requests.len(),
+            4,
+            "configured endpoint receives initialize, notification, discovery, and call"
+        );
+        assert!(
+            header_value(&configured_requests[3], "authorization")
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .is_some_and(|value| value == token),
+            "configured endpoint receives the synthetic bearer credential"
+        );
+        assert!(
+            destination
+                .requests
+                .lock()
+                .expect("redirect fixture request headers")
+                .is_empty(),
+            "redirect destination receives no request or authorization header"
+        );
     }
 
     #[test]
