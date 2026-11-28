@@ -24,6 +24,7 @@ pub use config::{
     MistakePolicy, Modality, ModelPack, ModelRoute, OptimizerConfig, ProviderCompatibility,
     ProviderConfig, ProviderHeader, ProviderModel, ProviderProtocol, ProviderRetryPolicy,
     ProviderTransport, SessionSettings, SkillConfig, StructuredEncoding, ToolPermissions,
+    CapabilityPolicy, DEFAULT_CAPABILITY_POLICY, DEVELOPMENT_CAPABILITY_POLICY,
 };
 pub use harness::{HarnessTurnRequest, ModelCapabilities};
 pub use jobs::{
