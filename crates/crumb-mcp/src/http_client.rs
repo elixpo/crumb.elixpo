@@ -1,10 +1,7 @@
 use std::collections::BTreeSet;
-use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use crumb_agent::{
@@ -12,8 +9,8 @@ use crumb_agent::{
     ToolHandler, ToolHost, ToolOutput, ToolTransport,
 };
 use crumb_auth::SecretString;
-use reqwest::blocking::{Client, Response};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::{Client, Response};
 use serde_json::{Value, json};
 
 use crate::client::{
@@ -136,6 +133,7 @@ fn register_tool(
 
 struct StreamableHttpClient {
     client: Client,
+    runtime: Mutex<tokio::runtime::Runtime>,
     endpoint: String,
     credential: Option<Arc<SecretString>>,
     session_id: Mutex<Option<String>>,
@@ -153,14 +151,21 @@ impl StreamableHttpClient {
         if limits.max_response_bytes == 0 || limits.max_tools == 0 {
             bail!("MCP limits must be positive");
         }
-        let client = Client::builder()
-            .connect_timeout(limits.startup_timeout)
-            .timeout(limits.request_timeout)
-            .redirect(reqwest::redirect::Policy::none())
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
-            .context("external MCP HTTP client is unavailable")?;
+            .context("external MCP HTTP runtime is unavailable")?;
+        let client = runtime.block_on(async {
+            Client::builder()
+                .connect_timeout(limits.startup_timeout)
+                .pool_max_idle_per_host(0)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .context("external MCP HTTP client is unavailable")
+        })?;
         let result = Self {
             client,
+            runtime: Mutex::new(runtime),
             endpoint: endpoint.to_owned(),
             credential: credential.map(Arc::new),
             session_id: Mutex::new(None),
@@ -271,56 +276,47 @@ impl StreamableHttpClient {
         if encoded.len() > self.limits.max_response_bytes {
             bail!("external MCP request exceeded the byte limit");
         }
-        let client = self.client.clone();
-        let endpoint = self.endpoint.clone();
-        let credential = self.credential.clone();
         let session_id = self
             .session_id
             .lock()
             .map_err(|_| anyhow!("external MCP HTTP session state is unavailable"))?
             .clone();
         let maximum = self.limits.max_response_bytes;
-        let (sender, receiver) = mpsc::sync_channel(1);
-        thread::Builder::new()
-            .name("crumb-mcp-http".to_owned())
-            .spawn(move || {
-                let request = HttpRequest {
-                    encoded,
-                    expected_id,
-                    retry_safe,
-                };
-                let result = perform_request(
-                    &client,
-                    &endpoint,
-                    credential.as_deref(),
-                    session_id.as_deref(),
-                    maximum,
-                    &request,
-                );
-                let _ = sender.send(result);
-            })
-            .context("failed to start external MCP HTTP request")?;
-        let deadline = Instant::now() + timeout;
-        loop {
-            if cancellation.is_cancelled() {
-                bail!("external MCP request cancelled");
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                bail!("external MCP request timed out");
-            }
-            match receiver.recv_timeout(
-                deadline
-                    .saturating_duration_since(now)
-                    .min(Duration::from_millis(25)),
-            ) {
-                Ok(result) => return result,
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    bail!("external MCP HTTP request failed");
+        let request = HttpRequest {
+            encoded,
+            expected_id,
+            retry_safe,
+        };
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow!("external MCP HTTP runtime is unavailable"))?;
+        runtime
+            .block_on(async {
+                match tokio::time::timeout(
+                    timeout,
+                    perform_request(
+                        &self.client,
+                        &self.endpoint,
+                        self.credential.as_deref(),
+                        session_id.as_deref(),
+                        maximum,
+                        &request,
+                        cancellation,
+                    ),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => bail!("external MCP request timed out"),
                 }
-            }
-        }
+            })
+            .and_then(|result| {
+                if cancellation.is_cancelled() {
+                    bail!("external MCP request cancelled");
+                }
+                Ok(result)
+            })
     }
 
     fn update_session(&self, session_id: Option<String>) -> Result<()> {
@@ -341,13 +337,14 @@ struct HttpRequest {
     retry_safe: bool,
 }
 
-fn perform_request(
+async fn perform_request(
     client: &Client,
     endpoint: &str,
     credential: Option<&SecretString>,
     session_id: Option<&str>,
     maximum: usize,
     request: &HttpRequest,
+    cancellation: &CancellationToken,
 ) -> Result<(Value, Option<String>)> {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -378,9 +375,16 @@ fn perform_request(
             .body(request.encoded.clone())
             .send()
     };
-    let response = match send() {
+    let first_attempt = tokio::select! {
+        result = send() => result,
+        () = cancellation.cancelled() => bail!("external MCP request cancelled"),
+    };
+    let response = match first_attempt {
         Ok(response) => response,
-        Err(_) if request.retry_safe => send().map_err(|error| sanitized_http_error(&error))?,
+        Err(_) if request.retry_safe && !cancellation.is_cancelled() => tokio::select! {
+            result = send() => result.map_err(|error| sanitized_http_error(&error))?,
+            () = cancellation.cancelled() => bail!("external MCP request cancelled"),
+        },
         Err(error) => return Err(sanitized_http_error(&error)),
     };
     let session_id = response
@@ -404,7 +408,10 @@ fn perform_request(
     let response = response
         .error_for_status()
         .context("external MCP HTTP request failed")?;
-    let body = read_bounded(response, maximum)?;
+    let body = read_bounded(response, maximum, cancellation).await?;
+    if cancellation.is_cancelled() {
+        bail!("external MCP request cancelled");
+    }
     let value = if content_type.starts_with("text/event-stream") {
         parse_sse(&body, request.expected_id.expect("checked above"))?
     } else {
@@ -424,15 +431,20 @@ fn sanitized_http_error(error: &reqwest::Error) -> anyhow::Error {
     }
 }
 
-fn read_bounded(response: Response, maximum: usize) -> Result<Vec<u8>> {
-    let limit = u64::try_from(maximum).unwrap_or(u64::MAX).saturating_add(1);
+async fn read_bounded(
+    mut response: Response,
+    maximum: usize,
+    cancellation: &CancellationToken,
+) -> Result<Vec<u8>> {
     let mut body = Vec::new();
-    response
-        .take(limit)
-        .read_to_end(&mut body)
-        .context("external MCP HTTP response failed")?;
-    if body.len() > maximum {
-        bail!("external MCP response exceeded the byte limit");
+    while let Some(chunk) = tokio::select! {
+        result = response.chunk() => result.context("external MCP HTTP response failed")?,
+        () = cancellation.cancelled() => bail!("external MCP request cancelled"),
+    } {
+        if body.len().saturating_add(chunk.len()) > maximum {
+            bail!("external MCP response exceeded the byte limit");
+        }
+        body.extend_from_slice(&chunk);
     }
     Ok(body)
 }
@@ -468,32 +480,75 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Instant;
 
     use crumb_agent::{AgentMode, ConfiguredApprovals, DenyAllApprovals};
 
     use super::*;
 
+    #[derive(Clone, Copy)]
+    enum FixtureBehavior {
+        Normal,
+        HoldHeaders(&'static str),
+        StreamThenHold(&'static str),
+        DropFirst(&'static str),
+    }
+
+    struct FixtureSignals<'a> {
+        calls: &'a AtomicUsize,
+        methods: &'a Mutex<Vec<String>>,
+        requests: &'a mpsc::SyncSender<String>,
+        chunks_sent: &'a mpsc::SyncSender<()>,
+        connections_closed: &'a mpsc::SyncSender<bool>,
+    }
+
     struct Fixture {
         url: String,
         calls: Arc<AtomicUsize>,
+        methods: Arc<Mutex<Vec<String>>>,
+        requests: mpsc::Receiver<String>,
+        chunks_sent: mpsc::Receiver<()>,
+        connections_closed: mpsc::Receiver<bool>,
         stopped: Arc<AtomicBool>,
         worker: Option<thread::JoinHandle<()>>,
     }
 
     impl Fixture {
-        fn start(delay: Duration, malformed_list: bool) -> Self {
+        fn start(malformed_list: bool) -> Self {
+            Self::start_with_behavior(malformed_list, FixtureBehavior::Normal)
+        }
+
+        fn start_with_behavior(malformed_list: bool, behavior: FixtureBehavior) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener");
             listener.set_nonblocking(true).expect("fixture nonblocking");
             let address = listener.local_addr().expect("fixture address");
             let calls = Arc::new(AtomicUsize::new(0));
+            let methods = Arc::new(Mutex::new(Vec::new()));
             let stopped = Arc::new(AtomicBool::new(false));
             let worker_calls = Arc::clone(&calls);
+            let worker_methods = Arc::clone(&methods);
             let worker_stopped = Arc::clone(&stopped);
+            let (request_sender, requests) = mpsc::sync_channel(16);
+            let (chunk_sender, chunks_sent) = mpsc::sync_channel(2);
+            let (closed_sender, connections_closed) = mpsc::sync_channel(2);
             let worker = thread::spawn(move || {
                 while !worker_stopped.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            handle_request(&mut stream, &worker_calls, delay, malformed_list);
+                            handle_request(
+                                &mut stream,
+                                &FixtureSignals {
+                                    calls: &worker_calls,
+                                    methods: &worker_methods,
+                                    requests: &request_sender,
+                                    chunks_sent: &chunk_sender,
+                                    connections_closed: &closed_sender,
+                                },
+                                malformed_list,
+                                behavior,
+                            );
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(2));
@@ -505,6 +560,10 @@ mod tests {
             Self {
                 url: format!("http://{address}/mcp"),
                 calls,
+                methods,
+                requests,
+                chunks_sent,
+                connections_closed,
                 stopped,
                 worker: Some(worker),
             }
@@ -539,9 +598,9 @@ mod tests {
 
     fn handle_request(
         stream: &mut TcpStream,
-        calls: &AtomicUsize,
-        delay: Duration,
+        fixture: &FixtureSignals<'_>,
         malformed_list: bool,
+        behavior: FixtureBehavior,
     ) {
         // Windows inherits the listener's nonblocking mode on accept; block so the 1s
         // read timeout bounds the request instead of rejecting bytes that have not arrived.
@@ -555,6 +614,41 @@ mod tests {
             return;
         };
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+        let attempt = {
+            let mut methods = fixture.methods.lock().expect("fixture request methods");
+            methods.push(method.to_owned());
+            methods
+                .iter()
+                .filter(|seen| seen.as_str() == method)
+                .count()
+        };
+        let _ = fixture.requests.send(method.to_owned());
+
+        if let FixtureBehavior::DropFirst(drop_method) = behavior
+            && method == drop_method
+            && attempt == 1
+        {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+        if let FixtureBehavior::HoldHeaders(held_method) = behavior
+            && method == held_method
+        {
+            report_connection_close(stream, fixture.connections_closed);
+            return;
+        }
+        if let FixtureBehavior::StreamThenHold(held_method) = behavior
+            && method == held_method
+        {
+            let body = b"{\"jsonrpc\":\"2.0\",";
+            let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 256\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(response);
+            let _ = stream.write_all(body);
+            let _ = stream.flush();
+            let _ = fixture.chunks_sent.send(());
+            report_connection_close(stream, fixture.connections_closed);
+            return;
+        }
         if method == "notifications/initialized" {
             let _ = stream.write_all(
                 b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -578,8 +672,7 @@ mod tests {
                 "result":{"tools":[{"name":"echo","description":"fixture","inputSchema":{"type":"object"}}]}
             }),
             "tools/call" => {
-                thread::sleep(delay);
-                calls.fetch_add(1, Ordering::Relaxed);
+                fixture.calls.fetch_add(1, Ordering::Relaxed);
                 json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"called"}],"isError":false}})
             }
             _ => return,
@@ -591,6 +684,23 @@ mod tests {
         );
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.write_all(&encoded);
+    }
+
+    fn report_connection_close(stream: &mut TcpStream, closed: &mpsc::SyncSender<bool>) {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut byte = [0_u8; 1];
+        let disconnected = match stream.read(&mut byte) {
+            Ok(0) => true,
+            Err(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+            ),
+            Ok(_) => false,
+        };
+        let _ = closed.send(disconnected);
     }
 
     fn read_http_body(stream: &mut TcpStream) -> Option<Vec<u8>> {
@@ -616,9 +726,44 @@ mod tests {
         Some(body)
     }
 
+    fn wait_for_request(fixture: &Fixture, expected_method: &str) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let method = fixture
+                .requests
+                .recv_timeout(remaining)
+                .expect("fixture receives the expected request");
+            if method == expected_method {
+                return;
+            }
+        }
+    }
+
+    fn spawn_tool_call(
+        client: StreamableHttpClient,
+        cancellation: CancellationToken,
+    ) -> (mpsc::Receiver<Result<ToolOutput>>, thread::JoinHandle<()>) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let result = client.call("echo", &json!({}), &cancellation);
+            let _ = sender.send(result);
+        });
+        (receiver, worker)
+    }
+
+    fn assert_connection_closed(fixture: &Fixture) {
+        assert!(
+            fixture
+                .connections_closed
+                .recv_timeout(Duration::from_secs(3))
+                .expect("fixture observes client connection termination")
+        );
+    }
+
     #[test]
     fn remote_calls_are_discovered_and_denied_before_network() {
-        let fixture = Fixture::start(Duration::ZERO, false);
+        let fixture = Fixture::start(false);
         let mut host = ToolHost::default();
         let diagnostics = register_streamable_http_servers(
             &mut host,
@@ -662,7 +807,7 @@ mod tests {
 
     #[test]
     fn malformed_remote_servers_are_isolated() {
-        let fixture = Fixture::start(Duration::ZERO, true);
+        let fixture = Fixture::start(true);
         let mut host = ToolHost::default();
         let diagnostics = register_streamable_http_servers(
             &mut host,
@@ -676,22 +821,8 @@ mod tests {
     }
 
     #[test]
-    fn timeouts_and_credentials_are_redacted() {
-        let fixture = Fixture::start(Duration::from_millis(100), false);
-        let client = StreamableHttpClient::connect(
-            &fixture.url,
-            None,
-            StreamableHttpLimits {
-                startup_timeout: Duration::from_secs(1),
-                request_timeout: Duration::from_millis(20),
-                ..StreamableHttpLimits::default()
-            },
-        )
-        .expect("client connects");
-        let error = client
-            .call("echo", &json!({}), &CancellationToken::default())
-            .expect_err("slow remote call times out");
-        assert!(error.to_string().contains("timed out"));
+    fn credential_resolution_errors_are_redacted() {
+        let fixture = Fixture::start(false);
 
         let mut host = ToolHost::default();
         let mut credential_server = fixture.server();
@@ -710,23 +841,152 @@ mod tests {
 
     #[test]
     fn active_remote_calls_can_be_cancelled() {
-        let fixture = Fixture::start(Duration::from_secs(2), false);
-        let client =
-            StreamableHttpClient::connect(&fixture.url, None, StreamableHttpLimits::default())
-                .expect("client connects");
+        let fixture =
+            Fixture::start_with_behavior(false, FixtureBehavior::HoldHeaders("tools/call"));
+        let client = StreamableHttpClient::connect(
+            &fixture.url,
+            None,
+            StreamableHttpLimits {
+                request_timeout: Duration::from_secs(1),
+                ..StreamableHttpLimits::default()
+            },
+        )
+        .expect("client connects");
         let cancellation = CancellationToken::default();
-        let trigger = cancellation.clone();
-        let worker = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(10));
-            trigger.cancel();
-        });
-        let started = Instant::now();
-        let error = client
-            .call("echo", &json!({}), &cancellation)
+        let (result, worker) = spawn_tool_call(client, cancellation.clone());
+        wait_for_request(&fixture, "tools/call");
+        cancellation.cancel();
+        let error = result
+            .recv_timeout(Duration::from_secs(3))
+            .expect("cancelled call returns promptly")
             .expect_err("remote call is cancelled");
-        worker.join().expect("cancellation worker");
+        worker.join().expect("tool call worker");
         assert!(error.to_string().contains("cancelled"));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_connection_closed(&fixture);
+    }
+
+    #[test]
+    fn cancellation_stops_response_body_streaming() {
+        let fixture =
+            Fixture::start_with_behavior(false, FixtureBehavior::StreamThenHold("tools/call"));
+        let client = StreamableHttpClient::connect(
+            &fixture.url,
+            None,
+            StreamableHttpLimits {
+                request_timeout: Duration::from_secs(1),
+                ..StreamableHttpLimits::default()
+            },
+        )
+        .expect("client connects");
+        let cancellation = CancellationToken::default();
+        let (result, worker) = spawn_tool_call(client, cancellation.clone());
+        wait_for_request(&fixture, "tools/call");
+        fixture
+            .chunks_sent
+            .recv_timeout(Duration::from_secs(3))
+            .expect("fixture sends a partial response body");
+        cancellation.cancel();
+        let error = result
+            .recv_timeout(Duration::from_secs(3))
+            .expect("cancelled streaming call returns promptly")
+            .expect_err("remote call is cancelled");
+        worker.join().expect("tool call worker");
+        assert!(error.to_string().contains("cancelled"));
+        assert_connection_closed(&fixture);
+    }
+
+    #[test]
+    fn request_timeout_closes_the_in_flight_connection() {
+        let fixture =
+            Fixture::start_with_behavior(false, FixtureBehavior::HoldHeaders("tools/call"));
+        let client = StreamableHttpClient::connect(
+            &fixture.url,
+            None,
+            StreamableHttpLimits {
+                request_timeout: Duration::from_millis(100),
+                ..StreamableHttpLimits::default()
+            },
+        )
+        .expect("client connects");
+        let error = client
+            .call("echo", &json!({}), &CancellationToken::default())
+            .expect_err("delayed response times out");
+        assert!(error.to_string().contains("timed out"));
+        assert_connection_closed(&fixture);
+    }
+
+    #[test]
+    fn startup_timeout_closes_the_initialization_connection() {
+        let fixture =
+            Fixture::start_with_behavior(false, FixtureBehavior::HoldHeaders("initialize"));
+        let url = fixture.url.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let result = StreamableHttpClient::connect(
+                &url,
+                None,
+                StreamableHttpLimits {
+                    startup_timeout: Duration::from_millis(100),
+                    request_timeout: Duration::from_secs(1),
+                    ..StreamableHttpLimits::default()
+                },
+            );
+            let _ = sender.send(result);
+        });
+        wait_for_request(&fixture, "initialize");
+        let result = receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("initialization timeout returns promptly");
+        let error = result.err().expect("delayed initialization times out");
+        worker.join().expect("initialization worker");
+        assert!(error.to_string().contains("timed out"));
+        assert_connection_closed(&fixture);
+    }
+
+    #[test]
+    fn retries_only_idempotent_mcp_requests() {
+        let discovery_fixture =
+            Fixture::start_with_behavior(false, FixtureBehavior::DropFirst("tools/list"));
+        StreamableHttpClient::connect(
+            &discovery_fixture.url,
+            None,
+            StreamableHttpLimits::default(),
+        )
+        .expect("tool discovery retries once");
+        wait_for_request(&discovery_fixture, "tools/list");
+        wait_for_request(&discovery_fixture, "tools/list");
+        assert_eq!(
+            discovery_fixture
+                .methods
+                .lock()
+                .expect("fixture methods")
+                .iter()
+                .filter(|method| method.as_str() == "tools/list")
+                .count(),
+            2
+        );
+
+        let call_fixture =
+            Fixture::start_with_behavior(false, FixtureBehavior::DropFirst("tools/call"));
+        let client =
+            StreamableHttpClient::connect(&call_fixture.url, None, StreamableHttpLimits::default())
+                .expect("client connects");
+        assert!(
+            client
+                .call("echo", &json!({}), &CancellationToken::default())
+                .is_err()
+        );
+        wait_for_request(&call_fixture, "tools/call");
+        assert_eq!(
+            call_fixture
+                .methods
+                .lock()
+                .expect("fixture methods")
+                .iter()
+                .filter(|method| method.as_str() == "tools/call")
+                .count(),
+            1
+        );
     }
 
     #[test]
