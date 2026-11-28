@@ -158,7 +158,7 @@ impl StreamableHttpClient {
         let client = runtime.block_on(async {
             Client::builder()
                 .connect_timeout(limits.startup_timeout)
-                .timeout(limits.request_timeout)
+                .pool_max_idle_per_host(0)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .context("external MCP HTTP client is unavailable")
@@ -953,6 +953,8 @@ mod tests {
             StreamableHttpLimits::default(),
         )
         .expect("tool discovery retries once");
+        wait_for_request(&discovery_fixture, "tools/list");
+        wait_for_request(&discovery_fixture, "tools/list");
         assert_eq!(
             discovery_fixture
                 .methods
@@ -974,6 +976,7 @@ mod tests {
                 .call("echo", &json!({}), &CancellationToken::default())
                 .is_err()
         );
+        wait_for_request(&call_fixture, "tools/call");
         assert_eq!(
             call_fixture
                 .methods
