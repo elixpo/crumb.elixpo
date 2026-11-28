@@ -458,20 +458,150 @@ pub(crate) fn redacted_error(error: &anyhow::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::{
+        io::Cursor,
+        path::Path,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use crumb_agent::{McpServer, McpTransport, ToolHost};
+
     #[cfg(unix)]
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     #[cfg(unix)]
     use crumb_agent::{
-        AgentMode, CancellationToken, ConfiguredApprovals, DenyAllApprovals, McpServer, RiskClass,
-        ToolHost,
+        AgentMode, CancellationToken, ConfiguredApprovals, DenyAllApprovals, RiskClass,
     };
     use serde_json::json;
 
     #[cfg(unix)]
-    use super::{StdioMcpClient, StdioMcpLimits, register_stdio_servers};
-    use super::{parse_tool, parse_tool_output, read_frame, redacted_error};
+    use super::StdioMcpClient;
+    use super::{
+        StdioMcpLimits, parse_tool, parse_tool_output, read_frame, redacted_error,
+        register_stdio_servers,
+    };
+
+    const ENVIRONMENT_TEST_CHILD: &str = "CRUMB_MCP_ENVIRONMENT_TEST_CHILD";
+    const ENVIRONMENT_TEST_SECRET: &str = "CRUMB_MCP_TEST_SECRET";
+
+    fn temporary_workspace(label: &str) -> std::path::PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("crumb-mcp-{label}-{suffix}"));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        workspace
+    }
+
+    #[cfg(unix)]
+    fn environment_server(workspace: &Path) -> McpServer {
+        let script = workspace.join("environment.sh");
+        std::fs::write(
+            &script,
+            concat!(
+                "secret=cleared\n",
+                "test -n \"${CRUMB_MCP_TEST_SECRET+x}\" && secret=leaked\n",
+                "path=cleared\n",
+                "test -n \"${PATH+x}\" && path=allowed\n",
+                "home=cleared\n",
+                "test -n \"${HOME+x}\" && home=leaked\n",
+                "while IFS= read -r line; do\n",
+                "case \"$line\" in\n",
+                "  *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\"}}' ;;\n",
+                "  *'\"method\":\"tools/list\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"environment\",\"description\":\"%s,%s,%s\",\"inputSchema\":{\"type\":\"object\"}}]}}\\n' \"$secret\" \"$path\" \"$home\" ;;\n",
+                "esac\n",
+                "done\n"
+            ),
+        )
+        .expect("environment fixture");
+        McpServer {
+            id: "environment".to_owned(),
+            transport: McpTransport::Stdio,
+            command: "/bin/sh".into(),
+            arguments: vec![script.to_string_lossy().into_owned()],
+            url: None,
+            credential: None,
+            enabled: true,
+        }
+    }
+
+    #[cfg(windows)]
+    fn environment_server(workspace: &Path) -> McpServer {
+        let script = workspace.join("environment.ps1");
+        std::fs::write(
+            &script,
+            concat!(
+                "$secretStatus = if ($env:CRUMB_MCP_TEST_SECRET) { 'leaked' } else { 'cleared' }\n",
+                "$pathStatus = if ($env:PATH) { 'allowed' } else { 'cleared' }\n",
+                "$homeStatus = if ($env:HOME) { 'leaked' } else { 'cleared' }\n",
+                "$initialize = '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\"}}'\n",
+                "$tools = '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"environment\",\"description\":\"' + $secretStatus + ',' + $pathStatus + ',' + $homeStatus + '\",\"inputSchema\":{\"type\":\"object\"}}]}}'\n",
+                "while ($null -ne ($line = [Console]::In.ReadLine())) {\n",
+                "  if ($line.Contains('\"method\":\"initialize\"')) { [Console]::Out.WriteLine($initialize) }\n",
+                "  if ($line.Contains('\"method\":\"tools/list\"')) { [Console]::Out.WriteLine($tools) }\n",
+                "}\n"
+            ),
+        )
+        .expect("environment fixture");
+        McpServer {
+            id: "environment".to_owned(),
+            transport: McpTransport::Stdio,
+            command: std::env::var_os("SYSTEMROOT")
+                .map(std::path::PathBuf::from)
+                .map(|root| root.join("System32/WindowsPowerShell/v1.0/powershell.exe"))
+                .unwrap_or_else(|| "powershell.exe".into()),
+            arguments: vec![
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-ExecutionPolicy".to_owned(),
+                "Bypass".to_owned(),
+                "-File".to_owned(),
+                script.to_string_lossy().into_owned(),
+            ],
+            url: None,
+            credential: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn external_mcp_servers_receive_a_cleared_environment() {
+        if std::env::var_os(ENVIRONMENT_TEST_CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().expect("test executable"))
+                .arg("external_mcp_servers_receive_a_cleared_environment")
+                .arg("--nocapture")
+                .env(ENVIRONMENT_TEST_CHILD, "1")
+                .env(ENVIRONMENT_TEST_SECRET, "parent-only-fixture-secret")
+                .output()
+                .expect("environment test child starts");
+            assert!(
+                output.status.success(),
+                "environment test child failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let workspace = temporary_workspace("environment");
+        let server = environment_server(&workspace);
+        let mut host = ToolHost::default();
+        assert_eq!(
+            register_stdio_servers(&mut host, &[server], &workspace, StdioMcpLimits::default(),),
+            []
+        );
+        assert_eq!(
+            host.descriptor("mcp__environment__environment")
+                .expect("environment tool")
+                .description,
+            "cleared,allowed,cleared"
+        );
+        drop(host);
+        std::fs::remove_dir_all(workspace).expect("temporary workspace removed");
+    }
 
     #[test]
     fn discovery_rejects_unsafe_names_and_large_schemas() {
@@ -573,53 +703,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn stdio_failures_are_isolated_and_child_environment_is_cleared() {
+    fn stdio_failures_are_isolated() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is valid")
             .as_nanos();
         let workspace = std::env::temp_dir().join(format!("crumb-mcp-adversarial-{suffix}"));
         std::fs::create_dir_all(&workspace).expect("workspace");
-
-        let environment_script = workspace.join("environment.sh");
-        std::fs::write(
-            &environment_script,
-            concat!(
-                "while IFS= read -r line; do\n",
-                "case \"$line\" in\n",
-                "  *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\"}}' ;;\n",
-                "  *'\"method\":\"tools/list\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"environment\",\"description\":\"%s\",\"inputSchema\":{\"type\":\"object\"}}]}}\\n' \"${HOME:-cleared}\" ;;\n",
-                "esac\n",
-                "done\n"
-            ),
-        )
-        .expect("environment fixture");
-        let server = McpServer {
-            id: "environment".to_owned(),
-            transport: crumb_agent::McpTransport::Stdio,
-            command: "/bin/sh".into(),
-            arguments: vec![environment_script.to_string_lossy().into_owned()],
-            url: None,
-            credential: None,
-            enabled: true,
-        };
-        let mut host = ToolHost::default();
-        assert_eq!(
-            register_stdio_servers(
-                &mut host,
-                std::slice::from_ref(&server),
-                &workspace,
-                StdioMcpLimits::default(),
-            ),
-            []
-        );
-        assert_eq!(
-            host.descriptor("mcp__environment__environment")
-                .expect("environment tool")
-                .description,
-            "cleared"
-        );
-        drop(host);
 
         let malformed_script = workspace.join("malformed.sh");
         std::fs::write(
@@ -629,8 +719,12 @@ mod tests {
         .expect("malformed fixture");
         let malformed = McpServer {
             id: "malformed".to_owned(),
+            transport: McpTransport::Stdio,
+            command: "/bin/sh".into(),
             arguments: vec![malformed_script.to_string_lossy().into_owned()],
-            ..server.clone()
+            url: None,
+            credential: None,
+            enabled: true,
         };
         let diagnostics = register_stdio_servers(
             &mut ToolHost::default(),
@@ -646,8 +740,12 @@ mod tests {
         std::fs::write(&hanging_script, "IFS= read -r line\nsleep 5\n").expect("hanging fixture");
         let hanging = McpServer {
             id: "hanging".to_owned(),
+            transport: McpTransport::Stdio,
+            command: "/bin/sh".into(),
             arguments: vec![hanging_script.to_string_lossy().into_owned()],
-            ..server
+            url: None,
+            credential: None,
+            enabled: true,
         };
         let diagnostics = register_stdio_servers(
             &mut ToolHost::default(),
