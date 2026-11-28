@@ -3,7 +3,7 @@
 Crumb starts child processes for the shell tools, external harnesses, MCP
 servers, git worktrees, and small pieces of desktop integration. This page is
 the inventory of those call sites: what each one runs, whether the child
-inherits Crumb' environment, whether it runs inside the agent sandbox, and
+inherits Crumb's environment, whether it runs inside the agent sandbox, and
 whether the user approves it first.
 
 Environment entries say **cleared** when the call site calls `env_clear()`
