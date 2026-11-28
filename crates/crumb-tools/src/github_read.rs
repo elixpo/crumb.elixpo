@@ -508,9 +508,7 @@ mod tests {
     use reqwest::StatusCode;
     use serde_json::json;
 
-    use super::{
-        GitHubIssueLimits, Request, plan, render, run_with_token, status_message,
-    };
+    use super::{GitHubIssueLimits, Request, plan, render, run_with_token, status_message};
 
     #[derive(Clone)]
     struct ResponsePlan {
@@ -608,21 +606,17 @@ mod tests {
                         403 => "Forbidden",
                         404 => "Not Found",
                         429 => "Too Many Requests",
-                        status => "Error",
+                        _ => "Error",
                     };
                     let mut headers = plan.headers.clone();
-                    if !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("Content-Length")) {
-                        headers.push((
-                            "Content-Length".to_owned(),
-                            plan.body.len().to_string(),
-                        ));
+                    if !headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case("Content-Length"))
+                    {
+                        headers.push(("Content-Length".to_owned(), plan.body.len().to_string()));
                     }
                     headers.push(("Connection".to_owned(), "close".to_owned()));
-                    let mut response = format!(
-                        "HTTP/1.1 {} {}\r\n",
-                        plan.status,
-                        reason
-                    );
+                    let mut response = format!("HTTP/1.1 {} {}\r\n", plan.status, reason);
                     for (name, value) in &headers {
                         response.push_str(&format!("{name}: {value}\r\n"));
                     }
@@ -679,9 +673,7 @@ mod tests {
     }
 
     fn read_request_head(stream: &mut TcpStream) -> Option<String> {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
         let mut request = Vec::new();
         let mut byte = [0_u8; 1];
         while !request.ends_with(b"\r\n\r\n") {
@@ -694,7 +686,7 @@ mod tests {
         String::from_utf8(request).ok()
     }
 
-    fn request(operation: &str, url: &str) -> Request {
+    fn request(operation: &'static str, url: &str) -> Request {
         match operation {
             "repo" => Request {
                 operation,
@@ -719,7 +711,12 @@ mod tests {
         }
     }
 
-    fn execute(request: Request, fixture_limit: GitHubIssueLimits, token: Option<&str>, cancellation: &CancellationToken) -> Result<crumb_agent::ToolOutput, anyhow::Error> {
+    fn execute(
+        request: Request,
+        fixture_limit: GitHubIssueLimits,
+        token: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<crumb_agent::ToolOutput, anyhow::Error> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -821,9 +818,7 @@ mod tests {
         );
         assert_eq!(
             status_message(StatusCode::NOT_FOUND, false),
-            Some(
-                "Not found. If it is private, run `gh auth login`, then retry.".to_owned()
-            )
+            Some("Not found. If it is private, run `gh auth login`, then retry.".to_owned())
         );
         assert_eq!(
             status_message(StatusCode::NOT_FOUND, true),
@@ -938,10 +933,7 @@ mod tests {
 
     #[test]
     fn oversized_response_is_rejected_before_unbounded_rendering() {
-        let fixture = HttpFixture::start(ResponsePlan::json(
-            200,
-            vec![b'x'; 65 * 1024],
-        ));
+        let fixture = HttpFixture::start(ResponsePlan::json(200, vec![b'x'; 65 * 1024]));
         let output = execute(
             request("repo", &fixture.url),
             limits(Duration::from_secs(2), 1024),
@@ -980,7 +972,8 @@ mod tests {
 
     #[test]
     fn cancellation_while_waiting_for_headers_returns_cancelled() {
-        let mut plan = ResponsePlan::json(200, json!({"full_name": "o/r"}).to_string().into_bytes());
+        let mut plan =
+            ResponsePlan::json(200, json!({"full_name": "o/r"}).to_string().into_bytes());
         plan.gate_headers = true;
         let fixture = HttpFixture::start(plan);
         let cancellation = CancellationToken::default();
