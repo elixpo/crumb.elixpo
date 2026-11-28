@@ -383,6 +383,9 @@ fn perform_request(
         Err(_) if request.retry_safe => send().map_err(|error| sanitized_http_error(&error))?,
         Err(error) => return Err(sanitized_http_error(&error)),
     };
+    if !response.status().is_success() {
+        bail!("external MCP HTTP request failed");
+    }
     let session_id = response
         .headers()
         .get(SESSION_HEADER)
@@ -401,9 +404,6 @@ fn perform_request(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_owned();
-    let response = response
-        .error_for_status()
-        .context("external MCP HTTP request failed")?;
     let body = read_bounded(response, maximum)?;
     let value = if content_type.starts_with("text/event-stream") {
         parse_sse(&body, request.expected_id.expect("checked above"))?
@@ -586,8 +586,13 @@ mod tests {
             let response = format!(
                 "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             );
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
+            stream
+                .write_all(response.as_bytes())
+                .expect("fixture writes redirect response");
+            stream.flush().expect("fixture flushes redirect response");
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .expect("fixture closes redirect response");
             return;
         }
         if method == "notifications/initialized" {
@@ -807,7 +812,7 @@ mod tests {
             error
                 .to_string()
                 .contains("external MCP HTTP request failed"),
-            "redirect produces a controlled HTTP error"
+            "redirect produces a controlled HTTP error; received: {error:#}"
         );
         let configured_requests = configured
             .requests
