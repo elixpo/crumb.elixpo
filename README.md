@@ -198,6 +198,7 @@ secret, open an issue instead of working around it.
 
 ## Development notes
 
+- [docs/reference/environment.md](docs/reference/environment.md)
 - [docs/development/mcp-boundary.md](docs/development/mcp-boundary.md)
 - [docs/development/account-connector.md](docs/development/account-connector.md)
 - [docs/development/provider-configuration.md](docs/development/provider-configuration.md)
